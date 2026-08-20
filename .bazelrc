@@ -21,6 +21,30 @@ common --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1
 
 test --test_output=errors
 
+# Clippy, as an aspect over the targets the build already has.
+#
+#     bazel build --config=lint //...    # report
+#     bazel test //...                   # fail on a violation
+#
+# It sees the crates, features and dependencies the build sees, rather than a
+# second `cargo clippy` resolution that can disagree with it.
+build:lint --aspects=//tools/lint:linters.bzl%clippy
+build:lint --output_groups=clippy_checks
+build:lint --@rules_rust//:clippy.toml=//:clippy.toml
+# `clippy::pedantic` is a warning by workspace policy, and CLAUDE.md forbids
+# suppressing it. Warnings therefore have to fail, or the policy is decorative.
+build:lint --@rules_rust//:clippy_flags=-Dwarnings
+
+# Coverage. rules_rust emits LLVM source-based coverage, which Bazel merges into
+# one LCOV file at bazel-out/_coverage/_coverage_report.dat.
+#
+#     bazel coverage //crates/...
+#
+# Only first-party crates are instrumented: third-party coverage is noise, and
+# instrumenting the whole dependency closure is most of the run.
+coverage --combined_report=lcov
+coverage --instrumentation_filter=^//crates[:/]
+
 # The mutation rules ship no cargo-mutants binary of their own; point them at
 # the one built from //tools/mutants' lockfile.
 build --@rules_rs_mutants//mutants:cargo_mutants_binary=@mutants//:cargo-mutants__cargo-mutants

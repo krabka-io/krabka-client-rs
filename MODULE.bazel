@@ -17,9 +17,9 @@ bazel_dep(name = "rules_rs_mutants", version = "0.0.1")
 # `bazel_dep` above has nothing to resolve against without this override.
 git_override(
     module_name = "rules_rs_mutants",
-    remote = "https://github.com/robot-head/rules_rs_mutants",
     # v0.0.1, resolved to a commit so the checkout is reproducible.
     commit = "fbc5c265b268cd050f2b392fbbf7ea4fb5b1a656",
+    remote = "https://github.com/robot-head/rules_rs_mutants",
 )
 
 # A hermetic C++ toolchain rather than the host's.
@@ -35,6 +35,21 @@ bazel_dep(name = "llvm", version = "0.8.18")
 
 register_toolchains("@llvm//toolchain:all")
 
+# Format. See //tools/format.
+#
+# Formatting only: clippy comes from the @rules_rust that rules_rs already vends,
+# through its own aspect. aspect_rules_lint_rust would supply one too, but it
+# registers a Rust toolchain of its own pinned to 1.92.0 / edition 2021, and
+# rules_rs refuses two configurations under one repo name. Taking the aspect from
+# the build's own rules_rust keeps one toolchain and one resolution.
+# ---------------------------------------------------------------------------
+bazel_dep(name = "aspect_rules_lint", version = "2.7.2")
+bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.3")
+
+# `sh_test`. //bazel/defs.bzl is shared verbatim across the three repositories,
+# and its container-suite path builds one; no crate here uses that path today.
+bazel_dep(name = "rules_shell", version = "0.8.0")
+
 # rules_rs vends its own patched @rules_rust. `rust_doc_test` has no rules_rs
 # wrapper, so it is loaded from there directly rather than from a second copy.
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
@@ -46,6 +61,13 @@ use_repo(rules_rust, "rules_rust")
 toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
 toolchains.toolchain(
     edition = "2024",
+    # rustfmt.toml sets `format_code_in_doc_comments`, `group_imports` and
+    # `imports_granularity`, all still nightly-gated. Stable rustfmt does not
+    # fail on them, it warns and silently skips them -- so a stable formatter
+    # would quietly disagree with the tree, which CI formats with
+    # `cargo +nightly fmt`. rules_rs pins rustfmt separately from rustc for
+    # exactly this.
+    rustfmt_version = "nightly/2026-08-14",
     version = "1.97.0",
 )
 use_repo(toolchains, "default_rust_toolchains")
@@ -79,6 +101,7 @@ crate.from_cargo(
     cargo_toml = "//tools/mutants:Cargo.toml",
     platform_triples = PLATFORM_TRIPLES,
 )
+
 # The wire-layer crates come from the krabka-protocol repository, which is a
 # Cargo workspace whose `members` is the glob `crates/*`. rules_rs resolves a
 # git crate's directory by matching the crate name against the members list, and
@@ -115,7 +138,6 @@ crate.annotation(
     strip_prefix = "crates/protocol",
     workspace_cargo_toml = "Cargo.toml",
 )
-
 crate.annotation(
     crate = "cargo-mutants",
     gen_binaries = ["cargo-mutants"],

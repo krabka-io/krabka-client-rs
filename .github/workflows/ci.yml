@@ -1,11 +1,10 @@
 name: ci
-
 on:
   pull_request:
   push:
     branches: [main]
   schedule:
-    # Nightly, 05:00 UTC. Only the mutation sweep runs on this trigger.
+    # Nightly, 05:00 UTC: the mutation sweep.
     - cron: "0 5 * * *"
 
 permissions:
@@ -17,29 +16,90 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  bazel:
-    name: bazel test //...
+  # Build, test, lint and format. The Aspect CLI narrows each of these to what
+  # the change actually touched; `bazel build|test //...` is the equivalent for
+  # anyone without the CLI, and is what the nightly job runs.
+  ci:
+    name: build · test · lint · format
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          # Change detection needs the merge base, not just the tip.
+          fetch-depth: 0
+      - uses: aspect-build/setup-aspect@v0.4.0
         with:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
           repository-cache: true
-      - run: bazel test //...
+
+      - name: format
+        run: aspect format --severity=error
+
+      - name: lint
+        run: aspect lint
+
+      - name: build
+        run: aspect build //...
+
+      - name: test
+        run: aspect test //...
+
+  # LCOV over the first-party crates. Separate from `ci` because instrumented
+  # binaries are a different build, so sharing that job's cache would only
+  # evict it.
+  coverage:
+    name: coverage
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aspect-build/setup-aspect@v0.4.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-coverage
+          repository-cache: true
+      - run: bazel coverage //crates/...
+      - uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: bazel-out/_coverage/_coverage_report.dat
+          disable_search: true
+          fail_ci_if_error: false
+
+  # rustdoc for every crate, kept as an artifact. The `ci` job already builds
+  # these -- a `rust_doc` per crate is an ordinary target -- so this exists to
+  # publish the output, and to keep rendering the whole set even when `aspect
+  # build` narrowed to the crates a change touched.
+  docs:
+    name: docgen
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aspect-build/setup-aspect@v0.4.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-docs
+          repository-cache: true
+      - run: bazel build $(bazel query 'kind("rust_doc rule", //crates/...)')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustdoc
+          path: bazel-bin/crates/**/*.rustdoc
+          if-no-files-found: error
 
   # A mutation sweep rebuilds and re-runs a crate's unit tests once per mutant,
-  # so it is far too slow to gate a pull request. The targets carry `manual`
-  # tags to stay out of `//...`; this job names them explicitly.
+  # so it is far too slow to gate a pull request.
   #
-  # `continue-on-error`: a surviving mutant fails the test target, and survivors
-  # are expected here rather than exceptional -- `cargo_mutants_test` runs only
-  # `#[cfg(test)]` unit tests, so every mutant that the `tests/*.rs` suites would
-  # have killed is reported as a survivor. The job exists to produce that list to
-  # read, not to gate. Make it blocking once the score is one worth defending.
+  # `continue-on-error`: survivors are the expected state, not an exception --
+  # `cargo_mutants_test` runs only `#[cfg(test)]` unit tests, so every mutant the
+  # `tests/*.rs` suites would have killed is reported as one. The job exists to
+  # produce a list to read. Make it blocking once the score is worth defending.
   mutants:
     name: mutation sweep
     if: github.event_name == 'schedule'
@@ -48,13 +108,12 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7
-      - uses: bazel-contrib/setup-bazel@0.19.0
+      - uses: aspect-build/setup-aspect@v0.4.0
         with:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}-mutants
           repository-cache: true
-      - name: Collect mutation targets
-        id: targets
+      - id: targets
         run: |
           {
             echo 'targets<<EOF'

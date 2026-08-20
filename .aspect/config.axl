@@ -1,0 +1,22 @@
+"""Aspect CLI configuration.
+
+The CLI's tasks are what CI runs. Each one narrows to what a change actually
+touched, which for a repository this size is the difference between a minute and
+most of an hour:
+
+    aspect build      # build
+    aspect test       # test, `--coverage` for LCOV
+    aspect lint       # clippy, over changed targets
+    aspect format     # rustfmt/buildifier/yamlfmt, over changed files
+    aspect delivery   # push only images whose built output changed
+
+`bazel build|test //...` remains equivalent and is what a developer without the
+CLI runs; nothing here is required to build the repository.
+"""
+
+def config(ctx: ConfigContext):
+    # Register the clippy aspect so `aspect lint` runs it natively, without
+    # needing Bazel's `--config=lint`.
+    ctx.tasks["lint"].args.aspects = [
+        "//tools/lint:linters.bzl%clippy",
+    ]
