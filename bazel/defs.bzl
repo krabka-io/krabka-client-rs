@@ -69,8 +69,17 @@ def crate_library(name, srcs = None, **kwargs):
         **kwargs
     )
 
-def crate_binary(name, crate_root, lib, **kwargs):
-    """`rust_binary` for a `[[bin]]` target that links its own crate's library."""
+def crate_binary(name, crate_root, lib, tests = True, **kwargs):
+    """`rust_binary` for a `[[bin]]` target that links its own crate's library.
+
+    Args:
+      name: the binary target name, matching Cargo's `[[bin]] name`.
+      crate_root: the binary's entry point, e.g. `src/bin/broker.rs`.
+      lib: the `crate_library` target in this package that it links.
+      tests: emit a `rust_test` over the binary's own `#[cfg(test)]` module.
+        `cargo test` runs those; without this they are simply not run.
+      **kwargs: passed through to `rust_binary`.
+    """
     rust_binary(
         name = name,
         srcs = [crate_root],
@@ -83,6 +92,17 @@ def crate_binary(name, crate_root, lib, **kwargs):
         deps = all_crate_deps(normal = True) + [lib],
         **kwargs
     )
+
+    if tests:
+        rust_test(
+            name = name + "_test",
+            aliases = _aliases(["deps", "dev_deps"]),
+            crate = ":" + name,
+            crate_features = _features(),
+            edition = edition(),
+            rustc_flags = WORKSPACE_RUSTC_FLAGS,
+            deps = all_crate_deps(normal_dev = True),
+        )
 
 def crate_tests(
         lib,
