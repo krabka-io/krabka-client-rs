@@ -35,8 +35,10 @@ jobs:
           disk-cache: ${{ github.workflow }}
           repository-cache: true
 
+      # `--severity` defaults to `auto`, which the CLI resolves to `fail` on CI
+      # and `info` off it -- so this gates here and only reports locally.
       - name: format
-        run: aspect format --severity=error
+        run: aspect format
 
       - name: lint
         run: aspect lint
