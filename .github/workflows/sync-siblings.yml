@@ -1,0 +1,97 @@
+name: sync-siblings
+
+# Proposes a bump of each sibling repository's pinned revision.
+#
+# Renovate cannot do this: its Cargo manager does not read `[patch.*]` sections,
+# and a regex manager would rewrite the revision in Cargo.toml without touching
+# Cargo.lock -- which is worse than doing nothing, because rules_rs resolves from
+# the lockfile and would keep building the old revision while the manifest
+# claimed the new one.
+#
+# The bumps open a pull request rather than merging. These repositories are
+# tightly coupled by design, and adopting a new wire protocol or client is a
+# decision the test suite on the PR should gate.
+
+on:
+  schedule:
+    # Mondays, 04:00 UTC.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sibling: [krabka-protocol]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+
+      - id: bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIBLING: ${{ matrix.sibling }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/krabka-io/${SIBLING}"
+
+          # Every crate from one sibling shares a revision; they must move together.
+          current="$(grep -oP "(?<=git = \"${url//\//\\/}\", rev = \")[0-9a-f]{40}" Cargo.toml | sort -u)"
+          if [ "$(wc -l <<<"${current}")" -ne 1 ]; then
+            echo "::error::${SIBLING} is pinned at more than one revision: ${current}"
+            exit 1
+          fi
+          latest="$(gh api "repos/krabka-io/${SIBLING}/commits/main" --jq .sha)"
+
+          if [ "${current}" = "${latest}" ]; then
+            echo "${SIBLING} is already at ${latest:0:7}"
+            echo "changed=false" >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          sed -i "s|${current}|${latest}|g" Cargo.toml
+          cargo generate-lockfile
+
+          {
+            echo "changed=true"
+            echo "current=${current}"
+            echo "latest=${latest}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIBLING: ${{ matrix.sibling }}
+          CURRENT: ${{ steps.bump.outputs.current }}
+          LATEST: ${{ steps.bump.outputs.latest }}
+        run: |
+          set -euo pipefail
+          branch="sync/${SIBLING}-${LATEST:0:7}"
+          if gh pr list --head "${branch}" --state open --json number --jq 'length' | grep -qv '^0$'; then
+            echo "a pull request for ${branch} is already open"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${branch}"
+          git commit -qam "chore(deps): bump ${SIBLING} to ${LATEST:0:7}"
+          git push -q origin "${branch}"
+
+          gh pr create \
+            --title "chore(deps): bump ${SIBLING} to ${LATEST:0:7}" \
+            --body "$(printf '%s\n' \
+              "Moves the \`${SIBLING}\` pin in \`[patch.crates-io]\` from \`${CURRENT:0:7}\` to \`${LATEST:0:7}\`, and regenerates \`Cargo.lock\` so Bazel resolves the same revision Cargo does." \
+              "" \
+              "[Compare](https://github.com/krabka-io/${SIBLING}/compare/${CURRENT}...${LATEST})" \
+              "" \
+              "Not auto-merged: \`bazel test //...\` on this pull request is the gate.")"

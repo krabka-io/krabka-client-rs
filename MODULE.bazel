@@ -22,6 +22,19 @@ git_override(
     commit = "fbc5c265b268cd050f2b392fbbf7ea4fb5b1a656",
 )
 
+# A hermetic C++ toolchain rather than the host's.
+#
+# Bazel's autodetected toolchain links with whatever the machine happens to have.
+# GitHub's runners carry `ld.gold`, so it passed `-fuse-ld=gold` and every link
+# action printed "the gold linker is deprecated and has known bugs with Rust" --
+# hundreds of lines per CI run, from a linker choice nothing here made. Pinning
+# the toolchain links with lld instead, makes a local build and a CI build the
+# same build, and is what rules_rs_mutants needs on macOS, where Xcode's
+# cc_wrapper leaves a mutant link without `DEVELOPER_DIR`.
+bazel_dep(name = "llvm", version = "0.8.18")
+
+register_toolchains("@llvm//toolchain:all")
+
 # rules_rs vends its own patched @rules_rust. `rust_doc_test` has no rules_rs
 # wrapper, so it is loaded from there directly rather than from a second copy.
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")

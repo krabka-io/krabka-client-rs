@@ -6,6 +6,11 @@
 # Keep the action environment hermetic so build-script outputs are reproducible.
 build --incompatible_strict_action_env
 
+# Keep the autodetected host C++ toolchain from outranking the hermetic @llvm one
+# registered in MODULE.bazel.
+common --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+common --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1
+
 test --test_output=errors
 
 # The mutation rules ship no cargo-mutants binary of their own; point them at
