@@ -252,8 +252,13 @@ def crate_tests(
             # The caller's `data` comes along because its `env` may name those
             # labels in a `$(rootpath)`, which only resolves for a declared
             # prerequisite of this rule.
-            data = [":%s_docker_bin" % stem] + image_tars + (data or []),
-            env = dict(env, KRABKA_IMAGE_TARS = ":".join([
+            data = [":%s_docker_bin" % stem] + image_tars + (data or []) + [
+                "@rules_java//toolchains:current_java_runtime",
+            ],
+            toolchains = ["@rules_java//toolchains:current_java_runtime"],
+            # JAVA_HOME points the wrapper at the hermetic JDK, which it puts on
+            # PATH. `jvm_tiered_storage` shells out to `java` directly.
+            env = dict(env, JAVA_HOME = "$(JAVABASE)", KRABKA_IMAGE_TARS = ":".join([
                 "$(rootpath %s)" % tar
                 for tar in image_tars
             ])),

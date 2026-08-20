@@ -50,6 +50,11 @@ bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.3")
 # and its container-suite path builds one; no crate here uses that path today.
 bazel_dep(name = "rules_shell", version = "0.8.0")
 
+# A hermetic JDK. Like rules_shell above, this is here because //bazel/defs.bzl
+# is shared verbatim and its container-suite path declares one; no crate here
+# uses that path today.
+bazel_dep(name = "rules_java", version = "9.8.0")
+
 # rules_rs vends its own patched @rules_rust. `rust_doc_test` has no rules_rs
 # wrapper, so it is loaded from there directly rather than from a second copy.
 rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
