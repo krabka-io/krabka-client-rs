@@ -1,0 +1,111 @@
+"""krabka-client-rs — Bazel module (bzlmod).
+
+Bazel is the build and test path; Cargo stays the dependency source of truth.
+`crate.from_cargo` reads the same `Cargo.toml` / `Cargo.lock` that Cargo does,
+so there is no second dependency set to keep in sync.
+"""
+
+module(
+    name = "krabka_client_rs",
+    version = "0.4.0",
+)
+
+bazel_dep(name = "rules_rs", version = "0.0.106")
+bazel_dep(name = "rules_rs_mutants", version = "0.0.1")
+
+# rules_rs_mutants is not published to the Bazel Central Registry, so the
+# `bazel_dep` above has nothing to resolve against without this override.
+git_override(
+    module_name = "rules_rs_mutants",
+    remote = "https://github.com/robot-head/rules_rs_mutants",
+    # v0.0.1, resolved to a commit so the checkout is reproducible.
+    commit = "fbc5c265b268cd050f2b392fbbf7ea4fb5b1a656",
+)
+
+# rules_rs vends its own patched @rules_rust. `rust_doc_test` has no rules_rs
+# wrapper, so it is loaded from there directly rather than from a second copy.
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+use_repo(rules_rust, "rules_rust")
+
+# ---------------------------------------------------------------------------
+# Rust toolchain — pinned to the same channel as rust-toolchain.toml.
+# ---------------------------------------------------------------------------
+toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+toolchains.toolchain(
+    edition = "2024",
+    version = "1.97.0",
+)
+use_repo(toolchains, "default_rust_toolchains")
+
+register_toolchains("@default_rust_toolchains//...")
+
+# ---------------------------------------------------------------------------
+# Third-party crates, resolved from the Cargo workspace.
+# ---------------------------------------------------------------------------
+PLATFORM_TRIPLES = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lock = "//:Cargo.lock",
+    cargo_toml = "//:Cargo.toml",
+    platform_triples = PLATFORM_TRIPLES,
+)
+
+# rules_rs_mutants deliberately ships no cargo-mutants binary: every consumer
+# builds one from its own lockfile so the sweep and the build agree on a
+# version. `//tools/mutants` is that lockfile.
+crate.from_cargo(
+    name = "mutants",
+    cargo_lock = "//tools/mutants:Cargo.lock",
+    cargo_toml = "//tools/mutants:Cargo.toml",
+    platform_triples = PLATFORM_TRIPLES,
+)
+# The wire-layer crates come from the krabka-protocol repository, which is a
+# Cargo workspace whose `members` is the glob `crates/*`. rules_rs resolves a
+# git crate's directory by matching the crate name against the members list, and
+# it skips glob entries, so each member's path is named here instead.
+KRABKA_PROTOCOL_MEMBERS = {
+    "crabka-compression": "crates/compression",
+    "crabka-ids": "crates/ids",
+    "crabka-metadata": "crates/metadata",
+    "crabka-security": "crates/security",
+    "crabka-trace-context": "crates/trace-context",
+    "crabka-units": "crates/units",
+    "crabka-voters": "crates/voters",
+}
+
+[
+    crate.annotation(
+        crate = crate_name,
+        strip_prefix = directory,
+        workspace_cargo_toml = "Cargo.toml",
+    )
+    for crate_name, directory in KRABKA_PROTOCOL_MEMBERS.items()
+]
+
+# crabka-protocol carries the same member annotation plus one more. Its build.rs
+# only checks that its checked-in `generated/`
+# sources still match the `schemas/` SHAs; it emits no code. It reads its own
+# manifest directory through `env!("CARGO_MANIFEST_DIR")`, which rules_rust
+# rejects because it bakes an absolute build path into the binary. Nothing here
+# needs the check -- the generated sources are consumed directly -- and the
+# Cargo build in krabka-protocol still runs it.
+crate.annotation(
+    crate = "crabka-protocol",
+    gen_build_script = "off",
+    strip_prefix = "crates/protocol",
+    workspace_cargo_toml = "Cargo.toml",
+)
+
+crate.annotation(
+    crate = "cargo-mutants",
+    gen_binaries = ["cargo-mutants"],
+    repositories = ["mutants"],
+)
+use_repo(crate, "crates", "mutants")

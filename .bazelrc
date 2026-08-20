@@ -1,0 +1,16 @@
+# krabka-client-rs Bazel configuration.
+#
+# Cargo remains the dependency source of truth; Bazel reads the same
+# Cargo.toml / Cargo.lock through rules_rs (see MODULE.bazel).
+
+# Keep the action environment hermetic so build-script outputs are reproducible.
+build --incompatible_strict_action_env
+
+test --test_output=errors
+
+# The mutation rules ship no cargo-mutants binary of their own; point them at
+# the one built from //tools/mutants' lockfile.
+build --@rules_rs_mutants//mutants:cargo_mutants_binary=@mutants//:cargo-mutants__cargo-mutants
+
+# Optional developer-local overrides (registry mirrors, remote cache, etc.).
+try-import %workspace%/user.bazelrc

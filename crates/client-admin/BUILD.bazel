@@ -1,21 +1,10 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel:defs.bzl", "crate_library", "crate_tests")
 
-# Manifest is consumed by crate_universe (see //MODULE.bazel).
+package(default_visibility = ["//visibility:public"])
+
+# Consumed by `crate.from_cargo` (see //MODULE.bazel).
 exports_files(["Cargo.toml"])
 
-rust_library(
-    name = "client-admin",
-    srcs = glob(["src/**/*.rs"]),
-    aliases = aliases(),
-    crate_name = "crabka_client_admin",
-    edition = "2024",
-    proc_macro_deps = all_crate_deps(proc_macro = True),
-    visibility = ["//visibility:public"],
-    deps = all_crate_deps(normal = True) + [
-        "//crates/client-core",
-        "//crates/metadata",
-        "//crates/protocol",
-        "//crates/security",
-    ],
-)
+crate_library(name = "client-admin")
+
+crate_tests(lib = "client-admin")

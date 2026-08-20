@@ -1,0 +1,29 @@
+"""Root package: the public krabka Rust client surface."""
+
+package(default_visibility = ["//visibility:public"])
+
+# Consumed by `crate.from_cargo` (see //MODULE.bazel).
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+])
+
+alias(
+    name = "client_core",
+    actual = "//crates/client-core",
+)
+
+alias(
+    name = "client_producer",
+    actual = "//crates/client-producer",
+)
+
+alias(
+    name = "client_consumer",
+    actual = "//crates/client-consumer",
+)
+
+alias(
+    name = "client_admin",
+    actual = "//crates/client-admin",
+)

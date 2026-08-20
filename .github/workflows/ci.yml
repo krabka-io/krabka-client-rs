@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Nightly, 05:00 UTC. Only the mutation sweep runs on this trigger.
+    - cron: "0 5 * * *"
+
+permissions:
+  contents: read
+
+# Cancel superseded PR runs; let pushes to main run to completion.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  bazel:
+    name: bazel test //...
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+      - run: bazel test //...
+
+  # A mutation sweep rebuilds and re-runs a crate's unit tests once per mutant,
+  # so it is far too slow to gate a pull request. The targets carry `manual`
+  # tags to stay out of `//...`; this job names them explicitly.
+  #
+  # `continue-on-error`: a surviving mutant fails the test target, and survivors
+  # are expected here rather than exceptional -- `cargo_mutants_test` runs only
+  # `#[cfg(test)]` unit tests, so every mutant that the `tests/*.rs` suites would
+  # have killed is reported as a survivor. The job exists to produce that list to
+  # read, not to gate. Make it blocking once the score is one worth defending.
+  mutants:
+    name: mutation sweep
+    if: github.event_name == 'schedule'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-mutants
+          repository-cache: true
+      - name: Collect mutation targets
+        id: targets
+        run: |
+          {
+            echo 'targets<<EOF'
+            bazel query 'kind("cargo_mutants_test rule", //crates/...)'
+            echo EOF
+          } >>"${GITHUB_OUTPUT}"
+      - run: bazel test ${{ steps.targets.outputs.targets }}

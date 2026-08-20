@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# The cargo-mutants pin that Bazel builds //tools/mutants from is not a member.
+exclude = ["tools/mutants"]
+
+[workspace.package]
+version = "0.4.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["The Crabka Authors"]
+rust-version = "1.97.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# These three opt-outs are intentional while the public API is still pre-1.0;
+# re-evaluate once API surfaces stabilise.
+clone_on_copy = "warn"
+
+[profile.mutants]
+inherits = "test"
+debug = "none"
+
+[profile.dev]
+# Split debug info into a separate file (reduces linker work)
+split-debuginfo = "packed"
+
+[workspace.dependencies]
+# Expressive test assertions: `assert!(a == b)` / `check!(..)` with
+# captured-expression diagnostics. Used for all test assertions workspace-wide.
+assert2 = "0.4"
+async-trait = "0.1"
+bon = "3"
+bytes = "1"
+crc32c = "0.6"
+dashmap = "6"
+futures = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
+hex = "0.4"
+# mockall: generate test mocks for trait seams so engine-IO decision logic is
+# unit-testable (and mutation-killable) without a live broker/quorum/database.
+# Dev-dependency only — `#[cfg_attr(test, mockall::automock)]` keeps it out of
+# shipped builds.
+mockall = "0.15"
+# mutants: `#[cfg_attr(test, mutants::skip)]` attribute for cargo-mutants. Used
+# only where `exclude_re` cannot reliably suppress a mutant (struct-field-deletion
+# mutants on a live-IO adapter). Dev-dependency only; expands to nothing.
+mutants = "0.0.4"
+proptest = "1"
+refined_type = "0.6"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# rustls-pemfile retired upstream (RUSTSEC-2025-0134, archived 2025-08).
+# Use the PEM parsers in `rustls-pki-types` (same code; pull explicitly).
+rustls-pki-types = { version = "1.15", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Jepsen-style exhaustive concurrency-correctness model checking (KRaft
+# consensus). Dev-dependency only — never linked into a shipped binary.
+# Pinned: pre-1.0, minor bumps can be breaking.
+stateright = "=0.31.0"
+tempfile = "3"
+testcontainers = "0.28"
+# The latest crates.io release still requires testcontainers 0.27, whose
+# bollard-stubs version conflicts with testcontainers 0.28. Pin the upstream
+# compatibility update until the next testcontainers-modules release.
+testcontainers-modules = { git = "https://github.com/testcontainers/testcontainers-rs-modules-community", rev = "d69e3a09397532accea9d9e907fecc280b1513a8", features = ["kafka"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+tokio-util = { version = "0.7", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# First-party crates inherited by more than one member.
+crabka-units = "0.4.0"
+
+# Sibling repositories, pinned by revision. These crates are declared
+# against crates.io above and in the member manifests; the patch below is
+# the single place a sibling revision is bumped.
+[patch.crates-io]
+crabka-compression = { git = "https://github.com/krabka-io/krabka-protocol", rev = "eef1e4c598e2a08a3a73a4b73e6ee1c13c276c80" }
+crabka-ids = { git = "https://github.com/krabka-io/krabka-protocol", rev = "eef1e4c598e2a08a3a73a4b73e6ee1c13c276c80" }
+crabka-metadata = { git = "https://github.com/krabka-io/krabka-protocol", rev = "eef1e4c598e2a08a3a73a4b73e6ee1c13c276c80" }
+crabka-protocol = { git = "https://github.com/krabka-io/krabka-protocol", rev = "eef1e4c598e2a08a3a73a4b73e6ee1c13c276c80" }
+crabka-security = { git = "https://github.com/krabka-io/krabka-protocol", rev = "eef1e4c598e2a08a3a73a4b73e6ee1c13c276c80" }
+crabka-units = { git = "https://github.com/krabka-io/krabka-protocol", rev = "eef1e4c598e2a08a3a73a4b73e6ee1c13c276c80" }

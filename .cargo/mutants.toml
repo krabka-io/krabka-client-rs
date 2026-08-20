@@ -1,0 +1,14 @@
+# cargo-mutants configuration — https://mutants.rs
+#
+# Read both by a local `cargo mutants` run and by the `cargo_mutants_test`
+# targets, which shell out to a real cargo-mutants binary (see //tools/mutants).
+
+test_tool = "nextest"
+profile = "mutants"
+
+# A surviving mutant in the client paths is often only caught by the slower
+# in-process suites. Give every mutant a generous timeout relative to the
+# unmutated baseline so a legitimately-slower-but-correct run is not misreported
+# as a timeout survivor.
+timeout_multiplier = 5.0
+minimum_test_timeout = 120

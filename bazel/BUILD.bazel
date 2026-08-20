@@ -1,0 +1,2 @@
+# Macro package. See defs.bzl.
+exports_files(["defs.bzl"])

@@ -1,0 +1,23 @@
+target/
+**/*.rs.bk
+
+# `/.cargo/config.toml` is TRACKED. It holds the git-fetch setting that CI would
+# otherwise repeat per workflow. An ignored config file never reaches the
+# runners, so the setting stops working with nothing to show for it.
+
+# Bazel convenience symlinks + local user settings. MODULE.bazel.lock is
+# TRACKED, so CI resolves the same module graph a developer did.
+/bazel-*
+user.bazelrc
+
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Cargo mutant output
+mutants.out
+mutants.out.old
+
+# Python bytecode from local runs of scripts
+__pycache__/
