@@ -40,8 +40,15 @@ jobs:
       - name: format
         run: aspect format
 
+      # Plain Bazel rather than `aspect lint`: that task requires an aspect from
+      # aspect_rules_lint, and this repository's clippy aspect comes from the
+      # @rules_rust that rules_rs vends. aspect_rules_lint_rust would supply a
+      # conforming one, but it registers a Rust toolchain of its own pinned to
+      # 1.92.0 / edition 2021 and rules_rs refuses two configurations under one
+      # repo name -- so the choice is one toolchain or `aspect lint`'s PR
+      # annotations, and one toolchain matters more. Clippy still gates CI.
       - name: lint
-        run: aspect lint
+        run: bazel build --config=lint //...
 
       - name: build
         run: aspect build //...
