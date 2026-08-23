@@ -101,6 +101,17 @@ use_repo(toolchains, "krabka_rust_toolchains")
 register_toolchains("@krabka_rust_toolchains//...")
 
 # ---------------------------------------------------------------------------
+# Native `-sys` crates, built by Bazel rather than by their build scripts.
+#
+# rules_rs ships a well-known annotation for each of these and warns on every
+# build until it is applied. Each one otherwise compiles a bundled C library
+# through a `cc`-crate build script: the host's compiler, its flags, and its
+# headers, none of which the hermetic toolchain governs. Pointing them at the
+# BCR's own builds puts that C under the same toolchain as everything else.
+# ---------------------------------------------------------------------------
+bazel_dep(name = "zstd", version = "1.5.7.bcr.1")
+
+# ---------------------------------------------------------------------------
 # Third-party crates, resolved from the Cargo workspace.
 # ---------------------------------------------------------------------------
 PLATFORM_TRIPLES = [
@@ -168,5 +179,10 @@ crate.annotation(
     crate = "cargo-mutants",
     gen_binaries = ["cargo-mutants"],
     repositories = ["mutants"],
+)
+crate.annotation(
+    crate = "zstd-sys",
+    gen_build_script = "off",
+    deps = ["@zstd"],
 )
 use_repo(crate, "crates", "mutants")
