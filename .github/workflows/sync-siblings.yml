@@ -3,14 +3,23 @@ name: sync-siblings
 # Proposes a bump of each sibling repository's pinned revision.
 #
 # Renovate cannot do this: its Cargo manager does not read `[patch.*]` sections,
-# and a regex manager would rewrite the revision in Cargo.toml without touching
-# Cargo.lock -- which is worse than doing nothing, because rules_rs resolves from
-# the lockfile and would keep building the old revision while the manifest
-# claimed the new one.
+# so it sees only the `version` in each member manifest and takes the siblings
+# for registry dependencies. A regex manager would rewrite the revision in
+# Cargo.toml without touching Cargo.lock -- worse than doing nothing, because
+# rules_rs resolves from the lockfile and would keep building the old revision
+# while the manifest claimed the new one. //renovate.json disables the
+# `crabka-*` crates for that reason and leaves them to this workflow.
 #
 # The bumps open a pull request rather than merging. These repositories are
 # tightly coupled by design, and adopting a new wire protocol or client is a
-# decision the test suite on the PR should gate.
+# decision the test suite on the pull request should gate.
+#
+# SIBLING_SYNC_TOKEN is what makes that gate real. GitHub does not run workflows
+# for events raised by the built-in GITHUB_TOKEN, so a pull request opened with
+# it gets no checks at all -- and `main` requires three, which a pull request
+# with no checks can never satisfy. Without the secret this workflow still
+# proposes the bump, but the result is a pull request nobody can merge. With it,
+# CI runs and the pull request merges on a human's say-so.
 
 on:
   schedule:
@@ -32,13 +41,17 @@ jobs:
         sibling: [krabka-protocol]
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Carried into the push below, so the branch is pushed by whichever
+          # identity also opens the pull request.
+          token: ${{ secrets.SIBLING_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.1"
 
       - id: bump
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SIBLING_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
           SIBLING: ${{ matrix.sibling }}
         run: |
           set -euo pipefail
@@ -46,6 +59,13 @@ jobs:
 
           # Every crate from one sibling shares a revision; they must move together.
           current="$(grep -oP "(?<=git = \"${url//\//\\/}\", rev = \")[0-9a-f]{40}" Cargo.toml | sort -u)"
+          # `grep | sort` exits 0 even when grep matched nothing, so an unpinned
+          # sibling arrives here as the empty string rather than as a failure --
+          # and an empty `current` would reach `sed "s||...|g"` below.
+          if [ -z "${current}" ]; then
+            echo "::error::${SIBLING} is not pinned in Cargo.toml"
+            exit 1
+          fi
           if [ "$(wc -l <<<"${current}")" -ne 1 ]; then
             echo "::error::${SIBLING} is pinned at more than one revision: ${current}"
             exit 1
@@ -69,7 +89,7 @@ jobs:
 
       - if: steps.bump.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SIBLING_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
           SIBLING: ${{ matrix.sibling }}
           CURRENT: ${{ steps.bump.outputs.current }}
           LATEST: ${{ steps.bump.outputs.latest }}
