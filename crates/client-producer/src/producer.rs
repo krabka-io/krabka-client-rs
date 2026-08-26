@@ -250,6 +250,25 @@ impl Producer {
         self.identity.epoch
     }
 
+    /// Give the identity that the transaction coordinator minted for this
+    /// producer's `transactional.id`.
+    ///
+    /// [`Producer::init_transactions`] sets this pair, and the broker fences a
+    /// write that carries an older one. It is the fencing token of the
+    /// transactional flow.
+    ///
+    /// This is not the pair that [`Producer::producer_id`] and
+    /// [`Producer::producer_epoch`] report. Those come from the idempotent
+    /// `InitProducerId` that the builder sends with no transactional id, and
+    /// the coordinator never advances them.
+    ///
+    /// Returns `None` before `init_transactions` runs, and for a producer that
+    /// carries no `transactional_id`.
+    pub async fn transactional_identity(&self) -> Option<(i64, i16)> {
+        let (id, epoch) = *self.txn_pid_epoch.lock().await;
+        (id >= 0 && epoch >= 0).then_some((id, epoch))
+    }
+
     // ── Transactional API ────────────────────────────────────────────────────
 
     /// Begin a new transaction, returning a borrowed guard that must be

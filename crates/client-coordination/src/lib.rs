@@ -79,9 +79,20 @@ mod record;
 mod succession;
 mod transport;
 
+pub use broker::{
+    BrokerTransport, DEFAULT_COORDINATION_CLIENT_ID, DEFAULT_COORDINATION_FETCH_MAX_WAIT,
+    DEFAULT_COORDINATION_FETCH_PARTITION_MAX, DEFAULT_COORDINATION_PARTITIONS,
+    DEFAULT_COORDINATION_REPLICATION, DEFAULT_COORDINATION_REQUEST_TIMEOUT, role_partition,
+};
 pub use error::CoordinationError;
+pub use lease::{
+    Clock, DEFAULT_CHALLENGE_STAGGER, DEFAULT_LEASE_DURATION, DEFAULT_RENEW_INTERVAL, LeaseConfig,
+    LeaseTiming, SystemClock, TestClock,
+};
 pub use record::{
     COORDINATION_STATE_TOPIC, CoordinationKey, CoordinationRecord, FencingToken, Lease,
     MAX_MEMBER_ID_LEN, MAX_ROLE_LEN, MemberId, RecordError, RecordKind, Registration, Role,
     decode_key, decode_value, encode_key, encode_value,
 };
+pub use succession::{Decision, RoleState, RoleStateBuilder, RosterEntry, evaluate};
+pub use transport::{CoordinationTransport, RoleRecords};
