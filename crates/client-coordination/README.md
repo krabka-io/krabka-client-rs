@@ -42,4 +42,6 @@ a tombstone. See the `record` module documentation for the field lists.
 ## Documentation
 
 - [API documentation](https://docs.rs/crabka-client-coordination)
+- [Design](docs/design.md) - why the epoch comes from the transaction
+  coordinator, why the lease carries no safety, and the succession recipe.
 - [Crate style guides](../../docs/style_guides/README.md)
