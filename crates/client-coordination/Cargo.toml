@@ -1,0 +1,38 @@
+[package]
+name = "crabka-client-coordination"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Leader election, leases, and fencing tokens as a Kafka client API"
+repository = "https://github.com/robot-head/crabka"
+homepage = "https://github.com/robot-head/crabka"
+documentation = "https://docs.rs/crabka-client-coordination"
+readme = "README.md"
+keywords = ["kafka", "coordination", "leader-election", "lease", "crabka"]
+categories = ["api-bindings", "network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+assert2                = { workspace = true }
+crabka-client-admin    = { version = "0.4.0", path = "../client-admin" }
+crabka-client-core     = { version = "0.4.0", path = "../client-core" }
+crabka-client-producer = { version = "0.4.0", path = "../client-producer" }
+crabka-protocol        = { version = "0.4.0", default-features = false }
+crabka-units           = { workspace = true }
+async-trait            = { workspace = true }
+bon                    = { workspace = true }
+bytes                  = { workspace = true }
+thiserror              = { workspace = true }
+tokio                  = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing                = { workspace = true }
+
+[dev-dependencies]
+crabka-client-core = { path = "../client-core", features = ["mock"] }
+mockall            = { workspace = true }
+proptest           = { workspace = true }
+stateright         = { workspace = true }
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

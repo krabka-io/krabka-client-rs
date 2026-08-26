@@ -652,6 +652,7 @@ mod tests {
             .await
             .expect("reinitialization obtains a new epoch");
         assert_eq!(*producer.txn_pid_epoch.lock().await, (7, 4));
+        assert2::assert!(producer.transactional_identity().await == Some((7, 4)));
         producer
             .begin_transaction()
             .await

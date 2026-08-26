@@ -40,6 +40,9 @@ pub enum ClientError {
     #[error("protocol error from server: {error_code}")]
     Server { error_code: i16 },
 
+    #[error("FindCoordinator returned no entry for key {key:?}")]
+    NoCoordinator { key: String },
+
     #[error("codec: {0}")]
     Codec(#[from] crabka_protocol::ProtocolError),
 
