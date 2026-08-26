@@ -1272,9 +1272,12 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         49 => "INVALID_PRODUCER_ID_MAPPING",
         51 => "CONCURRENT_TRANSACTIONS",
         53 => "TRANSACTIONAL_ID_AUTHORIZATION_FAILED",
+        60 => "REASSIGNMENT_IN_PROGRESS",
         66 => "DELEGATION_TOKEN_EXPIRED",
         83 => "ELIGIBLE_LEADERS_NOT_AVAILABLE",
         84 => "ELECTION_NOT_NEEDED",
+        87 => "INVALID_RECORD",
+        90 => "PRODUCER_FENCED",
         91 => "RESOURCE_NOT_FOUND",
         92 => "DUPLICATE_RESOURCE",
         93 => "UNACCEPTABLE_CREDENTIAL",
@@ -1284,8 +1287,6 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         114 => "MISMATCHED_ENDPOINT_TYPE",
         115 => "UNSUPPORTED_ENDPOINT_TYPE",
         116 => "UNKNOWN_CONTROLLER_ID",
-        87 => "REASSIGNMENT_IN_PROGRESS",
-        90 => "PRODUCER_FENCED",
         _ => "UNKNOWN",
     }
 }
@@ -1691,6 +1692,30 @@ mod tests {
         })
         .await
         .expect("mock broker listener closes");
+    }
+
+    #[test]
+    fn error_names_match_the_codes_that_apache_kafka_defines() {
+        // Every pair below is read from Apache Kafka's `Errors` enum. A wrong
+        // name here sends an operator to the wrong cause, so the table is
+        // pinned rather than trusted.
+        let cases = [
+            (0_i16, "NONE"),
+            (41, "NOT_CONTROLLER"),
+            (47, "INVALID_PRODUCER_EPOCH"),
+            (48, "INVALID_TXN_STATE"),
+            (49, "INVALID_PRODUCER_ID_MAPPING"),
+            (53, "TRANSACTIONAL_ID_AUTHORIZATION_FAILED"),
+            (60, "REASSIGNMENT_IN_PROGRESS"),
+            (87, "INVALID_RECORD"),
+            (90, "PRODUCER_FENCED"),
+            (105, "TRANSACTIONAL_ID_NOT_FOUND"),
+            (i16::MAX, "UNKNOWN"),
+        ];
+
+        for (code, name) in cases {
+            assert2::assert!(kafka_error_name(code) == name, "code {code}");
+        }
     }
 
     #[test]
