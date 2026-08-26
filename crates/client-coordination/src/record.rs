@@ -665,6 +665,19 @@ mod tests {
         MemberId::new(name).unwrap()
     }
 
+    /// A name renders as itself. The codec writes the name from `as_str`, so
+    /// a `Display` that dropped the text would leave a log line and an error
+    /// message naming nothing while the wire stayed correct.
+    #[test]
+    fn a_role_and_a_member_render_as_their_own_names() {
+        check!(role("controller").to_string() == "controller");
+        check!(member("node-1").to_string() == "node-1");
+        check!(
+            format!("{} holds {}", member("node-1"), role("controller"))
+                == "node-1 holds controller"
+        );
+    }
+
     /// The frozen golden bytes of every record part.
     ///
     /// `krabka-streams-java` and `krabka-streams-go` assert the same arrays.

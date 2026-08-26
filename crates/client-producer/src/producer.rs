@@ -189,6 +189,18 @@ pub struct Producer {
     pub(crate) prepared_transaction_state: Arc<Mutex<Option<PreparedTransactionState>>>,
 }
 
+/// Reads a minted transactional identity out of the stored pair.
+///
+/// The coordinator has minted a pair only when both halves are non-negative.
+/// `InitProducerId` stores `(-1, -1)` before the first call, and Kafka writes
+/// `-1` in either half for "no producer", so both halves are checked. A check
+/// of one half alone would report a half-written pair as a real identity, and
+/// a lease written under it would carry an epoch no broker can fence on.
+fn minted_identity(pair: (i64, i16)) -> Option<(i64, i16)> {
+    let (id, epoch) = pair;
+    (id >= 0 && epoch >= 0).then_some(pair)
+}
+
 impl Producer {
     async fn register_transaction_partition(
         &self,
@@ -265,8 +277,7 @@ impl Producer {
     /// Returns `None` before `init_transactions` runs, and for a producer that
     /// carries no `transactional_id`.
     pub async fn transactional_identity(&self) -> Option<(i64, i16)> {
-        let (id, epoch) = *self.txn_pid_epoch.lock().await;
-        (id >= 0 && epoch >= 0).then_some((id, epoch))
+        minted_identity(*self.txn_pid_epoch.lock().await)
     }
 
     // ── Transactional API ────────────────────────────────────────────────────
@@ -1274,11 +1285,24 @@ mod tests {
         },
     };
 
-    use super::{DrainIntent, Producer, wake_sender_after_append};
+    use super::{DrainIntent, Producer, minted_identity, wake_sender_after_append};
     use crate::{
         accumulator::{Accumulator, AppendResult},
         error::ProducerError,
     };
+
+    /// Both halves of the pair must be non-negative. Kafka writes `-1` in
+    /// either half for "no producer", so a check of one half alone would
+    /// report a half-written pair as a minted identity.
+    #[test]
+    fn a_minted_identity_needs_both_halves_of_the_pair() {
+        assert2::check!(minted_identity((4242, 7)) == Some((4242, 7)));
+        assert2::check!(minted_identity((0, 0)) == Some((0, 0)));
+        assert2::check!(minted_identity((-1, -1)).is_none());
+        // Either half alone being negative is not a minted identity.
+        assert2::check!(minted_identity((4242, -1)).is_none());
+        assert2::check!(minted_identity((-1, 7)).is_none());
+    }
 
     const CLIENT_ID: &str = "producer-test";
 

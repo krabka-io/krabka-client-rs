@@ -1,9 +1,9 @@
 //! Transaction administration.
 
+use crabka_client_core::{CoordinatorKeyType, build_find_coordinator};
 use crabka_protocol::owned::{
     describe_transactions_request::DescribeTransactionsRequest,
     describe_transactions_response::{DescribeTransactionsResponse, TransactionState},
-    find_coordinator_request::FindCoordinatorRequest,
     find_coordinator_response::FindCoordinatorResponse,
     init_producer_id_request::InitProducerIdRequest,
 };
@@ -160,12 +160,10 @@ impl AdminClient {
 
         let response = self
             .conn
-            .send(FindCoordinatorRequest {
-                key: transactional_id.to_owned(),
-                key_type: 1,
-                coordinator_keys: vec![transactional_id.to_owned()],
-                ..Default::default()
-            })
+            .send(build_find_coordinator(
+                transactional_id,
+                CoordinatorKeyType::Transaction,
+            ))
             .await?;
         let coordinator = coordinator_address(transactional_id, response)?;
         let connection = Self::connect_one(&coordinator, self.options.clone()).await?;
@@ -217,12 +215,10 @@ impl AdminClient {
 
         let response = self
             .conn
-            .send(FindCoordinatorRequest {
-                key: transactional_id.to_owned(),
-                key_type: 1,
-                coordinator_keys: vec![transactional_id.to_owned()],
-                ..Default::default()
-            })
+            .send(build_find_coordinator(
+                transactional_id,
+                CoordinatorKeyType::Transaction,
+            ))
             .await?;
         let coordinator = coordinator_address(transactional_id, response)?;
         let connection = Self::connect_one(&coordinator, self.options.clone()).await?;

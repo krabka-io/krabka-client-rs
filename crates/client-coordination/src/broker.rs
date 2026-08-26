@@ -1098,6 +1098,83 @@ async fn close_producer(role: &Role, producer: Arc<Producer>) {
 
 #[cfg(test)]
 mod tests {
+    /// The `ListOffsets` timestamps are Kafka's own sentinels. A wrong sign
+    /// asks the broker for a real timestamp instead of the first or the last
+    /// offset, so the scan reads the wrong end of the partition.
+    #[test]
+    fn the_list_offsets_timestamps_are_the_sentinels_kafka_defines() {
+        check!(LIST_OFFSETS_EARLIEST == -2);
+        check!(LIST_OFFSETS_LATEST == -1);
+        check!(READ_COMMITTED == 1);
+    }
+
+    /// `partition_leader` reads a `Metadata` response. Broker id zero is a
+    /// real broker, so the check for a missing leader compares against a
+    /// negative id and not against a non-positive one.
+    #[test]
+    fn the_leader_of_a_partition_comes_from_the_metadata_response() {
+        use crabka_protocol::owned::metadata_response::{
+            MetadataResponsePartition, MetadataResponseTopic,
+        };
+
+        let response = |partition: i32, leader_id: i32, error_code: i16| MetadataResponse {
+            topics: vec![MetadataResponseTopic {
+                name: Some(COORDINATION_STATE_TOPIC.to_owned()),
+                partitions: vec![MetadataResponsePartition {
+                    partition_index: partition,
+                    leader_id,
+                    error_code,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Broker zero is a leader, not a missing one.
+        check!(partition_leader(&response(3, 0, 0), 3).unwrap() == 0);
+        check!(partition_leader(&response(3, 7, 0), 3).unwrap() == 7);
+
+        let code = |result: Result<i32, CoordinationError>| {
+            broker_code(&result.expect_err("the lookup fails"))
+        };
+
+        // A negative leader id means the cluster has no leader yet.
+        check!(code(partition_leader(&response(3, -1, 0), 3)) == Some(LEADER_NOT_AVAILABLE));
+        // A partition error is reported as the broker sent it.
+        check!(code(partition_leader(&response(3, 7, 9), 3)) == Some(9));
+        // A partition the response does not name is unknown.
+        check!(code(partition_leader(&response(3, 7, 0), 4)) == Some(UNKNOWN_TOPIC_OR_PARTITION));
+        // A response without the coordination topic is unknown.
+        check!(
+            code(partition_leader(&MetadataResponse::default(), 0))
+                == Some(UNKNOWN_TOPIC_OR_PARTITION)
+        );
+    }
+
+    #[tokio::test]
+    async fn address_resolution_returns_every_address_and_rejects_an_empty_list() {
+        let timeout = ClientDnsTimeout::default();
+
+        let resolved = resolve_addresses(&["127.0.0.1:9092".to_owned()], timeout)
+            .await
+            .expect("a literal address resolves");
+        check!(resolved.len() == 1);
+        check!(resolved[0].port() == 9092);
+
+        let both = resolve_addresses(
+            &["127.0.0.1:9092".to_owned(), "127.0.0.1:9093".to_owned()],
+            timeout,
+        )
+        .await
+        .expect("both literal addresses resolve");
+        check!(both.len() == 2);
+
+        // An empty bootstrap list resolves to nothing, which is a config fault.
+        let empty = resolve_addresses(&[], timeout).await;
+        check!(matches!(empty, Err(CoordinationError::InvalidConfig(_))));
+    }
+
     use assert2::{assert, check};
     use crabka_client_admin::KafkaError;
     use crabka_protocol::owned::{

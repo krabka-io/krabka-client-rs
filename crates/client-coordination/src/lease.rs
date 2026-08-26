@@ -36,7 +36,7 @@
 
 use std::{
     sync::atomic::{AtomicI64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crabka_units::{Time, convert::TimeExt, secs};
@@ -287,10 +287,25 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_millis(&self) -> i64 {
-        match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(since) => i64::try_from(since.as_millis()).unwrap_or(i64::MAX),
-            Err(before) => -i64::try_from(before.duration().as_millis()).unwrap_or(i64::MAX),
-        }
+        signed_millis(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|before| before.duration()),
+        )
+    }
+}
+
+/// Gives the epoch millis of a duration measured from the epoch.
+///
+/// `Ok` carries a duration after the epoch and `Err` carries the distance a
+/// host clock sits before it. A host clock set before 1970 gives a negative
+/// instant, and the sign is what keeps the ordering of two instants right.
+/// The function saturates rather than wrapping, because a lease deadline that
+/// wrapped would read as live.
+fn signed_millis(since_epoch: Result<Duration, Duration>) -> i64 {
+    match since_epoch {
+        Ok(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
+        Err(before) => -i64::try_from(before.as_millis()).unwrap_or(i64::MAX),
     }
 }
 
@@ -332,6 +347,20 @@ impl Clock for TestClock {
 
 #[cfg(test)]
 mod tests {
+    /// The epoch millis of an instant keep their sign. A host clock set
+    /// before 1970 gives a negative instant, and dropping the sign would put
+    /// that instant far in the future, where an expired lease reads as live.
+    #[test]
+    fn an_instant_before_the_epoch_stays_negative() {
+        check!(signed_millis(Ok(Duration::from_secs(1_700_000_000))) == 1_700_000_000_000);
+        check!(signed_millis(Ok(Duration::ZERO)) == 0);
+        check!(signed_millis(Err(Duration::from_secs(2))) == -2_000);
+        check!(signed_millis(Err(Duration::ZERO)) == 0);
+        // A duration past the range of an i64 saturates rather than wrapping.
+        check!(signed_millis(Ok(Duration::MAX)) == i64::MAX);
+        check!(signed_millis(Err(Duration::MAX)) == -i64::MAX);
+    }
+
     use assert2::{assert, check};
     use crabka_units::{millis, secs};
 

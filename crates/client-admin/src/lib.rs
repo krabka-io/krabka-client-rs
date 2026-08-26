@@ -1696,26 +1696,56 @@ mod tests {
 
     #[test]
     fn error_names_match_the_codes_that_apache_kafka_defines() {
-        // Every pair below is read from Apache Kafka's `Errors` enum. A wrong
-        // name here sends an operator to the wrong cause, so the table is
-        // pinned rather than trusted.
-        let cases = [
-            (0_i16, "NONE"),
+        // Every arm of the table, read from Apache Kafka's `Errors` enum. The
+        // list is exhaustive on purpose: a sampled table lets a deleted arm
+        // pass unnoticed, and a wrong name sends an operator to the wrong
+        // cause.
+        let cases: [(i16, &str); 38] = [
+            (0, "NONE"),
+            (3, "UNKNOWN_TOPIC_OR_PARTITION"),
+            (7, "REQUEST_TIMED_OUT"),
+            (14, "COORDINATOR_LOAD_IN_PROGRESS"),
+            (15, "COORDINATOR_NOT_AVAILABLE"),
+            (16, "NOT_COORDINATOR"),
+            (17, "INVALID_TOPIC_EXCEPTION"),
+            (19, "NOT_ENOUGH_REPLICAS"),
+            (31, "CLUSTER_AUTHORIZATION_FAILED"),
+            (33, "UNSUPPORTED_SASL_MECHANISM"),
+            (35, "UNSUPPORTED_VERSION"),
+            (36, "TOPIC_ALREADY_EXISTS"),
+            (37, "INVALID_PARTITIONS"),
+            (38, "INVALID_REPLICATION_FACTOR"),
+            (39, "INVALID_REPLICA_ASSIGNMENT"),
+            (40, "INVALID_CONFIG"),
             (41, "NOT_CONTROLLER"),
+            (42, "INVALID_REQUEST"),
             (47, "INVALID_PRODUCER_EPOCH"),
             (48, "INVALID_TXN_STATE"),
             (49, "INVALID_PRODUCER_ID_MAPPING"),
+            (51, "CONCURRENT_TRANSACTIONS"),
             (53, "TRANSACTIONAL_ID_AUTHORIZATION_FAILED"),
             (60, "REASSIGNMENT_IN_PROGRESS"),
+            (66, "DELEGATION_TOKEN_EXPIRED"),
+            (83, "ELIGIBLE_LEADERS_NOT_AVAILABLE"),
+            (84, "ELECTION_NOT_NEEDED"),
             (87, "INVALID_RECORD"),
             (90, "PRODUCER_FENCED"),
+            (91, "RESOURCE_NOT_FOUND"),
+            (92, "DUPLICATE_RESOURCE"),
+            (93, "UNACCEPTABLE_CREDENTIAL"),
+            (95, "INVALID_UPDATE_VERSION"),
             (105, "TRANSACTIONAL_ID_NOT_FOUND"),
-            (i16::MAX, "UNKNOWN"),
+            (107, "INELIGIBLE_REPLICA"),
+            (114, "MISMATCHED_ENDPOINT_TYPE"),
+            (115, "UNSUPPORTED_ENDPOINT_TYPE"),
+            (116, "UNKNOWN_CONTROLLER_ID"),
         ];
 
         for (code, name) in cases {
             assert2::assert!(kafka_error_name(code) == name, "code {code}");
         }
+        assert2::assert!(kafka_error_name(i16::MAX) == "UNKNOWN");
+        assert2::assert!(kafka_error_name(-1) == "UNKNOWN");
     }
 
     #[test]
