@@ -46,6 +46,7 @@ pub use topics::{
     DeleteRecordsOp, DeleteRecordsOutcome, DeleteTopicOutcome, TopicMetadata, TopicMetadataEntry,
     TopicReplicationStatus,
 };
+pub use transactions::TransactionDescription;
 pub use users::{
     AclEntry, AclEntryFilter, AclOperation, CreateAclOutcome, DEFAULT_SCRAM_ITERATIONS,
     DeleteAclFilterOutcome, MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS, PatternType,
@@ -1278,6 +1279,7 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         92 => "DUPLICATE_RESOURCE",
         93 => "UNACCEPTABLE_CREDENTIAL",
         95 => "INVALID_UPDATE_VERSION",
+        105 => "TRANSACTIONAL_ID_NOT_FOUND",
         107 => "INELIGIBLE_REPLICA",
         114 => "MISMATCHED_ENDPOINT_TYPE",
         115 => "UNSUPPORTED_ENDPOINT_TYPE",
