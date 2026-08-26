@@ -54,6 +54,7 @@
 mod bootstrap;
 mod client;
 mod connection;
+mod coordinator;
 mod error;
 mod fetch;
 mod offset_for_leader_epoch;
@@ -76,6 +77,10 @@ pub use connection::{
     ConnectionOptions, DEFAULT_CLIENT_CONNECT_TIMEOUT, DEFAULT_CLIENT_DNS_TIMEOUT,
     DEFAULT_CLIENT_FRAME_MAX, DEFAULT_CLIENT_REQUEST_TIMEOUT,
     DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY, MAX_CLIENT_FRAME_BYTES,
+};
+pub use coordinator::{
+    CoordinatorEndpoint, CoordinatorKeyType, build_find_coordinator, coordinator_endpoint,
+    find_coordinator,
 };
 pub use error::ClientError;
 pub use fetch::{
