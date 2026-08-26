@@ -26,11 +26,7 @@ impl UniformStickyPartitioner {
     pub fn pick(&self, topic: &str, key: Option<&[u8]>, num_partitions: i32) -> i32 {
         assert2::assert!(num_partitions > 0);
         if let Some(k) = key {
-            let h = murmur2(k);
-            // Result is always in [0, num_partitions) which fits i32
-            // because num_partitions: i32 and unsigned_abs() % u32 ≤ i32::MAX.
-            i32::try_from(h.unsigned_abs() % num_partitions.cast_unsigned())
-                .expect("partition index must fit in i32")
+            partition_for_key(k, num_partitions)
         } else {
             let mut s = self.sticky.lock().expect("sticky mutex poisoned");
             *s.entry(topic.to_string()).or_insert(0) % num_partitions
@@ -47,6 +43,25 @@ impl UniformStickyPartitioner {
         let entry = s.entry(topic.to_string()).or_insert(0);
         *entry = (*entry + 1) % num_partitions;
     }
+}
+
+/// Pick the partition that Kafka picks for `key`.
+///
+/// Kafka computes `toPositive(murmur2(key)) % num_partitions`, and
+/// `Utils.toPositive` masks the sign bit with `& 0x7fffffff`. It does not take
+/// the absolute value. The two agree for a non-negative hash and disagree for
+/// every negative one, so the mask is what keeps a Crabka producer and a JVM
+/// producer on the same partition for the same key.
+///
+/// # Panics
+///
+/// Panics when `num_partitions` is not greater than zero.
+#[must_use]
+pub fn partition_for_key(key: &[u8], num_partitions: i32) -> i32 {
+    assert2::assert!(num_partitions > 0);
+    // The mask clears the sign bit, so the value is in [0, i32::MAX] and the
+    // remainder is in [0, num_partitions).
+    (murmur2(key) & 0x7fff_ffff) % num_partitions
 }
 
 /// `MurmurHash2`, the key hash of Kafka's `DefaultPartitioner`.
@@ -156,6 +171,45 @@ mod tests {
         p.rotate("a", 4);
         // Topic "b"'s sticky is still 0.
         assert2::assert!(p.pick("b", None, 4) == 0);
+    }
+
+    #[test]
+    fn keyed_partitioning_matches_kafka_to_positive_not_absolute_value() {
+        // Kafka computes toPositive(murmur2(key)) % n, and toPositive masks the
+        // sign bit. An absolute value instead of the mask sends every key whose
+        // hash is negative to a different partition than a JVM producer picks,
+        // which breaks key ordering and co-partitioning across the two clients.
+        // Each row below is (key, num_partitions, partition), computed with
+        // Kafka's own expression.
+        for (key, partitions, want) in [
+            (b"".as_slice(), 10, 1),
+            (b"a".as_slice(), 10, 4),
+            (b"ab".as_slice(), 10, 4),
+            (b"abc".as_slice(), 10, 7),
+            (b"abcd".as_slice(), 10, 0),
+            (b"abcde".as_slice(), 10, 1),
+            (b"kafka".as_slice(), 10, 0),
+            (b"my-key".as_slice(), 10, 9),
+            (b"abcd".as_slice(), 16, 4),
+            (b"kafka".as_slice(), 16, 4),
+            (b"abcd".as_slice(), 3, 2),
+            (b"kafka".as_slice(), 3, 1),
+        ] {
+            let got = partition_for_key(key, partitions);
+            assert2::assert!(got == want, "key {key:?} over {partitions} partitions");
+            assert2::assert!(got >= 0 && got < partitions);
+        }
+    }
+
+    #[test]
+    fn a_negative_hash_masks_its_sign_bit_rather_than_negating() {
+        // "kafka" hashes to -798503068. The mask gives 1348980580, and the
+        // absolute value would give 798503068. The two land on different
+        // partitions, so this pins the one Kafka uses.
+        let hash = murmur2(b"kafka");
+        assert2::assert!(hash == -798_503_068);
+        assert2::assert!((hash & 0x7fff_ffff) == 1_348_980_580);
+        assert2::assert!(partition_for_key(b"kafka", 10) == 1_348_980_580 % 10);
     }
 
     #[test]
