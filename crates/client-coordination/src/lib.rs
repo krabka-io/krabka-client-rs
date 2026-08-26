@@ -72,8 +72,14 @@
 //! succession rules, the lease clock, and the codec below.
 #![doc(html_root_url = "https://docs.rs/crabka-client-coordination/0.4.0")]
 
+mod broker;
+mod error;
+mod lease;
 mod record;
+mod succession;
+mod transport;
 
+pub use error::CoordinationError;
 pub use record::{
     COORDINATION_STATE_TOPIC, CoordinationKey, CoordinationRecord, FencingToken, Lease,
     MAX_MEMBER_ID_LEN, MAX_ROLE_LEN, MemberId, RecordError, RecordKind, Registration, Role,

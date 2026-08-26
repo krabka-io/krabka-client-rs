@@ -17,9 +17,22 @@ categories = ["api-bindings", "network-programming"]
 workspace = true
 
 [dependencies]
-assert2   = { workspace = true }
-bytes     = { workspace = true }
-thiserror = { workspace = true }
+assert2                = { workspace = true }
+crabka-client-admin    = { version = "0.4.0", path = "../client-admin" }
+crabka-client-core     = { version = "0.4.0", path = "../client-core" }
+crabka-client-producer = { version = "0.4.0", path = "../client-producer" }
+crabka-protocol        = { version = "0.4.0", default-features = false }
+crabka-units           = { workspace = true }
+async-trait            = { workspace = true }
+bon                    = { workspace = true }
+bytes                  = { workspace = true }
+thiserror              = { workspace = true }
+tokio                  = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing                = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+crabka-client-core = { path = "../client-core", features = ["mock"] }
+mockall            = { workspace = true }
+proptest           = { workspace = true }
+stateright         = { workspace = true }
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
