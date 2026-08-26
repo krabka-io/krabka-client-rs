@@ -70,10 +70,9 @@ impl CoordinationError {
     /// event, from a fault that a retry could clear.
     #[must_use]
     pub fn is_fenced(&self) -> bool {
-        match self {
-            Self::Fenced { .. } => true,
-            Self::Producer(ProducerError::FencedProducer) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            Self::Fenced { .. } | Self::Producer(ProducerError::FencedProducer)
+        )
     }
 }
