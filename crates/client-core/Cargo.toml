@@ -1,5 +1,5 @@
 [package]
-name = "crabka-client-core"
+name = "krabka-client-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,9 @@ rust-version.workspace = true
 description = "Connection management and request dispatch for Apache Kafka in Rust"
 repository = "https://github.com/robot-head/crabka"
 homepage = "https://github.com/robot-head/crabka"
-documentation = "https://docs.rs/crabka-client-core"
+documentation = "https://docs.rs/krabka-client-core"
 readme = "README.md"
-keywords = ["kafka", "client", "protocol", "crabka"]
+keywords = ["kafka", "client", "protocol", "krabka"]
 categories = ["api-bindings", "network-programming"]
 
 [lints]
@@ -21,10 +21,10 @@ default = []
 mock = []
 
 [dependencies]
-crabka-protocol = { version = "0.4.0", default-features = false }
-crabka-security = { version = "0.4.0" }
-crabka-ids = { version = "0.4.0" }
-crabka-units = { workspace = true }
+krabka-protocol = { version = "0.4.0", default-features = false }
+krabka-security = { version = "0.4.0" }
+krabka-ids = { version = "0.4.0" }
+krabka-units = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }

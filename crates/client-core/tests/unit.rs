@@ -4,14 +4,14 @@
 //! `Connection::connect`, `Connection::send`, and the timeout path all
 //! behave correctly without any JVM dependency.
 //!
-//! Run with: `cargo test -p crabka-client-core --features mock --test unit`
+//! Run with: `cargo test -p krabka-client-core --features mock --test unit`
 
 use assert2::{assert, check};
 use bytes::BytesMut;
-use crabka_client_core::{ClientError, Connection, ConnectionOptions, MockBroker};
+use krabka_client_core::{ClientError, Connection, ConnectionOptions, MockBroker};
 // Use the raw constants so we don't need `ProtocolRequest` in scope.
-use crabka_protocol::owned::api_versions_request;
-use crabka_protocol::{
+use krabka_protocol::owned::api_versions_request;
+use krabka_protocol::{
     Encode,
     owned::{
         api_versions_response::{ApiVersion, ApiVersionsResponse},
@@ -72,7 +72,7 @@ fn metadata_response_at(version: i16) -> Vec<u8> {
 /// Encode a `MetadataResponse` at the given version with a custom
 /// `throttle_time_ms`, preceded by the correct `ResponseHeader` prefix.
 fn metadata_response_with_throttle(version: i16, throttle_time_ms: i32) -> Vec<u8> {
-    use crabka_protocol::owned::metadata_response::FLEXIBLE_MIN;
+    use krabka_protocol::owned::metadata_response::FLEXIBLE_MIN;
     let resp = MetadataResponse {
         throttle_time_ms,
         ..Default::default()
@@ -130,8 +130,8 @@ async fn timeout_when_handler_silent() {
     .await;
 
     let opts = ConnectionOptions {
-        connect_timeout: crabka_units::millis(200),
-        request_timeout: crabka_units::secs(30),
+        connect_timeout: krabka_units::millis(200),
+        request_timeout: krabka_units::secs(30),
         ..ConnectionOptions::default()
     };
 
@@ -245,7 +245,7 @@ async fn concurrent_sends_get_correct_responses() {
 /// registry population.
 #[tokio::test]
 async fn client_refresh_metadata_populates_pool() {
-    use crabka_protocol::owned::metadata_response::{
+    use krabka_protocol::owned::metadata_response::{
         FLEXIBLE_MIN, MetadataResponse, MetadataResponseBroker,
     };
 
@@ -283,7 +283,7 @@ async fn client_refresh_metadata_populates_pool() {
     })
     .await;
 
-    let client = crabka_client_core::Client::builder()
+    let client = krabka_client_core::Client::builder()
         .bootstrap(mock.addr.to_string())
         .build()
         .await

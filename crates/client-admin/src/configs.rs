@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crabka_protocol::owned::{
+use krabka_protocol::owned::{
     describe_configs_request::{DescribeConfigsRequest, DescribeConfigsResource},
     describe_configs_response::DescribeConfigsResourceResult,
     incremental_alter_configs_request::{
@@ -78,7 +78,7 @@ pub(crate) fn filter_dynamic_overrides(
 /// overrides or its broker error. It is a separate function so unit tests can
 /// cover both the success branch and the error branch with no broker.
 pub(crate) fn parse_describe_configs_resource(
-    r: crabka_protocol::owned::describe_configs_response::DescribeConfigsResult,
+    r: krabka_protocol::owned::describe_configs_response::DescribeConfigsResult,
 ) -> Result<TopicConfigOverrides, AdminError> {
     if r.error_code != 0 {
         return Err(AdminError::Broker {
@@ -94,7 +94,7 @@ pub(crate) fn parse_describe_configs_resource(
 /// Pure helper. It projects an `IncrementalAlterConfigsResponse` into the
 /// per-topic outcome list that the operator consumes.
 pub(crate) fn parse_incremental_alter_outcomes(
-    resp: <IncrementalAlterConfigsRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: <IncrementalAlterConfigsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Vec<AlterConfigsOutcome> {
     resp.responses
         .into_iter()
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn parse_describe_configs_resource_returns_overrides_on_success() {
-        use crabka_protocol::owned::describe_configs_response::DescribeConfigsResult;
+        use krabka_protocol::owned::describe_configs_response::DescribeConfigsResult;
         let r = DescribeConfigsResult {
             error_code: 0,
             error_message: None,
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn parse_describe_configs_resource_returns_broker_error_when_error_code_set() {
-        use crabka_protocol::owned::describe_configs_response::DescribeConfigsResult;
+        use krabka_protocol::owned::describe_configs_response::DescribeConfigsResult;
         let r = DescribeConfigsResult {
             error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
             error_message: Some("nope".into()),
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn parse_incremental_alter_outcomes_success() {
-        use crabka_protocol::owned::incremental_alter_configs_response::{
+        use krabka_protocol::owned::incremental_alter_configs_response::{
             AlterConfigsResourceResponse, IncrementalAlterConfigsResponse,
         };
         let resp = IncrementalAlterConfigsResponse {
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn parse_incremental_alter_outcomes_carries_errors() {
-        use crabka_protocol::owned::incremental_alter_configs_response::{
+        use krabka_protocol::owned::incremental_alter_configs_response::{
             AlterConfigsResourceResponse, IncrementalAlterConfigsResponse,
         };
         let resp = IncrementalAlterConfigsResponse {

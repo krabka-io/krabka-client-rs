@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use crabka_client_admin::{AdminClient, CreateTopicSpec};
+use krabka_client_admin::{AdminClient, CreateTopicSpec};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Connecting to Crabka broker at 127.0.0.1:9092...");
+    println!("Connecting to Krabka broker at 127.0.0.1:9092...");
     let mut admin = AdminClient::connect(&["127.0.0.1:9092".to_string()]).await?;
     println!("Connected successfully! Creating topic 'test-topic'...");
 
@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 replicas: 1,
                 configs: BTreeMap::new(),
             }],
-            crabka_units::secs(30),
+            krabka_units::secs(30),
         )
         .await?;
     println!("Topic 'test-topic' created successfully! Fetching metadata...");

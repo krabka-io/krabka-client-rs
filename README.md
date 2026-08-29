@@ -11,10 +11,10 @@ nothing else in the krabka stack — in particular, not on the broker.
 
 | Crate | What it is |
 | --- | --- |
-| `crabka-client-core` | Connection management, request dispatch, retries, and the SASL/TLS handshake. |
-| `crabka-client-producer` | Producer, including the idempotent and transactional paths. |
-| `crabka-client-consumer` | Consumer, consumer groups, and share groups. |
-| `crabka-client-admin` | Admin API: topics, configs, ACLs, groups, and offsets. |
+| `krabka-client-core` | Connection management, request dispatch, retries, and the SASL/TLS handshake. |
+| `krabka-client-producer` | Producer, including the idempotent and transactional paths. |
+| `krabka-client-consumer` | Consumer, consumer groups, and share groups. |
+| `krabka-client-admin` | Admin API: topics, configs, ACLs, groups, and offsets. |
 
 ## Build
 
@@ -40,7 +40,7 @@ tagged `manual`.
 
 `krabka-protocol` is pinned by revision in exactly one place, the
 `[patch.crates-io]` block at the bottom of the root `Cargo.toml`. Member
-manifests declare those crates as ordinary `crabka-x = "0.4.0"` requirements and
+manifests declare those crates as ordinary `krabka-x = "0.4.0"` requirements and
 the patch redirects them at the git checkout, so a manifest still reads as a
 normal Cargo manifest. To move to a newer wire layer, change the revision there
 and re-run `cargo generate-lockfile`.
@@ -104,5 +104,5 @@ sits below.
 
 These crates are published to crates.io from
 [`robot-head/crabka`](https://github.com/robot-head/crabka), which is still the
-release home for the `crabka-*` names. This repository has no release
+release home for the `krabka-*` names. This repository has no release
 automation; consumers pin it by git revision.

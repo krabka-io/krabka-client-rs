@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crabka_protocol::{
+use krabka_protocol::{
     owned::{
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
         offset_fetch_request::{
@@ -151,7 +151,7 @@ pub(crate) fn id_to_name(topic_ids: &HashMap<String, WireUuid>) -> HashMap<WireU
 #[cfg(test)]
 mod tests {
 
-    use crabka_protocol::{
+    use krabka_protocol::{
         UnknownTaggedFields,
         owned::offset_fetch_response::{
             OffsetFetchResponse, OffsetFetchResponseGroup, OffsetFetchResponsePartition,

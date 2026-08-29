@@ -1,5 +1,5 @@
 //! Background sender task. It drains ready batches from every accumulator and
-//! ships them as `ProduceRequest`s through `crabka-client-core`.
+//! ships them as `ProduceRequest`s through `krabka-client-core`.
 //!
 //! The builder `tokio::spawn`s the sender. The sender owns the `wake_rx`
 //! `Receiver` end of the wake channel, while the `Producer` holds the `wake_tx`
@@ -41,7 +41,9 @@ use std::{
     },
 };
 
-use crabka_protocol::{
+use dashmap::DashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
+use krabka_protocol::{
     owned::{
         produce_request::{PartitionProduceData, ProduceRequest, TopicProduceData},
         produce_response::ProduceResponse,
@@ -49,12 +51,10 @@ use crabka_protocol::{
     primitives::uuid::Uuid,
     records::{Attributes, Record, RecordBatch, RecordHeader},
 };
-use crabka_units::{
+use krabka_units::{
     Time,
     convert::{StdDurationExt as _, TimeExt as _},
 };
-use dashmap::DashMap;
-use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::{
     sync::{Mutex, Notify},
     time::Instant,
@@ -111,7 +111,7 @@ const BOOTSTRAP_LEADER: i32 = -1;
 ///
 /// The previous design drained up to `max_in_flight` batches per partition and
 /// fired them through `futures::future::join_all`. But the `send` of
-/// [`crabka_client_core::Client`] writes the request frame **and** awaits its
+/// [`krabka_client_core::Client`] writes the request frame **and** awaits its
 /// response in a single future. When several same-partition futures are polled
 /// concurrently, their frame writes race on the connection's writer channel, so
 /// the broker can receive `base_sequence` 16 before 0. The broker rejects the
@@ -1118,7 +1118,7 @@ fn interpret_response(
     // Surface the actual broker error code (and any inline leader hint) for a
     // rejected produce, so a retry loop can be diagnosed from the code rather
     // than inferred from the resend pattern. Error-gated to stay off the
-    // happy-path hot loop; enable with RUST_LOG=crabka_client_producer=debug.
+    // happy-path hot loop; enable with RUST_LOG=krabka_client_producer=debug.
     if part_resp.error_code != 0 {
         tracing::debug!(
             topic = %pb.topic,
@@ -1446,7 +1446,7 @@ mod tests {
     use std::time::Duration;
 
     use assert2::check;
-    use crabka_units::{millis, secs};
+    use krabka_units::{millis, secs};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -1709,8 +1709,8 @@ mod harness {
     };
 
     use assert2::check;
-    use crabka_client_core::ClientError;
-    use crabka_protocol::{
+    use krabka_client_core::ClientError;
+    use krabka_protocol::{
         owned::{
             metadata_response::{
                 MetadataResponse, MetadataResponsePartition, MetadataResponseTopic,
@@ -1722,7 +1722,7 @@ mod harness {
         },
         records::{Attributes, Record, RecordBatch},
     };
-    use crabka_units::{millis, minutes, secs};
+    use krabka_units::{millis, minutes, secs};
     use tokio::sync::oneshot;
 
     use super::*;

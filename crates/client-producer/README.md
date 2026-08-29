@@ -1,21 +1,21 @@
-# crabka-client-producer
+# krabka-client-producer
 
-[![Crates.io](https://img.shields.io/crates/v/crabka-client-producer.svg)](https://crates.io/crates/crabka-client-producer)
-[![Docs.rs](https://docs.rs/crabka-client-producer/badge.svg)](https://docs.rs/crabka-client-producer)
+[![Crates.io](https://img.shields.io/crates/v/krabka-client-producer.svg)](https://crates.io/crates/krabka-client-producer)
+[![Docs.rs](https://docs.rs/krabka-client-producer/badge.svg)](https://docs.rs/krabka-client-producer)
 [![CI](https://github.com/robot-head/crabka/actions/workflows/ci.yml/badge.svg)](https://github.com/robot-head/crabka/actions/workflows/ci.yml)
 
 Idempotent Kafka producer client for Rust.
 
-Part of [Crabka](https://github.com/robot-head/crabka), a Rust implementation
+Part of [Krabka](https://github.com/robot-head/crabka), a Rust implementation
 of Apache Kafka-compatible infrastructure and clients.
 
 ## Overview
 
-`crabka-client-producer` holds the high-level producer behavior above
-`crabka-client-core`. It batches and compresses records, retries sends, stamps
+`krabka-client-producer` holds the high-level producer behavior above
+`krabka-client-core`. It batches and compresses records, retries sends, stamps
 idempotent sequence numbers, and produces in transactions. It accepts raw
 `bytes::Bytes` keys and values, so an application can choose its own
-serialization layer, such as `crabka-schema-serde`.
+serialization layer, such as `krabka-schema-serde`.
 
 Use this crate for application writes, exactly-once produce flows, and
 consume-process-produce transactions.
@@ -44,7 +44,7 @@ typed schema values.
 ## Install
 
 ```sh
-cargo add crabka-client-producer
+cargo add krabka-client-producer
 cargo add bytes
 ```
 
@@ -58,7 +58,7 @@ Produce an idempotent record and wait for delivery metadata:
 use std::time::Duration;
 
 use bytes::Bytes;
-use crabka_client_producer::{Acks, Compression, Producer, ProducerRecord};
+use krabka_client_producer::{Acks, Compression, Producer, ProducerRecord};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let producer = Producer::builder()
@@ -87,8 +87,8 @@ producer.close().await?;
 
 ## Documentation
 
-- [API documentation](https://docs.rs/crabka-client-producer)
-- [Crabka repository](https://github.com/robot-head/crabka)
+- [API documentation](https://docs.rs/krabka-client-producer)
+- [Krabka repository](https://github.com/robot-head/crabka)
 - [Kafka compatibility matrix](https://github.com/robot-head/crabka/blob/main/docs/KIP_MATRIX.md)
 
 ## License

@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crabka_units::{Time, convert::TimeExt as _, minutes};
+use krabka_units::{Time, convert::TimeExt as _, minutes};
 use refined_type::rule::GreaterEqualI64;
 
 use crate::{
@@ -139,13 +139,13 @@ impl Client {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn start(
         #[builder(into)] bootstrap: String,
-        #[builder(into, default = "crabka".to_string())] client_id: String,
+        #[builder(into, default = "krabka".to_string())] client_id: String,
         #[builder(default = crate::DEFAULT_CLIENT_DNS_TIMEOUT)] dns_timeout: Time,
         #[builder(default = crate::DEFAULT_CLIENT_CONNECT_TIMEOUT)] connect_timeout: Time,
         #[builder(default = crate::DEFAULT_CLIENT_REQUEST_TIMEOUT)] request_timeout: Time,
         #[builder(default = crate::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
-        #[builder(default = crate::DEFAULT_CLIENT_FRAME_MAX)] frame_max: crabka_units::ByteSize,
+        #[builder(default = crate::DEFAULT_CLIENT_FRAME_MAX)] frame_max: krabka_units::ByteSize,
         #[builder(default)] metadata_recovery_strategy: MetadataRecoveryStrategy,
         #[builder(default = crate::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
         metadata_recovery_rebootstrap_trigger: Time,
@@ -274,8 +274,8 @@ impl Client {
 
     async fn request_metadata_from_current_cluster(
         &self,
-    ) -> Result<crabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
-        use crabka_protocol::owned::metadata_request::MetadataRequest;
+    ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
+        use krabka_protocol::owned::metadata_request::MetadataRequest;
 
         let broker_ids = self.pool.broker_ids();
         if broker_ids.is_empty() {
@@ -375,7 +375,7 @@ impl Client {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn refresh_metadata(
         &self,
-    ) -> Result<crabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
+    ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
         self.metadata_recovery.begin_attempt();
         let first = self.request_metadata_from_current_cluster().await;
         let resp = match first {
@@ -699,7 +699,7 @@ mod bootstrap_failover_tests {
     };
 
     use bytes::BytesMut;
-    use crabka_protocol::{
+    use krabka_protocol::{
         Encode,
         owned::{
             api_versions_request,
@@ -710,7 +710,7 @@ mod bootstrap_failover_tests {
             },
         },
     };
-    use crabka_units::{bytes, mebibytes, millis};
+    use krabka_units::{bytes, mebibytes, millis};
 
     use super::*;
     use crate::mock::MockBroker;
@@ -974,7 +974,7 @@ mod bootstrap_failover_tests {
             .expect("client builds");
 
         let _ = client
-            .send(crabka_protocol::owned::metadata_request::MetadataRequest::default())
+            .send(krabka_protocol::owned::metadata_request::MetadataRequest::default())
             .await
             .expect("first send succeeds via A");
 
@@ -984,7 +984,7 @@ mod bootstrap_failover_tests {
         client.reconnect_bootstrap().await;
 
         let md = client
-            .send(crabka_protocol::owned::metadata_request::MetadataRequest::default())
+            .send(krabka_protocol::owned::metadata_request::MetadataRequest::default())
             .await
             .expect("send after reconnect_bootstrap reaches B");
         assert2::assert!(!md.brokers.is_empty());
@@ -1018,7 +1018,7 @@ mod bootstrap_failover_tests {
 
         let md = client
             .broker(1)
-            .send(crabka_protocol::owned::metadata_request::MetadataRequest::default())
+            .send(krabka_protocol::owned::metadata_request::MetadataRequest::default())
             .await
             .expect("broker send should refresh metadata and redial broker 1 at B");
         assert2::assert!(!md.brokers.is_empty());

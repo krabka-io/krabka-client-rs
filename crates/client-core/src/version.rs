@@ -61,7 +61,7 @@ impl ApiVersionTable {
 #[cfg(test)]
 mod tests {
     use assert2::assert;
-    use crabka_protocol::owned::api_versions_request::ApiVersionsRequest;
+    use krabka_protocol::owned::api_versions_request::ApiVersionsRequest;
 
     use super::*;
 

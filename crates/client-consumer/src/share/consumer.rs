@@ -8,12 +8,12 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use crabka_client_core::Client;
-use crabka_protocol::{
+use krabka_client_core::Client;
+use krabka_protocol::{
     owned::share_group_heartbeat_request::ShareGroupHeartbeatRequest,
     primitives::uuid::Uuid as WireUuid,
 };
-use crabka_units::{
+use krabka_units::{
     ByteSize, Time, bytes,
     convert::{ByteSizeExt as _, TimeExt as _},
     mebibytes, secs,
@@ -306,7 +306,7 @@ impl ShareConsumer {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn start(
         #[builder(into)] bootstrap: String,
-        #[builder(into, default = "crabka-share-consumer".to_string())] client_id: String,
+        #[builder(into, default = "krabka-share-consumer".to_string())] client_id: String,
         #[builder(into)] group_id: String,
         #[builder(into)] subscribe: Vec<String>,
         #[builder(default = ShareAckMode::Implicit)] ack_mode: ShareAckMode,
@@ -317,14 +317,14 @@ impl ShareConsumer {
         #[builder(default = secs(3))] heartbeat_interval: Time,
         #[builder(default = DEFAULT_SHARE_CONSUMER_LEAVE_HEARTBEAT_TIMEOUT)]
         leave_heartbeat_timeout: Time,
-        #[builder(default = crabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
+        #[builder(default = krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
-        #[builder(default = crabka_client_core::DEFAULT_CLIENT_FRAME_MAX)] frame_max: ByteSize,
+        #[builder(default = krabka_client_core::DEFAULT_CLIENT_FRAME_MAX)] frame_max: ByteSize,
         #[builder(default)]
-        metadata_recovery_strategy: crabka_client_core::MetadataRecoveryStrategy,
-        #[builder(default = crabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
+        metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
+        #[builder(default = krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
         metadata_recovery_rebootstrap_trigger: Time,
-        security: Option<crabka_client_core::security::ClientSecurity>,
+        security: Option<krabka_client_core::security::ClientSecurity>,
     ) -> Result<Self, ConsumerError> {
         if subscribe.is_empty() {
             return Err(ConsumerError::NotSubscribed);
@@ -362,12 +362,12 @@ impl ShareConsumer {
             validated_time("share consumer heartbeat interval", heartbeat_interval)
                 .map_err(ConsumerError::RebalanceFailed)?;
         let dispatch_queue_capacity =
-            crabka_client_core::ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
+            krabka_client_core::ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
                 .map_err(ConsumerError::RebalanceFailed)?;
-        let frame_max = crabka_client_core::ClientFrameMax::try_from(frame_max)
+        let frame_max = krabka_client_core::ClientFrameMax::try_from(frame_max)
             .map_err(ConsumerError::RebalanceFailed)?;
         let metadata_recovery_rebootstrap_trigger =
-            crabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
+            krabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
                 metadata_recovery_rebootstrap_trigger,
             )
             .map_err(ConsumerError::RebalanceFailed)?;
@@ -549,8 +549,8 @@ impl ShareConsumer {
 #[cfg(test)]
 mod tests {
     use assert2::check;
-    use crabka_protocol::tagged_fields::UnknownTaggedFields;
-    use crabka_units::millis;
+    use krabka_protocol::tagged_fields::UnknownTaggedFields;
+    use krabka_units::millis;
 
     use super::*;
 
@@ -594,7 +594,7 @@ mod tests {
             .bootstrap("invalid.invalid:9092")
             .group_id("leave-validation")
             .subscribe(["topic".to_owned()])
-            .leave_heartbeat_timeout(crabka_units::secs(0))
+            .leave_heartbeat_timeout(krabka_units::secs(0))
             .build()
             .await
             .err()
@@ -751,11 +751,11 @@ mod tests {
             check!(response_has_error(code) == expected, "case {name}");
         }
         for (name, broker_ms, expected) in [
-            ("broker interval", 2500, crabka_units::millis(2500)),
-            ("fallback interval", 0, crabka_units::secs(3)),
+            ("broker interval", 2500, krabka_units::millis(2500)),
+            ("fallback interval", 0, krabka_units::secs(3)),
         ] {
             check!(
-                heartbeat_interval_from_response(broker_ms, crabka_units::secs(3)) == expected,
+                heartbeat_interval_from_response(broker_ms, krabka_units::secs(3)) == expected,
                 "case {name}"
             );
         }

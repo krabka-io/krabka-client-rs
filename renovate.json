@@ -65,7 +65,7 @@
         "cargo"
       ],
       "matchPackageNames": [
-        "/^crabka-/"
+        "/^krabka-/"
       ],
       "enabled": false
     }

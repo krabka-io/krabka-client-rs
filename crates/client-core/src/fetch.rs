@@ -1,6 +1,6 @@
 //! Minimal single-partition `Fetch` helper over a raw [`Connection`].
 //!
-//! `crabka-client-consumer`'s group `Consumer` owns subscription-style
+//! `krabka-client-consumer`'s group `Consumer` owns subscription-style
 //! consumption. This helper is the manual building block for callers that
 //! drive their own per-partition fetch loops with externally-owned offsets,
 //! for example the tiered-storage metadata-log consumer.
@@ -8,7 +8,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use bytes::Bytes;
-use crabka_protocol::{
+use krabka_protocol::{
     owned::{
         fetch_request::{FetchPartition, FetchRequest, FetchTopic},
         fetch_response::FetchResponse,
@@ -16,7 +16,7 @@ use crabka_protocol::{
     primitives::uuid::Uuid as WireUuid,
     records::RecordHeader,
 };
-use crabka_units::{
+use krabka_units::{
     ByteSize, Time, bytes,
     convert::{ByteSizeExt as _, TimeExt as _},
     mebibytes,
@@ -255,7 +255,7 @@ pub async fn fetch_partition_with_isolation(
 /// progress across filtered transactional and control batches.
 ///
 /// In `READ_COMMITTED` mode this function applies the response's
-/// `aborted_transactions` metadata client-side, because Crabka brokers return
+/// `aborted_transactions` metadata client-side, because Krabka brokers return
 /// the underlying record batches verbatim.
 ///
 /// # Errors
@@ -324,7 +324,7 @@ fn build_fetch_request(fetch: IsolatedFetch<'_>) -> FetchRequest {
 
 /// Decode one partition response with client-side transaction filtering.
 fn fetch_partition_with_isolation_progress_response(
-    resp: &crabka_protocol::owned::fetch_response::FetchResponse,
+    resp: &krabka_protocol::owned::fetch_response::FetchResponse,
     partition: i32,
     fetch_floor: i64,
     isolation_level: i8,
@@ -414,7 +414,7 @@ fn fetch_partition_with_isolation_progress_response(
 mod tests {
     use assert2::assert;
     use bytes::BufMut as _;
-    use crabka_protocol::{
+    use krabka_protocol::{
         UnknownTaggedFields,
         owned::{
             fetch_request::ReplicaState,
@@ -424,7 +424,7 @@ mod tests {
         },
         records::{Attributes, Record, RecordBatch, RecordsPayload},
     };
-    use crabka_units::{ByteSize, bytes, convert::ByteSizeExt as _, kibibytes, millis};
+    use krabka_units::{ByteSize, bytes, convert::ByteSizeExt as _, kibibytes, millis};
 
     use super::*;
 

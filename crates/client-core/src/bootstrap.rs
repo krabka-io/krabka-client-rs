@@ -3,7 +3,7 @@
 
 use std::{future::Future, net::SocketAddr};
 
-use crabka_units::convert::TimeExt as _;
+use krabka_units::convert::TimeExt as _;
 
 use crate::{connection::ClientDnsTimeout, error::ClientError};
 
@@ -54,7 +54,7 @@ mod tests {
     use std::time::Duration;
 
     use assert2::assert;
-    use crabka_units::millis;
+    use krabka_units::millis;
 
     use super::*;
     use crate::connection::ClientDnsTimeout;

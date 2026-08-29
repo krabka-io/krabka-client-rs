@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn configured_codec_rejects_a_frame_over_its_limit() {
-        let max = ClientFrameMax::try_from(crabka_units::bytes(8)).unwrap();
+        let max = ClientFrameMax::try_from(krabka_units::bytes(8)).unwrap();
         let mut codec = codec_with_max(max);
         let mut input = BytesMut::from(&[0, 0, 0, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8][..]);
 
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn configured_codec_accepts_the_exact_limit() {
-        let max = ClientFrameMax::try_from(crabka_units::bytes(8)).unwrap();
+        let max = ClientFrameMax::try_from(krabka_units::bytes(8)).unwrap();
         let mut codec = codec_with_max(max);
         let mut input = BytesMut::from(&[0, 0, 0, 8, 0, 1, 2, 3, 4, 5, 6, 7][..]);
 

@@ -7,8 +7,9 @@ use std::{
 };
 
 use bytes::BytesMut;
-use crabka_client_admin::{AclEntryFilter, AdminClient};
-use crabka_protocol::{
+use futures_util::{SinkExt, StreamExt};
+use krabka_client_admin::{AclEntryFilter, AdminClient};
+use krabka_protocol::{
     Encode,
     owned::{
         api_versions_request,
@@ -17,7 +18,6 @@ use crabka_protocol::{
         describe_acls_response::DescribeAclsResponse,
     },
 };
-use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_util::{
     codec::{Framed, LengthDelimitedCodec},
@@ -65,7 +65,7 @@ fn api_versions_response_v0() -> Vec<u8> {
 
 fn describe_acls_response(version: i16) -> Vec<u8> {
     let mut buf = BytesMut::new();
-    if version >= crabka_protocol::owned::describe_acls_response::FLEXIBLE_MIN {
+    if version >= krabka_protocol::owned::describe_acls_response::FLEXIBLE_MIN {
         buf.extend_from_slice(&[0x00]);
     }
     DescribeAclsResponse::default()
@@ -112,12 +112,12 @@ impl ClosingAclBroker {
                                         // Parse the request header's two adjacent
                                         // `int16`s into distinct newtypes so the
                                         // api_key/api_version pair cannot be transposed.
-                                        let api_key = crabka_ids::ApiKey(i16::from_be_bytes([frame[0], frame[1]]));
-                                        let version = crabka_ids::ApiVersion(i16::from_be_bytes([frame[2], frame[3]]));
+                                        let api_key = krabka_ids::ApiKey(i16::from_be_bytes([frame[0], frame[1]]));
+                                        let version = krabka_ids::ApiVersion(i16::from_be_bytes([frame[2], frame[3]]));
                                         let corr_id = i32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]);
-                                        let body = if api_key == crabka_ids::ApiKey(api_versions_request::API_KEY) {
+                                        let body = if api_key == krabka_ids::ApiKey(api_versions_request::API_KEY) {
                                             Some(api_versions_response_v0())
-                                        } else if api_key == crabka_ids::ApiKey(describe_acls_request::API_KEY) {
+                                        } else if api_key == krabka_ids::ApiKey(describe_acls_request::API_KEY) {
                                             conn_describe_calls.fetch_add(1, Ordering::SeqCst);
                                             if conn_first_acl_request.swap(false, Ordering::SeqCst) {
                                                 break;

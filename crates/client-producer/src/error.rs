@@ -4,10 +4,10 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum ProducerError {
     #[error("client: {0}")]
-    Client(#[from] crabka_client_core::ClientError),
+    Client(#[from] krabka_client_core::ClientError),
 
     #[error("protocol: {0}")]
-    Protocol(#[from] crabka_protocol::ProtocolError),
+    Protocol(#[from] krabka_protocol::ProtocolError),
 
     #[error("broker error_code {0}")]
     Server(i16),
@@ -34,7 +34,7 @@ pub enum ProducerError {
     FlushTimeout,
 
     #[error("compression: {0}")]
-    Compression(#[from] crabka_compression::CompressionError),
+    Compression(#[from] krabka_compression::CompressionError),
 
     #[error("producer is not transactional (no transactional_id configured)")]
     NotTransactional,

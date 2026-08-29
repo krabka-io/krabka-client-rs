@@ -1,6 +1,6 @@
 //! Subscribe-style consumer client for Apache Kafka in Rust.
 //!
-//! This crate builds on `crabka-client-core` for transport. It adds the classic
+//! This crate builds on `krabka-client-core` for transport. It adds the classic
 //! consumer-group lifecycle (`JoinGroup` → `SyncGroup` → `Heartbeat` →
 //! `Fetch` → `OffsetCommit` → `LeaveGroup`) and a built-in heartbeat
 //! task.
@@ -8,8 +8,8 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use crabka_client_consumer::{AutoOffsetReset, Consumer};
-//! use crabka_units::millis;
+//! use krabka_client_consumer::{AutoOffsetReset, Consumer};
+//! use krabka_units::millis;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut consumer = Consumer::builder()
@@ -34,8 +34,8 @@
 //! ## Share-group consumption
 //!
 //! ```no_run
-//! use crabka_client_consumer::{ShareAckMode, ShareAckType, ShareConsumer};
-//! use crabka_units::secs;
+//! use krabka_client_consumer::{ShareAckMode, ShareAckType, ShareConsumer};
+//! use krabka_units::secs;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut consumer = ShareConsumer::builder()
@@ -61,16 +61,16 @@
 //! assignment, fetch/poll, offset commit, cooperative shutdown, and KIP-932
 //! share-group consumption. It does not duplicate admin-client surfaces such as
 //! `DescribeGroups`/`ListGroups`. Manual partition fetches stay available
-//! through the lower-level helpers in `crabka-client-core`. Transactional
+//! through the lower-level helpers in `krabka-client-core`. Transactional
 //! consume-process-produce workflows use this crate's
-//! [`ConsumerGroupMetadata`] together with `crabka-client-producer`'s
+//! [`ConsumerGroupMetadata`] together with `krabka-client-producer`'s
 //! `send_offsets_to_transaction` support.
 //!
 //! ## Cargo features
 //!
 //! None for now.
 
-#![doc(html_root_url = "https://docs.rs/crabka-client-consumer/0.4.0")]
+#![doc(html_root_url = "https://docs.rs/krabka-client-consumer/0.4.0")]
 
 mod assignor;
 mod builder;

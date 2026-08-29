@@ -13,7 +13,7 @@
 //! rules one of them in. If the protocol is deadlock-free under exhaustive
 //! search, the investigation should redirect to the lost-wakeup path.
 //!
-//! ## Fidelity (the crabka stateright program's cardinal rule)
+//! ## Fidelity (the krabka stateright program's cardinal rule)
 //!
 //! Every modeled lock edge comes from the real source. The citations below use
 //! **function + lock variable**. Bare line numbers drift whenever someone adds

@@ -12,7 +12,7 @@
 //! These helpers do not retry. Each client crate keeps its own retry policy on
 //! top of them.
 
-use crabka_protocol::owned::{
+use krabka_protocol::owned::{
     find_coordinator_request::FindCoordinatorRequest,
     find_coordinator_response::FindCoordinatorResponse,
 };
@@ -153,7 +153,7 @@ pub async fn find_coordinator(
 #[cfg(test)]
 mod tests {
     use assert2::assert;
-    use crabka_protocol::{UnknownTaggedFields, owned::find_coordinator_response::Coordinator};
+    use krabka_protocol::{UnknownTaggedFields, owned::find_coordinator_response::Coordinator};
 
     use super::*;
 

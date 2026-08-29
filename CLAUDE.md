@@ -50,7 +50,7 @@ The wire layer lives in a sibling repository,
 [`krabka-protocol`](https://github.com/krabka-io/krabka-protocol). It is pinned
 by revision in one place -- the `[patch.crates-io]` block at the bottom of the
 root `Cargo.toml`. Member manifests declare those crates as ordinary
-`crabka-x = "0.4.0"` requirements; the patch is what redirects them at the git
+`krabka-x = "0.4.0"` requirements; the patch is what redirects them at the git
 checkout. To move to a newer wire layer, change the revision there, re-run
 `cargo generate-lockfile`, and commit both files.
 
@@ -114,6 +114,6 @@ shape.
 
 ## Releases
 
-This repository has no release automation. The `crabka-*` crates.io names are
+This repository has no release automation. The `krabka-*` crates.io names are
 still published from [`robot-head/crabka`](https://github.com/robot-head/crabka);
 consumers here pin by git revision.

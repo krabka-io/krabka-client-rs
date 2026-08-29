@@ -1,24 +1,24 @@
-# crabka-client-consumer
+# krabka-client-consumer
 
-[![Crates.io](https://img.shields.io/crates/v/crabka-client-consumer.svg)](https://crates.io/crates/crabka-client-consumer)
-[![Docs.rs](https://docs.rs/crabka-client-consumer/badge.svg)](https://docs.rs/crabka-client-consumer)
+[![Crates.io](https://img.shields.io/crates/v/krabka-client-consumer.svg)](https://crates.io/crates/krabka-client-consumer)
+[![Docs.rs](https://docs.rs/krabka-client-consumer/badge.svg)](https://docs.rs/krabka-client-consumer)
 [![CI](https://github.com/robot-head/crabka/actions/workflows/ci.yml/badge.svg)](https://github.com/robot-head/crabka/actions/workflows/ci.yml)
 
 Subscribe-style Kafka consumer client for Rust.
 
-Part of [Crabka](https://github.com/robot-head/crabka), a Rust implementation
+Part of [Krabka](https://github.com/robot-head/crabka), a Rust implementation
 of Apache Kafka-compatible infrastructure and clients.
 
 ## Overview
 
-`crabka-client-consumer` owns the high-level consumer behavior above
-`crabka-client-core`. It handles subscription, group membership, record polls,
+`krabka-client-consumer` owns the high-level consumer behavior above
+`krabka-client-core`. It handles subscription, group membership, record polls,
 offset commits, position validation, cooperative shutdown, and share-group
 consumption. Use this crate for application-style consumers that join Kafka
 groups and process records by topic subscription.
 
 Manual single-partition fetches and raw request dispatch stay in
-`crabka-client-core`. Admin group inspection stays in `crabka-client-admin`.
+`krabka-client-core`. Admin group inspection stays in `krabka-client-admin`.
 
 ## Capabilities
 
@@ -37,12 +37,12 @@ cooperative sticky assignment, KIP-320 leader-epoch validation, KIP-516 offset
 wire shapes, KIP-447 consumer group metadata, and KIP-932 share groups.
 
 The public API does not expose a JVM-style manual `assign()` consumer. Use
-`crabka-client-core` for lower-level partition fetches.
+`krabka-client-core` for lower-level partition fetches.
 
 ## Install
 
 ```sh
-cargo add crabka-client-consumer
+cargo add krabka-client-consumer
 ```
 
 For workspace development, use the path dependency from this repository.
@@ -54,7 +54,7 @@ Subscribe to a topic, poll records, and commit offsets:
 ```rust,no_run
 use std::time::Duration;
 
-use crabka_client_consumer::{AutoOffsetReset, Consumer};
+use krabka_client_consumer::{AutoOffsetReset, Consumer};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let mut consumer = Consumer::builder()
@@ -78,8 +78,8 @@ consumer.close().await?;
 
 ## Documentation
 
-- [API documentation](https://docs.rs/crabka-client-consumer)
-- [Crabka repository](https://github.com/robot-head/crabka)
+- [API documentation](https://docs.rs/krabka-client-consumer)
+- [Krabka repository](https://github.com/robot-head/crabka)
 - [Kafka compatibility matrix](https://github.com/robot-head/crabka/blob/main/docs/KIP_MATRIX.md)
 
 ## License

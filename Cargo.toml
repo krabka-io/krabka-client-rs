@@ -8,7 +8,7 @@ exclude = ["tools/mutants"]
 version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
-authors = ["The Crabka Authors"]
+authors = ["The Krabka Authors"]
 rust-version = "1.97.1"
 
 [workspace.lints.rust]
@@ -77,15 +77,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # First-party crates inherited by more than one member.
-crabka-units = "0.4.0"
+krabka-units = "0.4.0"
 
 # Sibling repositories, pinned by revision. These crates are declared
 # against crates.io above and in the member manifests; the patch below is
 # the single place a sibling revision is bumped.
 [patch.crates-io]
-crabka-compression = { git = "https://github.com/krabka-io/krabka-protocol", rev = "1e164af6f10275f14696418e61d60d5930788c1a" }
-crabka-ids = { git = "https://github.com/krabka-io/krabka-protocol", rev = "1e164af6f10275f14696418e61d60d5930788c1a" }
-crabka-metadata = { git = "https://github.com/krabka-io/krabka-protocol", rev = "1e164af6f10275f14696418e61d60d5930788c1a" }
-crabka-protocol = { git = "https://github.com/krabka-io/krabka-protocol", rev = "1e164af6f10275f14696418e61d60d5930788c1a" }
-crabka-security = { git = "https://github.com/krabka-io/krabka-protocol", rev = "1e164af6f10275f14696418e61d60d5930788c1a" }
-crabka-units = { git = "https://github.com/krabka-io/krabka-protocol", rev = "1e164af6f10275f14696418e61d60d5930788c1a" }
+krabka-compression = { git = "https://github.com/krabka-io/krabka-protocol", rev = "9b63d2e96e72ca336809bf414b42cfc1f1bed017" }
+krabka-ids = { git = "https://github.com/krabka-io/krabka-protocol", rev = "9b63d2e96e72ca336809bf414b42cfc1f1bed017" }
+krabka-metadata = { git = "https://github.com/krabka-io/krabka-protocol", rev = "9b63d2e96e72ca336809bf414b42cfc1f1bed017" }
+krabka-protocol = { git = "https://github.com/krabka-io/krabka-protocol", rev = "9b63d2e96e72ca336809bf414b42cfc1f1bed017" }
+krabka-security = { git = "https://github.com/krabka-io/krabka-protocol", rev = "9b63d2e96e72ca336809bf414b42cfc1f1bed017" }
+krabka-units = { git = "https://github.com/krabka-io/krabka-protocol", rev = "9b63d2e96e72ca336809bf414b42cfc1f1bed017" }

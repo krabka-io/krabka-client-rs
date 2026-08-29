@@ -1,4 +1,4 @@
-//! Error type for `crabka-client-consumer`.
+//! Error type for `krabka-client-consumer`.
 
 use thiserror::Error;
 
@@ -7,10 +7,10 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum ConsumerError {
     #[error("client: {0}")]
-    Client(#[from] crabka_client_core::ClientError),
+    Client(#[from] krabka_client_core::ClientError),
 
     #[error("protocol: {0}")]
-    Protocol(#[from] crabka_protocol::ProtocolError),
+    Protocol(#[from] krabka_protocol::ProtocolError),
 
     #[error("rebalance failed: {0}")]
     RebalanceFailed(String),

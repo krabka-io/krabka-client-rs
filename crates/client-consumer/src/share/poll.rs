@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use crabka_protocol::{
+use krabka_protocol::{
     owned::{
         share_acknowledge_request::{
             AcknowledgePartition, AcknowledgeTopic, AcknowledgementBatch as AckAckBatch,
@@ -41,7 +41,7 @@ use crabka_protocol::{
     },
     primitives::uuid::Uuid as WireUuid,
 };
-use crabka_units::{
+use krabka_units::{
     ByteSize, Time,
     convert::{ByteSizeExt as _, TimeExt as _},
 };
@@ -576,8 +576,8 @@ mod tests {
     use std::sync::Arc;
 
     use assert2::check;
-    use crabka_client_core::Client;
-    use crabka_protocol::tagged_fields::UnknownTaggedFields;
+    use krabka_client_core::Client;
+    use krabka_protocol::tagged_fields::UnknownTaggedFields;
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn standalone_ack_surfaces_partition_error() {
-        use crabka_protocol::owned::share_acknowledge_response::{
+        use krabka_protocol::owned::share_acknowledge_response::{
             PartitionData, ShareAcknowledgeTopicResponse,
         };
 
@@ -657,9 +657,9 @@ mod tests {
             "group-a".into(),
             "member-a".into(),
             4,
-            crabka_units::millis(250),
-            crabka_units::bytes(7),
-            crabka_units::bytes(65_536),
+            krabka_units::millis(250),
+            krabka_units::bytes(7),
+            krabka_units::bytes(65_536),
             37,
             ShareAcquireMode::RecordLimit,
             vec![topic.clone()],
@@ -688,8 +688,8 @@ mod tests {
             "member-a".into(),
             4,
             Time::from_millis(i64::from(u32::MAX)),
-            crabka_units::bytes(7),
-            crabka_units::bytes(65_536),
+            krabka_units::bytes(7),
+            krabka_units::bytes(65_536),
             37,
             ShareAcquireMode::BatchOptimized,
             Vec::new(),
@@ -702,9 +702,9 @@ mod tests {
             "group-a".into(),
             "member-a".into(),
             4,
-            crabka_units::micros(250_900),
-            crabka_units::bytes(7),
-            crabka_units::bytes(65_536),
+            krabka_units::micros(250_900),
+            krabka_units::bytes(7),
+            krabka_units::bytes(65_536),
             37,
             ShareAcquireMode::BatchOptimized,
             Vec::new(),
@@ -718,9 +718,9 @@ mod tests {
             "group-a".into(),
             "member-a".into(),
             0,
-            crabka_units::millis(500),
-            crabka_units::bytes(1),
-            crabka_units::mebibytes(50),
+            krabka_units::millis(500),
+            krabka_units::bytes(1),
+            krabka_units::mebibytes(50),
             500,
             ShareAcquireMode::BatchOptimized,
             Vec::new(),

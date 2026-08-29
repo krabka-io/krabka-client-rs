@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
-use crabka_protocol::{
+use krabka_protocol::{
     owned::{
         offset_commit_request::{OffsetCommitRequest, OffsetCommitRequestTopic},
         offset_commit_response::OffsetCommitResponse,
@@ -100,7 +100,7 @@ fn build_commit_request(
     generation_id_or_member_epoch: i32,
     member_id: String,
     group_instance_id: Option<String>,
-    topics: Vec<crabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic>,
+    topics: Vec<krabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic>,
 ) -> OffsetCommitRequest {
     OffsetCommitRequest {
         group_id,
@@ -331,7 +331,7 @@ impl Consumer {
 #[cfg(test)]
 mod tests {
     use assert2::check;
-    use crabka_protocol::{
+    use krabka_protocol::{
         UnknownTaggedFields,
         owned::{
             offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
@@ -412,7 +412,7 @@ mod tests {
         positions.insert(
             ("known".into(), 0),
             PartitionPosition {
-                offset_epoch: crabka_ids::LeaderEpoch(7),
+                offset_epoch: krabka_ids::LeaderEpoch(7),
                 ..Default::default()
             },
         );
@@ -447,7 +447,7 @@ mod tests {
         let positions = Arc::new(Mutex::new(HashMap::from([(
             ("alpha".to_string(), 1),
             PartitionPosition {
-                offset_epoch: crabka_ids::LeaderEpoch(7),
+                offset_epoch: krabka_ids::LeaderEpoch(7),
                 ..Default::default()
             },
         )])));
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn build_commit_request_preserves_group_member_generation_and_topics() {
         let topics = vec![
-            crabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic {
+            krabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic {
                 name: "topic".into(),
                 topic_id: Uuid::ZERO,
                 partitions: vec![OffsetCommitRequestPartition {

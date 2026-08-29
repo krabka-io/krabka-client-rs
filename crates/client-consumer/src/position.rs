@@ -3,7 +3,7 @@
 //! This module also holds the pure truncation decision that the proactive
 //! validate pass and the in-band `diverging_epoch` path use.
 
-use crabka_ids::LeaderEpoch;
+use krabka_ids::LeaderEpoch;
 
 /// Epoch metadata for one assigned partition.
 ///

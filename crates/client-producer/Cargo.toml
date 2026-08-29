@@ -1,5 +1,5 @@
 [package]
-name = "crabka-client-producer"
+name = "krabka-client-producer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,9 @@ rust-version.workspace = true
 description = "Idempotent producer client for Apache Kafka in Rust"
 repository = "https://github.com/robot-head/crabka"
 homepage = "https://github.com/robot-head/crabka"
-documentation = "https://docs.rs/crabka-client-producer"
+documentation = "https://docs.rs/krabka-client-producer"
 readme = "README.md"
-keywords = ["kafka", "producer", "client", "streaming", "crabka"]
+keywords = ["kafka", "producer", "client", "streaming", "krabka"]
 categories = ["api-bindings", "network-programming"]
 
 [lints]
@@ -21,11 +21,11 @@ default = []
 
 [dependencies]
 assert2 = { workspace = true }
-crabka-protocol = { version = "0.4.0", default-features = false }
-crabka-client-core = { version = "0.4.0", path = "../client-core" }
-crabka-client-consumer = { version = "0.4.0", path = "../client-consumer" }
-crabka-compression = { version = "0.4.0" }
-crabka-units = { workspace = true }
+krabka-protocol = { version = "0.4.0", default-features = false }
+krabka-client-core = { version = "0.4.0", path = "../client-core" }
+krabka-client-consumer = { version = "0.4.0", path = "../client-consumer" }
+krabka-compression = { version = "0.4.0" }
+krabka-units = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
@@ -40,8 +40,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 # `mock` exposes MockBroker so the ClientTransport adapter can be tested against
 # an in-process broker (no JVM).
-crabka-client-core = { path = "../client-core", features = ["mock"] }
-crabka-security = { version = "0.4.0" }
+krabka-client-core = { path = "../client-core", features = ["mock"] }
+krabka-security = { version = "0.4.0" }
 mutants = { workspace = true }
 stateright = { workspace = true }
 tempfile = { workspace = true }

@@ -1,16 +1,16 @@
-# crabka-client-coordination
+# krabka-client-coordination
 
-[![Crates.io](https://img.shields.io/crates/v/crabka-client-coordination.svg)](https://crates.io/crates/crabka-client-coordination)
-[![Docs.rs](https://docs.rs/crabka-client-coordination/badge.svg)](https://docs.rs/crabka-client-coordination)
+[![Crates.io](https://img.shields.io/crates/v/krabka-client-coordination.svg)](https://crates.io/crates/krabka-client-coordination)
+[![Docs.rs](https://docs.rs/krabka-client-coordination/badge.svg)](https://docs.rs/krabka-client-coordination)
 
 Leader election, leases, and fencing tokens for Apache Kafka clients.
 
-Part of [Crabka](https://github.com/robot-head/crabka), a Rust implementation
+Part of [Krabka](https://github.com/robot-head/crabka), a Rust implementation
 of Apache Kafka-compatible infrastructure and clients.
 
 ## Overview
 
-An active or standby process uses `crabka-client-coordination` to elect one
+An active or standby process uses `krabka-client-coordination` to elect one
 leader for each role and to prove that leadership on every guarded write. The
 crate builds the primitives on Kafka itself, so a cluster needs no second
 consensus service, and no broker-side feature.
@@ -41,7 +41,7 @@ a tombstone. See the `record` module documentation for the field lists.
 
 ## Documentation
 
-- [API documentation](https://docs.rs/crabka-client-coordination)
+- [API documentation](https://docs.rs/krabka-client-coordination)
 - [Design](docs/design.md) - why the epoch comes from the transaction
   coordinator, why the lease carries no safety, and the succession recipe.
 - [Crate style guides](../../docs/style_guides/README.md)

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crabka_protocol::owned::{
+use krabka_protocol::owned::{
     alter_replica_log_dirs_request::{
         AlterReplicaLogDir, AlterReplicaLogDirTopic, AlterReplicaLogDirsRequest,
     },
@@ -161,8 +161,8 @@ mod tests {
     };
 
     use bytes::{Buf, BytesMut};
-    use crabka_client_core::MockBroker;
-    use crabka_protocol::{
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
         Decode, Encode,
         owned::{
             alter_replica_log_dirs_request,

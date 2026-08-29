@@ -1,8 +1,8 @@
-//! Error type for `crabka-client-core`.
+//! Error type for `krabka-client-core`.
 
 use std::net::SocketAddr;
 
-use crabka_units::{Time, fmt::Human as _};
+use krabka_units::{Time, fmt::Human as _};
 use thiserror::Error;
 
 /// Errors returned by `Client`, `Connection`, and the broker pool.
@@ -44,7 +44,7 @@ pub enum ClientError {
     NoCoordinator { key: String },
 
     #[error("codec: {0}")]
-    Codec(#[from] crabka_protocol::ProtocolError),
+    Codec(#[from] krabka_protocol::ProtocolError),
 
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn display_is_useful() {
-        let e = ClientError::Timeout(crabka_units::secs(5));
+        let e = ClientError::Timeout(krabka_units::secs(5));
         assert!(e.to_string() == "request timed out after 5s");
     }
 

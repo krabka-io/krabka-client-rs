@@ -1,7 +1,7 @@
 //! Cluster feature administration.
 
-use crabka_protocol::owned::update_features_request::{FeatureUpdateKey, UpdateFeaturesRequest};
-use crabka_units::{Time, convert::TimeExt as _};
+use krabka_protocol::owned::update_features_request::{FeatureUpdateKey, UpdateFeaturesRequest};
+use krabka_units::{Time, convert::TimeExt as _};
 
 use crate::{AdminClient, AdminError, MetadataVersionUpdate, kafka_error_name};
 
@@ -10,7 +10,7 @@ const UPGRADE: i8 = 1;
 const SAFE_DOWNGRADE: i8 = 2;
 
 fn metadata_update_error(
-    response: &crabka_protocol::owned::update_features_response::UpdateFeaturesResponse,
+    response: &krabka_protocol::owned::update_features_response::UpdateFeaturesResponse,
 ) -> Option<AdminError> {
     if response.error_code != 0 {
         return Some(AdminError::Broker {
@@ -99,13 +99,13 @@ impl AdminClient {
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
-    use crabka_protocol::{Decode, Encode};
+    use krabka_protocol::{Decode, Encode};
 
     use super::*;
 
     #[test]
     fn metadata_update_selects_safe_downgrade() {
-        let request = metadata_update_request(15, true, crabka_units::secs(30));
+        let request = metadata_update_request(15, true, krabka_units::secs(30));
         let update = &request.feature_updates[0];
 
         assert2::assert!(request.timeout_ms == 30_000);
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn metadata_safe_downgrade_survives_v0_encoding() {
-        let request = metadata_update_request(15, true, crabka_units::secs(30));
+        let request = metadata_update_request(15, true, krabka_units::secs(30));
         let mut bytes = BytesMut::new();
         request.encode(&mut bytes, 0).unwrap();
 
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn metadata_update_surfaces_row_error_from_v0_or_v1() {
-        use crabka_protocol::owned::update_features_response::{
+        use krabka_protocol::owned::update_features_response::{
             UpdatableFeatureResult, UpdateFeaturesResponse,
         };
 
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn metadata_update_recognizes_not_controller_for_retry() {
-        let response = crabka_protocol::owned::update_features_response::UpdateFeaturesResponse {
+        let response = krabka_protocol::owned::update_features_response::UpdateFeaturesResponse {
             error_code: crate::NOT_CONTROLLER,
             ..Default::default()
         };

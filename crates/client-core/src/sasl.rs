@@ -16,8 +16,8 @@
 use std::path::PathBuf;
 
 use bytes::{Buf, BufMut, BytesMut};
-use crabka_ids::{ApiKey, ApiVersion};
-use crabka_protocol::{
+use krabka_ids::{ApiKey, ApiVersion};
+use krabka_protocol::{
     Decode, Encode,
     owned::{
         sasl_authenticate_request::SaslAuthenticateRequest,
@@ -26,8 +26,8 @@ use crabka_protocol::{
         sasl_handshake_response::SaslHandshakeResponse,
     },
 };
-use crabka_security::{SaslMechanism, ScramClientExchange};
-use crabka_units::{ByteSize, kibibytes};
+use krabka_security::{SaslMechanism, ScramClientExchange};
+use krabka_units::{ByteSize, kibibytes};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -370,7 +370,7 @@ async fn run_gssapi_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
 {
-    use crabka_security::gssapi::{
+    use krabka_security::gssapi::{
         client::{ClientStep, GssapiClientExchange},
         provider::SspiInitiator,
     };
@@ -544,11 +544,11 @@ where
 #[cfg(test)]
 mod tests {
     use assert2::check;
-    use crabka_protocol::owned::{
+    use krabka_protocol::owned::{
         sasl_authenticate_response::SaslAuthenticateResponse,
         sasl_handshake_response::SaslHandshakeResponse,
     };
-    use crabka_security::{ScramServerExchange, StepResult, hash_scram_password};
+    use krabka_security::{ScramServerExchange, StepResult, hash_scram_password};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         time::{Duration, timeout},
@@ -1051,7 +1051,7 @@ mod tests {
             &[0],
             SaslPolicy {
                 client_id: "",
-                frame_max: crate::ClientFrameMax::try_from(crabka_units::bytes(10)).unwrap(),
+                frame_max: crate::ClientFrameMax::try_from(krabka_units::bytes(10)).unwrap(),
             },
         )
         .await
@@ -1081,7 +1081,7 @@ mod tests {
             &[],
             SaslPolicy {
                 client_id: "",
-                frame_max: crate::ClientFrameMax::try_from(crabka_units::bytes(16)).unwrap(),
+                frame_max: crate::ClientFrameMax::try_from(krabka_units::bytes(16)).unwrap(),
             },
         )
         .await

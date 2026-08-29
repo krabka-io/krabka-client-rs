@@ -5,7 +5,7 @@
 //! epoch. That offset is the safe offset a fetcher must not have consumed
 //! past.
 
-use crabka_protocol::owned::{
+use krabka_protocol::owned::{
     offset_for_leader_epoch_request::{
         OffsetForLeaderEpochRequest, OffsetForLeaderPartition, OffsetForLeaderTopic,
     },
@@ -97,7 +97,7 @@ fn parse_single(
 #[cfg(test)]
 mod tests {
     use assert2::assert;
-    use crabka_protocol::{
+    use krabka_protocol::{
         UnknownTaggedFields,
         owned::offset_for_leader_epoch_response::{
             EpochEndOffset as WireEpochEndOffset, OffsetForLeaderEpochResponse,

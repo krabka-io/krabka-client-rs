@@ -39,7 +39,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crabka_units::{Time, convert::TimeExt, secs};
+use krabka_units::{Time, convert::TimeExt, secs};
 
 use crate::{
     error::CoordinationError,
@@ -362,7 +362,7 @@ mod tests {
     }
 
     use assert2::{assert, check};
-    use crabka_units::{millis, secs};
+    use krabka_units::{millis, secs};
 
     use super::*;
 
