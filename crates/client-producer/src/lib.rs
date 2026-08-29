@@ -77,8 +77,8 @@ pub use builder::{
     ProducerFlushTimeout, ProducerRetryPolicy, ProducerThroughputPolicy,
 };
 pub use compression::Compression;
-pub use krabka_client_consumer::ConsumerGroupMetadata;
 pub use error::ProducerError;
+pub use krabka_client_consumer::ConsumerGroupMetadata;
 pub use partitioner::partition_for_key;
 pub use producer::{Acks, Producer};
 pub use record::{Header, ProducerRecord, RecordMetadata};

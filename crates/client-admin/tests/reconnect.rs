@@ -7,6 +7,7 @@ use std::{
 };
 
 use bytes::BytesMut;
+use futures_util::{SinkExt, StreamExt};
 use krabka_client_admin::{AclEntryFilter, AdminClient};
 use krabka_protocol::{
     Encode,
@@ -17,7 +18,6 @@ use krabka_protocol::{
         describe_acls_response::DescribeAclsResponse,
     },
 };
-use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_util::{
     codec::{Framed, LengthDelimitedCodec},

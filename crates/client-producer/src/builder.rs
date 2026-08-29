@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use dashmap::DashMap;
 use krabka_client_core::{
     Client, ClientDnsTimeout, ClientError, ClientFrameMax, ConnectionDispatchQueueCapacity,
     DEFAULT_CLIENT_DNS_TIMEOUT, DEFAULT_CLIENT_FRAME_MAX,
@@ -22,7 +23,6 @@ use krabka_units::{
     ByteSize, Time,
     convert::{StdDurationExt as _, TimeExt as _},
 };
-use dashmap::DashMap;
 use refined_type::rule::{GreaterI32, GreaterUsize, MinMaxU128, MinMaxUsize};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;

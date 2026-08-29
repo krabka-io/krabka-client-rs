@@ -9,6 +9,7 @@ use std::{
     },
 };
 
+use dashmap::DashMap;
 use krabka_client_consumer::ConsumerGroupMetadata;
 use krabka_client_core::{
     Client, ClientFrameMax, ConnectionDispatchQueueCapacity, security::ClientSecurity,
@@ -25,7 +26,6 @@ use krabka_protocol::owned::{
     },
 };
 use krabka_units::{Time, convert::TimeExt};
-use dashmap::DashMap;
 use tokio::{
     sync::{Mutex, Notify, oneshot},
     task::JoinHandle,

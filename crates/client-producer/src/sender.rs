@@ -41,6 +41,8 @@ use std::{
     },
 };
 
+use dashmap::DashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
 use krabka_protocol::{
     owned::{
         produce_request::{PartitionProduceData, ProduceRequest, TopicProduceData},
@@ -53,8 +55,6 @@ use krabka_units::{
     Time,
     convert::{StdDurationExt as _, TimeExt as _},
 };
-use dashmap::DashMap;
-use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::{
     sync::{Mutex, Notify},
     time::Instant,
