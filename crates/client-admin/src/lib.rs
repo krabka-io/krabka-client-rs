@@ -1,11 +1,11 @@
-//! Admin client for Crabka operators and control-plane services.
+//! Admin client for Krabka operators and control-plane services.
 //!
 //! The client targets the active controller and retries selected RPCs on a
 //! refreshed controller connection when the broker returns `NOT_CONTROLLER`.
 //! It supports plaintext by default and the same client-side TLS/SASL security
-//! surface as [`crabka_client_core`] through [`AdminClient::connect_secured`].
+//! surface as [`krabka_client_core`] through [`AdminClient::connect_secured`].
 //!
-//! The client is built on `crabka_client_core::Connection`'s typed
+//! The client is built on `krabka_client_core::Connection`'s typed
 //! `send::<R: ProtocolRequest>`, so request-version negotiation is automatic
 //! through the `ApiVersionTable` that connect time populates. The public
 //! modules cover topic CRUD, partition expansion, config changes, SCRAM user
@@ -13,11 +13,11 @@
 
 use std::{any::Any, sync::Mutex};
 
-use crabka_client_core::{
+use krabka_client_core::{
     ClientError, Connection, ConnectionOptions, MetadataRecoveryRebootstrapTrigger,
     MetadataRecoveryStrategy, ProtocolRequest as _,
 };
-use crabka_units::{Time, convert::TimeExt as _, secs};
+use krabka_units::{Time, convert::TimeExt as _, secs};
 use thiserror::Error;
 
 pub mod configs;
@@ -164,7 +164,7 @@ pub trait AdminClientLike: Send {
 
     // ── delegation-token RPCs (KIP-48) ────────────────────────────────
     //
-    // Trait-level return type is `crabka_metadata::DelegationToken`
+    // Trait-level return type is `krabka_metadata::DelegationToken`
     // (the image type) rather than the raw `Create/RenewDelegationToken`
     // response. The `AdminClientLike for AdminClient` impl below
     // reshapes wire responses into the image type — see the per-method
@@ -175,16 +175,16 @@ pub trait AdminClientLike: Send {
         owner_principal_name: &str,
         renewers: &[String],
         max_lifetime: Option<Time>,
-    ) -> Result<crabka_metadata::DelegationToken, AdminError>;
+    ) -> Result<krabka_metadata::DelegationToken, AdminError>;
     async fn renew_delegation_token(
         &mut self,
         hmac: &[u8],
-    ) -> Result<crabka_metadata::DelegationToken, AdminError>;
+    ) -> Result<krabka_metadata::DelegationToken, AdminError>;
     async fn expire_delegation_token(&mut self, hmac: &[u8]) -> Result<(), AdminError>;
     async fn describe_delegation_tokens_owned_by(
         &mut self,
         owner_principal: &str,
-    ) -> Result<Vec<crabka_metadata::DelegationToken>, AdminError>;
+    ) -> Result<Vec<krabka_metadata::DelegationToken>, AdminError>;
 }
 
 #[async_trait::async_trait]
@@ -316,14 +316,14 @@ impl AdminClientLike for AdminClient {
     // return the wire-shaped response (`CreateDelegationTokenResponse`
     // for create, `i64` new expiry for renew, `()` for expire, image
     // `DelegationToken` for describe). The trait surface is normalised
-    // to `crabka_metadata::DelegationToken` so the operator's reconcile
+    // to `krabka_metadata::DelegationToken` so the operator's reconcile
     // path is wire-agnostic.
     async fn create_delegation_token_as_owner(
         &mut self,
         owner_principal_name: &str,
         renewers: &[String],
         max_lifetime: Option<Time>,
-    ) -> Result<crabka_metadata::DelegationToken, AdminError> {
+    ) -> Result<krabka_metadata::DelegationToken, AdminError> {
         // The create-response carries every field the image type needs
         // *except* the renewer list (the broker does not echo it back),
         // so we reconstruct that from the caller's input — which is the
@@ -340,9 +340,9 @@ impl AdminClientLike for AdminClient {
             .iter()
             .filter_map(|s| renewer_str_to_principal(s))
             .collect();
-        Ok(crabka_metadata::DelegationToken {
+        Ok(krabka_metadata::DelegationToken {
             token_id: resp.token_id,
-            owner: crabka_security::KafkaPrincipal {
+            owner: krabka_security::KafkaPrincipal {
                 principal_type: resp.principal_type,
                 name: resp.principal_name,
             },
@@ -357,7 +357,7 @@ impl AdminClientLike for AdminClient {
     async fn renew_delegation_token(
         &mut self,
         hmac: &[u8],
-    ) -> Result<crabka_metadata::DelegationToken, AdminError> {
+    ) -> Result<krabka_metadata::DelegationToken, AdminError> {
         // The renew-response (`RenewDelegationTokenResponse`) carries
         // only the new `expiry_timestamp_ms`. To rebuild the full
         // `DelegationToken` we follow up with `DescribeDelegationToken`
@@ -368,7 +368,7 @@ impl AdminClientLike for AdminClient {
         // owner principal into the trait method; keeping the surface
         // `hmac`-only matches the inherent O3 signature.
         let _new_expiry = AdminClient::renew_delegation_token(self, hmac).await?;
-        let req = crabka_protocol::owned::describe_delegation_token_request::DescribeDelegationTokenRequest::default();
+        let req = krabka_protocol::owned::describe_delegation_token_request::DescribeDelegationTokenRequest::default();
         let resp = self.conn.send(req).await?;
         if resp.error_code != 0 {
             return Err(AdminError::Broker {
@@ -388,9 +388,9 @@ impl AdminClientLike for AdminClient {
                         .into(),
                 )
             })?;
-        Ok(crabka_metadata::DelegationToken {
+        Ok(krabka_metadata::DelegationToken {
             token_id: matched.token_id,
-            owner: crabka_security::KafkaPrincipal {
+            owner: krabka_security::KafkaPrincipal {
                 principal_type: matched.principal_type,
                 name: matched.principal_name,
             },
@@ -401,7 +401,7 @@ impl AdminClientLike for AdminClient {
             renewers: matched
                 .renewers
                 .into_iter()
-                .map(|r| crabka_security::KafkaPrincipal {
+                .map(|r| krabka_security::KafkaPrincipal {
                     principal_type: r.principal_type,
                     name: r.principal_name,
                 })
@@ -416,7 +416,7 @@ impl AdminClientLike for AdminClient {
     async fn describe_delegation_tokens_owned_by(
         &mut self,
         owner_principal: &str,
-    ) -> Result<Vec<crabka_metadata::DelegationToken>, AdminError> {
+    ) -> Result<Vec<krabka_metadata::DelegationToken>, AdminError> {
         AdminClient::describe_delegation_tokens_owned_by(self, owner_principal).await
     }
 }
@@ -424,12 +424,12 @@ impl AdminClientLike for AdminClient {
 /// Splits `"Type:Name"` into a `KafkaPrincipal`. The default type is `User`.
 /// Empty input gives `None`, so the create path does not manufacture a
 /// principal from a bare `""` renewer entry.
-fn renewer_str_to_principal(s: &str) -> Option<crabka_security::KafkaPrincipal> {
+fn renewer_str_to_principal(s: &str) -> Option<krabka_security::KafkaPrincipal> {
     if s.is_empty() {
         return None;
     }
     let (pt, pn) = s.split_once(':').unwrap_or(("User", s));
-    Some(crabka_security::KafkaPrincipal {
+    Some(krabka_security::KafkaPrincipal {
         principal_type: pt.to_string(),
         name: pn.to_string(),
     })
@@ -477,7 +477,7 @@ pub(crate) fn kafka_error_if(code: i16, message: Option<String>) -> Option<Kafka
 
 async fn lookup_first<F, I>(
     host_port: &str,
-    dns_timeout: crabka_client_core::ClientDnsTimeout,
+    dns_timeout: krabka_client_core::ClientDnsTimeout,
     lookup: F,
 ) -> Result<std::net::SocketAddr, AdminError>
 where
@@ -563,7 +563,7 @@ impl RecoveringConnection {
 
     pub(crate) async fn send<R>(&self, request: R) -> Result<R::Response, AdminError>
     where
-        R: crabka_protocol::ProtocolRequest + Clone,
+        R: krabka_protocol::ProtocolRequest + Clone,
         R::Response: 'static,
     {
         self.send_with_min_version(request, None).await
@@ -575,7 +575,7 @@ impl RecoveringConnection {
         min_version: i16,
     ) -> Result<R::Response, AdminError>
     where
-        R: crabka_protocol::ProtocolRequest + Clone,
+        R: krabka_protocol::ProtocolRequest + Clone,
         R::Response: 'static,
     {
         self.send_with_min_version(request, Some(min_version)).await
@@ -587,7 +587,7 @@ impl RecoveringConnection {
         min_version: Option<i16>,
     ) -> Result<R::Response, AdminError>
     where
-        R: crabka_protocol::ProtocolRequest + Clone,
+        R: krabka_protocol::ProtocolRequest + Clone,
         R::Response: 'static,
     {
         self.require_advertised_controller_api::<R>().await?;
@@ -636,7 +636,7 @@ impl RecoveringConnection {
         min_version: Option<i16>,
     ) -> Result<R::Response, ClientError>
     where
-        R: crabka_protocol::ProtocolRequest,
+        R: krabka_protocol::ProtocolRequest,
     {
         let connection = self.inner.read().await;
         if let Some(min_version) = min_version {
@@ -651,7 +651,7 @@ impl RecoveringConnection {
         min_version: Option<i16>,
     ) -> Result<R::Response, AdminError>
     where
-        R: crabka_protocol::ProtocolRequest,
+        R: krabka_protocol::ProtocolRequest,
         R::Response: 'static,
     {
         self.rebootstrap().await?;
@@ -674,7 +674,7 @@ impl RecoveringConnection {
         min_version: Option<i16>,
     ) -> Result<R::Response, AdminError>
     where
-        R: crabka_protocol::ProtocolRequest + Clone,
+        R: krabka_protocol::ProtocolRequest + Clone,
         R::Response: 'static,
     {
         self.reconnect_current_metadata().await?;
@@ -698,7 +698,7 @@ impl RecoveringConnection {
 
     async fn require_advertised_controller_api<R>(&self) -> Result<(), AdminError>
     where
-        R: crabka_protocol::ProtocolRequest,
+        R: krabka_protocol::ProtocolRequest,
     {
         const UNSUPPORTED_ENDPOINT_TYPE: i16 = 115;
         if self.target == BootstrapTarget::Controllers
@@ -781,7 +781,7 @@ impl RecoveringConnection {
 
     fn observe_cluster_endpoints<T: Any>(&self, response: &T) {
         if let Some(metadata) = (response as &dyn Any)
-            .downcast_ref::<crabka_protocol::owned::metadata_response::MetadataResponse>(
+            .downcast_ref::<krabka_protocol::owned::metadata_response::MetadataResponse>(
         ) {
             let endpoints = metadata
                 .brokers
@@ -796,7 +796,7 @@ impl RecoveringConnection {
         }
         if self.target == BootstrapTarget::Controllers
             && let Some(cluster) = (response as &dyn Any).downcast_ref::<
-                crabka_protocol::owned::describe_cluster_response::DescribeClusterResponse,
+                krabka_protocol::owned::describe_cluster_response::DescribeClusterResponse,
             >()
         {
             let endpoints = cluster
@@ -815,8 +815,8 @@ impl RecoveringConnection {
         self.target == BootstrapTarget::Controllers
     }
 
-    fn begin_metadata_attempt<R: crabka_protocol::ProtocolRequest>(&self) {
-        if R::API_KEY != crabka_protocol::owned::metadata_request::MetadataRequest::API_KEY
+    fn begin_metadata_attempt<R: krabka_protocol::ProtocolRequest>(&self) {
+        if R::API_KEY != krabka_protocol::owned::metadata_request::MetadataRequest::API_KEY
             || self.strategy == MetadataRecoveryStrategy::None
         {
             return;
@@ -829,7 +829,7 @@ impl RecoveringConnection {
 
     fn response_requires_rebootstrap<T: Any>(response: &T) -> bool {
         (response as &dyn Any)
-            .downcast_ref::<crabka_protocol::owned::metadata_response::MetadataResponse>()
+            .downcast_ref::<krabka_protocol::owned::metadata_response::MetadataResponse>()
             .is_some_and(|metadata| metadata.error_code == 129)
     }
 
@@ -838,7 +838,7 @@ impl RecoveringConnection {
             return false;
         }
         let Some(metadata) = (response as &dyn Any)
-            .downcast_ref::<crabka_protocol::owned::metadata_response::MetadataResponse>(
+            .downcast_ref::<krabka_protocol::owned::metadata_response::MetadataResponse>(
         ) else {
             return false;
         };
@@ -852,7 +852,7 @@ impl RecoveringConnection {
 
     fn complete_metadata_attempt<T: Any>(&self, response: &T) {
         let has_brokers = (response as &dyn Any)
-            .downcast_ref::<crabka_protocol::owned::metadata_response::MetadataResponse>()
+            .downcast_ref::<krabka_protocol::owned::metadata_response::MetadataResponse>()
             .is_some_and(|metadata| !metadata.brokers.is_empty());
         if has_brokers {
             self.clear_metadata_attempt();
@@ -873,7 +873,7 @@ async fn send_connection_at_least<R>(
     min_version: i16,
 ) -> Result<R::Response, ClientError>
 where
-    R: crabka_protocol::ProtocolRequest,
+    R: krabka_protocol::ProtocolRequest,
 {
     let (broker_min, broker_max) = connection
         .advertised_api_range(R::API_KEY)
@@ -893,16 +893,16 @@ where
 }
 
 impl AdminClient {
-    /// Builds the per-connect options for `client_id="crabka-operator"` with
+    /// Builds the per-connect options for `client_id="krabka-operator"` with
     /// the supplied security policy.
-    fn opts(security: Option<crabka_client_core::security::ClientSecurity>) -> ConnectionOptions {
+    fn opts(security: Option<krabka_client_core::security::ClientSecurity>) -> ConnectionOptions {
         ConnectionOptions {
-            dns_timeout: crabka_client_core::ClientDnsTimeout::default(),
+            dns_timeout: krabka_client_core::ClientDnsTimeout::default(),
             connect_timeout: secs(5),
             request_timeout: secs(30),
-            client_id: "crabka-operator".to_string(),
-            dispatch_queue_capacity: crabka_client_core::ConnectionDispatchQueueCapacity::default(),
-            frame_max: crabka_client_core::ClientFrameMax::default(),
+            client_id: "krabka-operator".to_string(),
+            dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::default(),
+            frame_max: krabka_client_core::ClientFrameMax::default(),
             security: security.map(Box::new),
         }
     }
@@ -915,7 +915,7 @@ impl AdminClient {
     /// accepted the (optionally secured) connection.
     pub async fn connect_secured(
         bootstrap_addrs: &[String],
-        security: Option<crabka_client_core::security::ClientSecurity>,
+        security: Option<krabka_client_core::security::ClientSecurity>,
     ) -> Result<Self, AdminError> {
         Self::connect_with_options(bootstrap_addrs, Self::opts(security)).await
     }
@@ -927,8 +927,8 @@ impl AdminClient {
     /// Returns `AdminError::Connect { tried }` if no bootstrap address connects.
     pub async fn connect_secured_with_dns_timeout(
         bootstrap_addrs: &[String],
-        security: Option<crabka_client_core::security::ClientSecurity>,
-        dns_timeout: crabka_client_core::ClientDnsTimeout,
+        security: Option<krabka_client_core::security::ClientSecurity>,
+        dns_timeout: krabka_client_core::ClientDnsTimeout,
     ) -> Result<Self, AdminError> {
         let mut options = Self::opts(security);
         options.dns_timeout = dns_timeout;
@@ -942,7 +942,7 @@ impl AdminClient {
     /// Returns `AdminError::Connect { tried }` if no bootstrap address connects.
     pub async fn connect_with_dns_timeout(
         bootstrap_addrs: &[String],
-        dns_timeout: crabka_client_core::ClientDnsTimeout,
+        dns_timeout: krabka_client_core::ClientDnsTimeout,
     ) -> Result<Self, AdminError> {
         Self::connect_secured_with_dns_timeout(bootstrap_addrs, None, dns_timeout).await
     }
@@ -960,7 +960,7 @@ impl AdminClient {
             bootstrap_addrs,
             options,
             MetadataRecoveryStrategy::default(),
-            crabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
+            krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
             BootstrapTarget::Brokers,
         )
         .await
@@ -983,7 +983,7 @@ impl AdminClient {
     /// bootstrap endpoint can identify and connect to the active controller.
     pub async fn connect_controller_secured(
         bootstrap_controllers: &[String],
-        security: Option<crabka_client_core::security::ClientSecurity>,
+        security: Option<krabka_client_core::security::ClientSecurity>,
     ) -> Result<Self, AdminError> {
         Self::connect_controller_with_options(bootstrap_controllers, Self::opts(security)).await
     }
@@ -1001,7 +1001,7 @@ impl AdminClient {
             bootstrap_controllers,
             options,
             MetadataRecoveryStrategy::default(),
-            crabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
+            krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
             BootstrapTarget::Controllers,
         )
         .await
@@ -1064,7 +1064,7 @@ impl AdminClient {
                 }
                 Err(e) => {
                     tracing::debug!(
-                        target: "crabka_client_admin",
+                        target: "krabka_client_admin",
                         addr = %host_port,
                         error = %e,
                         "bootstrap connect failed",
@@ -1142,7 +1142,7 @@ impl AdminClient {
         host_port: &str,
         options: ConnectionOptions,
     ) -> Result<ConnectedTarget, AdminError> {
-        use crabka_protocol::owned::describe_cluster_request::DescribeClusterRequest;
+        use krabka_protocol::owned::describe_cluster_request::DescribeClusterRequest;
 
         const ENDPOINT_TYPE_CONTROLLERS: i8 = 2;
         let bootstrap = Self::connect_one(host_port, options.clone()).await?;
@@ -1219,7 +1219,7 @@ impl AdminClient {
                 }
                 Err(error) => {
                     tracing::debug!(
-                        target: "crabka_client_admin",
+                        target: "krabka_client_admin",
                         addr = %host_port,
                         error = %error,
                         "bootstrap reconnect failed",
@@ -1302,8 +1302,8 @@ mod tests {
     };
 
     use bytes::{BufMut, BytesMut};
-    use crabka_client_core::security::{ClientSecurity, SaslCredentials};
-    use crabka_protocol::{
+    use krabka_client_core::security::{ClientSecurity, SaslCredentials};
+    use krabka_protocol::{
         Decode, Encode,
         owned::{
             api_versions_request,
@@ -1320,7 +1320,7 @@ mod tests {
             sasl_handshake_response::SaslHandshakeResponse,
         },
     };
-    use crabka_security::ListenerProtocol;
+    use krabka_security::ListenerProtocol;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1587,13 +1587,13 @@ mod tests {
 
     fn custom_admin_options() -> ConnectionOptions {
         ConnectionOptions {
-            dns_timeout: crabka_client_core::ClientDnsTimeout::default(),
+            dns_timeout: krabka_client_core::ClientDnsTimeout::default(),
             client_id: "custom-admin".into(),
-            connect_timeout: crabka_units::millis(100),
-            request_timeout: crabka_units::millis(25),
-            dispatch_queue_capacity: crabka_client_core::ConnectionDispatchQueueCapacity::new(7)
+            connect_timeout: krabka_units::millis(100),
+            request_timeout: krabka_units::millis(25),
+            dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::new(7)
                 .unwrap(),
-            frame_max: crabka_client_core::ClientFrameMax::try_from(crabka_units::kibibytes(32))
+            frame_max: krabka_client_core::ClientFrameMax::try_from(krabka_units::kibibytes(32))
                 .unwrap(),
             security: Some(Box::new(ClientSecurity {
                 protocol: ListenerProtocol::SaslPlaintext,
@@ -1615,9 +1615,9 @@ mod tests {
     }
 
     fn assert_custom_connect_timeout_is_stored(admin: &AdminClient) {
-        assert2::assert!(admin.options.connect_timeout == crabka_units::millis(100));
+        assert2::assert!(admin.options.connect_timeout == krabka_units::millis(100));
         assert2::assert!(admin.options.dispatch_queue_capacity.get() == 7);
-        assert2::assert!(admin.options.frame_max.size() == crabka_units::kibibytes(32));
+        assert2::assert!(admin.options.frame_max.size() == krabka_units::kibibytes(32));
     }
 
     fn metadata_mock_response(version: i16, broker_id: i32, port: u16) -> Vec<u8> {
@@ -1809,8 +1809,8 @@ mod tests {
 
     #[tokio::test]
     async fn connect_secured_threads_security_and_fails_to_closed_port() {
-        use crabka_client_core::security::{ClientSecurity, SaslCredentials};
-        use crabka_security::ListenerProtocol;
+        use krabka_client_core::security::{ClientSecurity, SaslCredentials};
+        use krabka_security::ListenerProtocol;
 
         let security = ClientSecurity {
             protocol: ListenerProtocol::SaslPlaintext,
@@ -1829,7 +1829,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dns_lookup_stops_at_connection_option_deadline() {
-        let timeout = crabka_client_core::ClientDnsTimeout::new(Time::from_millis(37))
+        let timeout = krabka_client_core::ClientDnsTimeout::new(Time::from_millis(37))
             .expect("positive timeout");
         let started = tokio::time::Instant::now();
         let pending =
@@ -1869,14 +1869,14 @@ mod tests {
     #[tokio::test]
     async fn connect_with_dns_timeout_preserves_admin_defaults() {
         let live = ObservedAdminBroker::start(Duration::ZERO).await;
-        let timeout = crabka_client_core::ClientDnsTimeout::new(Time::from_millis(37))
+        let timeout = krabka_client_core::ClientDnsTimeout::new(Time::from_millis(37))
             .expect("positive timeout");
         let admin = AdminClient::connect_with_dns_timeout(&[live.addr.to_string()], timeout)
             .await
             .expect("admin connects");
 
         assert2::assert!(admin.options.dns_timeout == timeout);
-        assert2::assert!(admin.options.client_id == "crabka-operator");
+        assert2::assert!(admin.options.client_id == "krabka-operator");
         assert2::assert!(admin.options.connect_timeout == secs(5));
         assert2::assert!(admin.options.request_timeout == secs(30));
         live.stop();
@@ -1888,7 +1888,7 @@ mod tests {
         let healthy_calls = Arc::new(AtomicUsize::new(0));
         let h_port = healthy_port.clone();
         let h_calls = healthy_calls.clone();
-        let healthy = crabka_client_core::MockBroker::start(
+        let healthy = krabka_client_core::MockBroker::start(
             move |api_key, version, _correlation_id, _body| {
                 if api_key == api_versions_request::API_KEY {
                     return Some(admin_mock_api_versions());
@@ -1908,7 +1908,7 @@ mod tests {
         healthy_port.store(healthy.addr.port(), Ordering::SeqCst);
 
         let advertised_port = healthy_port.clone();
-        let seed = crabka_client_core::MockBroker::start(
+        let seed = krabka_client_core::MockBroker::start(
             move |api_key, version, _correlation_id, _body| {
                 if api_key == api_versions_request::API_KEY {
                     return Some(admin_mock_api_versions());
@@ -1924,7 +1924,7 @@ mod tests {
             .expect("admin connects to its seed");
         let first = admin
             .conn
-            .send(crabka_protocol::owned::metadata_request::MetadataRequest::default())
+            .send(krabka_protocol::owned::metadata_request::MetadataRequest::default())
             .await
             .expect("seed provides last-known broker metadata");
         assert2::assert!(first.brokers[0].node_id == 7);
@@ -1935,7 +1935,7 @@ mod tests {
 
         let refreshed = admin
             .conn
-            .send(crabka_protocol::owned::metadata_request::MetadataRequest::default())
+            .send(krabka_protocol::owned::metadata_request::MetadataRequest::default())
             .await
             .expect("admin refreshes through the learned broker");
         assert2::assert!(refreshed.brokers[0].node_id == 7);
@@ -1945,7 +1945,7 @@ mod tests {
     #[tokio::test]
     async fn recovering_connection_enforces_required_api_version() {
         let broker =
-            crabka_client_core::MockBroker::start(|api_key, _version, _correlation_id, _body| {
+            krabka_client_core::MockBroker::start(|api_key, _version, _correlation_id, _body| {
                 (api_key == api_versions_request::API_KEY)
                     .then(|| admin_mock_api_versions_with_describe_cluster(1))
             })
@@ -2011,7 +2011,7 @@ mod tests {
     #[tokio::test]
     async fn secured_dns_timeout_preserves_security_and_admin_defaults() {
         let live = ObservedAdminBroker::start(Duration::ZERO).await;
-        let timeout = crabka_client_core::ClientDnsTimeout::new(Time::from_millis(37))
+        let timeout = krabka_client_core::ClientDnsTimeout::new(Time::from_millis(37))
             .expect("positive timeout");
         let security = ClientSecurity {
             protocol: ListenerProtocol::SaslPlaintext,
@@ -2032,7 +2032,7 @@ mod tests {
 
         assert2::assert!(admin.options.dns_timeout == timeout);
         assert2::assert!(admin.options.security.is_some());
-        assert2::assert!(admin.options.client_id == "crabka-operator");
+        assert2::assert!(admin.options.client_id == "krabka-operator");
         assert2::assert!(admin.options.connect_timeout == secs(5));
         assert2::assert!(admin.options.request_timeout == secs(30));
         live.stop();
@@ -2097,7 +2097,7 @@ mod tests {
     fn existing_connectors_keep_admin_defaults() {
         let options = AdminClient::opts(None);
 
-        assert2::assert!(options.client_id == "crabka-operator");
+        assert2::assert!(options.client_id == "krabka-operator");
         assert2::assert!(options.connect_timeout == secs(5));
         assert2::assert!(options.request_timeout == secs(30));
         assert2::assert!(options.security.is_none());

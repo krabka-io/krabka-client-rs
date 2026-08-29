@@ -1,7 +1,7 @@
 //! The [`CoordinationTransport`] that talks to a Kafka cluster.
 //!
-//! [`BrokerTransport`] composes `crabka-client-producer`,
-//! `crabka-client-admin`, and `crabka-client-core`. It adds no wire message.
+//! [`BrokerTransport`] composes `krabka-client-producer`,
+//! `krabka-client-admin`, and `krabka-client-core`. It adds no wire message.
 //! The points below are the parts of the composition that a reader cannot see
 //! from the call sites, and each one is load-bearing.
 //!
@@ -41,7 +41,7 @@
 //! The succession rules rank candidates on the offset of their registration, so
 //! the records of one role need a total order, and one partition gives that
 //! order. Both producers pin the partition with
-//! [`ProducerRecord::partition`](crabka_client_producer::ProducerRecord), and
+//! [`ProducerRecord::partition`](krabka_client_producer::ProducerRecord), and
 //! they compute it from the role name.
 //!
 //! Pinning is a correctness requirement and not a preference. Kafka's default
@@ -53,7 +53,7 @@
 //! `krabka-streams-java` and `krabka-streams-go` write the same topic, so they
 //! need the same partition for the same role. [`role_partition`] is the rule
 //! the three implementations share. It calls
-//! `crabka_client_producer::partition_for_key`, which is Kafka's own rule:
+//! `krabka_client_producer::partition_for_key`, which is Kafka's own rule:
 //! `murmur2` of the role name in UTF-8, masked with `Utils.toPositive`, then
 //! the remainder of the partition count.
 //!
@@ -71,18 +71,18 @@ use std::{
 };
 
 use async_trait::async_trait;
-use crabka_client_admin::{
+use krabka_client_admin::{
     AdminClient, AdminError, CreateTopicOutcome, CreateTopicSpec, TransactionDescription,
 };
-use crabka_client_core::{
+use krabka_client_core::{
     BrokerInfo, BrokerPool, ClientDnsTimeout, ClientError, ClientSecurity, Connection,
     ConnectionOptions, DEFAULT_FETCH_RESPONSE_MAX, FetchMinBytes, FetchedRecord, IsolatedFetch,
     fetch_partition_with_isolation_progress,
 };
-use crabka_client_producer::{
+use krabka_client_producer::{
     Acks, Producer, ProducerError, ProducerRecord, RecordMetadata, partition_for_key,
 };
-use crabka_protocol::{
+use krabka_protocol::{
     owned::{
         list_offsets_request::{ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
         list_offsets_response::ListOffsetsResponse,
@@ -91,7 +91,7 @@ use crabka_protocol::{
     },
     primitives::uuid::Uuid as WireUuid,
 };
-use crabka_units::{ByteSize, Time, convert::TimeExt as _, mebibytes, millis, secs};
+use krabka_units::{ByteSize, Time, convert::TimeExt as _, mebibytes, millis, secs};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::{
@@ -126,7 +126,7 @@ pub const DEFAULT_COORDINATION_FETCH_MAX_WAIT: Time = millis(500);
 pub const DEFAULT_COORDINATION_FETCH_PARTITION_MAX: ByteSize = mebibytes(1);
 
 /// The client id that the transport gives every connection it opens.
-pub const DEFAULT_COORDINATION_CLIENT_ID: &str = "crabka-coordination";
+pub const DEFAULT_COORDINATION_CLIENT_ID: &str = "krabka-coordination";
 
 /// Kafka's `UNKNOWN_TOPIC_OR_PARTITION`.
 const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
@@ -738,7 +738,7 @@ async fn resolve_addresses(
 /// The partition that holds every record of `role`.
 ///
 /// The rule is Kafka's own key partitioning, which
-/// `crabka_client_producer::partition_for_key` implements: `murmur2` of the
+/// `krabka_client_producer::partition_for_key` implements: `murmur2` of the
 /// role name in UTF-8, masked with `Utils.toPositive`, then the remainder of
 /// `partitions`. `krabka-streams-java` and `krabka-streams-go` write the same
 /// topic, so they implement the same rule. A change here needs the same change
@@ -857,7 +857,7 @@ fn partition_leader(response: &MetadataResponse, partition: i32) -> Result<i32, 
 /// Picks the coordination topic out of a `Metadata` response.
 fn coordination_topic(
     response: &MetadataResponse,
-) -> Option<&crabka_protocol::owned::metadata_response::MetadataResponseTopic> {
+) -> Option<&krabka_protocol::owned::metadata_response::MetadataResponseTopic> {
     response
         .topics
         .iter()
@@ -1113,7 +1113,7 @@ mod tests {
     /// negative id and not against a non-positive one.
     #[test]
     fn the_leader_of_a_partition_comes_from_the_metadata_response() {
-        use crabka_protocol::owned::metadata_response::{
+        use krabka_protocol::owned::metadata_response::{
             MetadataResponsePartition, MetadataResponseTopic,
         };
 
@@ -1176,14 +1176,14 @@ mod tests {
     }
 
     use assert2::{assert, check};
-    use crabka_client_admin::KafkaError;
-    use crabka_protocol::owned::{
+    use krabka_client_admin::KafkaError;
+    use krabka_protocol::owned::{
         list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
         metadata_response::{
             MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
         },
     };
-    use crabka_units::secs;
+    use krabka_units::secs;
 
     use super::*;
     use crate::record::RecordKind;

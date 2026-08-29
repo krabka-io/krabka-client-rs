@@ -1,6 +1,6 @@
 //! The `Compression` enum, and the mapping from the producer's choice to a
 //! `RecordBatch` v2 `attributes` value and a
-//! `crabka-compression::CompressionType`.
+//! `krabka-compression::CompressionType`.
 
 use std::{fmt, str::FromStr};
 
@@ -47,13 +47,13 @@ impl FromStr for Compression {
 
 impl Compression {
     #[must_use]
-    pub(crate) fn compression_type(self) -> crabka_compression::CompressionType {
+    pub(crate) fn compression_type(self) -> krabka_compression::CompressionType {
         match self {
-            Compression::None => crabka_compression::CompressionType::None,
-            Compression::Gzip => crabka_compression::CompressionType::Gzip,
-            Compression::Snappy => crabka_compression::CompressionType::Snappy,
-            Compression::Lz4 => crabka_compression::CompressionType::Lz4,
-            Compression::Zstd => crabka_compression::CompressionType::Zstd,
+            Compression::None => krabka_compression::CompressionType::None,
+            Compression::Gzip => krabka_compression::CompressionType::Gzip,
+            Compression::Snappy => krabka_compression::CompressionType::Snappy,
+            Compression::Lz4 => krabka_compression::CompressionType::Lz4,
+            Compression::Zstd => krabka_compression::CompressionType::Zstd,
         }
     }
 
@@ -75,7 +75,7 @@ impl Compression {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub fn compress(self, raw: &[u8]) -> Result<Bytes, ProducerError> {
-        Ok(crabka_compression::compress(self.compression_type(), raw)?)
+        Ok(krabka_compression::compress(self.compression_type(), raw)?)
     }
 }
 
@@ -106,13 +106,13 @@ mod tests {
 
     #[test]
     fn gzip_round_trip_via_decoder() {
-        use crabka_compression::CompressionType;
+        use krabka_compression::CompressionType;
         let raw = b"the quick brown fox";
         let compressed = Compression::Gzip.compress(raw).unwrap();
-        let decoded = crabka_compression::decompress(
+        let decoded = krabka_compression::decompress(
             CompressionType::Gzip,
             &compressed,
-            crabka_units::convert::ByteSizeExt::from_bytes(u64::MAX),
+            krabka_units::convert::ByteSizeExt::from_bytes(u64::MAX),
         )
         .unwrap();
         assert2::assert!(decoded.as_ref() == raw);

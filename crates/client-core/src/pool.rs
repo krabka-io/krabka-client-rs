@@ -309,7 +309,7 @@ mod tests {
     };
 
     use assert2::{assert, check};
-    use crabka_units::millis;
+    use krabka_units::millis;
 
     use super::*;
     use crate::connection::ClientDnsTimeout;

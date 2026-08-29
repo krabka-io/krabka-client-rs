@@ -2,7 +2,7 @@
 //! [`Consumer::builder`].
 //!
 //! The consumer is subscribe-only and has no `assign()`. Use
-//! `crabka-client-core` directly for manual partition consumption.
+//! `krabka-client-core` directly for manual partition consumption.
 
 use std::{
     collections::HashMap,
@@ -14,8 +14,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use crabka_client_core::{Client, FetchMinBytes};
-use crabka_protocol::{
+use krabka_client_core::{Client, FetchMinBytes};
+use krabka_protocol::{
     owned::{
         join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol},
         join_group_response::JoinGroupResponse,
@@ -24,7 +24,7 @@ use crabka_protocol::{
     },
     primitives::uuid::Uuid as WireUuid,
 };
-use crabka_units::{
+use krabka_units::{
     ByteSize, Time,
     convert::{ByteSizeExt as _, StdDurationExt as _, TimeExt as _},
     millis, minutes, secs,
@@ -119,13 +119,13 @@ struct StartConfig {
     fetch_max: ByteSize,
     fetch_partition_max: ByteSize,
     request_timeout: Time,
-    dispatch_queue_capacity: crabka_client_core::ConnectionDispatchQueueCapacity,
-    frame_max: crabka_client_core::ClientFrameMax,
-    metadata_recovery_strategy: crabka_client_core::MetadataRecoveryStrategy,
+    dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity,
+    frame_max: krabka_client_core::ClientFrameMax,
+    metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
     metadata_recovery_rebootstrap_trigger: Time,
     leave_group_timeout: Time,
     client_rack: Option<String>,
-    security: Option<crabka_client_core::security::ClientSecurity>,
+    security: Option<krabka_client_core::security::ClientSecurity>,
     retry_policy: ConsumerRetryPolicy,
 }
 
@@ -636,7 +636,7 @@ fn primed_position(committed_epoch: i32) -> crate::position::PartitionPosition {
     crate::position::PartitionPosition {
         // Wrap the committed leader epoch (raw wire `int32` from OffsetFetch) at
         // the decode boundary.
-        offset_epoch: crabka_ids::LeaderEpoch(committed_epoch),
+        offset_epoch: krabka_ids::LeaderEpoch(committed_epoch),
         ..Default::default()
     }
 }
@@ -674,7 +674,7 @@ impl Consumer {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn start(
         #[builder(into)] bootstrap: String,
-        #[builder(into, default = "crabka-consumer".to_string())] client_id: String,
+        #[builder(into, default = "krabka-consumer".to_string())] client_id: String,
         #[builder(into)] group_id: String,
         #[builder(default = secs(45))] session_timeout: Time,
         #[builder(default = minutes(1))] rebalance_timeout: Time,
@@ -686,21 +686,21 @@ impl Consumer {
         #[builder(default = AutoOffsetReset::Latest)] auto_offset_reset: AutoOffsetReset,
         #[builder(default = IsolationLevel::ReadUncommitted)] isolation_level: IsolationLevel,
         #[builder(default = Assignor::Range)] assignor: Assignor,
-        #[builder(default = crabka_client_core::DEFAULT_FETCH_MIN)] fetch_min: ByteSize,
+        #[builder(default = krabka_client_core::DEFAULT_FETCH_MIN)] fetch_min: ByteSize,
         #[builder(default = crate::poll::DEFAULT_FETCH_MAX)] fetch_max: ByteSize,
         #[builder(default = crate::poll::DEFAULT_FETCH_PARTITION_MAX)]
         fetch_partition_max: ByteSize,
         #[builder(default = secs(30))] request_timeout: Time,
-        #[builder(default = crabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
+        #[builder(default = krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
-        #[builder(default = crabka_client_core::DEFAULT_CLIENT_FRAME_MAX)] frame_max: ByteSize,
+        #[builder(default = krabka_client_core::DEFAULT_CLIENT_FRAME_MAX)] frame_max: ByteSize,
         #[builder(default)]
-        metadata_recovery_strategy: crabka_client_core::MetadataRecoveryStrategy,
-        #[builder(default = crabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
+        metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
+        #[builder(default = krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
         metadata_recovery_rebootstrap_trigger: Time,
         #[builder(default = DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT)] leave_group_timeout: Time,
         #[builder(into)] client_rack: Option<String>,
-        security: Option<crabka_client_core::security::ClientSecurity>,
+        security: Option<krabka_client_core::security::ClientSecurity>,
         #[builder(default = ConsumerRetryPolicy::default())] retry_policy: ConsumerRetryPolicy,
     ) -> Result<Self, ConsumerError> {
         // Fail fast on misconfig — before any retry loop.
@@ -741,12 +741,12 @@ impl Consumer {
             )
             .map_err(ConsumerError::RebalanceFailed)?;
         let dispatch_queue_capacity =
-            crabka_client_core::ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
+            krabka_client_core::ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
                 .map_err(ConsumerError::RebalanceFailed)?;
-        let frame_max = crabka_client_core::ClientFrameMax::try_from(frame_max)
+        let frame_max = krabka_client_core::ClientFrameMax::try_from(frame_max)
             .map_err(ConsumerError::RebalanceFailed)?;
         let metadata_recovery_rebootstrap_trigger =
-            crabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
+            krabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
                 metadata_recovery_rebootstrap_trigger,
             )
             .map_err(ConsumerError::RebalanceFailed)?
@@ -807,7 +807,7 @@ impl Consumer {
                 Err(_elapsed) => {
                     if started.elapsed().as_time() >= config.retry_policy.startup_deadline() {
                         return Err(ConsumerError::Client(
-                            crabka_client_core::ClientError::Timeout(
+                            krabka_client_core::ClientError::Timeout(
                                 config.retry_policy.startup_attempt_timeout(),
                             ),
                         ));
@@ -1385,14 +1385,14 @@ fn is_retriable_consumer_start_error(error: &ConsumerError) -> bool {
         // 16 NOT_COORDINATOR, 22 ILLEGAL_GENERATION, 25 UNKNOWN_MEMBER_ID,
         // 27 REBALANCE_IN_PROGRESS, 79 MEMBER_ID_REQUIRED.
         ConsumerError::Server(14 | 15 | 16 | 22 | 25 | 27 | 79)
-            | ConsumerError::Client(crabka_client_core::ClientError::Disconnected)
+            | ConsumerError::Client(krabka_client_core::ClientError::Disconnected)
     ) || matches!(
         error,
         ConsumerError::StartupAfterJoin(inner)
             if is_retriable_consumer_start_error(inner)
                 || matches!(
                     inner.as_ref(),
-                    ConsumerError::Client(crabka_client_core::ClientError::Timeout(_))
+                    ConsumerError::Client(krabka_client_core::ClientError::Timeout(_))
                 )
     )
 }
@@ -1475,7 +1475,7 @@ impl Consumer {
 #[cfg(test)]
 mod protocol_millis_tests {
     use assert2::check;
-    use crabka_units::{Time, convert::TimeExt as _, millis, minutes, secs};
+    use krabka_units::{Time, convert::TimeExt as _, millis, minutes, secs};
 
     use super::protocol_millis_i32;
 
@@ -1518,7 +1518,7 @@ mod protocol_millis_tests {
 #[cfg(test)]
 mod consumer_retry_policy_tests {
     use assert2::{assert, check};
-    use crabka_units::{Time, convert::TimeExt as _, millis, minutes, secs};
+    use krabka_units::{Time, convert::TimeExt as _, millis, minutes, secs};
 
     use super::ConsumerRetryPolicy;
 
@@ -1623,11 +1623,11 @@ mod consumer_retry_policy_tests {
 #[cfg(test)]
 mod security_arg_tests {
     use assert2::check;
-    use crabka_client_core::{
+    use krabka_client_core::{
         ClientError, MockBroker,
         security::{ClientSecurity, SaslCredentials},
     };
-    use crabka_protocol::{
+    use krabka_protocol::{
         Encode, UnknownTaggedFields,
         owned::{
             api_versions_request,
@@ -1636,7 +1636,7 @@ mod security_arg_tests {
             leave_group_response::{self, LeaveGroupResponse},
         },
     };
-    use crabka_security::ListenerProtocol;
+    use krabka_security::ListenerProtocol;
 
     use super::*;
     use crate::builder::DecodedSubscription;
@@ -1736,7 +1736,7 @@ mod security_arg_tests {
             .bootstrap("invalid.invalid:9092")
             .group_id("metadata-refresh-validation")
             .subscribe(["topic".to_owned()])
-            .subscription_metadata_refresh_interval(crabka_units::secs(0))
+            .subscription_metadata_refresh_interval(krabka_units::secs(0))
             .build()
             .await
             .err()
@@ -1755,7 +1755,7 @@ mod security_arg_tests {
             .bootstrap("invalid.invalid:9092")
             .group_id("leave-validation")
             .subscribe(["topic".to_owned()])
-            .leave_group_timeout(crabka_units::secs(0))
+            .leave_group_timeout(krabka_units::secs(0))
             .build()
             .await
             .err()
@@ -1797,7 +1797,7 @@ mod security_arg_tests {
 
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
-            .request_timeout(crabka_units::millis(100))
+            .request_timeout(krabka_units::millis(100))
             .build()
             .await
             .unwrap();
@@ -1809,7 +1809,7 @@ mod security_arg_tests {
             "group-a",
             "member-a",
             Some("instance-a".into()),
-            crabka_units::millis(37),
+            krabka_units::millis(37),
         )
         .await;
 
@@ -1835,7 +1835,7 @@ mod security_arg_tests {
 
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
-            .request_timeout(crabka_units::secs(5))
+            .request_timeout(krabka_units::secs(5))
             .build()
             .await
             .expect("client");
@@ -1849,7 +1849,7 @@ mod security_arg_tests {
                 "group-a",
                 "member-a",
                 None,
-                crabka_units::millis(37),
+                krabka_units::millis(37),
             ),
         )
         .await
@@ -2027,9 +2027,9 @@ mod security_arg_tests {
         assert2::assert!(
             position
                 == crate::position::PartitionPosition {
-                    offset_epoch: crabka_ids::LeaderEpoch(9),
+                    offset_epoch: krabka_ids::LeaderEpoch(9),
                     leader_id: -1,
-                    leader_epoch: crabka_ids::LeaderEpoch(-1),
+                    leader_epoch: krabka_ids::LeaderEpoch(-1),
                     awaiting_validation: false,
                 }
         );
@@ -2044,7 +2044,7 @@ mod security_arg_tests {
             .client_id("timeout-consumer")
             .group_id("timeout-group")
             .subscribe(vec!["orders".to_string()])
-            .request_timeout(crabka_units::millis(100))
+            .request_timeout(krabka_units::millis(100))
             .build();
         let res = tokio::time::timeout(Duration::from_millis(500), build).await;
 
@@ -2057,7 +2057,7 @@ mod security_arg_tests {
         assert2::assert!(matches!(
             err,
             ConsumerError::Client(ClientError::Timeout(d))
-                if d == crabka_units::millis(100)
+                if d == krabka_units::millis(100)
         ));
     }
 
@@ -2067,7 +2067,7 @@ mod security_arg_tests {
             .bootstrap("127.0.0.1:1")
             .group_id("timeout-group")
             .subscribe(vec!["orders".to_string()])
-            .fetch_min(crabka_units::bytes(0))
+            .fetch_min(krabka_units::bytes(0))
             .build()
             .await;
         assert2::assert!(matches!(min, Err(ConsumerError::RebalanceFailed(_))));
@@ -2076,7 +2076,7 @@ mod security_arg_tests {
             .bootstrap("127.0.0.1:1")
             .group_id("timeout-group")
             .subscribe(vec!["orders".to_string()])
-            .fetch_max(crabka_units::bytes(0))
+            .fetch_max(krabka_units::bytes(0))
             .build()
             .await;
         assert2::assert!(matches!(max, Err(ConsumerError::RebalanceFailed(_))));
@@ -2085,7 +2085,7 @@ mod security_arg_tests {
             .bootstrap("127.0.0.1:1")
             .group_id("timeout-group")
             .subscribe(vec!["orders".to_string()])
-            .fetch_partition_max(crabka_units::bytes(0))
+            .fetch_partition_max(krabka_units::bytes(0))
             .build()
             .await;
         assert2::assert!(matches!(
@@ -2097,8 +2097,8 @@ mod security_arg_tests {
             .bootstrap("127.0.0.1:1")
             .group_id("timeout-group")
             .subscribe(vec!["orders".to_string()])
-            .fetch_min(crabka_units::bytes(2))
-            .fetch_max(crabka_units::bytes(1))
+            .fetch_min(krabka_units::bytes(2))
+            .fetch_max(krabka_units::bytes(1))
             .build()
             .await;
         assert2::assert!(matches!(
@@ -2160,7 +2160,7 @@ mod security_arg_tests {
             coordinator_shutdown: CancellationToken::new(),
             coordinator_handle: None,
             isolation_level: IsolationLevel::ReadUncommitted,
-            fetch_min: crabka_client_core::DEFAULT_FETCH_MIN,
+            fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
             fetch_max: crate::poll::DEFAULT_FETCH_MAX,
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
             auto_offset_reset: AutoOffsetReset::Latest,
@@ -2243,7 +2243,7 @@ mod security_arg_tests {
     fn retriable_error_classification() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        use crabka_client_core::ClientError;
+        use krabka_client_core::ClientError;
 
         // Transient group-protocol server codes.
         let transient_codes: &[i16] = &[14, 15, 16, 22, 25, 27, 79];
@@ -2271,13 +2271,13 @@ mod security_arg_tests {
             // the per-attempt timeout, not classified here).
             (
                 "timeout",
-                ConsumerError::Client(ClientError::Timeout(crabka_units::secs(1))),
+                ConsumerError::Client(ClientError::Timeout(krabka_units::secs(1))),
                 false,
             ),
             (
                 "startup after join",
                 ConsumerError::StartupAfterJoin(Box::new(ConsumerError::Client(
-                    ClientError::Timeout(crabka_units::secs(1)),
+                    ClientError::Timeout(krabka_units::secs(1)),
                 ))),
                 true,
             ),

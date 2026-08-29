@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crabka_protocol::{
+use krabka_protocol::{
     owned::{
         alter_partition_reassignments_request::{
             AlterPartitionReassignmentsRequest, ReassignablePartition, ReassignableTopic,
@@ -22,7 +22,7 @@ use crabka_protocol::{
     },
     primitives::uuid::Uuid as ProtoUuid,
 };
-use crabka_units::{Time, convert::TimeExt as _};
+use krabka_units::{Time, convert::TimeExt as _};
 use uuid::Uuid;
 
 use crate::{AdminClient, AdminError, KafkaError, NOT_CONTROLLER, kafka_error_if};
@@ -648,7 +648,7 @@ fn build_delete_records(ops: &[DeleteRecordsOp], timeout: Time) -> DeleteRecords
 }
 
 fn parse_create_topics(
-    resp: <CreateTopicsRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: <CreateTopicsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Vec<CreateTopicOutcome> {
     resp.topics
         .into_iter()
@@ -661,7 +661,7 @@ fn parse_create_topics(
 }
 
 fn parse_delete_topics(
-    resp: <DeleteTopicsRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: <DeleteTopicsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Vec<DeleteTopicOutcome> {
     resp.responses
         .into_iter()
@@ -673,7 +673,7 @@ fn parse_delete_topics(
 }
 
 fn parse_create_partitions(
-    resp: <CreatePartitionsRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: <CreatePartitionsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Vec<CreatePartitionsOutcome> {
     resp.results
         .into_iter()
@@ -685,7 +685,7 @@ fn parse_create_partitions(
 }
 
 fn parse_delete_records(
-    resp: <DeleteRecordsRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: <DeleteRecordsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Vec<DeleteRecordsOutcome> {
     resp.topics
         .into_iter()
@@ -714,7 +714,7 @@ fn delete_records_error_outcome(op: &DeleteRecordsOp, error_code: i16) -> Delete
 }
 
 fn parse_metadata(
-    resp: <MetadataRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: <MetadataRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> TopicMetadata {
     let topics = resp
         .topics
@@ -740,7 +740,7 @@ fn parse_metadata(
 }
 
 fn controller_endpoint(
-    resp: &<MetadataRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: &<MetadataRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Option<String> {
     let id = resp.controller_id;
     resp.brokers
@@ -750,7 +750,7 @@ fn controller_endpoint(
 }
 
 fn controller_requires_bootstrap_fallback(
-    resp: &<MetadataRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: &<MetadataRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> bool {
     resp.brokers
         .iter()
@@ -769,7 +769,7 @@ fn proto_uuid_to_opt(u: ProtoUuid) -> Option<Uuid> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crabka_protocol::{
+    use krabka_protocol::{
         UnknownTaggedFields,
         owned::metadata_response::{
             MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
@@ -827,7 +827,7 @@ mod tests {
                 &[1, 2, 3],
                 "orders",
                 replication_factor,
-                crabka_units::secs(5),
+                krabka_units::secs(5),
             )
             .unwrap();
             let expected = Some(AlterPartitionReassignmentsRequest {
@@ -858,7 +858,7 @@ mod tests {
             &[1, 2, 3],
             "orders",
             4,
-            crabka_units::secs(5),
+            krabka_units::secs(5),
         )
         .unwrap_err();
 
@@ -880,7 +880,7 @@ mod tests {
             &[1, 3],
             "orders",
             2,
-            crabka_units::secs(5),
+            krabka_units::secs(5),
         )
         .unwrap()
         .expect("fenced replica requires reassignment");
@@ -897,7 +897,7 @@ mod tests {
                 replicas: 1,
                 configs: BTreeMap::from([("retention.ms".to_string(), "60000".to_string())]),
             }],
-            crabka_units::secs(5),
+            krabka_units::secs(5),
         );
         assert2::assert!(
             req == CreateTopicsRequest {
@@ -940,7 +940,7 @@ mod tests {
                     offset: 75,
                 },
             ],
-            crabka_units::secs(5),
+            krabka_units::secs(5),
         );
 
         assert2::assert!(
@@ -980,7 +980,7 @@ mod tests {
 
     #[test]
     fn parse_delete_records_flattens_partition_errors() {
-        use crabka_protocol::owned::delete_records_response::{
+        use krabka_protocol::owned::delete_records_response::{
             DeleteRecordsPartitionResult, DeleteRecordsResponse, DeleteRecordsTopicResult,
         };
 
@@ -1096,7 +1096,7 @@ mod tests {
     /// reconnects to.
     #[test]
     fn controller_endpoint_picks_broker_with_matching_node_id() {
-        use crabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseBroker};
+        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseBroker};
         let resp = MetadataResponse {
             controller_id: 2,
             brokers: vec![
@@ -1126,7 +1126,7 @@ mod tests {
     /// The retry path maps that to `AdminError::NotControllerExhausted`.
     #[test]
     fn controller_endpoint_returns_none_when_no_match() {
-        use crabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseBroker};
+        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseBroker};
         let resp = MetadataResponse {
             controller_id: 99,
             brokers: vec![MetadataResponseBroker {
@@ -1143,7 +1143,7 @@ mod tests {
 
     #[test]
     fn controller_endpoint_rejects_non_dialable_ephemeral_port() {
-        use crabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseBroker};
+        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseBroker};
         let resp = MetadataResponse {
             controller_id: 1,
             brokers: vec![MetadataResponseBroker {
@@ -1169,7 +1169,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_carries_through_per_topic_errors() {
-        use crabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseTopic};
+        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseTopic};
         let resp = MetadataResponse {
             topics: vec![
                 MetadataResponseTopic {
@@ -1215,7 +1215,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_zero_uuid_becomes_none() {
-        use crabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseTopic};
+        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseTopic};
         let resp = MetadataResponse {
             topics: vec![MetadataResponseTopic {
                 name: Some("foo".into()),
@@ -1230,7 +1230,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_computes_partition_count_and_replication_factor() {
-        use crabka_protocol::owned::metadata_response::{
+        use krabka_protocol::owned::metadata_response::{
             MetadataResponse, MetadataResponsePartition, MetadataResponseTopic,
         };
         let part = MetadataResponsePartition {
@@ -1258,7 +1258,7 @@ mod tests {
 
     #[test]
     fn parse_create_topics_per_topic_error() {
-        use crabka_protocol::owned::create_topics_response::{
+        use krabka_protocol::owned::create_topics_response::{
             CreatableTopicResult, CreateTopicsResponse,
         };
         let resp = CreateTopicsResponse {
@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn parse_delete_topics_handles_missing_name() {
-        use crabka_protocol::owned::delete_topics_response::{
+        use krabka_protocol::owned::delete_topics_response::{
             DeletableTopicResult, DeleteTopicsResponse,
         };
         let resp = DeleteTopicsResponse {
@@ -1350,7 +1350,7 @@ mod tests {
 
     #[test]
     fn parse_create_partitions_per_topic_error() {
-        use crabka_protocol::owned::create_partitions_response::{
+        use krabka_protocol::owned::create_partitions_response::{
             CreatePartitionsResponse, CreatePartitionsTopicResult,
         };
         let resp = CreatePartitionsResponse {

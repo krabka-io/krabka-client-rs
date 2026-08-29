@@ -1,18 +1,18 @@
-# crabka-client-admin
+# krabka-client-admin
 
-[![Crates.io](https://img.shields.io/crates/v/crabka-client-admin.svg)](https://crates.io/crates/crabka-client-admin)
-[![Docs.rs](https://docs.rs/crabka-client-admin/badge.svg)](https://docs.rs/crabka-client-admin)
+[![Crates.io](https://img.shields.io/crates/v/krabka-client-admin.svg)](https://crates.io/crates/krabka-client-admin)
+[![Docs.rs](https://docs.rs/krabka-client-admin/badge.svg)](https://docs.rs/krabka-client-admin)
 [![CI](https://github.com/robot-head/crabka/actions/workflows/ci.yml/badge.svg)](https://github.com/robot-head/crabka/actions/workflows/ci.yml)
 
-Operator-side admin client for Crabka and Kafka-compatible clusters.
+Operator-side admin client for Krabka and Kafka-compatible clusters.
 
-Part of [Crabka](https://github.com/robot-head/crabka), a Rust implementation
+Part of [Krabka](https://github.com/robot-head/crabka), a Rust implementation
 of Apache Kafka-compatible infrastructure and clients.
 
 ## Overview
 
-Operators and automation use `crabka-client-admin` as their control-plane
-client. It builds on `crabka-client-core` for typed Kafka protocol dispatch and
+Operators and automation use `krabka-client-admin` as their control-plane
+client. It builds on `krabka-client-core` for typed Kafka protocol dispatch and
 tracks the active controller for controller-routed RPCs. It retries selected
 requests when a broker returns `NOT_CONTROLLER`.
 
@@ -33,19 +33,19 @@ without a dependency on broker internals.
 
 ## Kafka Scope
 
-The public API wraps the Kafka admin RPCs that Crabka operators need now. These
+The public API wraps the Kafka admin RPCs that Krabka operators need now. These
 RPCs cover SCRAM credentials (KIP-554), delegation tokens (KIP-48), dynamic
 topic configuration, ACLs, client quotas, and log-directory inspection. The API
 is not a complete clone of the JVM `AdminClient` surface.
 
 Log-directory calls target the connected broker. They do not retry against the
-controller. Quota helpers expose the per-user entity shape that Crabka's
+controller. Quota helpers expose the per-user entity shape that Krabka's
 operator controllers use.
 
 ## Install
 
 ```sh
-cargo add crabka-client-admin
+cargo add krabka-client-admin
 ```
 
 For workspace development, use the path dependency from this repository.
@@ -57,7 +57,7 @@ Create a topic and fetch its metadata:
 ```rust,no_run
 use std::collections::BTreeMap;
 
-use crabka_client_admin::{AdminClient, CreateTopicSpec};
+use krabka_client_admin::{AdminClient, CreateTopicSpec};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let mut admin = AdminClient::connect(&["127.0.0.1:9092".to_string()]).await?;
@@ -82,8 +82,8 @@ println!("topics: {:?}", metadata.topics);
 
 ## Documentation
 
-- [API documentation](https://docs.rs/crabka-client-admin)
-- [Crabka repository](https://github.com/robot-head/crabka)
+- [API documentation](https://docs.rs/krabka-client-admin)
+- [Krabka repository](https://github.com/robot-head/crabka)
 - [Kafka compatibility matrix](https://github.com/robot-head/crabka/blob/main/docs/KIP_MATRIX.md)
 
 ## License

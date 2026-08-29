@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use crabka_protocol::owned::{
+use krabka_protocol::owned::{
     alter_client_quotas_request::{
         AlterClientQuotasRequest, EntityData as AlterEntity, EntryData as AlterEntry,
         OpData as AlterOp,
@@ -168,8 +168,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bytes::{Buf, BytesMut};
-    use crabka_client_core::MockBroker;
-    use crabka_protocol::{
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
         Decode, Encode, UnknownTaggedFields,
         owned::{
             alter_client_quotas_request,

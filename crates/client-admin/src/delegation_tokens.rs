@@ -11,8 +11,8 @@
 //! tests cover each end of the pipe.
 
 use bytes::Bytes;
-use crabka_metadata::DelegationToken;
-use crabka_protocol::owned::{
+use krabka_metadata::DelegationToken;
+use krabka_protocol::owned::{
     create_delegation_token_request::{CreatableRenewers, CreateDelegationTokenRequest},
     create_delegation_token_response::CreateDelegationTokenResponse,
     describe_delegation_token_request::{
@@ -24,8 +24,8 @@ use crabka_protocol::owned::{
     expire_delegation_token_request::ExpireDelegationTokenRequest,
     renew_delegation_token_request::RenewDelegationTokenRequest,
 };
-use crabka_security::KafkaPrincipal;
-use crabka_units::{Time, convert::wire::opt_time_to_millis_i64};
+use krabka_security::KafkaPrincipal;
+use krabka_units::{Time, convert::wire::opt_time_to_millis_i64};
 
 use crate::{AdminClient, AdminError, kafka_error_name};
 
@@ -190,7 +190,7 @@ fn parse_describe_delegation_tokens(
 }
 
 /// Pure function. It maps wire `DescribedDelegationToken` →
-/// `crabka_metadata::DelegationToken`.
+/// `krabka_metadata::DelegationToken`.
 ///
 /// Field rename notes:
 /// - wire `issue_timestamp` → image `issue_timestamp_ms`
@@ -234,7 +234,7 @@ fn broker_err(api: &'static str, code: i16, message: Option<String>) -> AdminErr
 mod tests {
     use assert2::check;
     use bytes::Bytes;
-    use crabka_protocol::{
+    use krabka_protocol::{
         UnknownTaggedFields,
         owned::describe_delegation_token_response::{
             DescribeDelegationTokenResponse, DescribedDelegationToken,
@@ -258,7 +258,7 @@ mod tests {
         let req = build_create_delegation_token(
             "alice",
             &["User:bob".to_string(), "carol".to_string()],
-            Some(crabka_units::secs(60)),
+            Some(krabka_units::secs(60)),
         );
         assert2::assert!(
             req == CreateDelegationTokenRequest {

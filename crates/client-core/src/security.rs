@@ -5,7 +5,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use crabka_security::ListenerProtocol;
+use krabka_security::ListenerProtocol;
 use rustls_pki_types::pem::PemObject;
 use tokio_rustls::TlsConnector;
 
@@ -14,7 +14,7 @@ pub use crate::sasl::SaslCredentials;
 /// Client-side TLS trust + SNI.
 ///
 /// This struct mirrors the trust-roots half of the broker's
-/// `crabka_security::TlsConfig::build_client_config`.
+/// `krabka_security::TlsConfig::build_client_config`.
 #[derive(Debug, Clone)]
 pub struct TlsConnectorConfig {
     /// PEM file of CA certs the client trusts to verify the broker's
@@ -134,7 +134,7 @@ impl ClientSecurity {
 #[cfg(test)]
 mod tests {
     use assert2::assert;
-    use crabka_security::ListenerProtocol;
+    use krabka_security::ListenerProtocol;
 
     use super::*;
 

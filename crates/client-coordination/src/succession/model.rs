@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 
-use crabka_units::secs;
+use krabka_units::secs;
 use stateright::{Checker, Model, Property};
 
 use super::{Decision, RoleState, RosterEntry, evaluate};

@@ -5,13 +5,13 @@
 //! `CreateAcls`, `DeleteAcls`, `DescribeAcls`.
 //!
 //! Wire `i8` discriminants stay private to this module. Callers use the typed
-//! Rust enums below. `crates/client-admin` depends on `crabka-metadata` for
+//! Rust enums below. `crates/client-admin` depends on `krabka-metadata` for
 //! shared image types such as `DelegationToken`, but it stays free of
-//! `crabka-broker`, so out-of-process clients can use the crate. Unit tests
+//! `krabka-broker`, so out-of-process clients can use the crate. Unit tests
 //! cover the wire round-trip of the local enum copies.
 
 use bytes::Bytes;
-use crabka_protocol::owned::{
+use krabka_protocol::owned::{
     alter_user_scram_credentials_request::{
         AlterUserScramCredentialsRequest, ScramCredentialDeletion, ScramCredentialUpsertion,
     },
@@ -20,7 +20,7 @@ use crabka_protocol::owned::{
     describe_acls_request::DescribeAclsRequest,
     describe_user_scram_credentials_request::{DescribeUserScramCredentialsRequest, UserName},
 };
-use crabka_security::SaslMechanism;
+use krabka_security::SaslMechanism;
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::{AdminClient, AdminError, KafkaError, kafka_error_if, kafka_error_name};
@@ -31,7 +31,7 @@ const SCRAM_SHA_512_WIRE: i8 = 2;
 /// Paired with the `*_sha256` builders/helpers below.
 const SCRAM_SHA_256_WIRE: i8 = 1;
 
-pub use crabka_security::scram::{
+pub use krabka_security::scram::{
     DEFAULT_SCRAM_ITERATIONS, MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS, ScramIterations,
 };
 
@@ -147,7 +147,7 @@ impl AdminClient {
     /// `upsertions` carry plaintext passwords. The function generates a fresh
     /// 16-byte salt per row and computes the KIP-554 wire `salted_password`
     /// (PBKDF2-HMAC-SHA-512) client-side with
-    /// `crabka_security::pbkdf2_salted`. The broker never sees the raw
+    /// `krabka_security::pbkdf2_salted`. The broker never sees the raw
     /// password.
     ///
     /// # Errors
@@ -345,7 +345,7 @@ fn build_alter_scram_request(
         let mut salt = vec![0u8; 16];
         rng.fill(&mut salt)
             .map_err(|_| AdminError::Protocol("system RNG failure".into()))?;
-        let salted = crabka_security::pbkdf2_salted(
+        let salted = krabka_security::pbkdf2_salted(
             u.password.as_bytes(),
             mechanism,
             u32::try_from(u.iterations.max(0)).unwrap_or(0),
@@ -376,7 +376,7 @@ fn build_alter_scram_request(
 }
 
 fn parse_alter_scram_results(
-    resp: <AlterUserScramCredentialsRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: <AlterUserScramCredentialsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Vec<ScramUserOutcome> {
     resp.results
         .into_iter()
@@ -388,7 +388,7 @@ fn parse_alter_scram_results(
 }
 
 fn parse_describe_user_scram_credentials_response(
-    resp: <DescribeUserScramCredentialsRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: <DescribeUserScramCredentialsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Result<Vec<UserScramCredentials>, AdminError> {
     if resp.error_code != 0 {
         return Err(AdminError::Broker {
@@ -440,7 +440,7 @@ fn filter_to_describe_request(f: &AclEntryFilter) -> DescribeAclsRequest {
 }
 
 fn parse_describe_acls(
-    resp: <DescribeAclsRequest as crabka_protocol::ProtocolRequest>::Response,
+    resp: <DescribeAclsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Result<Vec<AclEntry>, AdminError> {
     if resp.error_code != 0 {
         return Err(AdminError::Broker {
@@ -525,7 +525,7 @@ fn acl_filter_wire_fields(f: &AclEntryFilter) -> AclFilterWireFields {
 // --- wire constants & enum encoding/decoding -----------------------------
 //
 // Kept private to this module; the broker has its own copy in
-// `crabka_broker::handlers::acl_wire`. Round-trip tests below lock the
+// `krabka_broker::handlers::acl_wire`. Round-trip tests below lock the
 // encoding against the values Kafka's protocol-spec docs publish.
 
 /// Kafka `AclBindingFilter.ANY` discriminant. Filter requests use it as the
@@ -611,8 +611,8 @@ mod tests {
 
     use assert2::check;
     use bytes::{Buf, BytesMut};
-    use crabka_client_core::MockBroker;
-    use crabka_protocol::{
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
         Decode, Encode, UnknownTaggedFields,
         owned::{
             alter_user_scram_credentials_response::{
@@ -1098,7 +1098,7 @@ mod tests {
 
     #[test]
     fn users_describe_scram_top_level_error_returns_broker_error() {
-        let resp = crabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
+        let resp = krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             error_code: 31,
             error_message: Some("cluster auth denied".to_string()),
             ..Default::default()
@@ -1130,17 +1130,17 @@ mod tests {
 
     #[test]
     fn users_describe_scram_preserves_credential_iterations() {
-        let resp = crabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
+        let resp = krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             results: vec![
-                crabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
+                krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
                     user: "alice".to_string(),
                     credential_infos: vec![
-                        crabka_protocol::owned::describe_user_scram_credentials_response::CredentialInfo {
+                        krabka_protocol::owned::describe_user_scram_credentials_response::CredentialInfo {
                             mechanism: 1,
                             iterations: 4096,
                             ..Default::default()
                         },
-                        crabka_protocol::owned::describe_user_scram_credentials_response::CredentialInfo {
+                        krabka_protocol::owned::describe_user_scram_credentials_response::CredentialInfo {
                             mechanism: 2,
                             iterations: 8192,
                             ..Default::default()
@@ -1180,9 +1180,9 @@ mod tests {
 
     #[test]
     fn users_describe_scram_unknown_user_preserves_resource_not_found_name() {
-        let resp = crabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
+        let resp = krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             results: vec![
-                crabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
+                krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
                     user: "ghost".to_string(),
                     error_code: 91,
                     error_message: Some("no such SCRAM user".to_string()),
@@ -1214,9 +1214,9 @@ mod tests {
 
     #[test]
     fn users_describe_scram_duplicate_user_preserves_duplicate_resource_name() {
-        let resp = crabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
+        let resp = krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             results: vec![
-                crabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
+                krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
                     user: "alice".to_string(),
                     error_code: 92,
                     error_message: Some("duplicate user".to_string()),
@@ -1248,15 +1248,15 @@ mod tests {
 
     #[test]
     fn users_alter_scram_preserves_scram_error_names() {
-        let resp = crabka_protocol::owned::alter_user_scram_credentials_response::AlterUserScramCredentialsResponse {
+        let resp = krabka_protocol::owned::alter_user_scram_credentials_response::AlterUserScramCredentialsResponse {
             results: vec![
-                crabka_protocol::owned::alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
+                krabka_protocol::owned::alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
                     user: "alice".to_string(),
                     error_code: 33,
                     error_message: Some("unknown mechanism".to_string()),
                     ..Default::default()
                 },
-                crabka_protocol::owned::alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
+                krabka_protocol::owned::alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
                     user: "bob".to_string(),
                     error_code: 93,
                     error_message: Some("too many iterations".to_string()),

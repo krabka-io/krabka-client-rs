@@ -71,7 +71,7 @@ impl IsolationLevel {
 
 // ── subscription / assignment codec (ConsumerProtocol v3) ─────────────────
 
-use crabka_protocol::{
+use krabka_protocol::{
     Decode, Encode, UnknownTaggedFields,
     owned::{
         consumer_protocol_assignment::{

@@ -26,8 +26,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use crabka_client_core::Client;
-use crabka_protocol::{
+use krabka_client_core::Client;
+use krabka_protocol::{
     owned::{
         find_coordinator_request::FindCoordinatorRequest,
         find_coordinator_response::FindCoordinatorResponse,
@@ -41,7 +41,7 @@ use crabka_protocol::{
     },
     primitives::uuid::Uuid as WireUuid,
 };
-use crabka_units::{
+use krabka_units::{
     Time,
     convert::{StdDurationExt as _, TimeExt as _},
 };
@@ -92,12 +92,12 @@ pub(crate) fn is_retriable_coordinator_code(code: i16) -> bool {
     )
 }
 
-pub(crate) fn is_retriable_transport_error(e: &crabka_client_core::ClientError) -> bool {
+pub(crate) fn is_retriable_transport_error(e: &krabka_client_core::ClientError) -> bool {
     matches!(
         e,
-        crabka_client_core::ClientError::Connect { .. }
-            | crabka_client_core::ClientError::Disconnected
-            | crabka_client_core::ClientError::Io(_)
+        krabka_client_core::ClientError::Connect { .. }
+            | krabka_client_core::ClientError::Disconnected
+            | krabka_client_core::ClientError::Io(_)
     )
 }
 
@@ -105,7 +105,7 @@ pub(crate) fn is_retriable_transport_error(e: &crabka_client_core::ClientError) 
 /// shapes.
 ///
 /// v4+ carries per-key rows in `coordinators`, and this function uses the
-/// first row. v0-v3 uses the top-level field. crabka's broker populates both,
+/// first row. v0-v3 uses the top-level field. krabka's broker populates both,
 /// so either read is correct against it. This function stays correct against
 /// real Kafka at any negotiated version.
 fn coordinator_error_code(r: &FindCoordinatorResponse) -> i16 {
@@ -129,7 +129,7 @@ fn coordinator_node_id(r: &FindCoordinatorResponse) -> i32 {
 /// cold and loading coordinator codes (14/15/16) with backoff. On success it
 /// calls `refresh_metadata`, so the pool learns the coordinator broker's
 /// address from the cluster's broker list. Without that refresh,
-/// [`Client::broker`](crabka_client_core::Client::broker) for the coordinator
+/// [`Client::broker`](krabka_client_core::Client::broker) for the coordinator
 /// id would fail with `Disconnected`.
 ///
 /// This function returns the coordinator's `node_id`. It errors with
@@ -955,7 +955,7 @@ fn build_revoked_commit_request(
     generation_id: i32,
     member_id: String,
     group_instance_id: Option<String>,
-    topics: Vec<crabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic>,
+    topics: Vec<krabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic>,
 ) -> OffsetCommitRequest {
     OffsetCommitRequest {
         group_id,
@@ -1368,7 +1368,7 @@ async fn prime_offsets(
         offsets.insert(key.clone(), starting);
         // Wrap the committed leader epoch (raw wire `int32` from OffsetFetch) at
         // the decode boundary.
-        positions.entry(key).or_default().offset_epoch = crabka_ids::LeaderEpoch(committed_epoch);
+        positions.entry(key).or_default().offset_epoch = krabka_ids::LeaderEpoch(committed_epoch);
     }
     // The broker may omit partitions that have no commit record at all;
     // ensure every requested partition has an entry so poll() can find it.
@@ -1394,8 +1394,8 @@ mod retry_tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use crabka_client_core::MockBroker;
-    use crabka_protocol::{
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
         Encode, UnknownTaggedFields,
         owned::{
             api_versions_request,
@@ -1403,7 +1403,7 @@ mod retry_tests {
             leave_group_request,
         },
     };
-    use crabka_units::{millis, minutes, secs};
+    use krabka_units::{millis, minutes, secs};
 
     use super::*;
 
@@ -1420,7 +1420,7 @@ mod retry_tests {
     }
 
     fn refused_connect_error() -> ConsumerError {
-        ConsumerError::Client(crabka_client_core::ClientError::Connect {
+        ConsumerError::Client(krabka_client_core::ClientError::Connect {
             addr: SocketAddr::from(([127, 0, 0, 1], 9092)),
             source: io::Error::new(io::ErrorKind::ConnectionRefused, "refused"),
         })
@@ -1481,7 +1481,7 @@ mod retry_tests {
         .await;
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
-            .request_timeout(crabka_units::secs(5))
+            .request_timeout(krabka_units::secs(5))
             .build()
             .await
             .expect("client");
@@ -1899,7 +1899,7 @@ mod retry_tests {
             |r: &Resp| r.error_code,
             || async {
                 Err::<Resp, _>(ConsumerError::Client(
-                    crabka_client_core::ClientError::Disconnected,
+                    krabka_client_core::ClientError::Disconnected,
                 ))
             },
         )
@@ -1928,7 +1928,7 @@ mod retry_tests {
 #[cfg(test)]
 mod find_coordinator_parse_tests {
 
-    use crabka_protocol::owned::find_coordinator_response::Coordinator;
+    use krabka_protocol::owned::find_coordinator_response::Coordinator;
 
     use super::*;
 
@@ -2078,8 +2078,8 @@ mod refind_tests {
     async fn connect_error_refinds_until_deadline() {
         let client = Client::builder()
             .bootstrap("127.0.0.1:1")
-            .connect_timeout(crabka_units::millis(10))
-            .request_timeout(crabka_units::millis(10))
+            .connect_timeout(krabka_units::millis(10))
+            .request_timeout(krabka_units::millis(10))
             .build()
             .await
             .unwrap();
@@ -2095,7 +2095,7 @@ mod refind_tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async {
                     Err::<Resp, _>(ConsumerError::Client(
-                        crabka_client_core::ClientError::Connect {
+                        krabka_client_core::ClientError::Connect {
                             addr: "127.0.0.1:9092".parse().unwrap(),
                             source: std::io::Error::new(
                                 std::io::ErrorKind::ConnectionRefused,

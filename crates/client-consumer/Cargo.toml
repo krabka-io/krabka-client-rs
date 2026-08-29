@@ -1,5 +1,5 @@
 [package]
-name = "crabka-client-consumer"
+name = "krabka-client-consumer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,9 @@ rust-version.workspace = true
 description = "Subscribe-style consumer client for Apache Kafka in Rust"
 repository = "https://github.com/robot-head/crabka"
 homepage = "https://github.com/robot-head/crabka"
-documentation = "https://docs.rs/crabka-client-consumer"
+documentation = "https://docs.rs/krabka-client-consumer"
 readme = "README.md"
-keywords = ["kafka", "consumer", "client", "streaming", "crabka"]
+keywords = ["kafka", "consumer", "client", "streaming", "krabka"]
 categories = ["api-bindings", "network-programming"]
 
 [lints]
@@ -22,10 +22,10 @@ default = []
 [dependencies]
 assert2 = { workspace = true }
 bon = { workspace = true }
-crabka-protocol = { version = "0.4.0", default-features = false }
-crabka-client-core = { version = "0.4.0", path = "../client-core", features = ["mock"] }
-crabka-ids = { version = "0.4.0" }
-crabka-units = { workspace = true }
+krabka-protocol = { version = "0.4.0", default-features = false }
+krabka-client-core = { version = "0.4.0", path = "../client-core", features = ["mock"] }
+krabka-ids = { version = "0.4.0" }
+krabka-units = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
@@ -35,8 +35,8 @@ futures-util = { workspace = true }
 refined_type = { workspace = true }
 
 [dev-dependencies]
-crabka-client-producer = { path = "../client-producer" }
-crabka-security = { version = "0.4.0" }
+krabka-client-producer = { path = "../client-producer" }
+krabka-security = { version = "0.4.0" }
 mutants = { workspace = true }
 stateright = { workspace = true }
 tempfile = { workspace = true }

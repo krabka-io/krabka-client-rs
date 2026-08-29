@@ -1,6 +1,6 @@
 //! Narrow KIP-853 metadata-quorum administration used by the operator.
 
-use crabka_protocol::owned::{
+use krabka_protocol::owned::{
     describe_quorum_request::{
         DescribeQuorumRequest, PartitionData as RequestPartition, TopicData as RequestTopic,
     },
@@ -39,7 +39,7 @@ fn broker_error(api: &'static str, code: i16, message: Option<String>) -> AdminE
 }
 
 fn replica(
-    value: &crabka_protocol::owned::common::describe_quorum_response::replica_state::ReplicaState,
+    value: &krabka_protocol::owned::common::describe_quorum_response::replica_state::ReplicaState,
 ) -> QuorumReplica {
     QuorumReplica {
         node_id: value.replica_id,
@@ -121,7 +121,7 @@ impl AdminClient {
             .send(RemoveRaftVoterRequest {
                 cluster_id: Some(cluster_id.to_string()),
                 voter_id: node_id,
-                voter_directory_id: crabka_protocol::primitives::uuid::Uuid(
+                voter_directory_id: krabka_protocol::primitives::uuid::Uuid(
                     *directory_id.as_bytes(),
                 ),
                 ..Default::default()

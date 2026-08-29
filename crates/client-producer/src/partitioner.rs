@@ -50,7 +50,7 @@ impl UniformStickyPartitioner {
 /// Kafka computes `toPositive(murmur2(key)) % num_partitions`, and
 /// `Utils.toPositive` masks the sign bit with `& 0x7fffffff`. It does not take
 /// the absolute value. The two agree for a non-negative hash and disagree for
-/// every negative one, so the mask is what keeps a Crabka producer and a JVM
+/// every negative one, so the mask is what keeps a Krabka producer and a JVM
 /// producer on the same partition for the same key.
 ///
 /// # Panics

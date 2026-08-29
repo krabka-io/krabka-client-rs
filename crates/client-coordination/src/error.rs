@@ -1,8 +1,8 @@
 //! The error type of the coordination client.
 
-use crabka_client_admin::AdminError;
-use crabka_client_core::ClientError;
-use crabka_client_producer::ProducerError;
+use krabka_client_admin::AdminError;
+use krabka_client_core::ClientError;
+use krabka_client_producer::ProducerError;
 use thiserror::Error;
 
 use crate::record::{MemberId, RecordError, Role};

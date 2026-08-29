@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crabka_ids::LeaderEpoch;
+use krabka_ids::LeaderEpoch;
 
 use crate::{
     consumer::Consumer,

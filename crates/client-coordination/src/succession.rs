@@ -337,7 +337,7 @@ mod model;
 #[cfg(test)]
 mod tests {
     use assert2::{assert, check};
-    use crabka_units::secs;
+    use krabka_units::secs;
 
     use super::*;
     use crate::record::{FencingToken, Registration};

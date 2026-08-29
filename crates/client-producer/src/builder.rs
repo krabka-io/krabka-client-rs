@@ -9,16 +9,16 @@ use std::{
     time::Duration,
 };
 
-use crabka_client_core::{
+use krabka_client_core::{
     Client, ClientDnsTimeout, ClientError, ClientFrameMax, ConnectionDispatchQueueCapacity,
     DEFAULT_CLIENT_DNS_TIMEOUT, DEFAULT_CLIENT_FRAME_MAX,
     DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY,
 };
-use crabka_protocol::owned::{
+use krabka_protocol::owned::{
     init_producer_id_request::InitProducerIdRequest,
     init_producer_id_response::InitProducerIdResponse,
 };
-use crabka_units::{
+use krabka_units::{
     ByteSize, Time,
     convert::{StdDurationExt as _, TimeExt as _},
 };
@@ -461,7 +461,7 @@ impl Producer {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn start(
         #[builder(into)] bootstrap: String,
-        #[builder(into, default = "crabka-producer".to_string())] client_id: String,
+        #[builder(into, default = "krabka-producer".to_string())] client_id: String,
         #[builder(default = DEFAULT_PRODUCER_COMPRESSION)] compression: Compression,
         #[builder(default = true)] enable_idempotence: bool,
         #[builder(default = Acks::One)] acks: Acks,
@@ -480,13 +480,13 @@ impl Producer {
         #[builder(default = DEFAULT_PRODUCER_INIT_MAX_BACKOFF)] init_max_backoff: Duration,
         #[builder(default = DEFAULT_PRODUCER_MAX_IN_FLIGHT)] max_in_flight_per_connection: usize,
         #[builder(default)]
-        metadata_recovery_strategy: crabka_client_core::MetadataRecoveryStrategy,
-        #[builder(default = crabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
+        metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
+        #[builder(default = krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
         metadata_recovery_rebootstrap_trigger: Time,
         #[builder(into)] transactional_id: Option<String>,
         transaction_timeout: Option<Duration>,
         #[builder(default)] transaction_two_phase_commit_enable: bool,
-        security: Option<crabka_client_core::security::ClientSecurity>,
+        security: Option<krabka_client_core::security::ClientSecurity>,
     ) -> Result<Self, ProducerError> {
         if transaction_two_phase_commit_enable && transaction_timeout.is_some() {
             return Err(ProducerError::InvalidConfig(
@@ -508,7 +508,7 @@ impl Producer {
         let frame_max =
             ClientFrameMax::try_from(frame_max).map_err(ProducerError::InvalidConfig)?;
         let metadata_recovery_rebootstrap_trigger =
-            crabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
+            krabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
                 metadata_recovery_rebootstrap_trigger,
             )
             .map_err(ProducerError::InvalidConfig)?;
@@ -689,11 +689,11 @@ mod security_arg_tests {
     };
 
     use bytes::BytesMut;
-    use crabka_client_core::{
+    use krabka_client_core::{
         MockBroker,
         security::{ClientSecurity, SaslCredentials},
     };
-    use crabka_protocol::{
+    use krabka_protocol::{
         Encode,
         owned::{
             api_versions_request,
@@ -701,8 +701,8 @@ mod security_arg_tests {
             init_producer_id_request,
         },
     };
-    use crabka_security::ListenerProtocol;
-    use crabka_units::{micros, millis};
+    use krabka_security::ListenerProtocol;
+    use krabka_units::{micros, millis};
 
     use super::*;
 
@@ -1165,7 +1165,7 @@ mod security_arg_tests {
         assert2::assert!(matches!(
             err,
             ProducerError::Client(ClientError::Timeout(d))
-                if d == crabka_units::millis(100)
+                if d == krabka_units::millis(100)
         ));
     }
 
@@ -1297,7 +1297,7 @@ mod security_arg_tests {
         assert2::assert!(matches!(
             error,
             ProducerError::Client(ClientError::Timeout(timeout))
-                if timeout == crabka_units::millis(10)
+                if timeout == krabka_units::millis(10)
         ));
     }
 
@@ -1399,7 +1399,7 @@ mod security_arg_tests {
 
     #[tokio::test]
     async fn producer_builder_rejects_invalid_metadata_rebootstrap_trigger_before_io() {
-        for trigger in [Time::from_millis(-1), crabka_units::micros(1)] {
+        for trigger in [Time::from_millis(-1), krabka_units::micros(1)] {
             let error = Producer::builder()
                 .bootstrap("127.0.0.1:1")
                 .metadata_recovery_rebootstrap_trigger(trigger)
@@ -1427,14 +1427,14 @@ mod security_arg_tests {
         let producer = Producer::builder()
             .bootstrap("127.0.0.1:1")
             .dispatch_queue_capacity(7)
-            .frame_max(crabka_units::kibibytes(32))
+            .frame_max(krabka_units::kibibytes(32))
             .enable_idempotence(false)
             .build()
             .await
             .expect("valid client resource policy");
 
         assert2::assert!(producer.dispatch_queue_capacity.get() == 7);
-        assert2::assert!(producer.frame_max.size() == crabka_units::kibibytes(32));
+        assert2::assert!(producer.frame_max.size() == krabka_units::kibibytes(32));
         producer.close().await.expect("close producer");
     }
 

@@ -321,8 +321,8 @@ mod tests {
     };
 
     use bytes::BytesMut;
-    use crabka_client_core::MockBroker;
-    use crabka_protocol::{
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
         Encode,
         owned::{
             api_versions_request,

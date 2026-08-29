@@ -1,6 +1,6 @@
 //! Idempotent producer client for Apache Kafka in Rust.
 //!
-//! It builds on [`crabka_client_core`] for transport, and adds full
+//! It builds on [`krabka_client_core`] for transport, and adds full
 //! idempotent-producer semantics: `InitProducerId` on connect, per-batch
 //! `(producer_id, producer_epoch, base_sequence)`, and retries that re-frame
 //! the same `RecordBatch` so the broker's dedup catches them.
@@ -16,7 +16,7 @@
 //! use std::time::Duration;
 //!
 //! use bytes::Bytes;
-//! use crabka_client_producer::{Acks, Compression, Producer, ProducerRecord};
+//! use krabka_client_producer::{Acks, Compression, Producer, ProducerRecord};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let producer = Producer::builder()
@@ -53,7 +53,7 @@
 //! schema-registry or serde integration can sit on top without constraining the
 //! producer API.
 
-#![doc(html_root_url = "https://docs.rs/crabka-client-producer/0.4.0")]
+#![doc(html_root_url = "https://docs.rs/krabka-client-producer/0.4.0")]
 
 mod accumulator;
 mod builder;
@@ -77,7 +77,7 @@ pub use builder::{
     ProducerFlushTimeout, ProducerRetryPolicy, ProducerThroughputPolicy,
 };
 pub use compression::Compression;
-pub use crabka_client_consumer::ConsumerGroupMetadata;
+pub use krabka_client_consumer::ConsumerGroupMetadata;
 pub use error::ProducerError;
 pub use partitioner::partition_for_key;
 pub use producer::{Acks, Producer};

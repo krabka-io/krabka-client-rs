@@ -14,15 +14,15 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use crabka_client_core::Client;
-use crabka_protocol::{
+use krabka_client_core::Client;
+use krabka_protocol::{
     owned::{
         share_group_heartbeat_request::ShareGroupHeartbeatRequest,
         share_group_heartbeat_response::Assignment,
     },
     primitives::uuid::Uuid as WireUuid,
 };
-use crabka_units::{Time, convert::TimeExt as _};
+use krabka_units::{Time, convert::TimeExt as _};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -256,8 +256,8 @@ mod tests {
     };
 
     use bytes::BytesMut;
-    use crabka_client_core::MockBroker;
-    use crabka_protocol::{
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
         Encode,
         owned::{
             api_versions_request,
@@ -320,7 +320,7 @@ mod tests {
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
             .client_id("share-leave-timeout-test")
-            .request_timeout(crabka_units::secs(5))
+            .request_timeout(krabka_units::secs(5))
             .build()
             .await
             .expect("client");
@@ -332,8 +332,8 @@ mod tests {
             assignment: Arc::new(Mutex::new(Vec::new())),
             topic_names: Arc::new(Mutex::new(HashMap::new())),
             subscribe: vec!["topic-a".into()],
-            heartbeat_interval: crabka_units::secs(1),
-            leave_heartbeat_timeout: crabka_units::millis(37),
+            heartbeat_interval: krabka_units::secs(1),
+            leave_heartbeat_timeout: krabka_units::millis(37),
         };
 
         tokio::time::timeout(Duration::from_secs(1), leave_group(&state))
@@ -360,8 +360,8 @@ mod tests {
             assignment: Arc::new(Mutex::new(Vec::new())),
             topic_names: Arc::new(Mutex::new(names)),
             subscribe: vec!["topic-a".into()],
-            heartbeat_interval: crabka_units::secs(1),
-            leave_heartbeat_timeout: crabka_units::secs(5),
+            heartbeat_interval: krabka_units::secs(1),
+            leave_heartbeat_timeout: krabka_units::secs(5),
         }
     }
 

@@ -1,6 +1,6 @@
 //! Transport seam for the background sender.
 //!
-//! The sender needs only a narrow slice of [`crabka_client_core::Client`]. It
+//! The sender needs only a narrow slice of [`krabka_client_core::Client`]. It
 //! ships a single-partition `ProduceRequest` to a partition leader, or to the
 //! bootstrap connection when the leader is unknown. It evicts a dead broker
 //! connection, asks whether a broker id is dialable, and refreshes cluster
@@ -12,8 +12,8 @@
 //! [`ClientTransport`] is the thin production adapter over a real `Client`.
 
 use async_trait::async_trait;
-use crabka_client_core::{Client, ClientError};
-use crabka_protocol::owned::{
+use krabka_client_core::{Client, ClientError};
+use krabka_protocol::owned::{
     metadata_response::MetadataResponse, produce_request::ProduceRequest,
     produce_response::ProduceResponse,
 };
@@ -118,8 +118,8 @@ mod tests {
     };
 
     use bytes::BytesMut;
-    use crabka_client_core::{Client, MockBroker};
-    use crabka_protocol::{
+    use krabka_client_core::{Client, MockBroker};
+    use krabka_protocol::{
         Encode,
         owned::{
             api_versions_request,

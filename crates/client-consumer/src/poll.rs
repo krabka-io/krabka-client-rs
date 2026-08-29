@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 
-use crabka_ids::LeaderEpoch;
-use crabka_protocol::owned::{
+use krabka_ids::LeaderEpoch;
+use krabka_protocol::owned::{
     fetch_request::{FetchPartition, FetchRequest, FetchTopic},
     list_offsets_request::{ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
 };
-use crabka_units::{
+use krabka_units::{
     ByteSize, Time,
     convert::{ByteSizeExt as _, TimeExt as _},
     mebibytes,
@@ -58,13 +58,13 @@ fn is_read_committed(isolation_level: IsolationLevel) -> bool {
     isolation_level == IsolationLevel::ReadCommitted
 }
 
-fn is_transient_transport_error(e: &crabka_client_core::ClientError) -> bool {
+fn is_transient_transport_error(e: &krabka_client_core::ClientError) -> bool {
     matches!(
         e,
-        crabka_client_core::ClientError::Connect { .. }
-            | crabka_client_core::ClientError::Disconnected
-            | crabka_client_core::ClientError::Timeout(_)
-            | crabka_client_core::ClientError::Io(_)
+        krabka_client_core::ClientError::Connect { .. }
+            | krabka_client_core::ClientError::Disconnected
+            | krabka_client_core::ClientError::Timeout(_)
+            | krabka_client_core::ClientError::Io(_)
     )
 }
 
@@ -94,7 +94,7 @@ fn record_timestamp(base_timestamp: i64, timestamp_delta: i64) -> i64 {
 
 fn build_fetch_topic(
     name: String,
-    topic_id: crabka_protocol::primitives::uuid::Uuid,
+    topic_id: krabka_protocol::primitives::uuid::Uuid,
     partitions: Vec<FetchSpec>,
     partition_max: ByteSize,
 ) -> FetchTopic {
@@ -209,8 +209,8 @@ impl Consumer {
     }
     async fn process_fetch_responses(
         &mut self,
-        responses: Vec<crabka_protocol::owned::fetch_response::FetchResponse>,
-        topic_ids: &HashMap<String, crabka_protocol::primitives::uuid::Uuid>,
+        responses: Vec<krabka_protocol::owned::fetch_response::FetchResponse>,
+        topic_ids: &HashMap<String, krabka_protocol::primitives::uuid::Uuid>,
     ) -> Result<Vec<ConsumerRecord>, ConsumerError> {
         // 3. Decode each partition's RecordBatches, advance next-offsets.
         //
@@ -365,8 +365,8 @@ impl Consumer {
         &self,
         timeout: Time,
         by_leader: FetchByLeader,
-        topic_ids: &HashMap<String, crabka_protocol::primitives::uuid::Uuid>,
-    ) -> Result<Vec<crabka_protocol::owned::fetch_response::FetchResponse>, ConsumerError> {
+        topic_ids: &HashMap<String, krabka_protocol::primitives::uuid::Uuid>,
+    ) -> Result<Vec<krabka_protocol::owned::fetch_response::FetchResponse>, ConsumerError> {
         // Truncate rather than round: `max_wait_ms` is a wire field, and a
         // fractional millisecond rounded up would ask the broker to hold the
         // Fetch open past the caller's budget. A negative budget — a deadline
@@ -495,7 +495,7 @@ impl Consumer {
         offsets: &mut HashMap<(String, i32), i64>,
         key: &(String, i32),
         topic_name: &str,
-        part: &crabka_protocol::owned::fetch_response::PartitionData,
+        part: &krabka_protocol::owned::fetch_response::PartitionData,
         out: &mut Vec<ConsumerRecord>,
     ) -> Result<(), ConsumerError> {
         let Some(payload) = &part.records else {
@@ -618,7 +618,7 @@ impl Consumer {
 /// This function returns `None` when there are no batches, which leaves the
 /// offset unchanged. The consumer uses it to advance past control and aborted
 /// batches that emit no records, instead of re-fetching them.
-fn next_offset_after(batches: &[crabka_protocol::records::RecordBatch]) -> Option<i64> {
+fn next_offset_after(batches: &[krabka_protocol::records::RecordBatch]) -> Option<i64> {
     batches
         .iter()
         .map(|b| b.base_offset + i64::from(b.last_offset_delta) + 1)
@@ -725,13 +725,13 @@ mod offset_advance_tests {
     use std::collections::HashMap;
 
     use assert2::check;
-    use crabka_protocol::{
+    use krabka_protocol::{
         owned::fetch_request::ReplicaState,
         primitives::uuid::Uuid as WireUuid,
         records::{RecordBatch, RecordsPayload},
         tagged_fields::UnknownTaggedFields,
     };
-    use crabka_units::kibibytes;
+    use krabka_units::kibibytes;
 
     use super::*;
 
@@ -808,13 +808,13 @@ mod offset_advance_tests {
     fn transient_transport_error_classification_is_narrow() {
         use std::io;
 
-        use crabka_client_core::ClientError;
+        use krabka_client_core::ClientError;
 
         let transport_cases = vec![
             ("disconnected", ClientError::Disconnected, true),
             (
                 "timeout",
-                ClientError::Timeout(crabka_units::millis(10)),
+                ClientError::Timeout(krabka_units::millis(10)),
                 true,
             ),
             (
@@ -896,7 +896,7 @@ mod offset_advance_tests {
         let req = build_fetch_request(
             123,
             IsolationLevel::ReadCommitted,
-            crabka_units::bytes(7),
+            krabka_units::bytes(7),
             mebibytes(2),
             vec![topic.clone()],
         );

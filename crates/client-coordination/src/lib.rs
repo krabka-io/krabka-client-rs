@@ -31,7 +31,7 @@
 //! `krabka-streams-go` also implement.
 //!
 //! ```
-//! use crabka_client_coordination::{
+//! use krabka_client_coordination::{
 //!     CoordinationKey, CoordinationRecord, FencingToken, Lease, MemberId, Role, decode_key,
 //!     decode_value, encode_key, encode_value,
 //! };
@@ -70,7 +70,7 @@
 //! it. It does not change the broker, and it needs no broker-side feature. A
 //! caller supplies its own producer and consumer, and this crate supplies the
 //! succession rules, the lease clock, and the codec below.
-#![doc(html_root_url = "https://docs.rs/crabka-client-coordination/0.4.0")]
+#![doc(html_root_url = "https://docs.rs/krabka-client-coordination/0.4.0")]
 
 mod broker;
 mod error;

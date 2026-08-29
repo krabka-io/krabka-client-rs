@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crabka_protocol::{
+use krabka_protocol::{
     owned::{
         list_groups_request::ListGroupsRequest,
         metadata_request::MetadataRequest,

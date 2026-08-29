@@ -9,11 +9,11 @@ use std::{
     },
 };
 
-use crabka_client_consumer::ConsumerGroupMetadata;
-use crabka_client_core::{
+use krabka_client_consumer::ConsumerGroupMetadata;
+use krabka_client_core::{
     Client, ClientFrameMax, ConnectionDispatchQueueCapacity, security::ClientSecurity,
 };
-use crabka_protocol::owned::{
+use krabka_protocol::owned::{
     add_offsets_to_txn_request::AddOffsetsToTxnRequest,
     add_partitions_to_txn_request::{AddPartitionsToTxnRequest, AddPartitionsToTxnTransaction},
     common::add_partitions_to_txn_request::add_partitions_to_txn_topic::AddPartitionsToTxnTopic,
@@ -24,7 +24,7 @@ use crabka_protocol::owned::{
         TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
     },
 };
-use crabka_units::{Time, convert::TimeExt};
+use krabka_units::{Time, convert::TimeExt};
 use dashmap::DashMap;
 use tokio::{
     sync::{Mutex, Notify, oneshot},
@@ -75,7 +75,7 @@ pub(crate) struct TopicMetadata {
     /// the `topic_id` on the wire. Zero, `Uuid::ZERO`, is a valid sentinel that
     /// means "not yet known". For older wire versions the broker falls back to
     /// the `name` field.
-    pub topic_id: crabka_protocol::primitives::uuid::Uuid,
+    pub topic_id: krabka_protocol::primitives::uuid::Uuid,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1139,7 +1139,7 @@ impl Producer {
                     }
                     _ => (
                         UNRESOLVED_TOPIC_PARTITION_COUNT,
-                        crabka_protocol::primitives::uuid::Uuid::ZERO,
+                        krabka_protocol::primitives::uuid::Uuid::ZERO,
                     ),
                 };
                 // NOTE: an unresolved lookup is cached as `{count: 1, topic_id:
@@ -1274,8 +1274,8 @@ mod tests {
     };
 
     use bytes::{Bytes, BytesMut};
-    use crabka_client_core::MockBroker;
-    use crabka_protocol::{
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
         Decode, Encode,
         owned::{
             api_versions_request,
@@ -1313,11 +1313,11 @@ mod tests {
         let mut coalesced = Accumulator::new(1024);
         let AppendResult { wakes_sender, .. } =
             coalesced.try_append(None, Some(Bytes::from_static(b"a")), vec![], 0, None);
-        wake_sender_after_append(&wake_tx, crabka_units::millis(10), wakes_sender);
+        wake_sender_after_append(&wake_tx, krabka_units::millis(10), wakes_sender);
         assert_eq!(wake_rx.try_recv(), Ok(DrainIntent::Ready));
         let AppendResult { wakes_sender, .. } =
             coalesced.try_append(None, Some(Bytes::from_static(b"b")), vec![], 0, None);
-        wake_sender_after_append(&wake_tx, crabka_units::millis(10), wakes_sender);
+        wake_sender_after_append(&wake_tx, krabka_units::millis(10), wakes_sender);
         assert_eq!(
             wake_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1327,12 +1327,12 @@ mod tests {
         let _ = rollover.try_append(None, Some(Bytes::from_static(b"a")), vec![], 0, None);
         let AppendResult { wakes_sender, .. } =
             rollover.try_append(None, Some(Bytes::from_static(b"b")), vec![], 0, None);
-        wake_sender_after_append(&wake_tx, crabka_units::millis(10), wakes_sender);
+        wake_sender_after_append(&wake_tx, krabka_units::millis(10), wakes_sender);
         assert_eq!(wake_rx.try_recv(), Ok(DrainIntent::Ready));
 
         let mut immediate = Accumulator::new(1024);
         let _ = immediate.try_append(None, Some(Bytes::from_static(b"a")), vec![], 0, None);
-        wake_sender_after_append(&wake_tx, crabka_units::secs(0), false);
+        wake_sender_after_append(&wake_tx, krabka_units::secs(0), false);
         assert_eq!(wake_rx.try_recv(), Ok(DrainIntent::Force));
     }
 

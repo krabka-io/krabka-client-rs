@@ -144,13 +144,13 @@ crate.from_cargo(
 # git crate's directory by matching the crate name against the members list, and
 # it skips glob entries, so each member's path is named here instead.
 KRABKA_PROTOCOL_MEMBERS = {
-    "crabka-compression": "crates/compression",
-    "crabka-ids": "crates/ids",
-    "crabka-metadata": "crates/metadata",
-    "crabka-security": "crates/security",
-    "crabka-trace-context": "crates/trace-context",
-    "crabka-units": "crates/units",
-    "crabka-voters": "crates/voters",
+    "krabka-compression": "crates/compression",
+    "krabka-ids": "crates/ids",
+    "krabka-metadata": "crates/metadata",
+    "krabka-security": "crates/security",
+    "krabka-trace-context": "crates/trace-context",
+    "krabka-units": "crates/units",
+    "krabka-voters": "crates/voters",
 }
 
 [
@@ -162,7 +162,7 @@ KRABKA_PROTOCOL_MEMBERS = {
     for crate_name, directory in KRABKA_PROTOCOL_MEMBERS.items()
 ]
 
-# crabka-protocol carries the same member annotation plus one more. Its build.rs
+# krabka-protocol carries the same member annotation plus one more. Its build.rs
 # only checks that its checked-in `generated/`
 # sources still match the `schemas/` SHAs; it emits no code. It reads its own
 # manifest directory through `env!("CARGO_MANIFEST_DIR")`, which rules_rust
@@ -170,7 +170,7 @@ KRABKA_PROTOCOL_MEMBERS = {
 # needs the check -- the generated sources are consumed directly -- and the
 # Cargo build in krabka-protocol still runs it.
 crate.annotation(
-    crate = "crabka-protocol",
+    crate = "krabka-protocol",
     gen_build_script = "off",
     strip_prefix = "crates/protocol",
     workspace_cargo_toml = "Cargo.toml",

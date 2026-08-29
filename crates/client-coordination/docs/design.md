@@ -67,11 +67,11 @@ The stagger is an optimisation. `InitProducerId` is atomic at the coordinator, s
 
 The client builds on three existing layers and adds no wire message.
 
-`crabka-client-producer` mints the epoch. A producer built with `transactional_id = <role>` calls `init_transactions`, which sends `InitProducerId` to the coordinator and stores the returned identity. The same producer is then bound to that epoch. The leadership handle gives it to the caller, so the broker fences every write the caller makes.
+`krabka-client-producer` mints the epoch. A producer built with `transactional_id = <role>` calls `init_transactions`, which sends `InitProducerId` to the coordinator and stores the returned identity. The same producer is then bound to that epoch. The leadership handle gives it to the caller, so the broker fences every write the caller makes.
 
-`crabka-client-admin` answers the third-party question with `describe_transaction`.
+`krabka-client-admin` answers the third-party question with `describe_transaction`.
 
-`crabka-client-core` supplies the coordinator lookup and the committed-read fetch that the state reader uses.
+`krabka-client-core` supplies the coordinator lookup and the committed-read fetch that the state reader uses.
 
 A role needs two producers. The transactional producer writes lease records under the role's epoch. A second, plain producer appends registrations, because Kafka requires every send from a transactional producer to sit inside a transaction.
 

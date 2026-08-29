@@ -1,7 +1,7 @@
 //! Connection management and request dispatch for Apache Kafka in Rust.
 //!
-//! This crate is the first I/O-doing layer of Crabka. It wraps
-//! `crabka-protocol`'s typed request/response messages in a `tokio`-based
+//! This crate is the first I/O-doing layer of Krabka. It wraps
+//! `krabka-protocol`'s typed request/response messages in a `tokio`-based
 //! TCP client that:
 //!
 //! - Opens one connection per broker and multiplexes requests by
@@ -13,8 +13,8 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use crabka_client_core::Client;
-//! use crabka_protocol::owned::api_versions_request::ApiVersionsRequest;
+//! use krabka_client_core::Client;
+//! use krabka_protocol::owned::api_versions_request::ApiVersionsRequest;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let client = Client::builder()

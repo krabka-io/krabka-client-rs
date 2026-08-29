@@ -1,16 +1,16 @@
 [package]
-name = "crabka-client-admin"
+name = "krabka-client-admin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Operator-side admin client for Crabka clusters"
+description = "Operator-side admin client for Krabka clusters"
 repository = "https://github.com/robot-head/crabka"
 homepage = "https://github.com/robot-head/crabka"
-documentation = "https://docs.rs/crabka-client-admin"
+documentation = "https://docs.rs/krabka-client-admin"
 readme = "README.md"
-keywords = ["kafka", "admin", "client", "crabka"]
+keywords = ["kafka", "admin", "client", "krabka"]
 categories = ["api-bindings", "network-programming"]
 
 [lints]
@@ -18,12 +18,12 @@ workspace = true
 
 [dependencies]
 assert2            = { workspace = true }
-crabka-units = { workspace = true }
-crabka-client-core = { version = "0.4.0", path = "../client-core" }
-crabka-ids         = { version = "0.4.0" }
-crabka-metadata    = { version = "0.4.0" }
-crabka-protocol    = { version = "0.4.0", default-features = false }
-crabka-security    = { version = "0.4.0" }
+krabka-units = { workspace = true }
+krabka-client-core = { version = "0.4.0", path = "../client-core" }
+krabka-ids         = { version = "0.4.0" }
+krabka-metadata    = { version = "0.4.0" }
+krabka-protocol    = { version = "0.4.0", default-features = false }
+krabka-security    = { version = "0.4.0" }
 async-trait        = { workspace = true }
 bytes              = { workspace = true }
 ring               = { workspace = true }
@@ -33,9 +33,9 @@ tracing            = { workspace = true }
 uuid               = { workspace = true }
 
 [dev-dependencies]
-crabka-client-consumer = { path = "../client-consumer" }
-crabka-client-core = { path = "../client-core", features = ["mock"] }
-crabka-client-producer = { path = "../client-producer" }
+krabka-client-consumer = { path = "../client-consumer" }
+krabka-client-core = { path = "../client-core", features = ["mock"] }
+krabka-client-producer = { path = "../client-producer" }
 futures-util       = { workspace = true }
 tempfile           = { workspace = true }
 tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
