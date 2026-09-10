@@ -11,7 +11,7 @@
 //! modules cover topic CRUD, partition expansion, config changes, SCRAM user
 //! credentials, ACLs, quotas, delegation tokens, and log-dir inspection.
 
-use std::{any::Any, sync::Mutex};
+use std::{any::Any, collections::BTreeMap, sync::Mutex};
 
 use krabka_client_core::{
     ClientError, Connection, ConnectionOptions, MetadataRecoveryRebootstrapTrigger,
@@ -104,6 +104,41 @@ pub trait AdminClientLike: Send {
         replication_factor: i32,
         timeout: Time,
     ) -> Result<TopicReplicationStatus, AdminError>;
+    /// Read exact replica membership without changing broker state.
+    async fn describe_partition_assignments(
+        &mut self,
+        _topics: &[&str],
+    ) -> Result<Vec<PartitionAssignment>, AdminError> {
+        Err(AdminError::Protocol(
+            "Describe partition assignments is not implemented by this admin client".into(),
+        ))
+    }
+    /// List active reassignments for the selected partitions.
+    async fn list_partition_reassignments(
+        &mut self,
+        _partitions: &BTreeMap<String, Vec<i32>>,
+        _timeout: Time,
+    ) -> Result<Vec<PartitionAssignment>, AdminError> {
+        Err(AdminError::Protocol(
+            "ListPartitionReassignments is not implemented by this admin client".into(),
+        ))
+    }
+    /// Submit exact replica assignments, or cancel them with `None`.
+    async fn alter_partition_assignments(
+        &mut self,
+        _assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
+        _timeout: Time,
+    ) -> Result<Vec<PartitionAssignmentOutcome>, AdminError> {
+        Err(AdminError::Protocol(
+            "AlterPartitionReassignments is not implemented by this admin client".into(),
+        ))
+    }
+    /// Remove a broker registration through the active controller.
+    async fn unregister_broker(&mut self, _broker_id: i32) -> Result<(), AdminError> {
+        Err(AdminError::Protocol(
+            "UnregisterBroker is not implemented by this admin client".into(),
+        ))
+    }
     async fn create_topics(
         &mut self,
         specs: &[CreateTopicSpec],
@@ -225,6 +260,29 @@ impl AdminClientLike for AdminClient {
     ) -> Result<TopicReplicationStatus, AdminError> {
         AdminClient::reconcile_topic_replication_factor(self, topic, replication_factor, timeout)
             .await
+    }
+    async fn describe_partition_assignments(
+        &mut self,
+        topics: &[&str],
+    ) -> Result<Vec<PartitionAssignment>, AdminError> {
+        AdminClient::describe_partition_assignments(self, topics).await
+    }
+    async fn list_partition_reassignments(
+        &mut self,
+        partitions: &BTreeMap<String, Vec<i32>>,
+        timeout: Time,
+    ) -> Result<Vec<PartitionAssignment>, AdminError> {
+        AdminClient::list_partition_reassignments(self, partitions, timeout).await
+    }
+    async fn alter_partition_assignments(
+        &mut self,
+        assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
+        timeout: Time,
+    ) -> Result<Vec<PartitionAssignmentOutcome>, AdminError> {
+        AdminClient::alter_partition_assignments(self, assignments, timeout).await
+    }
+    async fn unregister_broker(&mut self, broker_id: i32) -> Result<(), AdminError> {
+        AdminClient::unregister_broker(self, broker_id).await
     }
     async fn create_topics(
         &mut self,
@@ -2104,5 +2162,17 @@ mod tests {
         assert2::assert!(options.connect_timeout == secs(5));
         assert2::assert!(options.request_timeout == secs(30));
         assert2::assert!(options.security.is_none());
+    }
+
+    #[test]
+    fn evacuation_methods_are_available_on_trait_objects() {
+        fn compile_calls(client: &mut dyn AdminClientLike) {
+            drop(client.describe_partition_assignments(&["orders"]));
+            drop(client.list_partition_reassignments(&BTreeMap::new(), secs(30)));
+            drop(client.alter_partition_assignments(&BTreeMap::new(), secs(30)));
+            drop(client.unregister_broker(7));
+        }
+
+        std::hint::black_box(compile_calls as fn(&mut dyn AdminClientLike));
     }
 }
