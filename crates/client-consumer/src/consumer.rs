@@ -30,7 +30,10 @@ use krabka_units::{
     millis, minutes, secs,
 };
 use refined_type::rule::{GreaterI32, GreaterI64, MinMaxU128};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -60,17 +63,18 @@ pub struct Consumer {
     pub(crate) coordinator_id: Arc<AtomicI32>,
     pub(crate) retry_policy: CoordinatorRetryPolicy,
     pub(crate) member_id: String,
+    pub(crate) commit_identity: Arc<Mutex<CommitIdentity>>,
+    pub(crate) commit_serialization: Arc<Mutex<()>>,
     pub(crate) group_instance_id: Option<String>,
-    /// The group generation that the commit path stamps onto `OffsetCommit`.
-    /// This `Arc<AtomicI32>` is shared with the coordinator task, which is the
-    /// sole writer and publishes the new value on every join and rejoin. A
-    /// commit issued after a rebalance therefore uses the *current* generation
-    /// and not a stale start-up snapshot, which the broker rejects with
-    /// `ILLEGAL_GENERATION`.
+    /// The current group generation exposed by [`Consumer::generation`].
+    /// Commit RPCs use the generation atomically paired with membership and
+    /// partition ownership in `commit_identity`.
     pub(crate) current_generation: Arc<AtomicI32>,
     pub(crate) subscribed_topics: Vec<String>,
     /// Current assigned partitions: `(topic, partition_index)`.
     pub(crate) assigned: Arc<Mutex<Vec<(String, i32)>>>,
+    /// Wakes selected-offset commits after assignment publication.
+    pub(crate) assignment_changed: Arc<Notify>,
     /// Next offset to fetch per partition.
     pub(crate) next_offsets: Arc<Mutex<HashMap<(String, i32), i64>>>,
     /// KIP-320 per-partition leader-epoch metadata, keyed like `next_offsets`.
@@ -99,6 +103,13 @@ pub struct Consumer {
     /// surfaces `ConsumerError::LogTruncation`. Any other value makes `poll`
     /// apply the safe offset, per KIP-320.
     pub(crate) auto_offset_reset: AutoOffsetReset,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommitIdentity {
+    pub generation: i32,
+    pub member_id: String,
+    pub ownership_ids: HashMap<(String, i32), u64>,
 }
 
 #[derive(Clone)]
@@ -1293,7 +1304,21 @@ async fn spawn_consumer(
         .build()
         .await?;
 
+    let ownership_ids = assigned_partitions
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, partition)| (partition, index as u64 + 1))
+        .collect();
+    let next_ownership_id = assigned_partitions.len() as u64 + 1;
     let assigned = Arc::new(Mutex::new(assigned_partitions));
+    let assignment_changed = Arc::new(Notify::new());
+    let commit_identity = Arc::new(Mutex::new(CommitIdentity {
+        generation: generation_id,
+        member_id: member_id.clone(),
+        ownership_ids,
+    }));
+    let commit_serialization = Arc::new(Mutex::new(()));
     let next_offsets = Arc::new(Mutex::new(next_offsets));
     let positions = Arc::new(Mutex::new(positions));
     let pending_seeks = Arc::new(Mutex::new(HashMap::new()));
@@ -1308,12 +1333,15 @@ async fn spawn_consumer(
         group_id: group_id.clone(),
         coordinator_id: Arc::clone(&coordinator_id),
         member_id: member_id.clone(),
+        commit_identity: Arc::clone(&commit_identity),
         group_instance_id: group_instance_id.clone(),
         generation_id,
         current_generation: Arc::clone(&current_generation),
         assignor,
         subscribed_topics: subscribe.clone(),
         assigned: Arc::clone(&assigned),
+        assignment_changed: Arc::clone(&assignment_changed),
+        next_ownership_id,
         next_offsets: Arc::clone(&next_offsets),
         positions: Arc::clone(&positions),
         topic_ids: Arc::clone(&topic_ids),
@@ -1343,10 +1371,13 @@ async fn spawn_consumer(
         coordinator_id,
         retry_policy: retry_policy.into(),
         member_id,
+        commit_identity,
+        commit_serialization,
         group_instance_id: group_instance_id.clone(),
         current_generation,
         subscribed_topics: subscribe,
         assigned,
+        assignment_changed,
         next_offsets,
         positions,
         pending_seeks,
@@ -2146,10 +2177,17 @@ mod security_arg_tests {
             coordinator_id: Arc::new(AtomicI32::new(3)),
             retry_policy: ConsumerRetryPolicy::default().into(),
             member_id: "member-a".into(),
+            commit_identity: Arc::new(Mutex::new(CommitIdentity {
+                generation: 7,
+                member_id: "member-a".into(),
+                ownership_ids: HashMap::from([(("orders".into(), 0), 1)]),
+            })),
+            commit_serialization: Arc::new(Mutex::new(())),
             group_instance_id: Some("instance-a".into()),
             current_generation: Arc::new(AtomicI32::new(7)),
             subscribed_topics: vec!["orders".into(), "payments".into()],
             assigned: Arc::new(Mutex::new(vec![("orders".into(), 0)])),
+            assignment_changed: Arc::new(Notify::new()),
             next_offsets: Arc::new(Mutex::new(HashMap::new())),
             positions: Arc::new(Mutex::new(HashMap::new())),
             pending_seeks: Arc::new(Mutex::new(HashMap::new())),

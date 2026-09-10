@@ -23,7 +23,7 @@
 //! It keeps only what a deadlock can depend on: **which task holds which
 //! `tokio::sync::Mutex` and where each task is suspended.**
 //!
-//! ## The five shared `tokio::sync::Mutex`es
+//! ## The seven shared `tokio::sync::Mutex`es
 //!
 //! `Consumer` declares them in `consumer.rs`, in the `Consumer` mutex fields,
 //! and shares them into `CoordinatorState` with `Arc::clone`:
@@ -35,16 +35,16 @@
 //! | 2  | `next_offsets` | N      |
 //! | 3  | `positions`    | P      |
 //! | 4  | `topic_ids`    | T      |
+//! | 5  | `commit_identity` | CI  |
+//! | 6  | `commit_serialization` | CS |
 //!
 //! ## Modeled lock-holding regions (sequences where >1 guard is alive at once,
 //! plus single-lock regions for completeness). Citations are to the real code.
 //!
-//! Critically: **no guard is ever held across an `.await` that is not itself a
-//! `.lock().await`**. The code drops guards explicitly before every RPC. A
-//! region is therefore a contiguous run of nested `.lock().await` acquisitions.
-//! The only suspension point *inside* a region is the next lock acquisition.
-//! That acquisition is exactly where a deadlock cycle would form, so it is the
-//! thing this model interleaves.
+//! `commit_serialization` is intentionally held across commit RPCs and rebalance
+//! waits, but no coordinator path needs that lock. All other guards are dropped
+//! before RPCs. The model abstracts network waits and keeps every nested mutex
+//! acquisition, because only those acquisitions can form lock-order cycles.
 //!
 //! ### poll task (`poll.rs`, `seek.rs`, `validate.rs`)
 //! - `apply_pending_seeks` (seek.rs): PS fast-path probe (released) → A
@@ -67,11 +67,12 @@
 //!   refresh `.await`.
 //!
 //! ### coordinator task (`coordinator.rs`)
-//! - `rejoin`: A alone in every scope (`assigned.clone()` owned snapshot;
-//!   per-phase `assigned` retain/merge/publish; `owned_after_revoke`
-//!   `assigned.clone()`). It also runs **N→P** scopes (the eager and
+//! - `rejoin`: A alone for assignment snapshots. `publish_assignment` holds
+//!   **A→CI** while it atomically publishes assignment and commit identity. It
+//!   also runs **N→P** scopes (the eager and
 //!   cooperative `next_offsets`→`positions` prunes). A is never held while N or
 //!   P is acquired.
+//! - `run` after `UNKNOWN_MEMBER_ID`: **CI alone** while clearing identity.
 //! - `commit_revoked`: **N→P** (the commit snapshot); then T alone
 //!   (`topic_ids.clone()`).
 //! - `prime_offsets`: T alone (`topic_ids.clone()`), then **N→P**
@@ -79,19 +80,18 @@
 //! - `join_and_sync` (leader branch): **T alone** (`topic_ids` merge).
 //!
 //! ### commit task (`commit.rs`)
-//! - `commit_sync` (N `next_offsets.clone()`, then P, then T `topic_ids.clone()`)
-//!   and the `commit_async` spawned task (same N→P→T sequence): **at most one
-//!   lock held at a time**, that is N, then P, then T, each released before the
-//!   next. There is no multi-lock region, so the commit task can never be half
-//!   of a cycle. Modeled as three independent single-lock regions to confirm
-//!   this.
+//! - Every commit holds **CS** for its complete operation. Synchronous commits
+//!   initially nest **CI→N** under CS. The asynchronous snapshot takes CI and N
+//!   separately under CS. Retry snapshots take CI alone under CS, followed by
+//!   P and T alone under CS. This serializes concurrent commits without blocking
+//!   coordinator publication, because the coordinator never takes CS.
 //!
 //! ## The lock hierarchy these regions imply
 //!
 //! Collecting every "hold L1 while acquiring L2" edge actually observed:
-//!   PS → N,  PS → P (transitively),  N → P.
-//! A and T are only ever held *alone*, never with another lock live. So the
-//! partial order is `PS < N < P`, with `A` and `T` as incomparable singletons.
+//!   PS → N, N → P, A → CI, CS → CI, CI → N, CS → P, CS → T.
+//! The resulting partial order is acyclic: `A < CI < N < P`,
+//! `CS < CI < N < P`, `PS < N < P`, and `CS < T`.
 //! This is acyclic ⇒ the prediction is **deadlock-free**, and the model proves
 //! it exhaustively across all task interleavings.
 
@@ -106,7 +106,9 @@ const A: u8 = 1; // assigned
 const N: u8 = 2; // next_offsets
 const P: u8 = 3; // positions
 const T: u8 = 4; // topic_ids
-const NUM_LOCKS: usize = 5;
+const CI: u8 = 5; // commit_identity
+const CS: u8 = 6; // commit_serialization
+const NUM_LOCKS: usize = 7;
 
 /// A single lock operation in a task's program. `Acquire` is a suspension
 /// point, a `.lock().await`. `Release` drops a guard at the end of a scope or
@@ -241,12 +243,12 @@ fn poll_program() -> Vec<Op> {
 /// Sequence (coordinator.rs `rejoin`, cooperative-revoke path):
 ///   A alone (`rejoin`: `assigned.clone()` owned snapshot)
 ///   [`join_and_sync` → T alone (`topic_ids` merge)]
-///   A alone (`rejoin`: phase-1 `assigned` retain)
+///   A→CI (`publish_assignment`: phase-1 assignment + commit identity)
 ///   [`commit_revoked` → N,P (`next_offsets`→`positions`) ; T alone (`topic_ids.clone()`)]
 ///   N,P prune (`rejoin`: phase-1 `next_offsets`→`positions` remove)
 ///   A alone (`rejoin`: `owned_after_revoke` `assigned.clone()` snapshot)
 ///   [`prime_offsets` → T alone (`topic_ids.clone()`) ; N,P (`next_offsets`→`positions`)]
-///   A alone (`rejoin`: publish phase-2 `assigned`)
+///   A→CI (`publish_assignment`: phase-2 assignment + commit identity)
 fn coordinator_program() -> Vec<Op> {
     vec![
         // rejoin: owned snapshot (`assigned.clone()`)
@@ -255,8 +257,10 @@ fn coordinator_program() -> Vec<Op> {
         // join_and_sync → topic_ids merge (leader branch, T alone)
         Acquire(T),
         Release(T),
-        // rejoin: phase-1 retain of kept partitions (`assigned`)
+        // publish_assignment: assigned → commit_identity
         Acquire(A),
+        Acquire(CI),
+        Release(CI),
         Release(A),
         // commit_revoked: N→P (`next_offsets`→`positions`)
         Acquire(N),
@@ -282,26 +286,59 @@ fn coordinator_program() -> Vec<Op> {
         Acquire(P),
         Release(P),
         Release(N),
-        // rejoin: publish phase-2 assignment (`assigned`)
+        // publish_assignment: assigned → commit_identity
         Acquire(A),
+        Acquire(CI),
+        Release(CI),
         Release(A),
+        // run: UNKNOWN_MEMBER_ID clears commit_identity alone.
+        Acquire(CI),
+        Release(CI),
     ]
 }
 
-/// The commit task (`commit.rs` `commit_sync` / `commit_async`): N, then P,
-/// then T, each released before the next is taken. At most one lock is held at
-/// a time, so it can never be half of a cycle. Modeled faithfully to confirm.
+/// A synchronous commit task. CS spans the whole operation. The initial
+/// validation/snapshot holds CI→N. Each attempt then snapshots CI, P, and T in
+/// separate regions, and the deferred-response path snapshots CI once more.
 fn commit_program() -> Vec<Op> {
     vec![
-        // next_offsets snapshot (commit_sync / commit_async: `next_offsets.clone()`)
+        Acquire(CS),
+        // commit_sync / commit_offsets_sync initial ownership + offset snapshot.
+        Acquire(CI),
         Acquire(N),
         Release(N),
-        // positions snapshot (commit_sync / commit_async: `positions`)
+        Release(CI),
+        // commit_pending_offsets identity snapshot.
+        Acquire(CI),
+        Release(CI),
+        // positions snapshot.
         Acquire(P),
         Release(P),
-        // topic_ids snapshot (commit_sync / commit_async: `topic_ids.clone()`)
+        // topic_ids snapshot.
         Acquire(T),
         Release(T),
+        // Deferred response ownership/identity snapshot.
+        Acquire(CI),
+        Release(CI),
+        Release(CS),
+    ]
+}
+
+/// The asynchronous commit task. CS spans snapshot, RPC, and coordinator
+/// re-find. `snapshot_commit_topics` clones CI before acquiring N, so these are
+/// separate regions; P and T are likewise acquired alone under CS.
+fn async_commit_program() -> Vec<Op> {
+    vec![
+        Acquire(CS),
+        Acquire(CI),
+        Release(CI),
+        Acquire(N),
+        Release(N),
+        Acquire(P),
+        Release(P),
+        Acquire(T),
+        Release(T),
+        Release(CS),
     ]
 }
 
@@ -428,14 +465,16 @@ mod tests {
 
     /// MAIN RESULT: the real classic-consumer lock protocol is DEADLOCK-FREE
     /// under exhaustive interleaving. The protocol here is the poll task, the
-    /// coordinator task, and the commit task, each running its extracted
-    /// acquire/release sequence.
+    /// coordinator task, and concurrent sync/async commit tasks, each running
+    /// its extracted acquire/release sequence. The two commit programs make
+    /// contention on `commit_serialization` reachable.
     #[test]
     fn classic_consumer_lock_protocol_is_deadlock_free() {
         let checker = run_model(vec![
             ("poll", poll_program()),
             ("coordinator", coordinator_program()),
-            ("commit", commit_program()),
+            ("commit-sync", commit_program()),
+            ("commit-async", async_commit_program()),
         ])
         .spawn_bfs()
         .join();

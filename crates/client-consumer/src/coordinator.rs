@@ -45,7 +45,7 @@ use krabka_units::{
     Time,
     convert::{StdDurationExt as _, TimeExt as _},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -54,7 +54,7 @@ use crate::{
         AutoOffsetReset, decode_assignment, decode_subscription, encode_assignment,
         encode_subscription,
     },
-    consumer::{ConsumerRetryPolicy, reset_starting_offset, starting_offset},
+    consumer::{CommitIdentity, ConsumerRetryPolicy, reset_starting_offset, starting_offset},
     error::ConsumerError,
     offset_wire::{build_commit_topics, build_offset_fetch, id_to_name, parse_offset_fetch},
 };
@@ -361,6 +361,7 @@ pub(crate) struct CoordinatorState {
     /// same coordinator and sees re-discovery updates the moment they land.
     pub coordinator_id: Arc<AtomicI32>,
     pub member_id: String,
+    pub commit_identity: Arc<Mutex<CommitIdentity>>,
     pub group_instance_id: Option<String>,
     pub generation_id: i32,
     /// Published copy of `generation_id`. This `Arc<AtomicI32>` is shared with
@@ -373,6 +374,8 @@ pub(crate) struct CoordinatorState {
     pub assignor: Assignor,
     pub subscribed_topics: Vec<String>,
     pub assigned: Arc<Mutex<Vec<(String, i32)>>>,
+    pub assignment_changed: Arc<Notify>,
+    pub next_ownership_id: u64,
     pub next_offsets: Arc<Mutex<HashMap<(String, i32), i64>>>,
     pub positions: Arc<Mutex<HashMap<(String, i32), crate::position::PartitionPosition>>>,
     pub topic_ids: Arc<Mutex<HashMap<String, WireUuid>>>,
@@ -405,7 +408,54 @@ fn set_generation(state: &mut CoordinatorState, generation_id: i32) {
     state.generation_id = generation_id;
     state
         .current_generation
-        .store(generation_id, Ordering::Relaxed);
+        .store(generation_id, Ordering::Release);
+}
+
+async fn publish_assignment(
+    state: &mut CoordinatorState,
+    assignment: &[(String, i32)],
+    preserve_retained: bool,
+    generation_id: i32,
+) {
+    let mut next_id = state.next_ownership_id;
+    let mut assigned = state.assigned.lock().await;
+    let mut identity = state.commit_identity.lock().await;
+    update_ownership(
+        &mut identity.ownership_ids,
+        assignment,
+        preserve_retained,
+        &mut next_id,
+    );
+    assigned.clear();
+    assigned.extend_from_slice(assignment);
+    identity.generation = generation_id;
+    identity.member_id.clone_from(&state.member_id);
+    drop(identity);
+    drop(assigned);
+    state.next_ownership_id = next_id;
+    set_generation(state, generation_id);
+    state.assignment_changed.notify_waiters();
+}
+
+fn update_ownership(
+    ownership: &mut HashMap<(String, i32), u64>,
+    assignment: &[(String, i32)],
+    preserve_retained: bool,
+    next_id: &mut u64,
+) {
+    if preserve_retained {
+        let assigned = assignment.iter().collect::<HashSet<_>>();
+        ownership.retain(|partition, _| assigned.contains(partition));
+    } else {
+        ownership.clear();
+    }
+    for partition in assignment {
+        ownership.entry(partition.clone()).or_insert_with(|| {
+            let id = *next_id;
+            *next_id = next_id.wrapping_add(1);
+            id
+        });
+    }
 }
 
 /// Outcome of a single heartbeat RPC.
@@ -604,7 +654,13 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     HeartbeatOutcome::NeedRejoin => needs_rejoin = true,
                     HeartbeatOutcome::RejoinFromScratch => {
                         state.member_id.clear();
+                        let mut identity = state.commit_identity.lock().await;
+                        identity.member_id.clear();
+                        identity.ownership_ids.clear();
+                        identity.generation = -1;
+                        drop(identity);
                         set_generation(&mut state, -1);
+                        state.assignment_changed.notify_waiters();
                         needs_rejoin = true;
                     }
                 },
@@ -784,10 +840,7 @@ async fn rejoin(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, Co
             // first → a partition is only visible in `assigned` once its
             // next_offset is established.
             prime_offsets(state, &added).await?;
-            {
-                let mut a = state.assigned.lock().await;
-                a.clone_from(&new_assignment);
-            }
+            publish_assignment(state, &new_assignment, false, new_generation).await;
             {
                 let mut off = state.next_offsets.lock().await;
                 off.retain(|k, _| new_set.contains(k));
@@ -796,7 +849,6 @@ async fn rejoin(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, Co
                 let mut pos = state.positions.lock().await;
                 pos.retain(|k, _| new_set.contains(k));
             }
-            set_generation(state, new_generation);
             topic_partitions
         }
         RebalanceProtocol::Cooperative => {
@@ -811,25 +863,19 @@ async fn rejoin(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, Co
                 // `unwrap_or(0)`), re-delivering records the previous owner
                 // already committed past at revoke time.
                 prime_offsets(state, &added).await?;
-                {
-                    let mut a = state.assigned.lock().await;
-                    for p in &added {
-                        if !a.contains(p) {
-                            a.push(p.clone());
-                        }
-                    }
-                }
-                set_generation(state, new_generation);
+                publish_assignment(state, &new_assignment, true, new_generation).await;
                 topic_partitions
             } else {
                 // Phase 1: drop the partitions we're losing, then
                 // immediately rejoin so the leader can place them on
                 // whoever needs them in phase 2. Keeping kept partitions
                 // active throughout is the whole point of KIP-429.
-                {
-                    let mut a = state.assigned.lock().await;
-                    a.retain(|p| !revoked.contains(p));
-                }
+                let kept: Vec<_> = owned
+                    .iter()
+                    .filter(|p| !revoked.contains(p))
+                    .cloned()
+                    .collect();
+                publish_assignment(state, &kept, true, new_generation).await;
                 // Adopt the generation from round 1 *before* committing: the
                 // broker advanced the group epoch when we rejoined above, so
                 // an OffsetCommit carrying the pre-rebalance generation is
@@ -838,7 +884,6 @@ async fn rejoin(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, Co
                 // member that picks them up in phase 2 primes from the offset
                 // we'd consumed to, rather than re-delivering records we
                 // already saw (KIP-429 onPartitionsRevoked semantics).
-                set_generation(state, new_generation);
                 commit_revoked(state, &revoked).await;
                 {
                     let mut off = state.next_offsets.lock().await;
@@ -872,11 +917,7 @@ async fn rejoin(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, Co
                 // revoking member committed at revoke time; fetching from 0
                 // instead would re-deliver the records it already consumed.
                 prime_offsets(state, &added2).await?;
-                {
-                    let mut a = state.assigned.lock().await;
-                    *a = assignment2;
-                }
-                set_generation(state, gen2);
+                publish_assignment(state, &assignment2, true, gen2).await;
                 topic_partitions2
             }
         }
@@ -1490,12 +1531,19 @@ mod retry_tests {
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(0)),
             member_id: "member-a".into(),
+            commit_identity: Arc::new(Mutex::new(CommitIdentity {
+                generation: 1,
+                member_id: "member-a".into(),
+                ownership_ids: HashMap::new(),
+            })),
             group_instance_id: None,
             generation_id: 1,
             current_generation: Arc::new(AtomicI32::new(1)),
             assignor: Assignor::Range,
             subscribed_topics: vec!["topic".into()],
             assigned: Arc::new(Mutex::new(Vec::new())),
+            assignment_changed: Arc::new(Notify::new()),
+            next_ownership_id: 1,
             next_offsets: Arc::new(Mutex::new(HashMap::new())),
             positions: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
@@ -2110,5 +2158,45 @@ mod refind_tests {
 
         assert2::assert!(matches!(r, Err(ConsumerError::CoordinatorUnavailable)));
         assert2::assert!(calls.load(Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn cooperative_ownership_preserves_retained_and_rotates_reassigned_partitions() {
+        let p0 = ("topic".to_string(), 0);
+        let p1 = ("topic".to_string(), 1);
+        let mut ownership = HashMap::from([(p0.clone(), 7), (p1.clone(), 8)]);
+        let mut next_id = 9;
+
+        update_ownership(
+            &mut ownership,
+            std::slice::from_ref(&p0),
+            true,
+            &mut next_id,
+        );
+        assert2::assert!(ownership == HashMap::from([(p0.clone(), 7)]));
+
+        update_ownership(
+            &mut ownership,
+            &[p0.clone(), p1.clone()],
+            true,
+            &mut next_id,
+        );
+        assert2::assert!(ownership == HashMap::from([(p0, 7), (p1, 9)]));
+    }
+
+    #[test]
+    fn eager_assignment_rotates_even_retained_partition_ownership() {
+        let p0 = ("topic".to_string(), 0);
+        let mut ownership = HashMap::from([(p0.clone(), 7)]);
+        let mut next_id = 8;
+
+        update_ownership(
+            &mut ownership,
+            std::slice::from_ref(&p0),
+            false,
+            &mut next_id,
+        );
+
+        assert2::assert!(ownership == HashMap::from([(p0, 8)]));
     }
 }

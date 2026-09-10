@@ -1,7 +1,7 @@
 //! `Consumer::commit_sync` and `commit_async`.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, atomic::Ordering},
 };
 
@@ -15,7 +15,7 @@ use krabka_protocol::{
 use tokio::sync::Mutex;
 
 use crate::{
-    consumer::Consumer,
+    consumer::{CommitIdentity, Consumer},
     coordinator::{find_coordinator, is_retriable_transport_error, with_coordinator_refind},
     error::ConsumerError,
     offset_wire::build_commit_topics,
@@ -79,11 +79,14 @@ fn validate_selected_offsets(
 }
 
 async fn snapshot_commit_topics(
+    commit_identity: &Arc<Mutex<CommitIdentity>>,
     offsets: &Arc<Mutex<HashMap<(String, i32), i64>>>,
     positions: &Arc<Mutex<HashMap<(String, i32), PartitionPosition>>>,
     topic_ids: &Arc<Mutex<HashMap<String, WireUuid>>>,
-) -> Option<(usize, Vec<OffsetCommitRequestTopic>)> {
-    let raw_offsets = offsets.lock().await.clone();
+) -> Option<(usize, Vec<OffsetCommitRequestTopic>, (i32, String))> {
+    let identity = commit_identity.lock().await.clone();
+    let mut raw_offsets = offsets.lock().await.clone();
+    raw_offsets.retain(|partition, _| identity.ownership_ids.contains_key(partition));
     if raw_offsets.is_empty() {
         return None;
     }
@@ -92,7 +95,11 @@ async fn snapshot_commit_topics(
     let offsets = commit_offsets(raw_offsets, &pos);
     drop(pos);
     let topic_ids = topic_ids.lock().await.clone();
-    Some((partitions, build_commit_topics(offsets, &topic_ids)))
+    Some((
+        partitions,
+        build_commit_topics(offsets, &topic_ids),
+        (identity.generation, identity.member_id),
+    ))
 }
 
 fn build_commit_request(
@@ -117,25 +124,63 @@ fn build_commit_request(
 ///
 /// `0` is success. This function DEFERS the rebalance codes
 /// `ILLEGAL_GENERATION (22)` and `REBALANCE_IN_PROGRESS (27)`, that is it
-/// treats them as `Ok`, ONLY while the coordinator task is alive to rejoin and
-/// republish the generation in `current_generation`. The offsets then stay in
-/// `next_offsets` and recommit on the next call, which is at-least-once. A
-/// long-running block-builder or compactor commit loop therefore survives a
-/// routine rebalance instead of crashing.
+/// classifies them as deferred ONLY while the coordinator task is alive to
+/// rejoin. The synchronous commit loop then retries continuously-owned
+/// partitions under the newly-published identity. A long-running block-builder
+/// or compactor commit loop therefore survives a routine rebalance without
+/// reporting an unacknowledged commit as successful.
 ///
 /// If the coordinator task has EXITED it can never republish a fresh
 /// generation, so deferral would silently never advance. This function then
 /// surfaces those codes as fatal, so the process restarts and rejoins from
 /// scratch. Any other non-zero code is always fatal.
+#[cfg(test)]
 fn commit_response_result(
     resp: &OffsetCommitResponse,
     coordinator_alive: bool,
 ) -> Result<(), ConsumerError> {
-    match first_commit_error(resp) {
-        0 => Ok(()),
-        22 | 25 | 27 if coordinator_alive => Ok(()),
-        code => Err(ConsumerError::Server(code)),
+    commit_response_outcome(resp, coordinator_alive).map(|_| ())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CommitOutcome {
+    Acked(HashSet<(String, i32)>),
+    Deferred {
+        code: i16,
+        acknowledged: HashSet<(String, i32)>,
+    },
+}
+
+fn commit_response_outcome(
+    resp: &OffsetCommitResponse,
+    coordinator_alive: bool,
+) -> Result<CommitOutcome, ConsumerError> {
+    let mut deferred = None;
+    let mut acknowledged = HashSet::new();
+    for topic in &resp.topics {
+        for partition in &topic.partitions {
+            match partition.error_code {
+                0 => {
+                    acknowledged.insert((topic.name.clone(), partition.partition_index));
+                }
+                code @ (22 | 25 | 27) if coordinator_alive => {
+                    deferred.get_or_insert(code);
+                }
+                code => return Err(ConsumerError::Server(code)),
+            }
+        }
     }
+    Ok(match deferred {
+        Some(code) => CommitOutcome::Deferred { code, acknowledged },
+        None => CommitOutcome::Acked(acknowledged),
+    })
+}
+
+fn retain_continuously_owned(
+    pending: &mut HashMap<(String, i32), (i64, u64)>,
+    current: &HashMap<(String, i32), u64>,
+) {
+    pending.retain(|partition, (_, ownership_id)| current.get(partition) == Some(ownership_id));
 }
 
 impl Consumer {
@@ -158,14 +203,26 @@ impl Consumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn commit_sync(&self) -> Result<(), ConsumerError> {
-        let Some((partitions, topics)) =
-            snapshot_commit_topics(&self.next_offsets, &self.positions, &self.topic_ids).await
-        else {
-            return Ok(());
+        let _commit_guard = self.commit_serialization.lock().await;
+        let pending = {
+            let identity = self.commit_identity.lock().await;
+            let offsets = self.next_offsets.lock().await;
+            offsets
+                .iter()
+                .filter_map(|(partition, offset)| {
+                    identity
+                        .ownership_ids
+                        .get(partition)
+                        .map(|ownership_id| (partition.clone(), (*offset, *ownership_id)))
+                })
+                .collect::<HashMap<_, _>>()
         };
-        tracing::Span::current().record("partitions", partitions);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        tracing::Span::current().record("partitions", pending.len());
 
-        self.commit_topics_sync(topics).await
+        self.commit_pending_offsets(pending).await
     }
 
     /// Commit caller-selected next offsets for currently assigned partitions.
@@ -174,31 +231,106 @@ impl Consumer {
     ///
     /// # Errors
     ///
+    /// `Ok(())` means each requested offset was broker-acknowledged while this
+    /// consumer continuously owned its partition, or that ownership ended and
+    /// the new owner will safely replay from the prior committed offset.
+    ///
     /// Returns an error if an offset is negative, targets an unassigned
     /// partition, is ahead of the current consumed position, or the coordinator
-    /// rejects the commit.
+    /// rejects the commit with a non-rebalance error.
     pub async fn commit_offsets_sync(
         &self,
         offsets: HashMap<(String, i32), i64>,
     ) -> Result<(), ConsumerError> {
+        let _commit_guard = self.commit_serialization.lock().await;
         if offsets.is_empty() {
             return Ok(());
         }
-        let assigned = self.assigned.lock().await.clone();
-        let consumed_positions = self.next_offsets.lock().await.clone();
-        validate_selected_offsets(&offsets, &assigned, &consumed_positions)?;
+        let pending = {
+            let identity = self.commit_identity.lock().await;
+            let consumed_positions = self.next_offsets.lock().await;
+            let owned = identity.ownership_ids.keys().cloned().collect::<Vec<_>>();
+            validate_selected_offsets(&offsets, &owned, &consumed_positions)?;
+            offsets
+                .into_iter()
+                .map(|(partition, offset)| {
+                    let ownership_id = identity.ownership_ids[&partition];
+                    (partition, (offset, ownership_id))
+                })
+                .collect::<HashMap<_, _>>()
+        };
 
-        let position_epochs = self.positions.lock().await.clone();
-        let offsets = commit_offsets(offsets, &position_epochs);
-        let topic_ids = self.topic_ids.lock().await.clone();
-        let topics = build_commit_topics(offsets, &topic_ids);
-        self.commit_topics_sync(topics).await
+        self.commit_pending_offsets(pending).await
     }
 
-    async fn commit_topics_sync(
+    async fn commit_pending_offsets(
+        &self,
+        mut pending: HashMap<(String, i32), (i64, u64)>,
+    ) -> Result<(), ConsumerError> {
+        loop {
+            let identity = self.commit_identity.lock().await.clone();
+            retain_continuously_owned(&mut pending, &identity.ownership_ids);
+            if pending.is_empty() {
+                return Ok(());
+            }
+
+            let mut assignment_changed = Box::pin(self.assignment_changed.notified());
+            assignment_changed.as_mut().enable();
+            let position_epochs = self.positions.lock().await.clone();
+            let offsets = commit_offsets(
+                pending
+                    .iter()
+                    .map(|(partition, (offset, _))| (partition.clone(), *offset))
+                    .collect(),
+                &position_epochs,
+            );
+            let topic_ids = self.topic_ids.lock().await.clone();
+            let topics = build_commit_topics(offsets, &topic_ids);
+            match self
+                .commit_topics_once(topics, (identity.generation, identity.member_id.clone()))
+                .await?
+            {
+                CommitOutcome::Acked(acknowledged) => {
+                    pending.retain(|partition, _| !acknowledged.contains(partition));
+                    if pending.is_empty() {
+                        return Ok(());
+                    }
+                    return Err(ConsumerError::IllegalState(
+                        "offset commit response omitted requested partitions".into(),
+                    ));
+                }
+                CommitOutcome::Deferred { code, acknowledged } => {
+                    tracing::warn!(
+                        group = %self.group_id,
+                        error_code = code,
+                        "offset commit deferred until the coordinator rejoins",
+                    );
+                    pending.retain(|partition, _| !acknowledged.contains(partition));
+                    let current_identity = self.commit_identity.lock().await.clone();
+                    retain_continuously_owned(&mut pending, &current_identity.ownership_ids);
+                    if pending.is_empty() {
+                        return Ok(());
+                    }
+                    if current_identity.generation == identity.generation
+                        && current_identity.member_id == identity.member_id
+                    {
+                        tokio::select! {
+                            () = &mut assignment_changed => {}
+                            () = self.coordinator_shutdown.cancelled() => {
+                                return Err(ConsumerError::Server(code));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn commit_topics_once(
         &self,
         topics: Vec<OffsetCommitRequestTopic>,
-    ) -> Result<(), ConsumerError> {
+        identity: (i32, String),
+    ) -> Result<CommitOutcome, ConsumerError> {
         // OffsetCommit is a coordinator RPC: route it to the coordinator broker
         // (discovered at build time, kept current by the coordinator task), and
         // re-discover on a cold/relocating-coordinator code so a coordinator
@@ -211,17 +343,18 @@ impl Consumer {
             first_commit_error,
             || {
                 let group_id = self.group_id.clone();
-                let member_id = self.member_id.clone();
                 let group_instance_id = self.group_instance_id.clone();
                 let topics = topics.clone();
                 let client = &self.client;
                 let target = self.coordinator_id.load(Ordering::Relaxed);
+                let identity = identity.clone();
                 async move {
+                    let (generation, member_id) = identity;
                     client
                         .broker(target)
                         .send(build_commit_request(
                             group_id,
-                            self.current_generation.load(Ordering::Relaxed),
+                            generation,
                             member_id,
                             group_instance_id,
                             topics,
@@ -244,15 +377,15 @@ impl Consumer {
             .coordinator_handle
             .as_ref()
             .is_none_or(|h| !h.is_finished());
-        let code = first_commit_error(&resp);
-        if (code == 22 || code == 27) && coordinator_alive {
+        let outcome = commit_response_outcome(&resp, coordinator_alive)?;
+        if let CommitOutcome::Deferred { code, .. } = outcome {
             tracing::warn!(
                 group = %self.group_id,
                 error_code = code,
                 "offset commit deferred: group rebalancing; will recommit after the coordinator rejoins",
             );
         }
-        commit_response_result(&resp, coordinator_alive)
+        Ok(outcome)
     }
 
     /// Fire-and-forget commit.
@@ -274,8 +407,8 @@ impl Consumer {
     pub fn commit_async(&self) {
         let client = self.client.clone();
         let group_id = self.group_id.clone();
-        let generation = self.current_generation.load(Ordering::Relaxed);
-        let member_id = self.member_id.clone();
+        let commit_identity = Arc::clone(&self.commit_identity);
+        let commit_serialization = Arc::clone(&self.commit_serialization);
         let group_instance_id = self.group_instance_id.clone();
         let offsets = Arc::clone(&self.next_offsets);
         let positions = Arc::clone(&self.positions);
@@ -283,7 +416,9 @@ impl Consumer {
         let coordinator_id = Arc::clone(&self.coordinator_id);
         let retry_policy = self.retry_policy;
         tokio::spawn(async move {
-            let Some((_, topics)) = snapshot_commit_topics(&offsets, &positions, &topic_ids).await
+            let _commit_guard = commit_serialization.lock().await;
+            let Some((_, topics, (generation, member_id))) =
+                snapshot_commit_topics(&commit_identity, &offsets, &positions, &topic_ids).await
             else {
                 return;
             };
@@ -330,17 +465,26 @@ impl Consumer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
+
     use assert2::check;
+    use krabka_client_core::{Client, MockBroker};
     use krabka_protocol::{
-        UnknownTaggedFields,
+        Encode, UnknownTaggedFields,
         owned::{
+            api_versions_request,
+            api_versions_response::{ApiVersion, ApiVersionsResponse},
+            offset_commit_request,
             offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
             offset_commit_response::{OffsetCommitResponsePartition, OffsetCommitResponseTopic},
         },
         primitives::uuid::Uuid,
     };
+    use krabka_units::secs;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::{Assignor, AutoOffsetReset, IsolationLevel, consumer::ConsumerRetryPolicy};
 
     fn response(errors: &[i16]) -> OffsetCommitResponse {
         OffsetCommitResponse {
@@ -363,6 +507,210 @@ mod tests {
             }],
             unknown_tagged_fields: UnknownTaggedFields::default(),
         }
+    }
+
+    fn encode_response(response: &OffsetCommitResponse, version: i16) -> Vec<u8> {
+        let mut buf = bytes::BytesMut::new();
+        response.encode(&mut buf, version).unwrap();
+        buf.to_vec()
+    }
+
+    fn api_versions() -> Vec<u8> {
+        let response = ApiVersionsResponse {
+            error_code: 0,
+            api_keys: vec![
+                ApiVersion {
+                    api_key: api_versions_request::API_KEY,
+                    min_version: 0,
+                    max_version: 3,
+                    ..Default::default()
+                },
+                ApiVersion {
+                    api_key: offset_commit_request::API_KEY,
+                    min_version: 2,
+                    max_version: 2,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        response.encode(&mut buf, 0).unwrap();
+        buf.to_vec()
+    }
+
+    fn request_generation(body: &[u8]) -> i32 {
+        fn string_end(body: &[u8], start: usize) -> usize {
+            let len = i16::from_be_bytes([body[start], body[start + 1]]);
+            start + 2 + usize::try_from(len.max(0)).unwrap()
+        }
+        let group_start = string_end(body, 0);
+        let generation_start = string_end(body, group_start);
+        i32::from_be_bytes(
+            body[generation_start..generation_start + 4]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn request_member_id(body: &[u8]) -> String {
+        fn string(body: &[u8], start: usize) -> (usize, String) {
+            let len =
+                usize::try_from(i16::from_be_bytes([body[start], body[start + 1]]).max(0)).unwrap();
+            let end = start + 2 + len;
+            (
+                end,
+                String::from_utf8(body[start + 2..end].to_vec()).unwrap(),
+            )
+        }
+        let (group_start, _) = string(body, 0);
+        let (generation_start, _) = string(body, group_start);
+        let (_, member_id) = string(body, generation_start + 4);
+        member_id
+    }
+
+    fn request_offsets(body: &[u8]) -> Vec<(i32, i64)> {
+        fn string_end(body: &[u8], start: usize) -> usize {
+            let len = i16::from_be_bytes([body[start], body[start + 1]]);
+            start + 2 + usize::try_from(len.max(0)).unwrap()
+        }
+        fn i32_at(body: &[u8], start: usize) -> i32 {
+            i32::from_be_bytes(body[start..start + 4].try_into().unwrap())
+        }
+        fn i64_at(body: &[u8], start: usize) -> i64 {
+            i64::from_be_bytes(body[start..start + 8].try_into().unwrap())
+        }
+
+        let mut cursor = string_end(body, 0);
+        cursor = string_end(body, cursor);
+        cursor += 4;
+        cursor = string_end(body, cursor);
+        cursor += 8;
+        let topic_count = usize::try_from(i32_at(body, cursor)).unwrap();
+        cursor += 4;
+        let mut offsets = Vec::new();
+        for _ in 0..topic_count {
+            cursor = string_end(body, cursor);
+            let partition_count = usize::try_from(i32_at(body, cursor)).unwrap();
+            cursor += 4;
+            for _ in 0..partition_count {
+                offsets.push((i32_at(body, cursor), i64_at(body, cursor + 4)));
+                cursor += 12;
+                cursor = string_end(body, cursor);
+            }
+        }
+        offsets
+    }
+
+    fn commit_identity(generation: i32, member_id: &str) -> Arc<Mutex<CommitIdentity>> {
+        Arc::new(Mutex::new(CommitIdentity {
+            generation,
+            member_id: member_id.into(),
+            ownership_ids: HashMap::from([(("topic".into(), 0), 1)]),
+        }))
+    }
+
+    async fn selected_commit_consumer(
+        commit_identity: Arc<Mutex<CommitIdentity>>,
+        assignment_changed: Arc<tokio::sync::Notify>,
+        generation: Arc<AtomicI32>,
+        requests: Arc<AtomicUsize>,
+        mixed_response: bool,
+        on_first_request: impl Fn(&Arc<Mutex<CommitIdentity>>, &Arc<AtomicI32>, i32, &str)
+        + Send
+        + 'static,
+    ) -> (Consumer, MockBroker, Arc<std::sync::Mutex<Vec<(i32, i64)>>>) {
+        let identity_in_mock = Arc::clone(&commit_identity);
+        let generation_in_mock = Arc::clone(&generation);
+        let changed_in_mock = Arc::clone(&assignment_changed);
+        let requests_in_mock = Arc::clone(&requests);
+        let seen_offsets = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_offsets_in_mock = Arc::clone(&seen_offsets);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions());
+            }
+            if api_key != offset_commit_request::API_KEY {
+                return None;
+            }
+            let attempt = requests_in_mock.fetch_add(1, Ordering::SeqCst);
+            let offsets = request_offsets(body);
+            seen_offsets_in_mock.lock().unwrap().extend(&offsets);
+            let partitions = offsets
+                .iter()
+                .map(|(partition, _)| *partition)
+                .collect::<Vec<_>>();
+            if attempt == 0 {
+                on_first_request(
+                    &identity_in_mock,
+                    &generation_in_mock,
+                    request_generation(body),
+                    &request_member_id(body),
+                );
+                changed_in_mock.notify_waiters();
+                let errors = if mixed_response {
+                    vec![0, 27]
+                } else {
+                    vec![27]
+                };
+                Some(encode_response(&response(&errors), version))
+            } else {
+                let errors = if mixed_response && partitions != [1] {
+                    vec![42; partitions.len()]
+                } else {
+                    vec![0; partitions.len()]
+                };
+                let mut response = response(&errors);
+                for (partition, partition_index) in
+                    response.topics[0].partitions.iter_mut().zip(partitions)
+                {
+                    partition.partition_index = partition_index;
+                }
+                Some(encode_response(&response, version))
+            }
+        })
+        .await;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .unwrap();
+        let ownership = commit_identity.lock().await.ownership_ids.clone();
+        let assigned = ownership.keys().cloned().collect::<Vec<_>>();
+        let next_offsets = ownership
+            .keys()
+            .cloned()
+            .map(|partition| (partition, 12))
+            .collect();
+        let consumer = Consumer {
+            client,
+            group_id: "group-a".into(),
+            coordinator_id: Arc::new(AtomicI32::new(0)),
+            retry_policy: ConsumerRetryPolicy::default().into(),
+            member_id: "member-a".into(),
+            commit_identity,
+            commit_serialization: Arc::new(Mutex::new(())),
+            group_instance_id: None,
+            current_generation: generation,
+            subscribed_topics: vec!["topic".into()],
+            assigned: Arc::new(Mutex::new(assigned)),
+            assignment_changed,
+            next_offsets: Arc::new(Mutex::new(next_offsets)),
+            positions: Arc::new(Mutex::new(HashMap::new())),
+            pending_seeks: Arc::new(Mutex::new(HashMap::new())),
+            topic_ids: Arc::new(Mutex::new(HashMap::new())),
+            session_timeout: secs(45),
+            heartbeat_interval: secs(3),
+            assignor: Assignor::Range,
+            coordinator_shutdown: CancellationToken::new(),
+            coordinator_handle: None,
+            isolation_level: IsolationLevel::ReadUncommitted,
+            fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
+            fetch_max: crate::poll::DEFAULT_FETCH_MAX,
+            fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
+            auto_offset_reset: AutoOffsetReset::Latest,
+        };
+        (consumer, mock, seen_offsets)
     }
 
     #[test]
@@ -429,17 +777,23 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_commit_topics_returns_none_for_empty_offsets() {
+        let identity = commit_identity(7, "member-a");
         let offsets = Arc::new(Mutex::new(HashMap::new()));
         let positions = Arc::new(Mutex::new(HashMap::new()));
         let topic_ids = Arc::new(Mutex::new(HashMap::new()));
 
-        let snapshot = snapshot_commit_topics(&offsets, &positions, &topic_ids).await;
+        let snapshot = snapshot_commit_topics(&identity, &offsets, &positions, &topic_ids).await;
 
         assert2::assert!(snapshot.is_none());
     }
 
     #[tokio::test]
     async fn snapshot_commit_topics_preserves_count_topics_offsets_and_epochs() {
+        let identity = Arc::new(Mutex::new(CommitIdentity {
+            generation: 7,
+            member_id: "member-a".into(),
+            ownership_ids: HashMap::from([(("alpha".into(), 0), 1), (("alpha".into(), 1), 2)]),
+        }));
         let offsets = Arc::new(Mutex::new(HashMap::from([
             (("alpha".to_string(), 0), 10),
             (("alpha".to_string(), 1), 20),
@@ -454,9 +808,10 @@ mod tests {
         let topic_id = Uuid([1; 16]);
         let topic_ids = Arc::new(Mutex::new(HashMap::from([("alpha".to_string(), topic_id)])));
 
-        let (partition_count, topics) = snapshot_commit_topics(&offsets, &positions, &topic_ids)
-            .await
-            .expect("non-empty offsets are snapshotted");
+        let (partition_count, topics, seen_identity) =
+            snapshot_commit_topics(&identity, &offsets, &positions, &topic_ids)
+                .await
+                .expect("non-empty offsets are snapshotted");
         let mut topics = topics;
         topics[0].partitions.sort_by_key(|p| p.partition_index);
 
@@ -487,6 +842,7 @@ mod tests {
                     }]
                 )
         );
+        assert2::assert!(seen_identity == (7, "member-a".into()));
     }
 
     #[test]
@@ -547,9 +903,9 @@ mod tests {
             ("rebalance after exit", &[27][..], false, Some(27)),
             (
                 "fatal error takes precedence",
-                &[16, 27][..],
+                &[27, 42][..],
                 true,
-                Some(16),
+                Some(42),
             ),
         ] {
             let actual = commit_response_result(&response(errors), coordinator_alive);
@@ -560,5 +916,269 @@ mod tests {
             };
             check!(actual_error == expected_error, "case {name}");
         }
+    }
+
+    #[tokio::test]
+    async fn selected_commit_retries_a_continuously_owned_partition_after_rejoin() {
+        let identity = commit_identity(7, "member-a");
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let generation = Arc::new(AtomicI32::new(7));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (consumer, mock, _) = selected_commit_consumer(
+            identity,
+            changed,
+            generation,
+            Arc::clone(&requests),
+            false,
+            |identity, generation, _request_generation, _request_member_id| {
+                identity.try_lock().unwrap().generation = 8;
+                generation.store(8, Ordering::Relaxed);
+            },
+        )
+        .await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            consumer.commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)])),
+        )
+        .await
+        .expect("selected commit completes after retained rejoin")
+        .expect("retained offset is acknowledged");
+
+        mock.stop();
+        assert2::assert!(requests.load(Ordering::SeqCst) == 2);
+    }
+
+    #[tokio::test]
+    async fn selected_commit_drops_revoked_or_reassigned_ownership_without_stale_retry() {
+        for reassigned in [false, true] {
+            let identity = commit_identity(7, "member-a");
+            let changed = Arc::new(tokio::sync::Notify::new());
+            let generation = Arc::new(AtomicI32::new(7));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let (consumer, mock, _) = selected_commit_consumer(
+                identity,
+                changed,
+                generation,
+                Arc::clone(&requests),
+                false,
+                move |identity, generation, _request_generation, _request_member_id| {
+                    let mut identity = identity.try_lock().expect("identity lock available");
+                    identity.ownership_ids.clear();
+                    if reassigned {
+                        identity.ownership_ids.insert(("topic".into(), 0), 2);
+                    }
+                    identity.generation = 8;
+                    generation.store(8, Ordering::Relaxed);
+                },
+            )
+            .await;
+
+            consumer
+                .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+                .await
+                .expect("revocation safely ends the old ownership commit");
+
+            mock.stop();
+            check!(
+                requests.load(Ordering::SeqCst) == 1,
+                "reassigned={reassigned}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_commit_registers_rejoin_notification_before_sending() {
+        let identity = commit_identity(7, "member-a");
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let generation = Arc::new(AtomicI32::new(7));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (consumer, mock, _) = selected_commit_consumer(
+            identity,
+            changed,
+            generation,
+            Arc::clone(&requests),
+            false,
+            |_ownership, _generation, _request_generation, _request_member_id| {},
+        )
+        .await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            consumer.commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)])),
+        )
+        .await
+        .expect("notification sent before response is not lost")
+        .expect("selected offset is acknowledged on retry");
+
+        mock.stop();
+        assert2::assert!(requests.load(Ordering::SeqCst) == 2);
+    }
+
+    #[tokio::test]
+    async fn selected_commit_uses_snapshot_generation_if_ownership_changes_before_rpc() {
+        let identity = commit_identity(7, "member-a");
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let generation = Arc::new(AtomicI32::new(7));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen_generation = Arc::new(AtomicI32::new(-1));
+        let seen_in_mock = Arc::clone(&seen_generation);
+        let (consumer, mock, _) = selected_commit_consumer(
+            Arc::clone(&identity),
+            changed,
+            Arc::clone(&generation),
+            requests,
+            false,
+            move |_ownership, _generation, request_generation, _request_member_id| {
+                seen_in_mock.store(request_generation, Ordering::Relaxed);
+            },
+        )
+        .await;
+        let mut changed_identity = identity.lock().await;
+        changed_identity
+            .ownership_ids
+            .insert(("topic".into(), 0), 2);
+        changed_identity.generation = 8;
+        drop(changed_identity);
+        generation.store(8, Ordering::Relaxed);
+        let topics = build_commit_topics(
+            commit_offsets(HashMap::from([(("topic".into(), 0), 12)]), &HashMap::new()),
+            &HashMap::new(),
+        );
+
+        let outcome = consumer
+            .commit_topics_once(topics, (7, "member-a".into()))
+            .await
+            .expect("rebalance response is deferred");
+
+        mock.stop();
+        assert2::assert!(
+            outcome
+                == CommitOutcome::Deferred {
+                    code: 27,
+                    acknowledged: HashSet::new(),
+                }
+        );
+        assert2::assert!(seen_generation.load(Ordering::Relaxed) == 7);
+    }
+
+    #[tokio::test]
+    async fn selected_commit_uses_live_member_id_after_from_scratch_rejoin() {
+        let identity = commit_identity(8, "member-new");
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let generation = Arc::new(AtomicI32::new(7));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen_new_member = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_in_mock = Arc::clone(&seen_new_member);
+        let (consumer, mock, _) = selected_commit_consumer(
+            identity,
+            changed,
+            generation,
+            requests,
+            false,
+            move |_identity, generation, _request_generation, request_member_id| {
+                seen_in_mock.store(request_member_id == "member-new", Ordering::Relaxed);
+                generation.store(8, Ordering::Release);
+            },
+        )
+        .await;
+        consumer
+            .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+            .await
+            .expect("selected commit retries with live member identity");
+
+        mock.stop();
+        assert2::assert!(seen_new_member.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn bulk_commit_retries_only_deferred_partitions_from_a_mixed_response() {
+        let identity = Arc::new(Mutex::new(CommitIdentity {
+            generation: 7,
+            member_id: "member-a".into(),
+            ownership_ids: HashMap::from([(("topic".into(), 0), 1), (("topic".into(), 1), 2)]),
+        }));
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let generation = Arc::new(AtomicI32::new(7));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (consumer, mock, _) = selected_commit_consumer(
+            identity,
+            changed,
+            generation,
+            Arc::clone(&requests),
+            true,
+            |identity, generation, _request_generation, _request_member_id| {
+                identity.try_lock().unwrap().generation = 8;
+                generation.store(8, Ordering::Relaxed);
+            },
+        )
+        .await;
+
+        consumer
+            .commit_sync()
+            .await
+            .expect("the deferred partition is acknowledged on retry");
+
+        mock.stop();
+        assert2::assert!(requests.load(Ordering::SeqCst) == 2);
+    }
+
+    #[tokio::test]
+    async fn deferred_commit_finishes_before_a_newer_commit_for_the_same_partition() {
+        let identity = commit_identity(7, "member-a");
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let generation = Arc::new(AtomicI32::new(7));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (consumer, mock, seen_offsets) = selected_commit_consumer(
+            identity,
+            changed,
+            generation,
+            requests,
+            false,
+            |identity, generation, _request_generation, _request_member_id| {
+                identity.try_lock().unwrap().generation = 8;
+                generation.store(8, Ordering::Relaxed);
+            },
+        )
+        .await;
+        let consumer = Arc::new(consumer);
+        let blocker = Arc::clone(&consumer.commit_serialization)
+            .lock_owned()
+            .await;
+        let older = {
+            let consumer = Arc::clone(&consumer);
+            tokio::spawn(async move {
+                consumer
+                    .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 10)]))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let newer = {
+            let consumer = Arc::clone(&consumer);
+            tokio::spawn(async move {
+                consumer
+                    .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(blocker);
+
+        older.await.unwrap().unwrap();
+        newer.await.unwrap().unwrap();
+
+        mock.stop();
+        assert2::assert!(*seen_offsets.lock().unwrap() == vec![(0, 10), (0, 10), (0, 12)]);
+    }
+
+    #[test]
+    fn selected_commit_topics_exclude_unrequested_assignment_positions() {
+        let selected = commit_offsets(HashMap::from([(("topic".into(), 0), 12)]), &HashMap::new());
+        let topics = build_commit_topics(selected, &HashMap::new());
+
+        assert2::assert!(topics.len() == 1);
+        assert2::assert!(topics[0].partitions.len() == 1);
+        assert2::assert!(topics[0].partitions[0].partition_index == 0);
     }
 }
