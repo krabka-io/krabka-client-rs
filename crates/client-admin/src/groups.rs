@@ -59,19 +59,32 @@ impl AdminClient {
         offsets: &BTreeMap<(String, i32), i64>,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
         self.reconnect_group_coordinator(group).await?;
+        let topic_ids = self.topic_ids().await?;
+        let topic_names = topic_ids
+            .iter()
+            .map(|(name, id)| (*id, name.clone()))
+            .collect::<HashMap<_, _>>();
         let response = self
             .conn
-            .send(offset_commit_request(group, offsets))
+            .send(offset_commit_request(group, offsets, &topic_ids))
             .await?;
         Ok(response
             .topics
             .into_iter()
             .flat_map(|topic| {
+                let name = if topic.name.is_empty() {
+                    topic_names
+                        .get(&topic.topic_id)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    topic.name
+                };
                 topic
                     .partitions
                     .into_iter()
                     .map(move |partition| ConsumerGroupOffsetOutcome {
-                        topic: topic.name.clone(),
+                        topic: name.clone(),
                         partition: partition.partition_index,
                         error: kafka_error_if(partition.error_code, None),
                     })
@@ -154,19 +167,12 @@ impl AdminClient {
         // all topics). At OffsetFetch v10 the response omits names, so this is
         // how empty-named entries below recover their topic; at v8/v9 names are
         // already present and the per-entry resolution simply ignores this map.
-        let id_to_name: HashMap<WireUuid, String> = {
-            let meta = self.conn.send(MetadataRequest::default()).await?;
-            meta.topics
-                .into_iter()
-                .filter_map(|t| {
-                    if t.topic_id == WireUuid::ZERO {
-                        None
-                    } else {
-                        t.name.map(|n| (t.topic_id, n))
-                    }
-                })
-                .collect()
-        };
+        let id_to_name = self
+            .topic_ids()
+            .await?
+            .into_iter()
+            .map(|(name, id)| (id, name))
+            .collect::<HashMap<_, _>>();
 
         let mut out = BTreeMap::new();
         for e in raw {
@@ -192,11 +198,29 @@ impl AdminClient {
         self.reconnect(&format_host_port(&coordinator.host, coordinator.port))
             .await
     }
+
+    async fn topic_ids(&self) -> Result<HashMap<String, WireUuid>, AdminError> {
+        Ok(self
+            .conn
+            .send(MetadataRequest::default())
+            .await?
+            .topics
+            .into_iter()
+            .filter_map(|topic| {
+                if topic.topic_id == WireUuid::ZERO {
+                    None
+                } else {
+                    topic.name.map(|name| (name, topic.topic_id))
+                }
+            })
+            .collect())
+    }
 }
 
 fn offset_commit_request(
     group: &str,
     offsets: &BTreeMap<(String, i32), i64>,
+    topic_ids: &HashMap<String, WireUuid>,
 ) -> OffsetCommitRequest {
     let mut topics = BTreeMap::<String, Vec<OffsetCommitRequestPartition>>::new();
     for ((topic, partition), offset) in offsets {
@@ -218,6 +242,7 @@ fn offset_commit_request(
         topics: topics
             .into_iter()
             .map(|(name, partitions)| OffsetCommitRequestTopic {
+                topic_id: topic_ids.get(&name).copied().unwrap_or_default(),
                 name,
                 partitions,
                 ..Default::default()
@@ -235,21 +260,26 @@ mod tests {
     };
 
     use assert2::assert;
-    use bytes::BytesMut;
+    use bytes::{Buf, BytesMut};
     use krabka_client_core::MockBroker;
     use krabka_protocol::{
-        Encode,
+        Decode, Encode,
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             find_coordinator_request,
             find_coordinator_response::FindCoordinatorResponse,
             metadata_request,
-            metadata_response::MetadataResponse,
+            metadata_response::{MetadataResponse, MetadataResponseTopic},
             offset_commit_request,
-            offset_commit_response::OffsetCommitResponse,
+            offset_commit_response::{
+                OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+            },
             offset_fetch_request,
-            offset_fetch_response::{OffsetFetchResponse, OffsetFetchResponseGroup},
+            offset_fetch_response::{
+                OffsetFetchResponse, OffsetFetchResponseGroup, OffsetFetchResponsePartitions,
+                OffsetFetchResponseTopics,
+            },
         },
     };
 
@@ -258,11 +288,17 @@ mod tests {
     #[test]
     fn offset_reset_builds_admin_commit() {
         let offsets = BTreeMap::from([(("orders".into(), 2), 41)]);
-        let request = offset_commit_request("worker", &offsets);
+        let topic_id = WireUuid([7; 16]);
+        let request = offset_commit_request(
+            "worker",
+            &offsets,
+            &HashMap::from([("orders".into(), topic_id)]),
+        );
         let expected = OffsetCommitRequest {
             group_id: "worker".into(),
             topics: vec![OffsetCommitRequestTopic {
                 name: "orders".into(),
+                topic_id,
                 partitions: vec![OffsetCommitRequestPartition {
                     partition_index: 2,
                     committed_offset: 41,
@@ -302,20 +338,20 @@ mod tests {
                     },
                     ApiVersion {
                         api_key: offset_commit_request::API_KEY,
-                        min_version: 2,
-                        max_version: 2,
+                        min_version: 10,
+                        max_version: 10,
                         ..Default::default()
                     },
                     ApiVersion {
                         api_key: offset_fetch_request::API_KEY,
-                        min_version: 8,
-                        max_version: 8,
+                        min_version: 10,
+                        max_version: 10,
                         ..Default::default()
                     },
                     ApiVersion {
                         api_key: metadata_request::API_KEY,
-                        min_version: 0,
-                        max_version: 0,
+                        min_version: 13,
+                        max_version: 13,
                         ..Default::default()
                     },
                 ],
@@ -328,20 +364,31 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_offset_rpcs_use_the_group_coordinator() {
+        let topic_id = WireUuid([7; 16]);
+        let commit_used_topic_id = Arc::new(AtomicUsize::new(0));
+        let used_topic_id = Arc::clone(&commit_used_topic_id);
         let coordinator_group_rpcs = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&coordinator_group_rpcs);
-        let coordinator = MockBroker::start(move |api_key, version, _, _| match api_key {
+        let coordinator = MockBroker::start(move |api_key, version, _, mut body| match api_key {
             api_versions_request::API_KEY => Some(api_versions()),
             offset_commit_request::API_KEY => {
                 seen.fetch_add(1, Ordering::SeqCst);
-                Some(encode(&OffsetCommitResponse::default(), version, false))
-            }
-            offset_fetch_request::API_KEY => {
-                seen.fetch_add(1, Ordering::SeqCst);
+                let client_id_len = body.get_i16();
+                body.advance(usize::try_from(client_id_len).expect("client id length"));
+                body.advance(1);
+                let request = OffsetCommitRequest::decode(&mut body, version)
+                    .expect("offset commit request decodes");
+                if request.topics[0].topic_id == topic_id {
+                    used_topic_id.fetch_add(1, Ordering::SeqCst);
+                }
                 Some(encode(
-                    &OffsetFetchResponse {
-                        groups: vec![OffsetFetchResponseGroup {
-                            group_id: "workers".into(),
+                    &OffsetCommitResponse {
+                        topics: vec![OffsetCommitResponseTopic {
+                            topic_id,
+                            partitions: vec![OffsetCommitResponsePartition {
+                                partition_index: 2,
+                                ..Default::default()
+                            }],
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -350,7 +397,41 @@ mod tests {
                     true,
                 ))
             }
-            metadata_request::API_KEY => Some(encode(&MetadataResponse::default(), version, false)),
+            offset_fetch_request::API_KEY => {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Some(encode(
+                    &OffsetFetchResponse {
+                        groups: vec![OffsetFetchResponseGroup {
+                            group_id: "workers".into(),
+                            topics: vec![OffsetFetchResponseTopics {
+                                topic_id,
+                                partitions: vec![OffsetFetchResponsePartitions {
+                                    partition_index: 2,
+                                    committed_offset: 41,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    version,
+                    true,
+                ))
+            }
+            metadata_request::API_KEY => Some(encode(
+                &MetadataResponse {
+                    topics: vec![MetadataResponseTopic {
+                        name: Some("orders".into()),
+                        topic_id,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                version,
+                true,
+            )),
             _ => None,
         })
         .await;
@@ -372,13 +453,13 @@ mod tests {
             )),
             offset_commit_request::API_KEY => {
                 wrong_broker.fetch_add(1, Ordering::SeqCst);
-                Some(encode(&OffsetCommitResponse::default(), version, false))
+                Some(encode(&OffsetCommitResponse::default(), version, true))
             }
             offset_fetch_request::API_KEY => {
                 wrong_broker.fetch_add(1, Ordering::SeqCst);
                 Some(encode(&OffsetFetchResponse::default(), version, true))
             }
-            metadata_request::API_KEY => Some(encode(&MetadataResponse::default(), version, false)),
+            metadata_request::API_KEY => Some(encode(&MetadataResponse::default(), version, true)),
             _ => None,
         })
         .await;
@@ -386,20 +467,23 @@ mod tests {
             .await
             .expect("admin connects");
 
-        admin
-            .alter_consumer_group_offsets("workers", &BTreeMap::new())
+        let committed = admin
+            .alter_consumer_group_offsets("workers", &BTreeMap::from([(("orders".into(), 2), 41)]))
             .await
             .expect("offset commit succeeds");
         let mut admin = AdminClient::connect(&[bootstrap.addr.to_string()])
             .await
             .expect("second admin connects");
-        admin
+        let fetched = admin
             .list_consumer_group_offsets("workers")
             .await
             .expect("offset fetch succeeds");
 
         assert!(bootstrap_group_rpcs.load(Ordering::SeqCst) == 0);
         assert!(coordinator_group_rpcs.load(Ordering::SeqCst) == 2);
+        assert!(commit_used_topic_id.load(Ordering::SeqCst) == 1);
+        assert!(committed[0].topic == "orders");
+        assert!(fetched == BTreeMap::from([(("orders".into(), 2), 41)]));
         bootstrap.stop();
         coordinator.stop();
     }
