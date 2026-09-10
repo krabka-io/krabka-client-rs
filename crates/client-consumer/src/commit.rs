@@ -139,7 +139,7 @@ fn commit_response_result(
     resp: &OffsetCommitResponse,
     coordinator_alive: bool,
 ) -> Result<(), ConsumerError> {
-    commit_response_outcome(resp, coordinator_alive).map(|_| ())
+    commit_response_outcome(resp, coordinator_alive, &HashMap::new()).map(|_| ())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,14 +154,23 @@ enum CommitOutcome {
 fn commit_response_outcome(
     resp: &OffsetCommitResponse,
     coordinator_alive: bool,
+    topic_names: &HashMap<WireUuid, String>,
 ) -> Result<CommitOutcome, ConsumerError> {
     let mut deferred = None;
     let mut acknowledged = HashSet::new();
     for topic in &resp.topics {
+        let name = if topic.name.is_empty() {
+            topic_names
+                .get(&topic.topic_id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            topic.name.clone()
+        };
         for partition in &topic.partitions {
             match partition.error_code {
                 0 => {
-                    acknowledged.insert((topic.name.clone(), partition.partition_index));
+                    acknowledged.insert((name.clone(), partition.partition_index));
                 }
                 code @ (22 | 25 | 27) if coordinator_alive => {
                     deferred.get_or_insert(code);
@@ -331,6 +340,10 @@ impl Consumer {
         topics: Vec<OffsetCommitRequestTopic>,
         identity: (i32, String),
     ) -> Result<CommitOutcome, ConsumerError> {
+        let topic_names = topics
+            .iter()
+            .map(|topic| (topic.topic_id, topic.name.clone()))
+            .collect::<HashMap<_, _>>();
         // OffsetCommit is a coordinator RPC: route it to the coordinator broker
         // (discovered at build time, kept current by the coordinator task), and
         // re-discover on a cold/relocating-coordinator code so a coordinator
@@ -377,7 +390,7 @@ impl Consumer {
             .coordinator_handle
             .as_ref()
             .is_none_or(|h| !h.is_finished());
-        let outcome = commit_response_outcome(&resp, coordinator_alive)?;
+        let outcome = commit_response_outcome(&resp, coordinator_alive, &topic_names)?;
         if let CommitOutcome::Deferred { code, .. } = outcome {
             tracing::warn!(
                 group = %self.group_id,
@@ -916,6 +929,33 @@ mod tests {
             };
             check!(actual_error == expected_error, "case {name}");
         }
+    }
+
+    #[test]
+    fn commit_response_resolves_v10_topic_ids_before_matching_acknowledgements() {
+        let topic_id = Uuid([7; 16]);
+        let response = OffsetCommitResponse {
+            topics: vec![OffsetCommitResponseTopic {
+                name: String::new(),
+                topic_id,
+                partitions: vec![OffsetCommitResponsePartition {
+                    partition_index: 3,
+                    error_code: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let outcome = commit_response_outcome(
+            &response,
+            true,
+            &HashMap::from([(topic_id, "topic".to_string())]),
+        )
+        .expect("v10 acknowledgement is successful");
+
+        assert2::assert!(outcome == CommitOutcome::Acked(HashSet::from([("topic".into(), 3)])));
     }
 
     #[tokio::test]
