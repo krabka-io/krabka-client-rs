@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use krabka_client_core::{CoordinatorKeyType, build_find_coordinator, coordinator_endpoint};
 use krabka_protocol::{
     owned::{
         list_groups_request::ListGroupsRequest,
@@ -27,7 +28,9 @@ use krabka_protocol::{
     primitives::uuid::Uuid as WireUuid,
 };
 
-use crate::{AdminClient, AdminError, KafkaError, kafka_error_if, kafka_error_name};
+use crate::{
+    AdminClient, AdminError, KafkaError, format_host_port, kafka_error_if, kafka_error_name,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerGroupOffsetOutcome {
@@ -55,6 +58,7 @@ impl AdminClient {
         group: &str,
         offsets: &BTreeMap<(String, i32), i64>,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
+        self.reconnect_group_coordinator(group).await?;
         let response = self
             .conn
             .send(offset_commit_request(group, offsets))
@@ -108,6 +112,7 @@ impl AdminClient {
         &mut self,
         group: &str,
     ) -> Result<BTreeMap<(String, i32), i64>, AdminError> {
+        self.reconnect_group_coordinator(group).await?;
         let req = OffsetFetchRequest {
             groups: vec![OffsetFetchRequestGroup {
                 group_id: group.to_string(),
@@ -177,6 +182,16 @@ impl AdminClient {
         }
         Ok(out)
     }
+
+    async fn reconnect_group_coordinator(&mut self, group: &str) -> Result<(), AdminError> {
+        let response = self
+            .conn
+            .send(build_find_coordinator(group, CoordinatorKeyType::Group))
+            .await?;
+        let coordinator = coordinator_endpoint(group, response)?;
+        self.reconnect(&format_host_port(&coordinator.host, coordinator.port))
+            .await
+    }
 }
 
 fn offset_commit_request(
@@ -214,7 +229,29 @@ fn offset_commit_request(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use assert2::assert;
+    use bytes::BytesMut;
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
+        Encode,
+        owned::{
+            api_versions_request,
+            api_versions_response::{ApiVersion, ApiVersionsResponse},
+            find_coordinator_request,
+            find_coordinator_response::FindCoordinatorResponse,
+            metadata_request,
+            metadata_response::MetadataResponse,
+            offset_commit_request,
+            offset_commit_response::OffsetCommitResponse,
+            offset_fetch_request,
+            offset_fetch_response::{OffsetFetchResponse, OffsetFetchResponseGroup},
+        },
+    };
 
     use super::*;
 
@@ -236,5 +273,134 @@ mod tests {
             ..Default::default()
         };
         assert!(request == expected);
+    }
+
+    fn encode(response: &impl Encode, version: i16, flexible: bool) -> Vec<u8> {
+        let mut bytes = BytesMut::new();
+        if flexible {
+            bytes.extend_from_slice(&[0]);
+        }
+        response.encode(&mut bytes, version).unwrap();
+        bytes.to_vec()
+    }
+
+    fn api_versions() -> Vec<u8> {
+        encode(
+            &ApiVersionsResponse {
+                api_keys: vec![
+                    ApiVersion {
+                        api_key: api_versions_request::API_KEY,
+                        min_version: 0,
+                        max_version: 0,
+                        ..Default::default()
+                    },
+                    ApiVersion {
+                        api_key: find_coordinator_request::API_KEY,
+                        min_version: 0,
+                        max_version: 0,
+                        ..Default::default()
+                    },
+                    ApiVersion {
+                        api_key: offset_commit_request::API_KEY,
+                        min_version: 2,
+                        max_version: 2,
+                        ..Default::default()
+                    },
+                    ApiVersion {
+                        api_key: offset_fetch_request::API_KEY,
+                        min_version: 8,
+                        max_version: 8,
+                        ..Default::default()
+                    },
+                    ApiVersion {
+                        api_key: metadata_request::API_KEY,
+                        min_version: 0,
+                        max_version: 0,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            0,
+            false,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_offset_rpcs_use_the_group_coordinator() {
+        let coordinator_group_rpcs = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&coordinator_group_rpcs);
+        let coordinator = MockBroker::start(move |api_key, version, _, _| match api_key {
+            api_versions_request::API_KEY => Some(api_versions()),
+            offset_commit_request::API_KEY => {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Some(encode(&OffsetCommitResponse::default(), version, false))
+            }
+            offset_fetch_request::API_KEY => {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Some(encode(
+                    &OffsetFetchResponse {
+                        groups: vec![OffsetFetchResponseGroup {
+                            group_id: "workers".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    version,
+                    true,
+                ))
+            }
+            metadata_request::API_KEY => Some(encode(&MetadataResponse::default(), version, false)),
+            _ => None,
+        })
+        .await;
+
+        let bootstrap_group_rpcs = Arc::new(AtomicUsize::new(0));
+        let wrong_broker = Arc::clone(&bootstrap_group_rpcs);
+        let coordinator_addr = coordinator.addr;
+        let bootstrap = MockBroker::start(move |api_key, version, _, _| match api_key {
+            api_versions_request::API_KEY => Some(api_versions()),
+            find_coordinator_request::API_KEY => Some(encode(
+                &FindCoordinatorResponse {
+                    node_id: 2,
+                    host: coordinator_addr.ip().to_string(),
+                    port: i32::from(coordinator_addr.port()),
+                    ..Default::default()
+                },
+                version,
+                false,
+            )),
+            offset_commit_request::API_KEY => {
+                wrong_broker.fetch_add(1, Ordering::SeqCst);
+                Some(encode(&OffsetCommitResponse::default(), version, false))
+            }
+            offset_fetch_request::API_KEY => {
+                wrong_broker.fetch_add(1, Ordering::SeqCst);
+                Some(encode(&OffsetFetchResponse::default(), version, true))
+            }
+            metadata_request::API_KEY => Some(encode(&MetadataResponse::default(), version, false)),
+            _ => None,
+        })
+        .await;
+        let mut admin = AdminClient::connect(&[bootstrap.addr.to_string()])
+            .await
+            .expect("admin connects");
+
+        admin
+            .alter_consumer_group_offsets("workers", &BTreeMap::new())
+            .await
+            .expect("offset commit succeeds");
+        let mut admin = AdminClient::connect(&[bootstrap.addr.to_string()])
+            .await
+            .expect("second admin connects");
+        admin
+            .list_consumer_group_offsets("workers")
+            .await
+            .expect("offset fetch succeeds");
+
+        assert!(bootstrap_group_rpcs.load(Ordering::SeqCst) == 0);
+        assert!(coordinator_group_rpcs.load(Ordering::SeqCst) == 2);
+        bootstrap.stop();
+        coordinator.stop();
     }
 }
