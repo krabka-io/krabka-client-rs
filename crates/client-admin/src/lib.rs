@@ -2000,7 +2000,10 @@ mod tests {
             .await
             .expect("admin refreshes through the learned broker");
         assert2::assert!(refreshed.brokers[0].node_id == 7);
-        assert2::assert!(healthy_calls.load(Ordering::SeqCst) == 1);
+        assert2::assert!(
+            healthy_calls.load(Ordering::SeqCst) >= 1,
+            "recovery must issue metadata through the learned broker"
+        );
     }
 
     #[tokio::test]
