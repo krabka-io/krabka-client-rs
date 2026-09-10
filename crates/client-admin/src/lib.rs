@@ -20,6 +20,7 @@ use krabka_client_core::{
 use krabka_units::{Time, convert::TimeExt as _, secs};
 use thiserror::Error;
 
+pub mod brokers;
 pub mod configs;
 pub mod delegation_tokens;
 pub mod features;
@@ -38,13 +39,15 @@ pub struct MetadataVersionUpdate {
 }
 
 pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
+pub use features::{FeatureMetadata, FeatureRange, FeatureUpdate, FeatureUpdateOutcome};
+pub use groups::ConsumerGroupOffsetOutcome;
 pub use log_dirs::{AlterReplicaLogDirOutcome, LogDirInfo, LogDirPartitionInfo, LogDirTopicInfo};
 pub use quorum::{MetadataQuorum, QuorumReplica};
 pub use quotas::{QuotaOp, UserQuotaConfig, diff_user_quotas};
 pub use topics::{
     CreatePartitionsOp, CreatePartitionsOutcome, CreateTopicOutcome, CreateTopicSpec,
-    DeleteRecordsOp, DeleteRecordsOutcome, DeleteTopicOutcome, TopicMetadata, TopicMetadataEntry,
-    TopicReplicationStatus,
+    DeleteRecordsOp, DeleteRecordsOutcome, DeleteTopicOutcome, PartitionAssignment,
+    PartitionAssignmentOutcome, TopicMetadata, TopicMetadataEntry, TopicReplicationStatus,
 };
 pub use transactions::TransactionDescription;
 pub use users::{

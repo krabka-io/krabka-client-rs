@@ -15,7 +15,9 @@ use krabka_protocol::{
         },
         delete_topics_request::{DeleteTopicState, DeleteTopicsRequest},
         describe_cluster_request::DescribeClusterRequest,
-        list_partition_reassignments_request::ListPartitionReassignmentsRequest,
+        list_partition_reassignments_request::{
+            ListPartitionReassignmentsRequest, ListPartitionReassignmentsTopics,
+        },
         list_partition_reassignments_response::ListPartitionReassignmentsResponse,
         metadata_request::{MetadataRequest, MetadataRequestTopic},
         metadata_response::MetadataResponse,
@@ -102,7 +104,127 @@ pub enum TopicReplicationStatus {
     ReassignmentSubmitted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionAssignment {
+    pub topic: String,
+    pub partition: i32,
+    pub replicas: Vec<i32>,
+    pub adding_replicas: Vec<i32>,
+    pub removing_replicas: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionAssignmentOutcome {
+    pub topic: String,
+    pub partition: i32,
+    pub error: Option<KafkaError>,
+}
+
 impl AdminClient {
+    /// Returns current replica membership for every selected partition.
+    ///
+    /// Pass an empty topic slice to inspect the whole cluster before broker
+    /// evacuation.
+    ///
+    /// # Errors
+    /// Returns a transport or protocol error.
+    pub async fn describe_partition_assignments(
+        &mut self,
+        topics: &[&str],
+    ) -> Result<Vec<PartitionAssignment>, AdminError> {
+        let response: MetadataResponse = self.conn.send(build_metadata(topics)).await?;
+        Ok(response
+            .topics
+            .into_iter()
+            .flat_map(|topic| {
+                let name = topic.name.unwrap_or_default();
+                topic
+                    .partitions
+                    .into_iter()
+                    .map(move |partition| PartitionAssignment {
+                        topic: name.clone(),
+                        partition: partition.partition_index,
+                        replicas: partition.replica_nodes,
+                        adding_replicas: Vec::new(),
+                        removing_replicas: Vec::new(),
+                    })
+            })
+            .collect())
+    }
+
+    /// Lists active partition reassignments and their replica membership.
+    ///
+    /// An empty filter lists every active reassignment.
+    ///
+    /// # Errors
+    /// Returns a transport, protocol, or top-level broker error.
+    pub async fn list_partition_reassignments(
+        &mut self,
+        partitions: &BTreeMap<String, Vec<i32>>,
+        timeout: Time,
+    ) -> Result<Vec<PartitionAssignment>, AdminError> {
+        let response = self
+            .conn
+            .send(ListPartitionReassignmentsRequest {
+                timeout_ms: timeout.millis_i32(),
+                topics: (!partitions.is_empty()).then(|| {
+                    partitions
+                        .iter()
+                        .map(|(name, indexes)| ListPartitionReassignmentsTopics {
+                            name: name.clone(),
+                            partition_indexes: indexes.clone(),
+                            ..Default::default()
+                        })
+                        .collect()
+                }),
+                ..Default::default()
+            })
+            .await?;
+        broker_error(
+            "ListPartitionReassignments",
+            response.error_code,
+            response.error_message,
+        )?;
+        Ok(response
+            .topics
+            .into_iter()
+            .flat_map(|topic| {
+                topic
+                    .partitions
+                    .into_iter()
+                    .map(move |partition| PartitionAssignment {
+                        topic: topic.name.clone(),
+                        partition: partition.partition_index,
+                        replicas: partition.replicas,
+                        adding_replicas: partition.adding_replicas,
+                        removing_replicas: partition.removing_replicas,
+                    })
+            })
+            .collect())
+    }
+
+    /// Submits exact replica lists; `None` cancels an active reassignment.
+    ///
+    /// # Errors
+    /// Returns a transport, protocol, or top-level broker error.
+    pub async fn alter_partition_assignments(
+        &mut self,
+        assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
+        timeout: Time,
+    ) -> Result<Vec<PartitionAssignmentOutcome>, AdminError> {
+        let request = build_partition_assignment_request(assignments, timeout);
+        let first = self.conn.send(request.clone()).await?;
+        if first.error_code == NOT_CONTROLLER {
+            self.refresh_controller_connection().await?;
+            let second = self.conn.send(request).await?;
+            if second.error_code == NOT_CONTROLLER {
+                return Err(AdminError::NotControllerExhausted);
+            }
+            return parse_partition_assignment_response(second);
+        }
+        parse_partition_assignment_response(first)
+    }
+
     /// Metadata for the named topics. Pass an empty slice to fetch all
     /// topics, per Kafka semantics.
     ///
@@ -469,6 +591,60 @@ fn any_not_controller<T, F: Fn(&T) -> Option<&KafkaError>>(items: &[T], get_err:
         .any(|o| matches!(get_err(o), Some(e) if e.code == NOT_CONTROLLER))
 }
 
+fn build_partition_assignment_request(
+    assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
+    timeout: Time,
+) -> AlterPartitionReassignmentsRequest {
+    let mut topics = BTreeMap::<String, Vec<ReassignablePartition>>::new();
+    for ((topic, partition), replicas) in assignments {
+        topics
+            .entry(topic.clone())
+            .or_default()
+            .push(ReassignablePartition {
+                partition_index: *partition,
+                replicas: replicas.clone(),
+                ..Default::default()
+            });
+    }
+    AlterPartitionReassignmentsRequest {
+        timeout_ms: timeout.millis_i32(),
+        allow_replication_factor_change: true,
+        topics: topics
+            .into_iter()
+            .map(|(name, partitions)| ReassignableTopic {
+                name,
+                partitions,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn parse_partition_assignment_response(
+    response: AlterPartitionReassignmentsResponse,
+) -> Result<Vec<PartitionAssignmentOutcome>, AdminError> {
+    broker_error(
+        "AlterPartitionReassignments",
+        response.error_code,
+        response.error_message,
+    )?;
+    Ok(response
+        .responses
+        .into_iter()
+        .flat_map(|topic| {
+            topic
+                .partitions
+                .into_iter()
+                .map(move |partition| PartitionAssignmentOutcome {
+                    topic: topic.name.clone(),
+                    partition: partition.partition_index,
+                    error: kafka_error_if(partition.error_code, partition.error_message),
+                })
+        })
+        .collect())
+}
+
 fn build_metadata(topics: &[&str]) -> MetadataRequest {
     MetadataRequest {
         topics: if topics.is_empty() {
@@ -777,6 +953,29 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn exact_assignment_request_preserves_replica_order() {
+        let assignments = BTreeMap::from([(("orders".into(), 3), Some(vec![4, 2, 1]))]);
+        let request = build_partition_assignment_request(&assignments, krabka_units::secs(30));
+        assert2::assert!(
+            request
+                == AlterPartitionReassignmentsRequest {
+                    timeout_ms: 30_000,
+                    allow_replication_factor_change: true,
+                    topics: vec![ReassignableTopic {
+                        name: "orders".into(),
+                        partitions: vec![ReassignablePartition {
+                            partition_index: 3,
+                            replicas: Some(vec![4, 2, 1]),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+        );
+    }
 
     fn reassignment_metadata(assignments: &[&[i32]]) -> MetadataResponse {
         MetadataResponse {
