@@ -22,6 +22,10 @@ use crate::{
     position::PartitionPosition,
 };
 
+const ASYNC_COMMIT_IDLE: u8 = 0;
+const ASYNC_COMMIT_RUNNING: u8 = 1;
+const ASYNC_COMMIT_DIRTY: u8 = 2;
+
 /// First non-zero per-partition `error_code` in an `OffsetCommitResponse`, or
 /// `0` if every partition committed cleanly.
 ///
@@ -403,9 +407,10 @@ impl Consumer {
 
     /// Fire-and-forget commit.
     ///
-    /// This method returns once the request is enqueued on the client's writer
-    /// task. It does NOT wait for the broker ack. It logs errors and does not
-    /// return them.
+    /// This method returns after scheduling the latest offsets for a background
+    /// commit. Calls made while one is queued or running are coalesced into its
+    /// snapshot or one follow-up snapshot. It does NOT wait for the broker ack.
+    /// It logs errors and does not return them.
     #[cfg_attr(test, mutants::skip)] // cargo-mutants: fire-and-forget I/O spawn, exercised by integration tests
     #[tracing::instrument(
         name = "consumer.commit_async",
@@ -418,6 +423,41 @@ impl Consumer {
         )
     )]
     pub fn commit_async(&self) {
+        loop {
+            match self.commit_async_state.load(Ordering::Acquire) {
+                ASYNC_COMMIT_IDLE => {
+                    if self
+                        .commit_async_state
+                        .compare_exchange(
+                            ASYNC_COMMIT_IDLE,
+                            ASYNC_COMMIT_RUNNING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                ASYNC_COMMIT_RUNNING => {
+                    if self
+                        .commit_async_state
+                        .compare_exchange(
+                            ASYNC_COMMIT_RUNNING,
+                            ASYNC_COMMIT_DIRTY,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                ASYNC_COMMIT_DIRTY => return,
+                _ => unreachable!("invalid async commit state"),
+            }
+        }
+
         let client = self.client.clone();
         let group_id = self.group_id.clone();
         let commit_identity = Arc::clone(&self.commit_identity);
@@ -427,50 +467,84 @@ impl Consumer {
         let positions = Arc::clone(&self.positions);
         let topic_ids = Arc::clone(&self.topic_ids);
         let coordinator_id = Arc::clone(&self.coordinator_id);
+        let commit_async_state = Arc::clone(&self.commit_async_state);
         let retry_policy = self.retry_policy;
         tokio::spawn(async move {
-            let _commit_guard = commit_serialization.lock().await;
-            let Some((_, topics, (generation, member_id))) =
-                snapshot_commit_topics(&commit_identity, &offsets, &positions, &topic_ids).await
-            else {
-                return;
-            };
-            // Route to the coordinator broker. If it returns a moved/cold
-            // coordinator code (or the socket is gone), re-discover once and
-            // retry — but don't block a background commit on the full retry
-            // loop; one re-find recovers a coordinator move at-least-once.
-            let make_req = |topics: Vec<_>| {
-                build_commit_request(
-                    group_id.clone(),
-                    generation,
-                    member_id.clone(),
-                    group_instance_id.clone(),
-                    topics,
-                )
-            };
-            let target = coordinator_id.load(Ordering::Relaxed);
-            let res = client.broker(target).send(make_req(topics.clone())).await;
-            let moved = match &res {
-                Ok(resp) => {
-                    crate::coordinator::is_retriable_coordinator_code(first_commit_error(resp))
-                }
-                Err(e) if is_retriable_transport_error(e) => true,
-                Err(_) => false,
-            };
-            if moved {
-                match find_coordinator(&client, &group_id, retry_policy).await {
-                    Ok(id) => {
-                        coordinator_id.store(id, Ordering::Relaxed);
-                        if let Err(e) = client.broker(id).send(make_req(topics)).await {
-                            tracing::warn!(error = %e, "commit_async retry after re-find failed");
+            loop {
+                {
+                    let _commit_guard = commit_serialization.lock().await;
+                    // Calls queued before this snapshot are represented by the
+                    // current offsets, so collapse them into this request.
+                    commit_async_state.store(ASYNC_COMMIT_RUNNING, Ordering::Release);
+                    if let Some((_, topics, (generation, member_id))) =
+                        snapshot_commit_topics(&commit_identity, &offsets, &positions, &topic_ids)
+                            .await
+                    {
+                        // Route to the coordinator broker. If it returns a moved/cold
+                        // coordinator code (or the socket is gone), re-discover once and
+                        // retry — but don't block a background commit on the full retry
+                        // loop; one re-find recovers a coordinator move at-least-once.
+                        let make_req = |topics: Vec<_>| {
+                            build_commit_request(
+                                group_id.clone(),
+                                generation,
+                                member_id.clone(),
+                                group_instance_id.clone(),
+                                topics,
+                            )
+                        };
+                        let target = coordinator_id.load(Ordering::Relaxed);
+                        let res = client.broker(target).send(make_req(topics.clone())).await;
+                        let moved = match &res {
+                            Ok(resp) => crate::coordinator::is_retriable_coordinator_code(
+                                first_commit_error(resp),
+                            ),
+                            Err(e) if is_retriable_transport_error(e) => true,
+                            Err(_) => false,
+                        };
+                        if moved {
+                            match find_coordinator(&client, &group_id, retry_policy).await {
+                                Ok(id) => {
+                                    coordinator_id.store(id, Ordering::Relaxed);
+                                    if let Err(e) = client.broker(id).send(make_req(topics)).await {
+                                        tracing::warn!(error = %e, "commit_async retry after re-find failed");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "commit_async coordinator re-discovery failed");
+                                }
+                            }
+                        } else if let Err(e) = res {
+                            tracing::warn!(error = %e, "commit_async failed");
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "commit_async coordinator re-discovery failed");
-                    }
                 }
-            } else if let Err(e) = res {
-                tracing::warn!(error = %e, "commit_async failed");
+
+                if commit_async_state
+                    .compare_exchange(
+                        ASYNC_COMMIT_RUNNING,
+                        ASYNC_COMMIT_IDLE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+                // A caller marked the worker dirty during the RPC. Claim that
+                // single coalesced follow-up and rejoin the FIFO behind any
+                // synchronous commit already waiting on the mutex.
+                if commit_async_state
+                    .compare_exchange(
+                        ASYNC_COMMIT_DIRTY,
+                        ASYNC_COMMIT_RUNNING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
             }
         });
     }
@@ -703,6 +777,7 @@ mod tests {
             member_id: "member-a".into(),
             commit_identity,
             commit_serialization: Arc::new(Mutex::new(())),
+            commit_async_state: Arc::new(std::sync::atomic::AtomicU8::new(ASYNC_COMMIT_IDLE)),
             group_instance_id: None,
             current_generation: generation,
             subscribed_topics: vec!["topic".into()],
@@ -1210,6 +1285,42 @@ mod tests {
 
         mock.stop();
         assert2::assert!(*seen_offsets.lock().unwrap() == vec![(0, 10), (0, 10), (0, 12)]);
+    }
+
+    #[tokio::test]
+    async fn async_commits_queued_behind_an_rpc_are_coalesced() {
+        let identity = commit_identity(7, "member-a");
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let generation = Arc::new(AtomicI32::new(7));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (consumer, mock, _) = selected_commit_consumer(
+            identity,
+            changed,
+            generation,
+            Arc::clone(&requests),
+            false,
+            |_identity, _generation, _request_generation, _request_member_id| {},
+        )
+        .await;
+        let blocker = consumer.commit_serialization.lock().await;
+
+        for _ in 0..100 {
+            consumer.commit_async();
+        }
+        tokio::task::yield_now().await;
+        assert2::assert!(consumer.commit_async_state.load(Ordering::Acquire) == ASYNC_COMMIT_DIRTY);
+        drop(blocker);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while consumer.commit_async_state.load(Ordering::Acquire) != ASYNC_COMMIT_IDLE {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("coalesced async commit completes");
+        mock.stop();
+
+        assert2::assert!(requests.load(Ordering::SeqCst) == 1);
     }
 
     #[test]

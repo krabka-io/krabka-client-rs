@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicI32, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -65,6 +65,7 @@ pub struct Consumer {
     pub(crate) member_id: String,
     pub(crate) commit_identity: Arc<Mutex<CommitIdentity>>,
     pub(crate) commit_serialization: Arc<Mutex<()>>,
+    pub(crate) commit_async_state: Arc<AtomicU8>,
     pub(crate) group_instance_id: Option<String>,
     /// The current group generation exposed by [`Consumer::generation`].
     /// Commit RPCs use the generation atomically paired with membership and
@@ -1319,6 +1320,7 @@ async fn spawn_consumer(
         ownership_ids,
     }));
     let commit_serialization = Arc::new(Mutex::new(()));
+    let commit_async_state = Arc::new(AtomicU8::new(0));
     let next_offsets = Arc::new(Mutex::new(next_offsets));
     let positions = Arc::new(Mutex::new(positions));
     let pending_seeks = Arc::new(Mutex::new(HashMap::new()));
@@ -1373,6 +1375,7 @@ async fn spawn_consumer(
         member_id,
         commit_identity,
         commit_serialization,
+        commit_async_state,
         group_instance_id: group_instance_id.clone(),
         current_generation,
         subscribed_topics: subscribe,
@@ -2183,6 +2186,7 @@ mod security_arg_tests {
                 ownership_ids: HashMap::from([(("orders".into(), 0), 1)]),
             })),
             commit_serialization: Arc::new(Mutex::new(())),
+            commit_async_state: Arc::new(AtomicU8::new(0)),
             group_instance_id: Some("instance-a".into()),
             current_generation: Arc::new(AtomicI32::new(7)),
             subscribed_topics: vec!["orders".into(), "payments".into()],
