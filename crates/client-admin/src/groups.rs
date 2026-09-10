@@ -19,12 +19,22 @@ use krabka_protocol::{
     owned::{
         list_groups_request::ListGroupsRequest,
         metadata_request::MetadataRequest,
+        offset_commit_request::{
+            OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+        },
         offset_fetch_request::{OffsetFetchRequest, OffsetFetchRequestGroup},
     },
     primitives::uuid::Uuid as WireUuid,
 };
 
-use crate::{AdminClient, AdminError, kafka_error_name};
+use crate::{AdminClient, AdminError, KafkaError, kafka_error_if, kafka_error_name};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerGroupOffsetOutcome {
+    pub topic: String,
+    pub partition: i32,
+    pub error: Option<KafkaError>,
+}
 
 /// One committed-offset row collected from an `OffsetFetch` response. It keeps
 /// the `topic_id`, so `Metadata` can resolve name-less v10 topics.
@@ -36,6 +46,35 @@ struct Entry {
 }
 
 impl AdminClient {
+    /// Commits explicit offsets for an inactive consumer group.
+    ///
+    /// # Errors
+    /// Returns an error when encoding, transport, or response handling fails.
+    pub async fn alter_consumer_group_offsets(
+        &mut self,
+        group: &str,
+        offsets: &BTreeMap<(String, i32), i64>,
+    ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
+        let response = self
+            .conn
+            .send(offset_commit_request(group, offsets))
+            .await?;
+        Ok(response
+            .topics
+            .into_iter()
+            .flat_map(|topic| {
+                topic
+                    .partitions
+                    .into_iter()
+                    .map(move |partition| ConsumerGroupOffsetOutcome {
+                        topic: topic.name.clone(),
+                        partition: partition.partition_index,
+                        error: kafka_error_if(partition.error_code, None),
+                    })
+            })
+            .collect())
+    }
+
     /// Returns the group-id of every consumer group known to the broker.
     ///
     /// # Errors
@@ -137,5 +176,65 @@ impl AdminClient {
             out.insert((name, e.partition), e.offset);
         }
         Ok(out)
+    }
+}
+
+fn offset_commit_request(
+    group: &str,
+    offsets: &BTreeMap<(String, i32), i64>,
+) -> OffsetCommitRequest {
+    let mut topics = BTreeMap::<String, Vec<OffsetCommitRequestPartition>>::new();
+    for ((topic, partition), offset) in offsets {
+        topics
+            .entry(topic.clone())
+            .or_default()
+            .push(OffsetCommitRequestPartition {
+                partition_index: *partition,
+                committed_offset: *offset,
+                committed_leader_epoch: -1,
+                committed_metadata: None,
+                ..Default::default()
+            });
+    }
+    OffsetCommitRequest {
+        group_id: group.into(),
+        generation_id_or_member_epoch: -1,
+        member_id: String::new(),
+        topics: topics
+            .into_iter()
+            .map(|(name, partitions)| OffsetCommitRequestTopic {
+                name,
+                partitions,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use assert2::assert;
+
+    use super::*;
+
+    #[test]
+    fn offset_reset_builds_admin_commit() {
+        let offsets = BTreeMap::from([(("orders".into(), 2), 41)]);
+        let request = offset_commit_request("worker", &offsets);
+        let expected = OffsetCommitRequest {
+            group_id: "worker".into(),
+            topics: vec![OffsetCommitRequestTopic {
+                name: "orders".into(),
+                partitions: vec![OffsetCommitRequestPartition {
+                    partition_index: 2,
+                    committed_offset: 41,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(request == expected);
     }
 }
