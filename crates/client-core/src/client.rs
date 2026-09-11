@@ -190,8 +190,8 @@ impl Client {
         metadata_recovery_strategy: MetadataRecoveryStrategy,
         metadata_recovery_rebootstrap_trigger: MetadataRecoveryRebootstrapTrigger,
     ) -> Result<Self, ClientError> {
-        let addrs = bootstrap::resolve(&bootstrap, options.dns_timeout).await?;
-        let pool = Arc::new(BrokerPool::new(addrs, options.clone()));
+        let addrs = bootstrap::resolve_with_server_names(&bootstrap, options.dns_timeout).await?;
+        let pool = Arc::new(BrokerPool::new_with_server_names(addrs, options.clone()));
         Ok(Client {
             bootstrap,
             pool,
@@ -260,14 +260,17 @@ impl Client {
     #[tracing::instrument(level = "debug", skip_all, fields(bootstrap = %self.bootstrap))]
     pub async fn reconnect_bootstrap(&self) {
         self.pool.evict_bootstrap();
-        if let Ok(addrs) = bootstrap::resolve(&self.bootstrap, self.options.dns_timeout).await {
-            self.pool.replace_bootstrap(addrs);
+        if let Ok(addrs) =
+            bootstrap::resolve_with_server_names(&self.bootstrap, self.options.dns_timeout).await
+        {
+            self.pool.replace_bootstrap_with_server_names(addrs);
         }
     }
 
     async fn rebootstrap_metadata(&self) -> Result<(), ClientError> {
-        let addrs = bootstrap::resolve(&self.bootstrap, self.options.dns_timeout).await?;
-        self.pool.rebootstrap(addrs);
+        let addrs =
+            bootstrap::resolve_with_server_names(&self.bootstrap, self.options.dns_timeout).await?;
+        self.pool.rebootstrap_with_server_names(addrs);
         self.metadata_recovery.complete_attempt();
         Ok(())
     }

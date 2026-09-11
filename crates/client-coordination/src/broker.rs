@@ -77,7 +77,7 @@ use krabka_client_admin::{
 use krabka_client_core::{
     BrokerInfo, BrokerPool, ClientDnsTimeout, ClientError, ClientSecurity, Connection,
     ConnectionOptions, DEFAULT_FETCH_RESPONSE_MAX, FetchMinBytes, FetchedRecord, IsolatedFetch,
-    fetch_partition_with_isolation_progress,
+    connection_target_host, fetch_partition_with_isolation_progress,
 };
 use krabka_client_producer::{
     Acks, Producer, ProducerError, ProducerRecord, RecordMetadata, partition_for_key,
@@ -294,7 +294,7 @@ impl BrokerTransport {
             topic_partitions,
             topic_replication,
             admin: Mutex::new(admin),
-            pool: BrokerPool::new(resolved, options),
+            pool: BrokerPool::new_with_server_names(resolved, options),
             layout: OnceCell::new(),
             registrar: OnceCell::new(),
             holders: Mutex::new(HashMap::new()),
@@ -711,7 +711,7 @@ fn check_topic_shape(partitions: i32, replication: i32) -> Result<(), Coordinati
 async fn resolve_addresses(
     addresses: &[String],
     dns_timeout: ClientDnsTimeout,
-) -> Result<Vec<SocketAddr>, CoordinationError> {
+) -> Result<Vec<(SocketAddr, String)>, CoordinationError> {
     let mut resolved = Vec::new();
     for address in addresses {
         let lookup = tokio::time::timeout(
@@ -725,7 +725,7 @@ async fn resolve_addresses(
         .map_err(|error| {
             CoordinationError::InvalidConfig(format!("the DNS lookup of {address} failed: {error}"))
         })?;
-        resolved.extend(lookup);
+        resolved.extend(lookup.map(|socket| (socket, connection_target_host(address).to_owned())));
     }
     if resolved.is_empty() {
         return Err(CoordinationError::InvalidConfig(format!(
@@ -1160,7 +1160,8 @@ mod tests {
             .await
             .expect("a literal address resolves");
         check!(resolved.len() == 1);
-        check!(resolved[0].port() == 9092);
+        check!(resolved[0].0.port() == 9092);
+        check!(resolved[0].1 == "127.0.0.1");
 
         let both = resolve_addresses(
             &["127.0.0.1:9092".to_owned(), "127.0.0.1:9093".to_owned()],

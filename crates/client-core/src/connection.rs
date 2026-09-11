@@ -313,11 +313,13 @@ impl Connection {
             let connector = tls
                 .connector()
                 .map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
-            let sni =
-                tokio_rustls::rustls::pki_types::ServerName::try_from(tls.server_name.clone())
-                    .map_err(|e| {
-                        ClientError::Io(std::io::Error::other(format!("invalid SNI: {e}")))
-                    })?;
+            let server_name = if tls.server_name.is_empty() {
+                addr.ip().to_string()
+            } else {
+                tls.server_name.clone()
+            };
+            let sni = tokio_rustls::rustls::pki_types::ServerName::try_from(server_name)
+                .map_err(|e| ClientError::Io(std::io::Error::other(format!("invalid SNI: {e}"))))?;
             let s = connector
                 .connect(sni, tcp)
                 .await

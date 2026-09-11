@@ -15,7 +15,7 @@ use std::{any::Any, collections::BTreeMap, sync::Mutex};
 
 use krabka_client_core::{
     ClientError, Connection, ConnectionOptions, MetadataRecoveryRebootstrapTrigger,
-    MetadataRecoveryStrategy, ProtocolRequest as _,
+    MetadataRecoveryStrategy, ProtocolRequest as _, connection_target_host,
 };
 use krabka_units::{Time, convert::TimeExt as _, secs};
 use thiserror::Error;
@@ -1159,8 +1159,11 @@ impl AdminClient {
 
     async fn connect_one(
         host_port: &str,
-        opts: ConnectionOptions,
+        mut opts: ConnectionOptions,
     ) -> Result<Connection, AdminError> {
+        if let Some(security) = opts.security.as_mut() {
+            **security = security.for_target_host(connection_target_host(host_port));
+        }
         let addr = lookup_first(
             host_port,
             opts.dns_timeout,
