@@ -5,7 +5,7 @@ use std::{future::Future, net::SocketAddr};
 
 use krabka_units::convert::TimeExt as _;
 
-use crate::{connection::ClientDnsTimeout, error::ClientError};
+use crate::{connection::ClientDnsTimeout, error::ClientError, security::connection_target_host};
 
 pub(crate) async fn bounded_lookup<F>(
     timeout: ClientDnsTimeout,
@@ -23,10 +23,20 @@ where
 /// This function silently skips entries that fail to resolve. It returns
 /// [`ClientError::Disconnected`] if *none* resolve.
 #[tracing::instrument(level = "debug", skip_all, fields(bootstrap = %bootstrap), err)]
+#[cfg(test)]
 pub async fn resolve(
     bootstrap: &str,
     dns_timeout: ClientDnsTimeout,
 ) -> Result<Vec<SocketAddr>, ClientError> {
+    resolve_with_server_names(bootstrap, dns_timeout)
+        .await
+        .map(|addresses| addresses.into_iter().map(|(address, _)| address).collect())
+}
+
+pub(crate) async fn resolve_with_server_names(
+    bootstrap: &str,
+    dns_timeout: ClientDnsTimeout,
+) -> Result<Vec<(SocketAddr, String)>, ClientError> {
     let mut out = Vec::new();
     for part in bootstrap.split(',') {
         let part = part.trim();
@@ -34,7 +44,9 @@ pub async fn resolve(
             continue;
         }
         match bounded_lookup(dns_timeout, tokio::net::lookup_host(part)).await {
-            Ok(Ok(iter)) => out.extend(iter),
+            Ok(Ok(iter)) => {
+                out.extend(iter.map(|address| (address, connection_target_host(part).to_owned())));
+            }
             Ok(Err(error)) => {
                 tracing::warn!(part, error = %error, "bootstrap resolve failed");
             }
@@ -71,6 +83,25 @@ mod tests {
         assert!(addrs.len() == 2);
         assert!(addrs.iter().any(|addr| addr.port() == 9092));
         assert!(addrs.iter().any(|addr| addr.port() == 9093));
+    }
+
+    #[tokio::test]
+    async fn resolve_retains_tls_names_before_dns() {
+        let addresses =
+            resolve_with_server_names("localhost:9092,[::1]:9093", ClientDnsTimeout::default())
+                .await
+                .expect("addresses resolve");
+
+        assert!(
+            addresses
+                .iter()
+                .any(|(address, name)| address.port() == 9092 && name == "localhost")
+        );
+        assert!(
+            addresses
+                .iter()
+                .any(|(address, name)| address.port() == 9093 && name == "::1")
+        );
     }
 
     #[tokio::test]

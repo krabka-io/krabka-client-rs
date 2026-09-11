@@ -94,5 +94,5 @@ pub use offset_for_leader_epoch::{EpochEndOffset, offset_for_leader_epoch};
 pub use pool::{BrokerInfo, BrokerPool};
 pub use request::ProtocolRequest;
 pub use sasl::{OutboundSaslError, SaslCredentials, outbound_sasl};
-pub use security::{ClientSecurity, TlsConnectorConfig};
+pub use security::{ClientSecurity, TlsConnectorConfig, connection_target_host};
 pub use version::ApiVersionTable;

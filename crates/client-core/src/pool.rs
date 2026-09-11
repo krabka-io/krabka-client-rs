@@ -48,8 +48,8 @@ pub trait BrokerConnector: Send + Sync {
     /// decisions are observable without a real socket.
     type Conn: Send + Sync;
 
-    /// Dial `addr` and return a ready connection, or a transport error.
-    async fn dial(&self, addr: SocketAddr) -> Result<Self::Conn, ClientError>;
+    /// Dial `addr` with its pre-DNS `server_name`, or return a transport error.
+    async fn dial(&self, addr: SocketAddr, server_name: &str) -> Result<Self::Conn, ClientError>;
 }
 
 /// Production [`BrokerConnector`]: opens a real [`Connection`] that honours
@@ -67,8 +67,12 @@ impl BrokerConnector for TcpConnector {
     type Conn = Connection;
 
     #[tracing::instrument(level = "debug", skip_all, fields(addr = %addr), err)]
-    async fn dial(&self, addr: SocketAddr) -> Result<Connection, ClientError> {
-        Connection::connect_with_options(addr, self.options.clone()).await
+    async fn dial(&self, addr: SocketAddr, server_name: &str) -> Result<Connection, ClientError> {
+        let mut options = self.options.clone();
+        if let Some(security) = options.security.as_mut() {
+            **security = security.for_target_host(server_name);
+        }
+        Connection::connect_with_options(addr, options).await
     }
 }
 
@@ -82,8 +86,8 @@ impl BrokerConnector for TcpConnector {
 /// and every downstream use stay `BrokerPool` and need no type argument.
 pub struct BrokerPool<C: BrokerConnector = TcpConnector> {
     by_id: DashMap<i32, Arc<C::Conn>>,
-    by_addr: DashMap<i32, SocketAddr>,
-    bootstrap: RwLock<Vec<SocketAddr>>,
+    by_endpoint: DashMap<i32, (SocketAddr, String)>,
+    bootstrap: RwLock<Vec<(SocketAddr, String)>>,
     dns_timeout: ClientDnsTimeout,
     connector: C,
 }
@@ -104,8 +108,21 @@ impl BrokerPool<TcpConnector> {
     /// Create a new pool with the given bootstrap addresses and connection options.
     #[must_use]
     pub fn new(bootstrap: Vec<SocketAddr>, options: ConnectionOptions) -> Self {
+        let bootstrap = bootstrap
+            .into_iter()
+            .map(|address| (address, address.ip().to_string()))
+            .collect();
+        Self::new_with_server_names(bootstrap, options)
+    }
+
+    /// Create a pool whose bootstrap TLS names retain their pre-DNS hostnames.
+    #[must_use]
+    pub fn new_with_server_names(
+        bootstrap: Vec<(SocketAddr, String)>,
+        options: ConnectionOptions,
+    ) -> Self {
         let dns_timeout = options.dns_timeout;
-        BrokerPool::with_connector(bootstrap, TcpConnector { options }, dns_timeout)
+        BrokerPool::with_connector_and_names(bootstrap, TcpConnector { options }, dns_timeout)
     }
 }
 
@@ -114,14 +131,27 @@ impl<C: BrokerConnector> BrokerPool<C> {
     /// for the live connector, and tests call it for a mock connector.
     ///
     /// [`new`]: BrokerPool::new
+    #[cfg(test)]
     fn with_connector(
         bootstrap: Vec<SocketAddr>,
         connector: C,
         dns_timeout: ClientDnsTimeout,
     ) -> Self {
+        let bootstrap = bootstrap
+            .into_iter()
+            .map(|address| (address, address.ip().to_string()))
+            .collect();
+        Self::with_connector_and_names(bootstrap, connector, dns_timeout)
+    }
+
+    fn with_connector_and_names(
+        bootstrap: Vec<(SocketAddr, String)>,
+        connector: C,
+        dns_timeout: ClientDnsTimeout,
+    ) -> Self {
         Self {
             by_id: DashMap::new(),
-            by_addr: DashMap::new(),
+            by_endpoint: DashMap::new(),
             bootstrap: RwLock::new(bootstrap),
             dns_timeout,
             connector,
@@ -139,12 +169,12 @@ impl<C: BrokerConnector> BrokerPool<C> {
         if let Some(entry) = self.by_id.get(&broker_id) {
             return Ok(Arc::clone(&entry));
         }
-        let addr = self
-            .by_addr
+        let (addr, server_name) = self
+            .by_endpoint
             .get(&broker_id)
-            .map(|e| *e)
+            .map(|entry| entry.value().clone())
             .ok_or(ClientError::Disconnected)?;
-        let conn = Arc::new(self.connector.dial(addr).await?);
+        let conn = Arc::new(self.connector.dial(addr, &server_name).await?);
         self.by_id.insert(broker_id, Arc::clone(&conn));
         Ok(conn)
     }
@@ -178,6 +208,15 @@ impl<C: BrokerConnector> BrokerPool<C> {
     /// Replace the bootstrap address list and drop the cached bootstrap
     /// connection so the next bootstrap send dials the fresh addresses.
     pub fn replace_bootstrap(&self, bootstrap: Vec<SocketAddr>) {
+        let bootstrap = bootstrap
+            .into_iter()
+            .map(|address| (address, address.ip().to_string()))
+            .collect();
+        self.replace_bootstrap_with_server_names(bootstrap);
+    }
+
+    /// Replace bootstrap addresses while retaining their TLS server names.
+    pub fn replace_bootstrap_with_server_names(&self, bootstrap: Vec<(SocketAddr, String)>) {
         match self.bootstrap.write() {
             Ok(mut guard) => *guard = bootstrap,
             Err(poisoned) => *poisoned.into_inner() = bootstrap,
@@ -188,8 +227,17 @@ impl<C: BrokerConnector> BrokerPool<C> {
     /// Replace bootstrap addresses and discard every connection and advertised
     /// broker address learned from stale metadata.
     pub fn rebootstrap(&self, bootstrap: Vec<SocketAddr>) {
+        let bootstrap = bootstrap
+            .into_iter()
+            .map(|address| (address, address.ip().to_string()))
+            .collect();
+        self.rebootstrap_with_server_names(bootstrap);
+    }
+
+    /// Replace all broker state while retaining bootstrap TLS server names.
+    pub fn rebootstrap_with_server_names(&self, bootstrap: Vec<(SocketAddr, String)>) {
         self.by_id.clear();
-        self.by_addr.clear();
+        self.by_endpoint.clear();
         match self.bootstrap.write() {
             Ok(mut guard) => *guard = bootstrap,
             Err(poisoned) => *poisoned.into_inner() = bootstrap,
@@ -210,8 +258,8 @@ impl<C: BrokerConnector> BrokerPool<C> {
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         let mut last_err: Option<ClientError> = None;
-        for addr in bootstrap {
-            match self.connector.dial(addr).await {
+        for (addr, server_name) in bootstrap {
+            match self.connector.dial(addr, &server_name).await {
                 Ok(c) => {
                     let arc = Arc::new(c);
                     self.by_id.insert(BOOTSTRAP_ID, Arc::clone(&arc));
@@ -257,7 +305,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
             )
             .await
             {
-                self.by_addr.insert(b.id, addr);
+                self.by_endpoint.insert(b.id, (addr, b.host.clone()));
             }
         }
     }
@@ -270,7 +318,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
     /// speculative connect.
     #[must_use]
     pub fn knows_broker(&self, broker_id: i32) -> bool {
-        self.by_addr.contains_key(&broker_id)
+        self.by_endpoint.contains_key(&broker_id)
     }
 
     /// Return the broker ids from the most recent usable metadata.
@@ -281,7 +329,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
     #[must_use]
     pub fn broker_ids(&self) -> Vec<i32> {
         let mut ids = self
-            .by_addr
+            .by_endpoint
             .iter()
             .map(|entry| *entry.key())
             .collect::<Vec<_>>();
@@ -358,10 +406,10 @@ mod tests {
             },
         ])
         .await;
-        assert!(pool.by_addr.contains_key(&1));
-        assert!(pool.by_addr.contains_key(&2));
-        check!(*pool.by_addr.get(&1).unwrap() == "127.0.0.1:9092".parse().unwrap());
-        check!(*pool.by_addr.get(&2).unwrap() == "127.0.0.1:9093".parse().unwrap());
+        assert!(pool.by_endpoint.contains_key(&1));
+        assert!(pool.by_endpoint.contains_key(&2));
+        check!(pool.by_endpoint.get(&1).unwrap().0 == "127.0.0.1:9092".parse().unwrap());
+        check!(pool.by_endpoint.get(&2).unwrap().0 == "127.0.0.1:9093".parse().unwrap());
     }
 
     #[tokio::test]
@@ -377,6 +425,7 @@ mod tests {
         }])
         .await;
         assert!(pool.knows_broker(7));
+        check!(pool.by_endpoint.get(&7).unwrap().1 == "localhost");
     }
 
     #[tokio::test]
@@ -416,6 +465,7 @@ mod tests {
     #[derive(Debug)]
     struct StubConn {
         addr: SocketAddr,
+        server_name: String,
     }
 
     struct CountingConnector {
@@ -428,12 +478,15 @@ mod tests {
     impl BrokerConnector for CountingConnector {
         type Conn = StubConn;
 
-        async fn dial(&self, addr: SocketAddr) -> Result<StubConn, ClientError> {
+        async fn dial(&self, addr: SocketAddr, server_name: &str) -> Result<StubConn, ClientError> {
             self.dials.fetch_add(1, Ordering::Relaxed);
             if self.fail.contains(&addr) {
                 return Err(ClientError::Disconnected);
             }
-            Ok(StubConn { addr })
+            Ok(StubConn {
+                addr,
+                server_name: server_name.to_owned(),
+            })
         }
     }
 
@@ -456,13 +509,35 @@ mod tests {
         assert!(matches!(pool.get(5).await, Err(ClientError::Disconnected)));
         assert!(dials.load(Ordering::Relaxed) == 0);
 
-        pool.by_addr.insert(5, addr(9092));
+        pool.by_endpoint.insert(5, (addr(9092), "127.0.0.1".into()));
         let first = pool.get(5).await.unwrap();
         assert!(first.addr == addr(9092));
         // Second get is served from cache: still a single dial.
         let second = pool.get(5).await.unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert!(dials.load(Ordering::Relaxed) == 1);
+    }
+
+    #[tokio::test]
+    async fn get_dials_an_advertised_broker_with_its_hostname() {
+        let pool = BrokerPool::with_connector(
+            vec![],
+            CountingConnector {
+                dials: Arc::new(AtomicUsize::new(0)),
+                fail: vec![],
+            },
+            ClientDnsTimeout::default(),
+        );
+        pool.refresh_brokers(&[BrokerInfo {
+            id: 7,
+            host: "localhost".into(),
+            port: 9092,
+            rack: None,
+        }])
+        .await;
+
+        let connection = pool.get(7).await.unwrap();
+        check!(connection.server_name == "localhost");
     }
 
     #[tokio::test]
@@ -476,8 +551,8 @@ mod tests {
             },
             ClientDnsTimeout::default(),
         );
-        pool.by_addr.insert(1, addr(9092));
-        pool.by_addr.insert(2, addr(9093));
+        pool.by_endpoint.insert(1, (addr(9092), "127.0.0.1".into()));
+        pool.by_endpoint.insert(2, (addr(9093), "127.0.0.1".into()));
         let _ = pool.get(1).await.unwrap();
         let _ = pool.get(2).await.unwrap();
         assert!(dials.load(Ordering::Relaxed) == 2);
@@ -552,7 +627,7 @@ mod tests {
             },
             ClientDnsTimeout::default(),
         );
-        pool.by_addr.insert(3, addr(9092));
+        pool.by_endpoint.insert(3, (addr(9092), "127.0.0.1".into()));
         let _ = pool.get(3).await.unwrap();
         let _ = pool.bootstrap_connection().await.unwrap();
         assert!(pool.by_id.contains_key(&BOOTSTRAP_ID));
@@ -603,7 +678,7 @@ mod tests {
             },
             ClientDnsTimeout::default(),
         );
-        pool.by_addr.insert(3, addr(3333));
+        pool.by_endpoint.insert(3, (addr(3333), "127.0.0.1".into()));
         let held_broker = pool.get(3).await.unwrap();
         let _ = pool.bootstrap_connection().await.unwrap();
 
@@ -627,8 +702,8 @@ mod tests {
             },
             ClientDnsTimeout::default(),
         );
-        pool.by_addr.insert(9, addr(9999));
-        pool.by_addr.insert(2, addr(2222));
+        pool.by_endpoint.insert(9, (addr(9999), "127.0.0.1".into()));
+        pool.by_endpoint.insert(2, (addr(2222), "127.0.0.1".into()));
 
         assert!(pool.broker_ids() == vec![2, 9]);
     }
@@ -644,7 +719,7 @@ mod tests {
             },
             ClientDnsTimeout::default(),
         );
-        pool.by_addr.insert(1, addr(9092));
+        pool.by_endpoint.insert(1, (addr(9092), "127.0.0.1".into()));
         let held = pool.get(1).await.unwrap();
         let _ = pool.bootstrap_connection().await.unwrap();
         // Two strong refs to broker 1's conn: the pool's and `held`.

@@ -11,6 +11,17 @@ use tokio_rustls::TlsConnector;
 
 pub use crate::sasl::SaslCredentials;
 
+/// Return the hostname from one Kafka `host:port` address.
+#[must_use]
+pub fn connection_target_host(address: &str) -> &str {
+    match address.strip_prefix('[') {
+        Some(bracketed) => bracketed
+            .split_once(']')
+            .map_or(bracketed, |(host, _)| host),
+        None => address.rsplit_once(':').map_or(address, |(host, _)| host),
+    }
+}
+
 /// Client-side TLS trust + SNI.
 ///
 /// This struct mirrors the trust-roots half of the broker's
@@ -23,8 +34,8 @@ pub struct TlsConnectorConfig {
     /// crate does not install. This mirrors the broker's strict
     /// `build_client_config`.
     pub trust_roots_pem: Option<PathBuf>,
-    /// SNI / server-name used for the TLS handshake and as the
-    /// canonical hostname for any GSSAPI SPN.
+    /// Explicit SNI / server-name override. An empty string uses each
+    /// connection's target hostname, including brokers learned from metadata.
     pub server_name: String,
     /// Optional mTLS client identity: `(cert_chain_pem, private_key_pem)`.
     ///
@@ -102,27 +113,43 @@ pub struct ClientSecurity {
     /// the protocol [`requires_sasl`], independent of TLS: a
     /// `SASL_PLAINTEXT` listener has no `tls` to source the host from, so
     /// without this GSSAPI would fall back to `localhost` and Kerberos
-    /// would reject the principal. `None` falls back to `tls.server_name`
-    /// then the connection's target host. PLAIN/SCRAM ignore it.
+    /// would reject the principal. `None` falls back to a non-empty
+    /// `tls.server_name`, then the connection's target host. PLAIN/SCRAM
+    /// ignore it.
     ///
     /// [`requires_sasl`]: ListenerProtocol::requires_sasl
     pub sasl_host: Option<String>,
 }
 
 impl ClientSecurity {
+    /// Clone this policy and fill its TLS server name from a connection target.
+    #[must_use]
+    pub fn for_target_host(&self, target_host: &str) -> Self {
+        let mut security = self.clone();
+        if let Some(tls) = &mut security.tls
+            && tls.server_name.is_empty()
+        {
+            target_host.clone_into(&mut tls.server_name);
+        }
+        security
+    }
+
     /// Resolve the hostname handed to the SASL handshake, the GSSAPI SPN host.
     ///
     /// This method prefers the explicit [`Self::sasl_host`], then the TLS SNI
     /// ([`TlsConnectorConfig::server_name`]), then the connection's target
     /// `host` if known. If it knows none of them, it returns `"localhost"`.
-    ///
-    /// TLS SNI is unaffected. It always comes from `tls.server_name`.
     #[must_use]
     pub fn sasl_handshake_host<'a>(&'a self, target_host: Option<&'a str>) -> &'a str {
         if let Some(h) = self.sasl_host.as_deref() {
             h
-        } else if let Some(tls) = self.tls.as_ref() {
-            tls.server_name.as_str()
+        } else if let Some(server_name) = self
+            .tls
+            .as_ref()
+            .map(|tls| tls.server_name.as_str())
+            .filter(|name| !name.is_empty())
+        {
+            server_name
         } else if let Some(h) = target_host {
             h
         } else {
@@ -204,6 +231,37 @@ mod tests {
 
         // Nothing set at all → localhost.
         assert!(no_tls.sasl_handshake_host(None) == "localhost");
+    }
+
+    #[test]
+    fn target_host_fills_dynamic_tls_name_but_preserves_an_override() {
+        let policy = |server_name| ClientSecurity {
+            protocol: ListenerProtocol::Ssl,
+            tls: Some(TlsConnectorConfig {
+                trust_roots_pem: None,
+                server_name,
+                client_identity: None,
+            }),
+            sasl: None,
+            sasl_host: None,
+        };
+
+        assert!(
+            policy(String::new())
+                .for_target_host("broker-2.example")
+                .tls
+                .unwrap()
+                .server_name
+                == "broker-2.example"
+        );
+        assert!(
+            policy("shared.example".into())
+                .for_target_host("broker-2.example")
+                .tls
+                .unwrap()
+                .server_name
+                == "shared.example"
+        );
     }
 
     #[test]
