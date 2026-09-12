@@ -33,8 +33,10 @@ bazel test //...
 cargo nextest run --workspace
 ```
 
-Both run the same 449 tests and the same 4 rustdoc examples; nothing here is
-tagged `manual`.
+Both run the same tests and the same 4 rustdoc examples; nothing here is
+tagged `manual`. The container suites are the one exception: they carry
+`#[ignore]`, so both commands compile them and skip them. See
+[Container-backed tests](#container-backed-tests).
 
 ## Depending on the wire layer
 
@@ -92,13 +94,31 @@ runs the full sweep. Only `#[cfg(test)]` unit tests take part, so mutants that
 the `tests/*.rs` suites would kill are reported as survivors and scores read
 lower than the monorepo's `cargo mutants` numbers for the same code.
 
-## Broker-backed tests
+## Container-backed tests
 
-Five suites that booted an in-process broker to exercise the admin and consumer
-clients moved to
-[`krabka-broker`](https://github.com/krabka-io/krabka-broker), where the broker
-lives. Keeping them here would have made this repository depend on the thing it
-sits below.
+Several suites exercise the clients against a real Kafka broker. In the
+monorepo they booted a broker in the same process. The broker now lives in
+[`krabka-broker`](https://github.com/krabka-io/krabka-broker), so these suites
+start a broker container instead, through `testcontainers`.
+
+Each crate that has such a suite carries the harness in
+`tests/support/mod.rs`. A suite declares `mod support;` and calls
+`support::start_kafka()`. The image is the one
+`crates/client-core/tests/integration.rs` already used:
+`confluentinc/cp-kafka:6.1.1`.
+
+Every case that needs the container carries `#[ignore]`, so `bazel test //...`
+and `cargo nextest run --workspace` compile the suite and skip the case. Run
+one suite with Docker present:
+
+```
+cargo test -p krabka-client-admin --test admin_round_trip -- --ignored --nocapture
+```
+
+Two suites need a broker release that the pinned image predates:
+`transactions_2pc_client` needs KIP-939 two-phase commit, and `share_consumer`
+needs KIP-932 share groups. Their `#[ignore]` messages say so. They compile
+here and wait for a newer image.
 
 ## Publishing
 
