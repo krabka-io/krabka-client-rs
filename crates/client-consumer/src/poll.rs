@@ -7,6 +7,7 @@ use krabka_ids::LeaderEpoch;
 use krabka_protocol::owned::{
     fetch_request::{FetchPartition, FetchRequest, FetchTopic},
     list_offsets_request::{ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
+    list_offsets_response::ListOffsetsResponse,
 };
 use krabka_units::{
     ByteSize, Time,
@@ -28,6 +29,8 @@ use crate::{
 const BOOTSTRAP_LEADER: i32 = -1;
 const UNKNOWN_FETCH_OFFSET: i64 = -1;
 const UNKNOWN_LEADER_ID: i32 = -1;
+/// The offset the wire uses for "the broker did not answer this".
+const UNKNOWN_OFFSET: i64 = -1;
 pub(crate) const DEFAULT_FETCH_PARTITION_MAX: ByteSize = mebibytes(1);
 pub(crate) const DEFAULT_FETCH_MAX: ByteSize = mebibytes(50);
 
@@ -137,7 +140,18 @@ fn build_fetch_request(
     }
 }
 
-fn build_latest_offsets_request(by_topic: HashMap<String, Vec<i32>>) -> ListOffsetsRequest {
+/// `ListOffsets` timestamp that asks for the log end offset.
+const LATEST_TIMESTAMP: i64 = -1;
+/// `ListOffsets` timestamp that asks for the log start offset.
+const EARLIEST_TIMESTAMP: i64 = -2;
+
+/// Placeholder for "fetch from the log end", resolved before the next Fetch.
+const LATEST_SENTINEL: i64 = i64::MAX;
+
+fn build_offsets_request(
+    by_topic: HashMap<String, Vec<i32>>,
+    timestamp: i64,
+) -> ListOffsetsRequest {
     let topics: Vec<ListOffsetsTopic> = by_topic
         .into_iter()
         .map(|(name, partitions)| ListOffsetsTopic {
@@ -146,7 +160,7 @@ fn build_latest_offsets_request(by_topic: HashMap<String, Vec<i32>>) -> ListOffs
                 .into_iter()
                 .map(|p| ListOffsetsPartition {
                     partition_index: p,
-                    timestamp: -1, // LATEST
+                    timestamp,
                     ..Default::default()
                 })
                 .collect(),
@@ -232,6 +246,11 @@ impl Consumer {
 
         let mut out: Vec<ConsumerRecord> = Vec::new();
         let mut refresh_after_processing = false;
+        // The partitions that answered `OFFSET_OUT_OF_RANGE` under `Earliest`
+        // or `None`, with the offset each was fetched from. Both policies need
+        // the broker's real log start, and reading that is an RPC, so the loop
+        // records them and the code below the guard resolves them.
+        let mut out_of_range: Vec<((String, i32), i64)> = Vec::new();
         let mut offsets = self.next_offsets.lock().await;
         for topic in responses.iter().flat_map(|resp| &resp.responses) {
             let topic_name = if topic.topic.is_empty() {
@@ -262,32 +281,28 @@ impl Consumer {
                 match part.error_code {
             0 => {}
             1 /* OFFSET_OUT_OF_RANGE */ => {
-                // Reset per policy using the response's log_start_offset
-                // (the broker includes it in every OOR partition response).
-                // We must NOT use a hardcoded 0: if retention has moved
-                // log_start forward, re-fetching from 0 re-triggers OOR
-                // forever. Mirrors what the replicator does on OOR.
-                // No RPC needed — log_start_offset is already in `part`.
-                let fetch_offset = fetch_offset_or_unknown(&offsets, &key);
-                let log_start = part.log_start_offset;
-                let (topic, partition) = (key.0.clone(), key.1);
+                // The response cannot say where the log now starts. Apache
+                // Kafka builds an errored partition with `log_start_offset`,
+                // `high_watermark` and `last_stable_offset` all set to -1, so
+                // `part.log_start_offset` is -1 here whatever the real log
+                // start is. Reading it and fetching from it wedges the
+                // partition: every following Fetch asks for -1 and gets
+                // OFFSET_OUT_OF_RANGE again. A hardcoded 0 wedges it the same
+                // way once retention has moved the log start past 0.
+                //
+                // So every policy resolves its position with a ListOffsets
+                // instead. Earliest and Latest plant a sentinel that
+                // `resolve_reset_sentinels` replaces before the next Fetch.
+                // None reports the error, and `deferred_out_of_range` carries
+                // it out of this loop so the true log start can be read once
+                // the offsets guard is released.
                 match self.auto_offset_reset {
-                    AutoOffsetReset::Earliest => {
-                        // Reset to the real log start, not 0.
-                        offsets.insert(key.clone(), log_start);
-                    }
                     AutoOffsetReset::Latest => {
-                        // Plant i64::MAX sentinel; resolved next poll
-                        // by resolve_latest_sentinels via ListOffsets.
-                        offsets.insert(key.clone(), i64::MAX);
+                        offsets.insert(key.clone(), LATEST_SENTINEL);
                     }
-                    AutoOffsetReset::None => {
-                        return Err(ConsumerError::LogTruncation {
-                            topic,
-                            partition,
-                            fetch_offset,
-                            safe_offset: log_start,
-                        });
+                    AutoOffsetReset::Earliest | AutoOffsetReset::None => {
+                        let fetch_offset = fetch_offset_or_unknown(&offsets, &key);
+                        out_of_range.push((key.clone(), fetch_offset));
                     }
                 }
                 continue;
@@ -351,6 +366,9 @@ impl Consumer {
         // RPC, and we must never hold a Mutex guard across an await point.
         drop(offsets);
         tracing::Span::current().record("records", out.len());
+        if !out_of_range.is_empty() {
+            self.recover_out_of_range(&out_of_range).await?;
+        }
         if refresh_after_processing {
             // Best-effort: a NOT_LEADER_OR_FOLLOWER without a current_leader
             // hint means our cached leader is stale; learn the new one so the
@@ -626,10 +644,12 @@ fn next_offset_after(batches: &[krabka_protocol::records::RecordBatch]) -> Optio
 }
 
 impl Consumer {
-    /// Replace any `i64::MAX` sentinel in `next_offsets` with the real log-end
+    /// Replace any `LATEST_SENTINEL` in `next_offsets` with the real log-end
     /// offset from `ListOffsets(timestamp=-1)`.
     ///
-    /// `auto_offset_reset = Latest` plants those sentinels at build time.
+    /// `auto_offset_reset = Latest` plants those sentinels at build time, and
+    /// the `OFFSET_OUT_OF_RANGE` arm of the poll loop plants them again. This
+    /// runs in `prepare_poll`, so a sentinel never reaches a Fetch.
     #[tracing::instrument(
         name = "consumer.resolve_latest_sentinels",
         level = "debug",
@@ -639,11 +659,7 @@ impl Consumer {
     )]
     async fn resolve_latest_sentinels(&self) -> Result<(), ConsumerError> {
         let mut offsets = self.next_offsets.lock().await;
-        let sentinels: Vec<(String, i32)> = offsets
-            .iter()
-            .filter(|(_, v)| **v == i64::MAX)
-            .map(|(k, _)| k.clone())
-            .collect();
+        let sentinels = keys_at(&offsets, LATEST_SENTINEL);
         if sentinels.is_empty() {
             return Ok(());
         }
@@ -654,7 +670,7 @@ impl Consumer {
         }
         let lo = self
             .client
-            .send(build_latest_offsets_request(by_topic))
+            .send(build_offsets_request(by_topic, LATEST_TIMESTAMP))
             .await?;
         for t in &lo.topics {
             for p in &t.partitions {
@@ -663,6 +679,110 @@ impl Consumer {
         }
         Ok(())
     }
+
+    /// Recover the partitions that answered `OFFSET_OUT_OF_RANGE`.
+    ///
+    /// An errored Fetch partition carries no usable `log_start_offset`, so one
+    /// `ListOffsets(timestamp=-2)` reads the real log start for the whole set.
+    /// `Earliest` then fetches from there. `None` reports the first partition
+    /// as a truncation, and the log start is the safe offset the caller seeks
+    /// to.
+    ///
+    /// The caller has already released the `next_offsets` guard, so the RPC
+    /// here holds no lock.
+    #[tracing::instrument(
+        name = "consumer.recover_out_of_range",
+        level = "debug",
+        skip_all,
+        fields(group_id = %self.group_id, partitions = out_of_range.len()),
+        err
+    )]
+    async fn recover_out_of_range(
+        &self,
+        out_of_range: &[((String, i32), i64)],
+    ) -> Result<(), ConsumerError> {
+        let mut by_topic: HashMap<String, Vec<i32>> = HashMap::new();
+        for ((topic, partition), _) in out_of_range {
+            by_topic.entry(topic.clone()).or_default().push(*partition);
+        }
+        let answer = self
+            .client
+            .send(build_offsets_request(by_topic, EARLIEST_TIMESTAMP))
+            .await?;
+        let log_starts = log_starts_in(&answer);
+
+        if let AutoOffsetReset::None = self.auto_offset_reset {
+            if let Some(truncation) = out_of_range_truncation(out_of_range, &log_starts) {
+                return Err(truncation);
+            }
+            return Ok(());
+        }
+
+        let mut offsets = self.next_offsets.lock().await;
+        for (key, log_start) in out_of_range_positions(out_of_range, &log_starts) {
+            offsets.insert(key, log_start);
+        }
+        Ok(())
+    }
+}
+
+/// The log start each partition of a `ListOffsets` answer reports.
+fn log_starts_in(answer: &ListOffsetsResponse) -> HashMap<(String, i32), i64> {
+    let mut log_starts = HashMap::new();
+    for topic in &answer.topics {
+        for partition in &topic.partitions {
+            log_starts.insert(
+                (topic.name.clone(), partition.partition_index),
+                partition.offset,
+            );
+        }
+    }
+    log_starts
+}
+
+/// The fetch position to write for each out-of-range partition.
+///
+/// A partition the answer does not mention keeps the position it has. The next
+/// poll fetches it again and gets `OFFSET_OUT_OF_RANGE` again, which retries
+/// this path. That is better than inventing an offset for it.
+fn out_of_range_positions(
+    out_of_range: &[((String, i32), i64)],
+    log_starts: &HashMap<(String, i32), i64>,
+) -> Vec<((String, i32), i64)> {
+    out_of_range
+        .iter()
+        .filter_map(|(key, _)| log_starts.get(key).map(|start| (key.clone(), *start)))
+        .collect()
+}
+
+/// The truncation that `auto.offset.reset=none` reports.
+///
+/// It names the first out-of-range partition, the offset the fetch asked for,
+/// and the log start the caller seeks to. `UNKNOWN_OFFSET` as the safe offset
+/// says the broker gave no answer for that partition.
+fn out_of_range_truncation(
+    out_of_range: &[((String, i32), i64)],
+    log_starts: &HashMap<(String, i32), i64>,
+) -> Option<ConsumerError> {
+    let ((topic, partition), fetch_offset) = out_of_range.first()?;
+    Some(ConsumerError::LogTruncation {
+        topic: topic.clone(),
+        partition: *partition,
+        fetch_offset: *fetch_offset,
+        safe_offset: log_starts
+            .get(&(topic.clone(), *partition))
+            .copied()
+            .unwrap_or(UNKNOWN_OFFSET),
+    })
+}
+
+/// The keys whose next offset is exactly `sentinel`.
+fn keys_at(offsets: &HashMap<(String, i32), i64>, sentinel: i64) -> Vec<(String, i32)> {
+    offsets
+        .iter()
+        .filter(|(_, value)| **value == sentinel)
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 impl Consumer {
@@ -726,7 +846,10 @@ mod offset_advance_tests {
 
     use assert2::check;
     use krabka_protocol::{
-        owned::fetch_request::ReplicaState,
+        owned::{
+            fetch_request::ReplicaState,
+            list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
+        },
         primitives::uuid::Uuid as WireUuid,
         records::{RecordBatch, RecordsPayload},
         tagged_fields::UnknownTaggedFields,
@@ -923,30 +1046,135 @@ mod offset_advance_tests {
         );
     }
 
+    /// The request carries the caller's timestamp verbatim and asks as a
+    /// consumer, which is `replica_id = -1`.
+    ///
+    /// `-1` asks for the log end and `-2` for the log start. The
+    /// `OFFSET_OUT_OF_RANGE` recovery path depends on the second one, because
+    /// an errored Fetch partition reports no usable `log_start_offset`.
     #[test]
-    fn latest_offsets_request_uses_latest_timestamp_and_replica_sentinel() {
-        let mut by_topic = HashMap::new();
-        by_topic.insert("topic-a".to_string(), vec![3]);
-        let req = build_latest_offsets_request(by_topic);
+    fn offsets_request_carries_the_timestamp_and_the_consumer_replica_id() {
+        for timestamp in [LATEST_TIMESTAMP, EARLIEST_TIMESTAMP] {
+            let mut by_topic = HashMap::new();
+            by_topic.insert("topic-a".to_string(), vec![3]);
+            let req = build_offsets_request(by_topic, timestamp);
 
-        assert2::assert!(
-            req == ListOffsetsRequest {
-                replica_id: -1,
-                isolation_level: 0,
-                topics: vec![ListOffsetsTopic {
-                    name: "topic-a".into(),
-                    partitions: vec![ListOffsetsPartition {
-                        partition_index: 3,
-                        current_leader_epoch: -1,
-                        timestamp: -1,
+            assert2::assert!(
+                req == ListOffsetsRequest {
+                    replica_id: -1,
+                    isolation_level: 0,
+                    topics: vec![ListOffsetsTopic {
+                        name: "topic-a".into(),
+                        partitions: vec![ListOffsetsPartition {
+                            partition_index: 3,
+                            current_leader_epoch: -1,
+                            timestamp,
+                            unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
+                        }],
                         unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
                     }],
+                    timeout_ms: 0,
                     unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
-                }],
-                timeout_ms: 0,
-                unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
-            }
+                }
+            );
+        }
+    }
+
+    /// A `ListOffsets(-2)` answer becomes a log start per partition.
+    #[test]
+    fn log_starts_in_reads_every_partition_of_the_answer() {
+        let answer = list_offsets_answer(&[("topic-a", 0, 5), ("topic-a", 1, 9)]);
+        let mut expected: HashMap<(String, i32), i64> = HashMap::new();
+        expected.insert(("topic-a".to_string(), 0), 5);
+        expected.insert(("topic-a".to_string(), 1), 9);
+        assert2::assert!(log_starts_in(&answer) == expected);
+    }
+
+    /// The recovery writes the broker's log start, and leaves a partition the
+    /// broker did not answer for alone.
+    ///
+    /// Inventing a position for an unanswered partition is what the old code
+    /// did: it wrote the -1 that an errored Fetch reports, and every following
+    /// Fetch then asked for -1 and was out of range again.
+    #[test]
+    fn out_of_range_positions_uses_the_log_start_and_skips_the_unanswered() {
+        let out_of_range = vec![
+            (("topic-a".to_string(), 0), 0),
+            (("topic-a".to_string(), 1), 3),
+        ];
+        let log_starts = log_starts_in(&list_offsets_answer(&[("topic-a", 0, 5)]));
+        assert2::assert!(
+            out_of_range_positions(&out_of_range, &log_starts)
+                == vec![(("topic-a".to_string(), 0), 5)]
         );
+    }
+
+    /// Under `auto.offset.reset=none` the first out-of-range partition becomes
+    /// the error, with the log start as the offset the caller seeks to.
+    ///
+    /// An answer that omits the partition gives `UNKNOWN_OFFSET`, which says
+    /// the broker did not report one. It is not a position to fetch from.
+    #[test]
+    fn out_of_range_truncation_names_the_first_partition_and_its_log_start() {
+        for (answered, expected_safe) in [(true, 5), (false, UNKNOWN_OFFSET)] {
+            let entries: &[(&str, i32, i64)] = if answered { &[("topic-a", 0, 5)] } else { &[] };
+            let log_starts = log_starts_in(&list_offsets_answer(entries));
+            let out_of_range = vec![
+                (("topic-a".to_string(), 0), 2),
+                (("topic-a".to_string(), 1), 3),
+            ];
+            assert2::assert!(
+                out_of_range_truncation(&out_of_range, &log_starts).map(|e| e.to_string())
+                    == Some(
+                        ConsumerError::LogTruncation {
+                            topic: "topic-a".to_string(),
+                            partition: 0,
+                            fetch_offset: 2,
+                            safe_offset: expected_safe,
+                        }
+                        .to_string()
+                    )
+            );
+        }
+    }
+
+    /// Nothing out of range means nothing to report.
+    #[test]
+    fn out_of_range_truncation_is_none_for_an_empty_set() {
+        assert2::assert!(out_of_range_truncation(&[], &HashMap::new()).is_none());
+    }
+
+    /// Build a `ListOffsets` answer from `(topic, partition, offset)` entries.
+    fn list_offsets_answer(entries: &[(&str, i32, i64)]) -> ListOffsetsResponse {
+        let mut topics: Vec<ListOffsetsTopicResponse> = Vec::new();
+        for (name, partition_index, offset) in entries {
+            let partition = ListOffsetsPartitionResponse {
+                partition_index: *partition_index,
+                offset: *offset,
+                ..Default::default()
+            };
+            match topics.iter_mut().find(|t| t.name == *name) {
+                Some(topic) => topic.partitions.push(partition),
+                None => topics.push(ListOffsetsTopicResponse {
+                    name: (*name).to_string(),
+                    partitions: vec![partition],
+                    ..Default::default()
+                }),
+            }
+        }
+        ListOffsetsResponse {
+            topics,
+            ..Default::default()
+        }
+    }
+
+    /// `keys_at` picks exactly the partitions parked on a sentinel.
+    #[test]
+    fn keys_at_selects_only_the_sentinel_partitions() {
+        let mut offsets: HashMap<(String, i32), i64> = HashMap::new();
+        offsets.insert(("topic-a".to_string(), 0), LATEST_SENTINEL);
+        offsets.insert(("topic-a".to_string(), 1), 42);
+        assert2::assert!(keys_at(&offsets, LATEST_SENTINEL) == vec![("topic-a".to_string(), 0)]);
     }
 
     #[test]

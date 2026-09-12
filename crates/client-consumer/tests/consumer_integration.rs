@@ -98,14 +98,23 @@ async fn wait_for_assignment(consumer: &Consumer, want: usize, what: &str) {
 /// Wait until `consumer` holds exactly `want` partitions, polling meanwhile.
 ///
 /// A rejoin needs the poll loop to run, so this variant drives `poll` on every
-/// attempt and ignores what it returns.
-async fn poll_until_assignment(consumer: &mut Consumer, want: usize, what: &str) {
+/// attempt. It returns every record those polls delivered rather than dropping
+/// them. A caller that seeded records before the rejoin must see a replay that
+/// lands inside this window, and a discarded record would hide one.
+async fn poll_until_assignment(
+    consumer: &mut Consumer,
+    want: usize,
+    what: &str,
+) -> Vec<ConsumerRecord> {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
+    let mut seen: Vec<ConsumerRecord> = Vec::new();
     loop {
-        let _ = consumer.poll(millis(200)).await;
+        if let Ok(records) = consumer.poll(millis(200)).await {
+            seen.extend(records);
+        }
         let held = consumer.assignment().await.len();
         if held == want {
-            return;
+            return seen;
         }
         assert!(
             Instant::now() < deadline,
@@ -318,9 +327,29 @@ async fn two_member_split(bootstrap: &str, group: &str, topic: &str) -> (Consume
 /// That path primes the fetch offset of the re-acquired partition before it
 /// publishes the assignment again. `m1` is its own leader here, so there is no
 /// follower wait to race.
-async fn drop_member_and_reacquire(m1: &mut Consumer, m2: Consumer) {
+///
+/// The rejoin wait polls, so this returns what those polls delivered. A lost
+/// prime replays the pre-split records inside that window, and a caller that
+/// dropped them would never see the replay.
+async fn drop_member_and_reacquire(m1: &mut Consumer, m2: Consumer) -> Vec<ConsumerRecord> {
     m2.close().await.expect("m2 leaves the group");
-    poll_until_assignment(m1, 2, "m1 re-acquires both partitions").await;
+    poll_until_assignment(m1, 2, "m1 re-acquires both partitions").await
+}
+
+/// Read one record from `consumer`, commit the position, and return the value.
+///
+/// The commit is what the eager rejoin later primes the partition from.
+async fn consume_one_and_commit(consumer: &mut Consumer, what: &str) -> String {
+    let records = collect_records(consumer, 1).await;
+    assert!(
+        records.len() == 1,
+        "{what} held one partition with one record, but read {records:?}"
+    );
+    consumer
+        .commit_sync()
+        .await
+        .unwrap_or_else(|error| panic!("{what} commit: {error}"));
+    value_of(&records[0])
 }
 
 /// Two Range (eager) consumers share a 2-partition topic.
@@ -335,6 +364,10 @@ async fn drop_member_and_reacquire(m1: &mut Consumer, m2: Consumer) {
 /// `coordinator.rs`. `cooperative_rebalance.rs` covers the cooperative
 /// branches. A poll that races the rejoin must not see a re-acquired partition
 /// with no primed offset and fetch it from 0.
+///
+/// Both partitions therefore carry a committed record before the split. That
+/// record is the evidence: a rejoin that fetches from 0 delivers it again,
+/// and a rejoin that primes correctly never does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn eager_rebalance_reacquires_and_primes() {
@@ -346,16 +379,44 @@ async fn eager_rebalance_reacquires_and_primes() {
     let producer = support::bootstrap_client(&kafka.bootstrap).await;
     support::create_topic_with_partitions(&producer, &topic, 2).await;
 
-    let (mut m1, m2) = two_member_split(&kafka.bootstrap, &group, &topic).await;
-    drop_member_and_reacquire(&mut m1, m2).await;
+    // Seed one record per partition BEFORE the split. Without a seed, a rejoin
+    // that lost the prime and fetched from offset 0 would read exactly the same
+    // fresh records as a correct prime, so the case would pass against a client
+    // that has the defect.
+    support::produce_to_partition(&producer, &topic, 0, &["a0"]).await;
+    support::produce_to_partition(&producer, &topic, 1, &["a1"]).await;
+
+    let (mut m1, mut m2) = two_member_split(&kafka.bootstrap, &group, &topic).await;
+
+    // Each member reads its own partition and commits. Those two commits are
+    // the positions the eager rejoin must prime from.
+    let seeded = HashSet::from([
+        consume_one_and_commit(&mut m1, "m1").await,
+        consume_one_and_commit(&mut m2, "m2").await,
+    ]);
+    assert!(seeded == HashSet::from(["a0".to_string(), "a1".to_string()]));
+
+    // The rejoin must replay nothing. A re-acquired partition that fetched from
+    // 0 instead of from the committed position delivers its seed record here.
+    let replayed = drop_member_and_reacquire(&mut m1, m2).await;
+    assert!(
+        replayed.is_empty(),
+        "the eager rejoin replayed pre-split records: {replayed:?}"
+    );
 
     // Produce a fresh record to each partition. m1 owns both again, so it must
-    // deliver both. That proves the re-acquired partition primed correctly and
-    // that poll did not stall on a missing next-offset entry.
+    // deliver both, at offset 1, and nothing else. That proves the re-acquired
+    // partition primed correctly and that poll did not stall on a missing
+    // next-offset entry.
     support::produce_to_partition(&producer, &topic, 0, &["b0"]).await;
     support::produce_to_partition(&producer, &topic, 1, &["b1"]).await;
-    let second = collect_prefixed(&mut m1, 'b', 2).await;
-    assert!(second == HashSet::from(["b0".to_string(), "b1".to_string()]));
+    let mut delivered: Vec<(i32, i64, String)> = collect_records(&mut m1, 2)
+        .await
+        .iter()
+        .map(|record| (record.partition, record.offset, value_of(record)))
+        .collect();
+    delivered.sort_unstable();
+    assert!(delivered == vec![(0, 1, "b0".to_string()), (1, 1, "b1".to_string())]);
 
     m1.close().await.expect("close m1");
     producer.close();
@@ -455,6 +516,16 @@ const RESET_SETTLE_POLLS: u32 = 3;
 struct OutOfRangeCase {
     /// The policy the recovering consumer runs with.
     policy: AutoOffsetReset,
+    /// Whether a seed member commits offset 0 for the group before the trim.
+    ///
+    /// `Latest` needs it. A fresh group under `Latest` starts at the `i64::MAX`
+    /// sentinel, which resolves straight to the live log end, so it is never
+    /// out of range and the recovery branch never runs at all. The committed 0
+    /// is what puts the consumer below the trimmed log start.
+    ///
+    /// `Earliest` needs none. It primes an uncommitted partition to 0 by
+    /// itself, and the trim puts that 0 below the log start.
+    seed_committed_zero: bool,
     /// Records produced after the reset has settled. `Latest` needs them,
     /// because its reset lands at the live log end and leaves nothing older to
     /// read. `Earliest` needs none, because its reset lands at the new log
@@ -480,6 +551,10 @@ async fn run_out_of_range_reset(case: &OutOfRangeCase) {
     let producer = support::bootstrap_client(&kafka.bootstrap).await;
     support::create_topic(&producer, &topic).await;
     support::produce(&producer, &topic, &OUT_OF_RANGE_SEED).await;
+
+    if case.seed_committed_zero {
+        seed_committed_offset_zero(&kafka.bootstrap, &group, &topic).await;
+    }
 
     // Trim the log start to 5. A consumer that starts at 0 is now below the
     // log. The returned low watermark is the broker's own new log start.
@@ -545,7 +620,13 @@ async fn settle_latest_reset(consumer: &mut Consumer) {
 
 /// `OFFSET_OUT_OF_RANGE` recovery under `auto.offset.reset=latest`.
 ///
-/// `Latest` writes the `i64::MAX` sentinel. The next poll resolves that
+/// A seed member commits offset 0 for the group before the trim, so the
+/// recovering consumer starts below the new log start and its first `Fetch`
+/// really does get `OFFSET_OUT_OF_RANGE`. Without that commit a fresh `Latest`
+/// group starts at the sentinel, resolves straight to the log end, and never
+/// reaches the recovery branch this case exists to cover.
+///
+/// `Latest` then writes the `i64::MAX` sentinel. The next poll resolves that
 /// sentinel to the live log end with `ListOffsets(-1)`. The consumer then reads
 /// the records produced after that point. This shows real recovery, with no
 /// error and a resumed fetch, and not a silent stall.
@@ -554,6 +635,7 @@ async fn settle_latest_reset(consumer: &mut Consumer) {
 async fn consumer_resets_on_offset_out_of_range_latest() {
     run_out_of_range_reset(&OutOfRangeCase {
         policy: AutoOffsetReset::Latest,
+        seed_committed_zero: true,
         produced_after_reset: &["NEW1", "NEW2", "NEW3"],
         expected: &["NEW1", "NEW2", "NEW3"],
     })
@@ -572,6 +654,7 @@ async fn consumer_resets_on_offset_out_of_range_latest() {
 async fn consumer_resets_on_offset_out_of_range_earliest() {
     run_out_of_range_reset(&OutOfRangeCase {
         policy: AutoOffsetReset::Earliest,
+        seed_committed_zero: false,
         produced_after_reset: &[],
         expected: &["f", "g", "h"],
     })
@@ -664,13 +747,17 @@ async fn consumer_none_policy_surfaces_log_truncation() {
                 topic: reported_topic,
                 partition,
                 fetch_offset,
-                ..
+                safe_offset,
             }) => {
                 assert!(reported_topic == topic);
                 assert!(partition == 0);
                 check!(
                     fetch_offset == 0,
                     "fetch_offset should be the out-of-range offset 0, got {fetch_offset}"
+                );
+                check!(
+                    safe_offset == low,
+                    "safe_offset should be the new log start {low}, got {safe_offset}"
                 );
                 got_truncation = true;
                 break;

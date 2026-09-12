@@ -1,4 +1,4 @@
-load("//bazel:defs.bzl", "crate_library", "crate_tests")
+load("//bazel:defs.bzl", "crate_example", "crate_library", "crate_tests")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -8,3 +8,10 @@ exports_files(["Cargo.toml"])
 crate_library(name = "client-producer")
 
 crate_tests(lib = "client-producer")
+
+# `examples/loadgen.rs`. Bazel is the build gate here, so the example needs
+# a target of its own or `bazel build //...` never compiles it.
+crate_example(
+    name = "loadgen",
+    lib = ":client-producer",
+)
