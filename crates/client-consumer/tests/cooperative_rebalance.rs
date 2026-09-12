@@ -46,11 +46,14 @@ async fn cooperative_three_member_partial_revocation() {
     assert2::assert!(m1.assignment().await.len() == 6);
 
     // m2 joins. Phase 1 keeps the partitions that m1 retains and gives m2
-    // none. Phase 2 moves the freed half to m2. `wait_for_total_assignment`
-    // gates both phases.
+    // none. Phase 2 moves the freed half to m2. Both members must hold a
+    // non-empty, disjoint share before m3 joins, which is what
+    // `wait_for_settled_split` demands. A union of six alone does not prove
+    // the round is over: m1 still reports all six while m2 sits at zero
+    // between the two phases.
     pace_join().await;
     let m2 = cooperative_consumer(&kafka.bootstrap, &group, "m2", &topic).await;
-    wait_for_total_assignment(&[&m1, &m2], 6).await;
+    wait_for_settled_split(&[&m1, &m2], 6).await;
 
     // m3 joins after the m1 and m2 round is complete. The settle loop below
     // gates the final round.
@@ -271,38 +274,19 @@ async fn wait_for_assignment_count(consumer: &Consumer, expected: usize) {
     .unwrap_or_else(|_| panic!("assignment count did not reach {expected} in {SETTLE_TIMEOUT:?}"));
 }
 
-/// Wait until the union of all assignments holds `expected` entries.
-///
-/// The entries are unique `(topic, partition)` pairs. A case uses this to
-/// confirm that a cooperative rebalance is complete before the next membership
-/// change.
-async fn wait_for_total_assignment(consumers: &[&Consumer], expected: usize) {
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
-        loop {
-            let mut union: HashSet<(String, i32)> = HashSet::new();
-            for consumer in consumers {
-                for tp in consumer.assignment().await {
-                    union.insert(tp);
-                }
-            }
-            if union.len() == expected {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("total assignment did not reach {expected} in {SETTLE_TIMEOUT:?}"));
-}
-
 /// Wait for a settled cooperative assignment and return its union.
 ///
 /// The correctness properties are that the union covers every partition, that
 /// no two members hold the same partition, and that every member holds at
-/// least one partition. The loop does not demand an even split. The three
-/// `assignment()` reads are not one atomic snapshot, so a phase-1 to phase-2
-/// transition can show one member with one partition and another with three.
-/// The loop condition rides out that window instead of failing on it.
+/// least one partition. Those three together are what proves the round is
+/// over: a union that covers every partition proves nothing on its own,
+/// because a member that has not yet processed its `SyncGroup` response still
+/// reports the partitions it is about to give up.
+///
+/// The loop does not demand an even split. The per-member `assignment()` reads
+/// are not one atomic snapshot, so a phase-1 to phase-2 transition can show one
+/// member with one partition and another with three. The loop condition rides
+/// out that window instead of failing on it.
 async fn wait_for_settled_split(
     consumers: &[&Consumer],
     expected: usize,

@@ -54,6 +54,9 @@ pub const BOOTSTRAP_MAX_ATTEMPTS: u32 = 15;
 pub const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// Attempts for a produce that races `CreateTopics` metadata propagation.
 pub const PRODUCE_MAX_ATTEMPTS: u32 = 10;
+/// Attempts for a Metadata lookup that races `CreateTopics`.
+pub const METADATA_MAX_ATTEMPTS: u32 = 25;
+pub const METADATA_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// Kafka error code `UNKNOWN_TOPIC_OR_PARTITION`.
 pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 
@@ -194,22 +197,42 @@ pub async fn create_topic(client: &Client, name: &str) {
 /// Produce and Fetch at v >= 13 carry only `topic_id` on the wire. A broker
 /// that predates KIP-516 reports the zero UUID, and the negotiated version is
 /// then below 13, so the name still settles the routing.
+///
+/// `CreateTopics` returns before the broker publishes the topic in its
+/// metadata cache. Until it does, the response either omits the topic or
+/// carries `UNKNOWN_TOPIC_OR_PARTITION` for it, and both shapes read as the
+/// zero UUID. A caller that kept that value would then send a Produce or a
+/// Fetch at v >= 13 that addresses no topic at all. So this retries until the
+/// broker answers for the topic with no error, and returns the ID it reports
+/// then. On a broker without topic IDs that ID is legitimately zero, and the
+/// loop still ends on the first clean answer.
 pub async fn topic_id_for(client: &Client, name: &str) -> WireUuid {
-    let resp = client
-        .send(MetadataRequest {
-            topics: Some(vec![MetadataRequestTopic {
-                name: Some(name.into()),
+    for attempt in 1..=METADATA_MAX_ATTEMPTS {
+        let resp = client
+            .send(MetadataRequest {
+                topics: Some(vec![MetadataRequestTopic {
+                    name: Some(name.into()),
+                    ..Default::default()
+                }]),
                 ..Default::default()
-            }]),
-            ..Default::default()
-        })
-        .await
-        .expect("Metadata for topic_id");
-    resp.topics
-        .iter()
-        .find(|t| t.name.as_deref() == Some(name))
-        .map(|t| t.topic_id)
-        .unwrap_or_default()
+            })
+            .await
+            .expect("Metadata for topic_id");
+        if let Some(topic) = resp.topics.iter().find(|t| t.name.as_deref() == Some(name))
+            && topic.error_code == 0
+        {
+            return topic.topic_id;
+        }
+        tracing::warn!(
+            topic = name,
+            attempt,
+            "metadata has no entry for the topic yet"
+        );
+        // Real-time wait, not a progress poll: the metadata refresh happens in
+        // the broker process and publishes no signal this side can await.
+        tokio::time::sleep(METADATA_RETRY_DELAY).await;
+    }
+    panic!("metadata never published topic {name} after {METADATA_MAX_ATTEMPTS} attempts");
 }
 
 /// Build a `RecordBatch` with one entry per value.
@@ -242,8 +265,11 @@ pub async fn produce(client: &Client, topic: &str, values: &[&str]) {
 /// `CreateTopics` returns, so an immediate produce can still see
 /// `UNKNOWN_TOPIC_OR_PARTITION`. The bounded retry covers that window.
 pub async fn produce_to_partition(client: &Client, topic: &str, partition: i32, values: &[&str]) {
-    let topic_id = topic_id_for(client, topic).await;
     for attempt in 1..=PRODUCE_MAX_ATTEMPTS {
+        // Re-read the ID on every attempt. A retry exists because the broker
+        // had not published the topic yet, and the ID read before that point
+        // is the one the broker has since replaced.
+        let topic_id = topic_id_for(client, topic).await;
         let resp = client
             .send(ProduceRequest {
                 acks: 1,
