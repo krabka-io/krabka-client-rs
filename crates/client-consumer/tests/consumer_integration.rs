@@ -747,13 +747,17 @@ async fn consumer_none_policy_surfaces_log_truncation() {
                 topic: reported_topic,
                 partition,
                 fetch_offset,
-                ..
+                safe_offset,
             }) => {
                 assert!(reported_topic == topic);
                 assert!(partition == 0);
                 check!(
                     fetch_offset == 0,
                     "fetch_offset should be the out-of-range offset 0, got {fetch_offset}"
+                );
+                check!(
+                    safe_offset == low,
+                    "safe_offset should be the new log start {low}, got {safe_offset}"
                 );
                 got_truncation = true;
                 break;
