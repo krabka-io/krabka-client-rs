@@ -7,6 +7,7 @@ use krabka_ids::LeaderEpoch;
 use krabka_protocol::owned::{
     fetch_request::{FetchPartition, FetchRequest, FetchTopic},
     list_offsets_request::{ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
+    list_offsets_response::ListOffsetsResponse,
 };
 use krabka_units::{
     ByteSize, Time,
@@ -704,41 +705,75 @@ impl Consumer {
         for ((topic, partition), _) in out_of_range {
             by_topic.entry(topic.clone()).or_default().push(*partition);
         }
-        let lo = self
+        let answer = self
             .client
             .send(build_offsets_request(by_topic, EARLIEST_TIMESTAMP))
             .await?;
-        let mut log_starts: HashMap<(String, i32), i64> = HashMap::new();
-        for topic in &lo.topics {
-            for partition in &topic.partitions {
-                log_starts.insert(
-                    (topic.name.clone(), partition.partition_index),
-                    partition.offset,
-                );
-            }
-        }
+        let log_starts = log_starts_in(&answer);
 
         if let AutoOffsetReset::None = self.auto_offset_reset {
-            let ((topic, partition), fetch_offset) = &out_of_range[0];
-            return Err(ConsumerError::LogTruncation {
-                topic: topic.clone(),
-                partition: *partition,
-                fetch_offset: *fetch_offset,
-                safe_offset: log_starts
-                    .get(&(topic.clone(), *partition))
-                    .copied()
-                    .unwrap_or(UNKNOWN_OFFSET),
-            });
+            if let Some(truncation) = out_of_range_truncation(out_of_range, &log_starts) {
+                return Err(truncation);
+            }
+            return Ok(());
         }
 
         let mut offsets = self.next_offsets.lock().await;
-        for (key, _) in out_of_range {
-            if let Some(log_start) = log_starts.get(key) {
-                offsets.insert(key.clone(), *log_start);
-            }
+        for (key, log_start) in out_of_range_positions(out_of_range, &log_starts) {
+            offsets.insert(key, log_start);
         }
         Ok(())
     }
+}
+
+/// The log start each partition of a `ListOffsets` answer reports.
+fn log_starts_in(answer: &ListOffsetsResponse) -> HashMap<(String, i32), i64> {
+    let mut log_starts = HashMap::new();
+    for topic in &answer.topics {
+        for partition in &topic.partitions {
+            log_starts.insert(
+                (topic.name.clone(), partition.partition_index),
+                partition.offset,
+            );
+        }
+    }
+    log_starts
+}
+
+/// The fetch position to write for each out-of-range partition.
+///
+/// A partition the answer does not mention keeps the position it has. The next
+/// poll fetches it again and gets `OFFSET_OUT_OF_RANGE` again, which retries
+/// this path. That is better than inventing an offset for it.
+fn out_of_range_positions(
+    out_of_range: &[((String, i32), i64)],
+    log_starts: &HashMap<(String, i32), i64>,
+) -> Vec<((String, i32), i64)> {
+    out_of_range
+        .iter()
+        .filter_map(|(key, _)| log_starts.get(key).map(|start| (key.clone(), *start)))
+        .collect()
+}
+
+/// The truncation that `auto.offset.reset=none` reports.
+///
+/// It names the first out-of-range partition, the offset the fetch asked for,
+/// and the log start the caller seeks to. `UNKNOWN_OFFSET` as the safe offset
+/// says the broker gave no answer for that partition.
+fn out_of_range_truncation(
+    out_of_range: &[((String, i32), i64)],
+    log_starts: &HashMap<(String, i32), i64>,
+) -> Option<ConsumerError> {
+    let ((topic, partition), fetch_offset) = out_of_range.first()?;
+    Some(ConsumerError::LogTruncation {
+        topic: topic.clone(),
+        partition: *partition,
+        fetch_offset: *fetch_offset,
+        safe_offset: log_starts
+            .get(&(topic.clone(), *partition))
+            .copied()
+            .unwrap_or(UNKNOWN_OFFSET),
+    })
 }
 
 /// The keys whose next offset is exactly `sentinel`.
@@ -811,7 +846,10 @@ mod offset_advance_tests {
 
     use assert2::check;
     use krabka_protocol::{
-        owned::fetch_request::ReplicaState,
+        owned::{
+            fetch_request::ReplicaState,
+            list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
+        },
         primitives::uuid::Uuid as WireUuid,
         records::{RecordBatch, RecordsPayload},
         tagged_fields::UnknownTaggedFields,
@@ -1039,6 +1077,94 @@ mod offset_advance_tests {
                     unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
                 }
             );
+        }
+    }
+
+    /// A `ListOffsets(-2)` answer becomes a log start per partition.
+    #[test]
+    fn log_starts_in_reads_every_partition_of_the_answer() {
+        let answer = list_offsets_answer(&[("topic-a", 0, 5), ("topic-a", 1, 9)]);
+        let mut expected: HashMap<(String, i32), i64> = HashMap::new();
+        expected.insert(("topic-a".to_string(), 0), 5);
+        expected.insert(("topic-a".to_string(), 1), 9);
+        assert2::assert!(log_starts_in(&answer) == expected);
+    }
+
+    /// The recovery writes the broker's log start, and leaves a partition the
+    /// broker did not answer for alone.
+    ///
+    /// Inventing a position for an unanswered partition is what the old code
+    /// did: it wrote the -1 that an errored Fetch reports, and every following
+    /// Fetch then asked for -1 and was out of range again.
+    #[test]
+    fn out_of_range_positions_uses_the_log_start_and_skips_the_unanswered() {
+        let out_of_range = vec![
+            (("topic-a".to_string(), 0), 0),
+            (("topic-a".to_string(), 1), 3),
+        ];
+        let log_starts = log_starts_in(&list_offsets_answer(&[("topic-a", 0, 5)]));
+        assert2::assert!(
+            out_of_range_positions(&out_of_range, &log_starts)
+                == vec![(("topic-a".to_string(), 0), 5)]
+        );
+    }
+
+    /// Under `auto.offset.reset=none` the first out-of-range partition becomes
+    /// the error, with the log start as the offset the caller seeks to.
+    ///
+    /// An answer that omits the partition gives `UNKNOWN_OFFSET`, which says
+    /// the broker did not report one. It is not a position to fetch from.
+    #[test]
+    fn out_of_range_truncation_names_the_first_partition_and_its_log_start() {
+        for (answered, expected_safe) in [(true, 5), (false, UNKNOWN_OFFSET)] {
+            let entries: &[(&str, i32, i64)] = if answered { &[("topic-a", 0, 5)] } else { &[] };
+            let log_starts = log_starts_in(&list_offsets_answer(entries));
+            let out_of_range = vec![
+                (("topic-a".to_string(), 0), 2),
+                (("topic-a".to_string(), 1), 3),
+            ];
+            assert2::assert!(
+                out_of_range_truncation(&out_of_range, &log_starts).map(|e| e.to_string())
+                    == Some(
+                        ConsumerError::LogTruncation {
+                            topic: "topic-a".to_string(),
+                            partition: 0,
+                            fetch_offset: 2,
+                            safe_offset: expected_safe,
+                        }
+                        .to_string()
+                    )
+            );
+        }
+    }
+
+    /// Nothing out of range means nothing to report.
+    #[test]
+    fn out_of_range_truncation_is_none_for_an_empty_set() {
+        assert2::assert!(out_of_range_truncation(&[], &HashMap::new()).is_none());
+    }
+
+    /// Build a `ListOffsets` answer from `(topic, partition, offset)` entries.
+    fn list_offsets_answer(entries: &[(&str, i32, i64)]) -> ListOffsetsResponse {
+        let mut topics: Vec<ListOffsetsTopicResponse> = Vec::new();
+        for (name, partition_index, offset) in entries {
+            let partition = ListOffsetsPartitionResponse {
+                partition_index: *partition_index,
+                offset: *offset,
+                ..Default::default()
+            };
+            match topics.iter_mut().find(|t| t.name == *name) {
+                Some(topic) => topic.partitions.push(partition),
+                None => topics.push(ListOffsetsTopicResponse {
+                    name: (*name).to_string(),
+                    partitions: vec![partition],
+                    ..Default::default()
+                }),
+            }
+        }
+        ListOffsetsResponse {
+            topics,
+            ..Default::default()
         }
     }
 
