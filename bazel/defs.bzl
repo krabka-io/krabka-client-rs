@@ -122,6 +122,39 @@ def crate_binary(name, crate_root, lib, tests = True, **kwargs):
             deps = all_crate_deps(normal_dev = True),
         )
 
+def crate_example(name, lib, **kwargs):
+    """`rust_binary` for a Cargo `examples/<name>.rs` target.
+
+    Cargo compiles an example only on `cargo build --examples` or
+    `cargo test`, and this repository's gate is Bazel. Without a target here
+    `bazel build //...` never compiles the file, so the example rots and the
+    build gate still passes.
+
+    Args:
+      name: the example's file stem, so `loadgen` for `examples/loadgen.rs`.
+      lib: the `crate_library` target in this package that it links.
+      **kwargs: passed through to `rust_binary`.
+    """
+    crate_root = "examples/%s.rs" % name
+    rust_binary(
+        name = name,
+        srcs = [crate_root],
+        aliases = _aliases(["deps"]),
+        crate_features = _features(),
+        crate_root = crate_root,
+        edition = edition(),
+        rustc_flags = WORKSPACE_RUSTC_FLAGS,
+        visibility = ["//visibility:public"],
+        deps = all_crate_deps(normal = True) + [lib],
+        **kwargs
+    )
+
+    # Clippy as a test, the same gate `crate_library` puts on the library.
+    clippy_test(
+        name = name + "_clippy",
+        srcs = [":" + name],
+    )
+
 def crate_tests(
         lib,
         data = None,
