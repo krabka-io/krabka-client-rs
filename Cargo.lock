@@ -1791,6 +1791,8 @@ dependencies = [
  "krabka-units",
  "ring",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1818,10 +1820,13 @@ dependencies = [
  "refined_type",
  "stateright",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1891,6 +1896,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "krabka-client-admin",
  "krabka-client-consumer",
  "krabka-client-core",
  "krabka-compression",
@@ -1901,10 +1907,13 @@ dependencies = [
  "refined_type",
  "stateright",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
