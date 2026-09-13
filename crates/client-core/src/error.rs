@@ -16,6 +16,25 @@ pub enum ClientError {
         source: std::io::Error,
     },
 
+    /// The TCP connection opened, but the TLS handshake failed.
+    #[error("TLS handshake with {addr}: {source}")]
+    Tls {
+        addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// SASL authentication failed after the TCP connection, and TLS if the
+    /// protocol uses it, came up. [`crate::OutboundSaslError::Sasl`] means
+    /// the SASL exchange failed, for example when the broker rejects the
+    /// mechanism or the credentials.
+    #[error("SASL authentication with {addr}: {source}")]
+    Sasl {
+        addr: SocketAddr,
+        #[source]
+        source: crate::sasl::OutboundSaslError,
+    },
+
     #[error("connection closed")]
     Disconnected,
 

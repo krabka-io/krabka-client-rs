@@ -292,6 +292,8 @@ impl Client {
                 Ok(connection) => connection,
                 Err(
                     error @ (ClientError::Connect { .. }
+                    | ClientError::Tls { .. }
+                    | ClientError::Sasl { .. }
                     | ClientError::Timeout(_)
                     | ClientError::Disconnected
                     | ClientError::Io(_)),
@@ -408,6 +410,8 @@ impl Client {
             // configured trigger expires.
             Err(
                 error @ (ClientError::Connect { .. }
+                | ClientError::Tls { .. }
+                | ClientError::Sasl { .. }
                 | ClientError::Timeout(_)
                 | ClientError::Disconnected
                 | ClientError::Io(_)),
@@ -473,6 +477,8 @@ impl Client {
             Ok(conn) => conn,
             Err(
                 ClientError::Connect { .. }
+                | ClientError::Tls { .. }
+                | ClientError::Sasl { .. }
                 | ClientError::Timeout(_)
                 | ClientError::Disconnected
                 | ClientError::Io(_),
@@ -525,9 +531,13 @@ impl Client {
     ) -> Result<crate::offset_for_leader_epoch::EpochEndOffset, ClientError> {
         let conn = match self.pool.get(broker_id).await {
             Ok(conn) => conn,
-            Err(ClientError::Connect { .. } | ClientError::Timeout(_) | ClientError::Io(_))
-                if self.pool.knows_broker(broker_id) =>
-            {
+            Err(
+                ClientError::Connect { .. }
+                | ClientError::Tls { .. }
+                | ClientError::Sasl { .. }
+                | ClientError::Timeout(_)
+                | ClientError::Io(_),
+            ) if self.pool.knows_broker(broker_id) => {
                 self.pool.evict(broker_id);
                 self.refresh_metadata().await?;
                 self.pool.get(broker_id).await?
@@ -575,9 +585,13 @@ impl Client {
             Err(ClientError::Disconnected) if !self.pool.knows_broker(broker_id) => {
                 self.pool.bootstrap_connection().await?
             }
-            Err(ClientError::Connect { .. } | ClientError::Timeout(_) | ClientError::Io(_))
-                if self.pool.knows_broker(broker_id) =>
-            {
+            Err(
+                ClientError::Connect { .. }
+                | ClientError::Tls { .. }
+                | ClientError::Sasl { .. }
+                | ClientError::Timeout(_)
+                | ClientError::Io(_),
+            ) if self.pool.knows_broker(broker_id) => {
                 self.pool.evict(broker_id);
                 self.refresh_metadata().await?;
                 match self.pool.get(broker_id).await {
@@ -641,9 +655,13 @@ impl BrokerHandle<'_> {
             Err(ClientError::Disconnected) if !self.client.pool.knows_broker(self.broker_id) => {
                 self.client.pool.bootstrap_connection().await?
             }
-            Err(ClientError::Connect { .. } | ClientError::Timeout(_) | ClientError::Io(_))
-                if self.client.pool.knows_broker(self.broker_id) =>
-            {
+            Err(
+                ClientError::Connect { .. }
+                | ClientError::Tls { .. }
+                | ClientError::Sasl { .. }
+                | ClientError::Timeout(_)
+                | ClientError::Io(_),
+            ) if self.client.pool.knows_broker(self.broker_id) => {
                 self.client.pool.evict(self.broker_id);
                 self.client.refresh_metadata().await?;
                 match self.client.pool.get(self.broker_id).await {
@@ -673,9 +691,13 @@ impl BrokerHandle<'_> {
             Err(ClientError::Disconnected) if !self.client.pool.knows_broker(self.broker_id) => {
                 self.client.pool.bootstrap_connection().await?
             }
-            Err(ClientError::Connect { .. } | ClientError::Timeout(_) | ClientError::Io(_))
-                if self.client.pool.knows_broker(self.broker_id) =>
-            {
+            Err(
+                ClientError::Connect { .. }
+                | ClientError::Tls { .. }
+                | ClientError::Sasl { .. }
+                | ClientError::Timeout(_)
+                | ClientError::Io(_),
+            ) if self.client.pool.knows_broker(self.broker_id) => {
                 self.client.pool.evict(self.broker_id);
                 self.client.refresh_metadata().await?;
                 match self.client.pool.get(self.broker_id).await {

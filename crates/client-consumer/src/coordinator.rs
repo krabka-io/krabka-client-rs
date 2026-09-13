@@ -96,6 +96,8 @@ pub(crate) fn is_retriable_transport_error(e: &krabka_client_core::ClientError) 
     matches!(
         e,
         krabka_client_core::ClientError::Connect { .. }
+            | krabka_client_core::ClientError::Tls { .. }
+            | krabka_client_core::ClientError::Sasl { .. }
             | krabka_client_core::ClientError::Disconnected
             | krabka_client_core::ClientError::Io(_)
     )
