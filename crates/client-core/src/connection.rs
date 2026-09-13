@@ -285,9 +285,10 @@ impl Connection {
     /// # Errors
     ///
     /// Returns [`ClientError::Connect`] / [`ClientError::Timeout`] on the
-    /// TCP dial, or [`ClientError::Io`] if the TLS or SASL handshake fails
-    /// or the security policy is internally inconsistent (e.g. a TLS
-    /// protocol with no TLS config).
+    /// TCP dial, [`ClientError::Tls`] if the TLS handshake fails,
+    /// [`ClientError::Sasl`] if SASL authentication fails, or
+    /// [`ClientError::Io`] if the security policy is internally inconsistent
+    /// (e.g. a TLS protocol with no TLS config).
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -323,7 +324,7 @@ impl Connection {
             let s = connector
                 .connect(sni, tcp)
                 .await
-                .map_err(|e| ClientError::Io(std::io::Error::other(e.to_string())))?;
+                .map_err(|source| ClientError::Tls { addr, source })?;
             Box::new(s)
         } else {
             Box::new(tcp)
@@ -348,7 +349,7 @@ impl Connection {
                 options.frame_max,
             )
             .await
-            .map_err(|e| ClientError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|source| ClientError::Sasl { addr, source })?;
         }
 
         Self::from_stream(stream, options).await

@@ -498,8 +498,19 @@ fn renewer_str_to_principal(s: &str) -> Option<krabka_security::KafkaPrincipal> 
 
 #[derive(Debug, Error)]
 pub enum AdminError {
-    #[error("no bootstrap address was reachable: tried {tried}")]
-    Connect { tried: usize },
+    /// No bootstrap address gave a usable connection. `source` holds the
+    /// error from the last address tried, and is `None` only when the list
+    /// was empty. Match it to tell an unreachable or silent broker
+    /// ([`ClientError::Connect`] or [`ClientError::Timeout`]) from a TLS
+    /// failure ([`ClientError::Tls`]) or a SASL rejection
+    /// ([`ClientError::Sasl`]).
+    #[error("no bootstrap address connected: tried {tried}{cause}",
+            cause = .source.as_ref().map(|e| format!("; last error: {e}")).unwrap_or_default())]
+    Connect {
+        tried: usize,
+        #[source]
+        source: Option<Box<AdminError>>,
+    },
     #[error("controller routing failed after retry")]
     NotControllerExhausted,
     #[error("broker returned error: api={api} code={code} ({name}){detail}",
@@ -784,26 +795,31 @@ impl RecoveringConnection {
     }
 
     pub(crate) async fn rebootstrap(&self) -> Result<(), AdminError> {
+        let mut last_error = None;
         for host_port in &self.bootstrap_addrs {
-            if let Ok(connected) = AdminClient::connect_target_one_with_discovery(
+            match AdminClient::connect_target_one_with_discovery(
                 host_port,
                 self.options.clone(),
                 self.target,
             )
             .await
             {
-                self.replace(connected.connection).await;
-                self.replace_known_addrs(if connected.discovered_addrs.is_empty() {
-                    self.bootstrap_addrs.clone()
-                } else {
-                    connected.discovered_addrs
-                });
-                self.clear_metadata_attempt();
-                return Ok(());
+                Ok(connected) => {
+                    self.replace(connected.connection).await;
+                    self.replace_known_addrs(if connected.discovered_addrs.is_empty() {
+                        self.bootstrap_addrs.clone()
+                    } else {
+                        connected.discovered_addrs
+                    });
+                    self.clear_metadata_attempt();
+                    return Ok(());
+                }
+                Err(error) => last_error = Some(Box::new(error)),
             }
         }
         Err(AdminError::Connect {
             tried: self.bootstrap_addrs.len(),
+            source: last_error,
         })
     }
 
@@ -813,23 +829,28 @@ impl RecoveringConnection {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let mut last_error = None;
         for host_port in &known_addrs {
-            if let Ok(connected) = AdminClient::connect_target_one_with_discovery(
+            match AdminClient::connect_target_one_with_discovery(
                 host_port,
                 self.options.clone(),
                 self.target,
             )
             .await
             {
-                self.replace(connected.connection).await;
-                if !connected.discovered_addrs.is_empty() {
-                    self.replace_known_addrs(connected.discovered_addrs);
+                Ok(connected) => {
+                    self.replace(connected.connection).await;
+                    if !connected.discovered_addrs.is_empty() {
+                        self.replace_known_addrs(connected.discovered_addrs);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                Err(error) => last_error = Some(Box::new(error)),
             }
         }
         Err(AdminError::Connect {
             tried: known_addrs.len(),
+            source: last_error,
         })
     }
 
@@ -972,8 +993,8 @@ impl AdminClient {
     /// which is identical to [`AdminClient::connect`].
     ///
     /// # Errors
-    /// Returns `AdminError::Connect { tried }` if no bootstrap address
-    /// accepted the (optionally secured) connection.
+    /// Returns [`AdminError::Connect`] if no bootstrap address accepted the
+    /// (optionally secured) connection. Its `source` holds the last cause.
     pub async fn connect_secured(
         bootstrap_addrs: &[String],
         security: Option<krabka_client_core::security::ClientSecurity>,
@@ -985,7 +1006,8 @@ impl AdminClient {
     /// standard admin identity, TCP-connect timeout, and request timeout.
     ///
     /// # Errors
-    /// Returns `AdminError::Connect { tried }` if no bootstrap address connects.
+    /// Returns [`AdminError::Connect`] with the last cause if no bootstrap
+    /// address connects.
     pub async fn connect_secured_with_dns_timeout(
         bootstrap_addrs: &[String],
         security: Option<krabka_client_core::security::ClientSecurity>,
@@ -1000,7 +1022,8 @@ impl AdminClient {
     /// deadline.
     ///
     /// # Errors
-    /// Returns `AdminError::Connect { tried }` if no bootstrap address connects.
+    /// Returns [`AdminError::Connect`] with the last cause if no bootstrap
+    /// address connects.
     pub async fn connect_with_dns_timeout(
         bootstrap_addrs: &[String],
         dns_timeout: krabka_client_core::ClientDnsTimeout,
@@ -1011,8 +1034,8 @@ impl AdminClient {
     /// Connects with a complete connection-options template.
     ///
     /// # Errors
-    /// Returns `AdminError::Connect { tried }` if no bootstrap address
-    /// accepted the connection.
+    /// Returns [`AdminError::Connect`] with the last cause if no bootstrap
+    /// address accepted the connection.
     pub async fn connect_with_options(
         bootstrap_addrs: &[String],
         options: ConnectionOptions,
@@ -1134,21 +1157,20 @@ impl AdminClient {
                 }
             }
         }
-        if target == BootstrapTarget::Controllers
-            && let Some(error) = last_error
-        {
-            return Err(error);
+        match (target, last_error) {
+            (BootstrapTarget::Controllers, Some(error)) => Err(error),
+            (_, last_error) => Err(AdminError::Connect {
+                tried: bootstrap_addrs.len(),
+                source: last_error.map(Box::new),
+            }),
         }
-        Err(AdminError::Connect {
-            tried: bootstrap_addrs.len(),
-        })
     }
 
     /// Tries each bootstrap address in order.
     ///
     /// Each entry is `host:port`. `tokio::net::lookup_host` resolves the DNS.
     /// The first successful connect wins. Returns
-    /// `AdminError::Connect { tried }` if none responded. The connection is
+    /// [`AdminError::Connect`] with the last cause if none responded. The connection is
     /// plaintext. See [`AdminClient::connect_secured`].
     ///
     /// # Errors
@@ -1275,6 +1297,7 @@ impl AdminClient {
     #[cfg(test)]
     pub(crate) async fn reconnect_bootstrap(&mut self) -> Result<(), AdminError> {
         let opts = self.options.clone();
+        let mut last_error = None;
         for host_port in &self.bootstrap_addrs {
             match Self::connect_target_one(host_port, opts.clone(), self.conn.target).await {
                 Ok(conn) => {
@@ -1288,11 +1311,13 @@ impl AdminClient {
                         error = %error,
                         "bootstrap reconnect failed",
                     );
+                    last_error = Some(Box::new(error));
                 }
             }
         }
         Err(AdminError::Connect {
             tried: self.bootstrap_addrs.len(),
+            source: last_error,
         })
     }
 
