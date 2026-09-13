@@ -1,0 +1,5 @@
+# `bazel coverage` instruments the test binaries (see //.bazelrc), so the LCOV
+# report also holds the `tests/` sources. Their line coverage says nothing about
+# the crates, so the report ignores them.
+ignore:
+  - "crates/*/tests/**"

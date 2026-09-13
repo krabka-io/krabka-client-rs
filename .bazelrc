@@ -47,6 +47,15 @@ test --@aspect_rules_lint//lint:fail_on_violation
 # instrumenting the whole dependency closure is most of the run.
 coverage --combined_report=lcov
 coverage --instrumentation_filter=^//crates[:/]
+# Instrument the test binaries too. A `rust_test` built from `tests/*.rs` links
+# the instrumented library, but rustc links the profiler runtime only into a
+# crate that it compiles with `-Cinstrument-coverage`. Without this flag Bazel
+# does not instrument test rules, so such a binary writes no `.profraw` and
+# rules_rust emits an empty report for it. The `rust_test` over the library
+# itself (`crate = ...`) is instrumented either way, and it reports every line
+# of the library as missed when the crate has no `#[cfg(test)]` module.
+# The test sources then appear in the report too; //codecov.yml ignores them.
+coverage --instrument_test_targets
 
 # The mutation rules ship no cargo-mutants binary of their own; point them at
 # the one built from //tools/mutants' lockfile.
