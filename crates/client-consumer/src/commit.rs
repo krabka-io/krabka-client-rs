@@ -784,6 +784,7 @@ mod tests {
             assigned: Arc::new(Mutex::new(assigned)),
             assignment_changed,
             next_offsets: Arc::new(Mutex::new(next_offsets)),
+            end_offsets: Arc::new(Mutex::new(HashMap::new())),
             positions: Arc::new(Mutex::new(HashMap::new())),
             pending_seeks: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
