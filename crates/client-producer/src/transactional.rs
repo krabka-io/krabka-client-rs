@@ -17,13 +17,33 @@ use crate::{error::ProducerError, producer::Producer};
 /// `-1` is `UNKNOWN_SERVER_ERROR`, so the empty value is outside that range.
 const NO_ABORTABLE_ERROR: i32 = i32::MIN;
 
-/// The error code that makes the current transaction abort-only.
+/// The sentinel that marks the slot as holding a timeout rather than a
+/// broker error code. It is one below `NO_ABORTABLE_ERROR`
+/// (`i32::MIN`), so it stays outside the `i16` code range and cannot
+/// collide with a real, sign-extended code.
+const ABORTABLE_TIMEOUT: i32 = i32::MIN + 1;
+
+/// The error that makes the current transaction abort-only.
 ///
 /// Apache Kafka's `TransactionManager` moves to the `ABORTABLE_ERROR` state
 /// when a batch of the transaction fails, or when a coordinator answers with a
 /// code that only an abort can clear (`abortableError`). Every later
 /// `commitTransaction` then fails with the stored error
-/// (`maybeFailWithError`), and only `abortTransaction` clears the state.
+/// (`maybeFailWithError`), and only `abortTransaction` clears the state. Kafka
+/// stores the raised exception itself, which is either a broker error code
+/// wrapped in a `KafkaException`, or a client-side `TimeoutException` that
+/// carries no code (a batch that ran out of retries or its routing budget
+/// with no broker answer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbortableError {
+    /// A coordinator, or a Produce response, answered with this code.
+    Server(i16),
+    /// A batch of the transaction was never acknowledged, and carries no
+    /// broker code. Kafka raises `TimeoutException` for the same case.
+    Timeout,
+}
+
+/// The error code that makes the current transaction abort-only.
 ///
 /// The sender task writes this slot from a synchronous context, so it holds an
 /// atomic rather than a mutex.
@@ -44,11 +64,22 @@ impl AbortableErrorSlot {
         self.0.store(i32::from(code), Ordering::Release);
     }
 
-    /// The stored error code, or `None` when the transaction can still
-    /// commit.
-    pub(crate) fn get(&self) -> Option<i16> {
-        let code = self.0.load(Ordering::Acquire);
-        (code != NO_ABORTABLE_ERROR).then(|| i16::try_from(code).unwrap_or(i16::MIN))
+    /// Store that the transaction can no longer commit because a batch of it
+    /// timed out with no broker code. A later error replaces an earlier one,
+    /// same as [`Self::set`].
+    pub(crate) fn set_timeout(&self) {
+        self.0.store(ABORTABLE_TIMEOUT, Ordering::Release);
+    }
+
+    /// The stored error, or `None` when the transaction can still commit.
+    pub(crate) fn get(&self) -> Option<AbortableError> {
+        match self.0.load(Ordering::Acquire) {
+            NO_ABORTABLE_ERROR => None,
+            ABORTABLE_TIMEOUT => Some(AbortableError::Timeout),
+            code => Some(AbortableError::Server(
+                i16::try_from(code).unwrap_or(i16::MIN),
+            )),
+        }
     }
 
     /// Forget the stored error. An abort and a new producer identity both
@@ -411,7 +442,7 @@ mod tests {
         },
     };
 
-    use super::{PreparedTransactionState, TxnState};
+    use super::{AbortableError, PreparedTransactionState, TxnState};
     use crate::{ProducerRecord, error::ProducerError, producer::Producer};
 
     #[test]
@@ -1599,7 +1630,10 @@ mod tests {
                     add_offsets_requests: coordinator.add_offsets.requests,
                     txn_offset_commit_requests: coordinator.txn_offset_commit.requests,
                     coordinator_lookups: coordinator.find_coordinator_requests,
-                    abortable_error: producer.txn_abortable_error.get(),
+                    abortable_error: producer.txn_abortable_error.get().map(|error| match error {
+                        AbortableError::Server(code) => code,
+                        AbortableError::Timeout => i16::MIN,
+                    }),
                     state,
                 }
             };
@@ -1671,7 +1705,11 @@ mod tests {
             }
             None => TxnResult::Other("the commit succeeded".to_owned()),
         };
-        let abortable_error_after_abort = producer.txn_abortable_error.get();
+        let abortable_error_after_abort =
+            producer.txn_abortable_error.get().map(|error| match error {
+                AbortableError::Server(code) => code,
+                AbortableError::Timeout => i16::MIN,
+            });
         let next_transaction = match producer.begin_transaction().await {
             Ok(transaction) => {
                 TxnResult::from(transaction.abort().await.map_err(|error| error.source))

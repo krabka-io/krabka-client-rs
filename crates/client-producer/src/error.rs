@@ -33,6 +33,12 @@ pub enum ProducerError {
     #[error("flush timed out")]
     FlushTimeout,
 
+    /// The batch ran out of retries, or its routing budget ended, before the
+    /// broker acknowledged it. Kafka raises `TimeoutException` for the same
+    /// case (`Sender.sendProducerData` and `RecordAccumulator.expiredBatches`).
+    #[error("the batch was not acknowledged before its retries ran out")]
+    SendTimeout,
+
     #[error("compression: {0}")]
     Compression(#[from] krabka_compression::CompressionError),
 
