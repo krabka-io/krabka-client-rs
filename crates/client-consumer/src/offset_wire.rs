@@ -11,7 +11,7 @@
 //! an `OffsetFetch` response across either shape and resolves `topic_id` back
 //! to a name, because the wire drops the name at v10.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use krabka_protocol::{
     owned::{
@@ -24,6 +24,8 @@ use krabka_protocol::{
     },
     primitives::uuid::Uuid as WireUuid,
 };
+
+use crate::coordinator::{COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR};
 
 /// Build an `OffsetFetch` request that covers `by_topic` and is valid at any
 /// negotiated version.
@@ -108,26 +110,171 @@ pub(crate) fn parse_offset_fetch(
     out
 }
 
-/// The first `UNKNOWN_TOPIC_OR_PARTITION` (3) or `UNKNOWN_TOPIC_ID` (100)
-/// partition error in an `OffsetFetch` response, or `None`.
+/// `UNKNOWN_TOPIC_OR_PARTITION`: the coordinator does not know the topic.
+const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+/// `TOPIC_AUTHORIZATION_FAILED`: the principal cannot describe the topic.
+const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+/// `GROUP_AUTHORIZATION_FAILED`: the principal cannot describe the group.
+const GROUP_AUTHORIZATION_FAILED: i16 = 30;
+/// `UNSTABLE_OFFSET_COMMIT`: a transaction or a replication holds the offset.
+const UNSTABLE_OFFSET_COMMIT: i16 = 88;
+/// `UNKNOWN_TOPIC_ID`: the coordinator does not hold the topic id.
+const UNKNOWN_TOPIC_ID: i16 = 100;
+
+/// What the consumer does with one `OffsetFetch` response.
 ///
-/// Kafka's `CommitRequestManager` treats these two partition codes as the only
-/// retriable ones. It sends the `OffsetFetch` again until the deadline. After
-/// the deadline it gives such a partition no committed offset, so the reset
-/// policy picks the position.
-pub(crate) fn retriable_offset_fetch_error(resp: &OffsetFetchResponse) -> Option<i16> {
-    let legacy = resp
-        .topics
-        .iter()
-        .flat_map(|t| &t.partitions)
-        .map(|p| p.error_code);
-    let grouped = resp
+/// The mapping follows Apache Kafka's `CommitRequestManager.OffsetFetchRequestState`
+/// (`onResponse`, `onFailure` and `onSuccess`) and
+/// `CommitRequestManager.fetchOffsetsWithRetries`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OffsetFetchAction {
+    /// Use the committed offsets in the response.
+    Complete,
+    /// A partition answered 3 or 100. Send the request again until the
+    /// deadline. After the deadline, use the response. Its errored partitions
+    /// start from the reset policy.
+    RetryUnknownTopic(i16),
+    /// The group answered a retriable code, or a partition answered 88. Send
+    /// the request again until the deadline, then fail with the code.
+    Retry(i16),
+    /// The group answered 15 or 16. Find the coordinator again and send the
+    /// request again until the deadline, then fail with the code.
+    FindCoordinator(i16),
+    /// The group answered 30. Fail.
+    GroupAuthorizationFailed,
+    /// Partitions answered 29. Fail with the names of their topics.
+    TopicAuthorizationFailed(BTreeSet<String>),
+    /// The group or a partition answered a code that Kafka does not retry.
+    /// Fail with the code.
+    Fatal(i16),
+}
+
+/// Classify an `OffsetFetch` response as Apache Kafka's consumer does.
+///
+/// A group error code comes first. Kafka's `OffsetFetchRequestState.onFailure`
+/// finds the coordinator again for 15 and 16, fails with a group authorization
+/// error for 30, retries every other `RetriableException` code, and fails for
+/// all other codes.
+///
+/// Without a group error, `OffsetFetchRequestState.onSuccess` reads each
+/// partition in order. The first code other than 0, 3, 29, 88 and 100 fails
+/// the fetch at once. After the loop, 29 fails the fetch with the topic names,
+/// then 88 makes it retriable, then 3 and 100 make it retriable with partial
+/// results.
+///
+/// v8+ data lives in `groups`, and v0-7 data lives in the top-level fields. At
+/// v10 the topic name is empty, so `id_to_name` resolves it from `topic_id`.
+pub(crate) fn classify_offset_fetch(
+    resp: &OffsetFetchResponse,
+    id_to_name: &HashMap<WireUuid, String>,
+) -> OffsetFetchAction {
+    let group_error = std::iter::once(resp.error_code)
+        .chain(resp.groups.iter().map(|g| g.error_code))
+        .find(|code| *code != 0);
+    if let Some(code) = group_error {
+        return classify_group_error(code);
+    }
+
+    let legacy = resp.topics.iter().flat_map(|t| {
+        t.partitions
+            .iter()
+            .map(move |p| (t.name.as_str(), p.error_code))
+    });
+    let grouped = resp.groups.iter().flat_map(|g| &g.topics).flat_map(|t| {
+        let name = if t.name.is_empty() {
+            id_to_name.get(&t.topic_id).map_or("", String::as_str)
+        } else {
+            t.name.as_str()
+        };
+        t.partitions.iter().map(move |p| (name, p.error_code))
+    });
+    let mut unauthorized_topics = BTreeSet::new();
+    let mut unstable = false;
+    let mut unknown_topic = None;
+    for (topic, code) in legacy.chain(grouped) {
+        match code {
+            0 => {}
+            UNKNOWN_TOPIC_OR_PARTITION | UNKNOWN_TOPIC_ID => {
+                unknown_topic.get_or_insert(code);
+            }
+            TOPIC_AUTHORIZATION_FAILED => {
+                unauthorized_topics.insert(topic.to_string());
+            }
+            UNSTABLE_OFFSET_COMMIT => unstable = true,
+            code => return OffsetFetchAction::Fatal(code),
+        }
+    }
+    if !unauthorized_topics.is_empty() {
+        OffsetFetchAction::TopicAuthorizationFailed(unauthorized_topics)
+    } else if unstable {
+        OffsetFetchAction::Retry(UNSTABLE_OFFSET_COMMIT)
+    } else if let Some(code) = unknown_topic {
+        OffsetFetchAction::RetryUnknownTopic(code)
+    } else {
+        OffsetFetchAction::Complete
+    }
+}
+
+fn classify_group_error(code: i16) -> OffsetFetchAction {
+    match code {
+        COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => OffsetFetchAction::FindCoordinator(code),
+        GROUP_AUTHORIZATION_FAILED => OffsetFetchAction::GroupAuthorizationFailed,
+        code if is_retriable_error(code) => OffsetFetchAction::Retry(code),
+        code => OffsetFetchAction::Fatal(code),
+    }
+}
+
+/// Whether Apache Kafka's `common/protocol/Errors` maps `code` to an exception
+/// that extends `RetriableException`.
+fn is_retriable_error(code: i16) -> bool {
+    matches!(
+        code,
+        2 | 3
+            | 5
+            | 6
+            | 7
+            | 9
+            | 13
+            | 14
+            | 15
+            | 16
+            | 19
+            | 20
+            | 41
+            | 51
+            | 56
+            | 70
+            | 71
+            | 72
+            | 74
+            | 75
+            | 78
+            | 80
+            | 83
+            | 84
+            | 88
+            | 89
+            | 100
+            | 103
+            | 106
+            | 122
+            | 123
+            | 133
+    )
+}
+
+/// The `topic_id → name` map of the topics in an `OffsetFetch` request.
+///
+/// A v10 response names topics by id only. Kafka's `OffsetFetchRequestState`
+/// keeps the same map (`topicNamesCache`) when it builds the request.
+pub(crate) fn request_topic_names(request: &OffsetFetchRequest) -> HashMap<WireUuid, String> {
+    request
         .groups
         .iter()
-        .flat_map(|g| &g.topics)
-        .flat_map(|t| &t.partitions)
-        .map(|p| p.error_code);
-    legacy.chain(grouped).find(|code| matches!(code, 3 | 100))
+        .flat_map(|g| g.topics.iter().flatten())
+        .filter(|t| t.topic_id != WireUuid::ZERO)
+        .map(|t| (t.topic_id, t.name.clone()))
+        .collect()
 }
 
 /// Build the `topics` for an `OffsetCommit` and tag each one with its
@@ -224,58 +371,195 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retriable_offset_fetch_error_finds_only_unknown_topic_codes() {
-        let grouped = |errors: &[i16]| OffsetFetchResponse {
+    /// A v10 response for group `g`. Each row is `(topic id byte, partition
+    /// error code)`.
+    fn grouped(group_error: i16, rows: &[(u8, i16)]) -> OffsetFetchResponse {
+        OffsetFetchResponse {
             groups: vec![OffsetFetchResponseGroup {
                 group_id: "g".into(),
-                topics: vec![OffsetFetchResponseTopics {
-                    topic_id: id(7),
-                    partitions: errors
-                        .iter()
-                        .zip(0..)
-                        .map(
-                            |(error_code, partition_index)| OffsetFetchResponsePartitions {
-                                partition_index,
-                                committed_offset: -1,
-                                error_code: *error_code,
-                                ..Default::default()
-                            },
-                        )
-                        .collect(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        for (name, response, expected) in [
-            ("no error", grouped(&[0, 0]), None),
-            ("unknown topic or partition", grouped(&[0, 3]), Some(3)),
-            ("not leader or follower", grouped(&[6]), None),
-            ("unknown topic id", grouped(&[100]), Some(100)),
-            ("topic authorization failed", grouped(&[29]), None),
-            (
-                "legacy topics",
-                OffsetFetchResponse {
-                    topics: vec![OffsetFetchResponseTopic {
-                        name: "t".into(),
-                        partitions: vec![OffsetFetchResponsePartition {
-                            error_code: 3,
+                error_code: group_error,
+                topics: rows
+                    .iter()
+                    .map(|(topic, error_code)| OffsetFetchResponseTopics {
+                        topic_id: id(*topic),
+                        partitions: vec![OffsetFetchResponsePartitions {
+                            committed_offset: -1,
+                            error_code: *error_code,
                             ..Default::default()
                         }],
                         ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A v2-7 response. Each row is `(topic name, partition error code)`.
+    fn legacy(group_error: i16, rows: &[(&str, i16)]) -> OffsetFetchResponse {
+        OffsetFetchResponse {
+            error_code: group_error,
+            topics: rows
+                .iter()
+                .map(|(name, error_code)| OffsetFetchResponseTopic {
+                    name: (*name).into(),
+                    partitions: vec![OffsetFetchResponsePartition {
+                        committed_offset: -1,
+                        error_code: *error_code,
+                        ..Default::default()
                     }],
                     ..Default::default()
-                },
-                Some(3),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Kafka's `CommitRequestManager.OffsetFetchRequestState` maps each group
+    /// and partition error code of an `OffsetFetch` response.
+    #[test]
+    fn classify_offset_fetch_maps_codes_as_kafka_does() {
+        use OffsetFetchAction::{
+            Complete, Fatal, FindCoordinator, GroupAuthorizationFailed, Retry, RetryUnknownTopic,
+            TopicAuthorizationFailed,
+        };
+        let topics = |names: &[&str]| {
+            TopicAuthorizationFailed(names.iter().map(|name| (*name).to_string()).collect())
+        };
+        for (name, response, expected) in [
+            ("no error", grouped(0, &[(1, 0), (2, 0)]), Complete),
+            ("no rows", grouped(0, &[]), Complete),
+            // Group codes: `onFailure`.
+            ("coordinator load in progress", grouped(14, &[]), Retry(14)),
+            (
+                "coordinator not available",
+                grouped(15, &[]),
+                FindCoordinator(15),
+            ),
+            ("not coordinator", grouped(16, &[]), FindCoordinator(16)),
+            ("request timed out", grouped(7, &[]), Retry(7)),
+            ("network exception", grouped(13, &[]), Retry(13)),
+            (
+                "group authorization failed",
+                grouped(30, &[]),
+                GroupAuthorizationFailed,
+            ),
+            ("unknown member id", grouped(25, &[]), Fatal(25)),
+            ("stale member epoch", grouped(113, &[]), Fatal(113)),
+            ("group id not found", grouped(69, &[]), Fatal(69)),
+            ("unknown server error", grouped(-1, &[]), Fatal(-1)),
+            (
+                "a group code hides the partition codes",
+                grouped(14, &[(1, 29)]),
+                Retry(14),
+            ),
+            // Partition codes: `onSuccess`.
+            (
+                "unknown topic or partition",
+                grouped(0, &[(1, 0), (2, 3)]),
+                RetryUnknownTopic(3),
+            ),
+            (
+                "unknown topic id",
+                grouped(0, &[(1, 100)]),
+                RetryUnknownTopic(100),
+            ),
+            (
+                "topic authorization failed names each topic",
+                grouped(0, &[(1, 29), (2, 29), (3, 29)]),
+                topics(&["orders", "payments", ""]),
+            ),
+            (
+                "unstable offset commit",
+                grouped(0, &[(1, 88)]),
+                Retry(UNSTABLE_OFFSET_COMMIT),
+            ),
+            (
+                "not leader or follower is unexpected",
+                grouped(0, &[(1, 6)]),
+                Fatal(6),
+            ),
+            (
+                "unknown member id on a partition is unexpected",
+                grouped(0, &[(1, 25)]),
+                Fatal(25),
+            ),
+            (
+                "topic authorization comes before unstable offsets",
+                grouped(0, &[(1, 88), (2, 29)]),
+                topics(&["payments"]),
+            ),
+            (
+                "unstable offsets come before unknown topics",
+                grouped(0, &[(1, 100), (2, 88)]),
+                Retry(UNSTABLE_OFFSET_COMMIT),
+            ),
+            (
+                "an unexpected code comes before collected codes",
+                grouped(0, &[(1, 29), (2, 6)]),
+                Fatal(6),
+            ),
+            (
+                "the first unexpected code wins",
+                grouped(0, &[(1, 6), (2, 25)]),
+                Fatal(6),
+            ),
+            // v2-7 responses.
+            (
+                "legacy group code",
+                legacy(16, &[("orders", 0)]),
+                FindCoordinator(16),
+            ),
+            (
+                "legacy topic authorization failed",
+                legacy(0, &[("orders", 29)]),
+                topics(&["orders"]),
+            ),
+            (
+                "legacy unknown topic or partition",
+                legacy(0, &[("orders", 3)]),
+                RetryUnknownTopic(3),
             ),
         ] {
+            let id_to_name = HashMap::from([
+                (id(1), "orders".to_string()),
+                (id(2), "payments".to_string()),
+            ]);
             assert2::check!(
-                retriable_offset_fetch_error(&response) == expected,
+                classify_offset_fetch(&response, &id_to_name) == expected,
                 "case {name}"
             );
         }
+    }
+
+    #[test]
+    fn is_retriable_error_matches_kafka_retriable_exceptions() {
+        let retriable = (-1..=140)
+            .filter(|code| is_retriable_error(*code))
+            .collect::<Vec<_>>();
+        assert2::assert!(
+            retriable
+                == vec![
+                    2, 3, 5, 6, 7, 9, 13, 14, 15, 16, 19, 20, 41, 51, 56, 70, 71, 72, 74, 75, 78,
+                    80, 83, 84, 88, 89, 100, 103, 106, 122, 123, 133,
+                ]
+        );
+    }
+
+    #[test]
+    fn request_topic_names_reads_the_grouped_topics_with_an_id() {
+        let request = build_offset_fetch(
+            "g",
+            &HashMap::from([
+                ("orders".to_string(), vec![0]),
+                ("new".to_string(), vec![1]),
+            ]),
+            &HashMap::from([("orders".to_string(), id(7))]),
+        );
+        assert2::assert!(
+            request_topic_names(&request) == HashMap::from([(id(7), "orders".to_string())])
+        );
     }
 
     #[test]

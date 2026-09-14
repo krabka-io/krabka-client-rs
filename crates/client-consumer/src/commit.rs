@@ -865,6 +865,7 @@ mod tests {
             fetch_max: crate::poll::DEFAULT_FETCH_MAX,
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
             auto_offset_reset: AutoOffsetReset::Latest,
+            poll_error: crate::coordinator::PollErrorSlot::default(),
         }
     }
 

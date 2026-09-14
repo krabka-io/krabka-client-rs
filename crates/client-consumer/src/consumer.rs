@@ -106,6 +106,9 @@ pub struct Consumer {
     /// surfaces `ConsumerError::LogTruncation`. Any other value makes `poll`
     /// apply the safe offset, per KIP-320.
     pub(crate) auto_offset_reset: AutoOffsetReset,
+    /// A fatal error from a coordinator rejoin that the next `poll` returns.
+    /// The coordinator task holds the same slot.
+    pub(crate) poll_error: crate::coordinator::PollErrorSlot,
 }
 
 #[derive(Clone)]
@@ -1079,7 +1082,8 @@ async fn finish_startup(
         // broker (its id is fresh from the join/sync above).
         let of = crate::coordinator::send_offset_fetch(
             &client,
-            coordinator_id.load(Ordering::Relaxed),
+            &group_id,
+            &coordinator_id,
             &crate::offset_wire::build_offset_fetch(&group_id, &by_topic, &topic_ids),
             coordinator_retry,
         )
@@ -1333,6 +1337,8 @@ async fn spawn_consumer(
     // current generation; the coordinator publishes to it on every (re)join.
     let current_generation = Arc::new(AtomicI32::new(generation_id));
 
+    let poll_error = crate::coordinator::PollErrorSlot::default();
+
     let shutdown = CancellationToken::new();
     let state = CoordinatorState {
         client: coordinator_client,
@@ -1366,6 +1372,7 @@ async fn spawn_consumer(
         // cold-start empty assignment permanently).
         initial_subscribed_counts: topic_partitions,
         retry_policy: retry_policy.into(),
+        poll_error: Arc::clone(&poll_error),
     };
     // IMPORTANT: `tokio::spawn` is the very last operation — no `.await`
     // follows it.  Dropping a timed-out `start_once` future before this
@@ -1401,6 +1408,7 @@ async fn spawn_consumer(
         fetch_max,
         fetch_partition_max,
         auto_offset_reset,
+        poll_error,
     })
 }
 
@@ -2230,6 +2238,7 @@ mod security_arg_tests {
             fetch_max: crate::poll::DEFAULT_FETCH_MAX,
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
             auto_offset_reset: AutoOffsetReset::Latest,
+            poll_error: crate::coordinator::PollErrorSlot::default(),
         }
     }
 
