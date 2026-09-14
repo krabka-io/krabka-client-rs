@@ -60,14 +60,15 @@ mod builder;
 #[cfg(test)]
 mod client_failover_model;
 mod compression;
-mod end_txn;
 mod error;
+mod error_class;
 mod partitioner;
 mod producer;
 mod record;
 mod sender;
 mod transactional;
 mod transport;
+mod txn_retry;
 
 pub use builder::{
     DEFAULT_PRODUCER_BATCH_BYTES, DEFAULT_PRODUCER_COMPRESSION, DEFAULT_PRODUCER_FLUSH_TIMEOUT,

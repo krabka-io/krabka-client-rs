@@ -17,6 +17,7 @@ use krabka_client_core::{
 use krabka_protocol::owned::{
     add_offsets_to_txn_request::AddOffsetsToTxnRequest,
     add_partitions_to_txn_request::{AddPartitionsToTxnRequest, AddPartitionsToTxnTransaction},
+    add_partitions_to_txn_response::AddPartitionsToTxnResponse,
     common::add_partitions_to_txn_request::add_partitions_to_txn_topic::AddPartitionsToTxnTopic,
     end_txn_request::EndTxnRequest,
     find_coordinator_request::FindCoordinatorRequest,
@@ -37,12 +38,12 @@ use crate::{
     accumulator::{Accumulator, AccumulatorMap, AppendResult},
     builder::{ProducerFlushTimeout, init_producer_id_with_retry},
     compression::Compression,
-    end_txn::{self, EndTxnAttempt, EndTxnDecision},
     error::ProducerError,
     partitioner::UniformStickyPartitioner,
     record::{ProducerRecord, RecordMetadata},
     sender::DrainIntent,
     transactional::{OwnedTransaction, PreparedTransactionState, Transaction, TxnState},
+    txn_retry::{self, AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,8 +202,32 @@ fn minted_identity(pair: (i64, i16)) -> Option<(i64, i16)> {
     (id >= 0 && epoch >= 0).then_some(pair)
 }
 
+/// Read the error code of the one partition in an `AddPartitionsToTxn`
+/// response.
+///
+/// Versions 0 to 3 carry the partition results in
+/// `results_by_topic_v3_and_below`, and versions 4 and later carry them in
+/// `results_by_transaction`. Kafka's `AddPartitionsToTxnResponse.errors` reads
+/// both. A response without a partition row gives the top-level code, which
+/// versions 4 and later carry.
+fn add_partitions_error_code(response: &AddPartitionsToTxnResponse) -> i16 {
+    response
+        .results_by_topic_v3_and_below
+        .first()
+        .or_else(|| {
+            response
+                .results_by_transaction
+                .first()
+                .and_then(|transaction| transaction.topic_results.first())
+        })
+        .and_then(|topic| topic.results_by_partition.first())
+        .map_or(response.error_code, |partition| {
+            partition.partition_error_code
+        })
+}
+
 impl Producer {
-    async fn register_transaction_partition(
+    pub(crate) async fn register_transaction_partition(
         &self,
         topic: &str,
         partition: i32,
@@ -236,42 +261,41 @@ impl Producer {
             ..Default::default()
         };
         // Adding a partition twice has no effect, so a lost request or a
-        // coordinator that is loading, unavailable or moved is safe to retry.
-        // Kafka's `AddPartitionsToTxnHandler` does the same.
+        // retriable code is safe to retry. Kafka's `AddPartitionsToTxnHandler`
+        // does the same.
         let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
         let max_backoff = self.init_max_backoff.to_std();
         let mut backoff = self.init_retry_backoff.to_std();
         loop {
-            let outcome = match coordinator.send(request.clone()).await {
+            let (attempt, last_error) = match coordinator.send(request.clone()).await {
                 Ok(response) => {
-                    let code = response
-                        .results_by_transaction
-                        .first()
-                        .and_then(|transaction| transaction.topic_results.first())
-                        .and_then(|topic| topic.results_by_partition.first())
-                        .map_or(response.error_code, |partition| {
-                            partition.partition_error_code
-                        });
-                    match code {
-                        0 => return Ok(()),
-                        47 | 90 => return Err(ProducerError::FencedProducer),
-                        14..=16 => ProducerError::Server(code),
-                        other => return Err(ProducerError::Server(other)),
-                    }
+                    let code = add_partitions_error_code(&response);
+                    (
+                        CoordinatorAttempt::Answered(code),
+                        ProducerError::Server(code),
+                    )
                 }
-                Err(error) => ProducerError::Client(error),
+                Err(error) => (CoordinatorAttempt::Lost, ProducerError::Client(error)),
+            };
+            let rediscover = match txn_retry::decide_add_partitions(attempt) {
+                AddPartitionsDecision::Added => return Ok(()),
+                AddPartitionsDecision::Fenced => return Err(ProducerError::FencedProducer),
+                AddPartitionsDecision::Refused(code) => return Err(ProducerError::Server(code)),
+                AddPartitionsDecision::Retry { rediscover } => rediscover,
             };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(outcome);
+                return Err(last_error);
             }
             tokio::time::sleep(backoff.min(remaining)).await;
             backoff = backoff.saturating_mul(2).min(max_backoff);
-            match self.reconnect_txn_coordinator(transactional_id).await {
-                Ok(fresh) => coordinator = fresh,
-                Err(error) => {
-                    tracing::warn!(%error, "transaction coordinator lookup failed; retrying");
-                    coordinator.reconnect_bootstrap().await;
+            if rediscover {
+                match self.reconnect_txn_coordinator(transactional_id).await {
+                    Ok(fresh) => coordinator = fresh,
+                    Err(error) => {
+                        tracing::warn!(%error, "transaction coordinator lookup failed; retrying");
+                        coordinator.reconnect_bootstrap().await;
+                    }
                 }
             }
         }
@@ -490,10 +514,13 @@ impl Producer {
     /// - [`ProducerError::NotTransactional`]: `transactional_id` was not set.
     /// - [`ProducerError::InvalidTransactionState`]: not currently in a transaction.
     /// - [`ProducerError::FencedProducer`]: broker returned `INVALID_PRODUCER_EPOCH (47)` or `PRODUCER_FENCED (90)`.
-    /// - [`ProducerError::ConcurrentTransactions`]: broker returned `CONCURRENT_TRANSACTIONS (51)`; caller may retry.
-    /// - [`ProducerError::Server`]: any other broker error code.
+    /// - [`ProducerError::ConcurrentTransactions`]: broker still returned `CONCURRENT_TRANSACTIONS (51)` when the retry deadline ended; caller may retry.
+    /// - [`ProducerError::Server`]: any other broker error code. For a retriable code, the broker still returned it when the retry deadline ended.
     /// - [`ProducerError::RecoveryRequired`]: a request was lost in transport,
     ///   and the retries did not learn the outcome before the deadline.
+    ///
+    /// The producer sends `EndTxn` again after a retriable code, until the
+    /// producer-ID initialization retry timeout ends.
     ///
     /// Every error except `RecoveryRequired` means that no request changed the
     /// transaction.
@@ -608,8 +635,9 @@ impl Producer {
     /// Send one `EndTxn` request until its answer decides the outcome.
     ///
     /// This follows Kafka's `EndTxnHandler`. A transport failure, or a
-    /// coordinator that is loading, unavailable or moved, causes a retry of the
-    /// same request with the same producer id and epoch. The retry uses capped
+    /// retriable code such as `CONCURRENT_TRANSACTIONS` or
+    /// `COORDINATOR_LOAD_IN_PROGRESS`, causes a retry of the same request with
+    /// the same producer id and epoch. The retry uses capped
     /// exponential backoff, and the producer-ID initialization retry timeout
     /// bounds it. A retry after a transport failure first finds the coordinator
     /// again and opens a new connection, because a broker restart leaves the
@@ -632,7 +660,7 @@ impl Producer {
                     tracing::Span::current().record("error_code", response.error_code);
                     let identity = (response.producer_id >= 0)
                         .then_some((response.producer_id, response.producer_epoch));
-                    (EndTxnAttempt::Answered(response.error_code), identity)
+                    (CoordinatorAttempt::Answered(response.error_code), identity)
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -640,18 +668,18 @@ impl Producer {
                         committed = request.committed,
                         "EndTxn request lost in transport; retrying to learn the outcome"
                     );
-                    (EndTxnAttempt::Lost, None)
+                    (CoordinatorAttempt::Lost, None)
                 }
             };
-            let decision = end_txn::decide(attempt, earlier_attempt_lost);
-            earlier_attempt_lost |= attempt == EndTxnAttempt::Lost;
+            let decision = txn_retry::decide_end_txn(attempt, earlier_attempt_lost);
+            earlier_attempt_lost |= attempt == CoordinatorAttempt::Lost;
             let EndTxnDecision::Retry { rediscover } = decision else {
                 return (decision, identity);
             };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return (
-                    end_txn::decide_at_deadline(attempt, earlier_attempt_lost),
+                    txn_retry::decide_end_txn_at_deadline(attempt, earlier_attempt_lost),
                     None,
                 );
             }
