@@ -26,18 +26,29 @@
 //! `OUT_OF_ORDER_SEQUENCE_NUMBER`.
 //!
 //! Recovery is correspondingly simple. A batch that fails, through a transport
-//! error, a routing miss, or a defensive `OUT_OF_ORDER`, is parked in its
+//! error, a routing miss, or a retriable broker code, is parked in its
 //! partition's single **retry slot**. On the next cycle the sender resends it
 //! verbatim, with the same allocated `base_sequence` and the same bytes, and
 //! ahead of any new batch for that partition. The broker dedups a re-landed
 //! write with `DUPLICATE_SEQUENCE_NUMBER`. The retry slots persist across
 //! cycles, and [`run`] owns them.
+//!
+//! ## Broker error codes
+//!
+//! [`classify_verdict`] follows Apache Kafka's `Sender.completeBatch` and
+//! `TransactionManager.canRetry`. A code whose exception is a
+//! `RetriableException` resends the batch, and an `InvalidMetadataException`
+//! also refreshes metadata. The idempotence codes follow the producer mode. For
+//! an idempotent producer, `OUT_OF_ORDER_SEQUENCE_NUMBER` and
+//! `UNKNOWN_PRODUCER_ID` raise the producer epoch and resend the batch at
+//! sequence 0, and a failed batch also raises the epoch, so its sequence leaves
+//! no gap.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -65,6 +76,7 @@ use crate::{
     accumulator::{AccumulatorMap, InProgressBatch, PendingRecord},
     compression::Compression,
     error::ProducerError,
+    error_class::{self, ErrorClass},
     partitioner::UniformStickyPartitioner,
     producer::{Acks, STATE_ACTIVE, STATE_FENCED, TopicMetadata, UNRESOLVED_TOPIC_PARTITION_COUNT},
     record::RecordMetadata,
@@ -75,26 +87,34 @@ use crate::{
 /// Wire error codes referenced when interpreting `PartitionProduceResponse`.
 mod codes {
     pub const NONE: i16 = 0;
-    /// The Produce reached a broker that does not lead the partition, which
-    /// means the routing is stale. Refresh metadata, re-resolve the leader, and
-    /// retry.
-    pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
-    /// The Produce reached a broker that does not lead the partition. With
-    /// rf=1 a misroute to a non-hosting broker surfaces as
-    /// `UNKNOWN_TOPIC_OR_PARTITION`, and a misroute to a follower surfaces
-    /// here.
-    pub const NOT_LEADER_OR_FOLLOWER: i16 = 6;
+    /// `CLUSTER_AUTHORIZATION_FAILED`. Kafka's `TransactionManager` makes it
+    /// fatal for an idempotent producer.
+    pub const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
+    /// `UNSUPPORTED_VERSION`. Fatal for an idempotent producer.
+    pub const UNSUPPORTED_VERSION: i16 = 35;
     pub const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
     pub const DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
-    /// `INVALID_PRODUCER_EPOCH` per the canonical Apache Kafka table (code 47).
-    pub const INVALID_PRODUCER_EPOCH: i16 = 47;
+    /// `INVALID_PRODUCER_ID_MAPPING`. Fatal for an idempotent producer.
+    pub const INVALID_PRODUCER_ID_MAPPING: i16 = 49;
+    /// `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`. Fatal for an idempotent
+    /// producer.
+    pub const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
+    /// `UNKNOWN_PRODUCER_ID`. The broker holds no state for the producer id.
+    pub const UNKNOWN_PRODUCER_ID: i16 = 59;
+    /// `PRODUCER_FENCED`. Fatal for an idempotent producer.
+    pub const PRODUCER_FENCED: i16 = 90;
+}
+
+/// Wire error codes that only the tests name. The sender handles them through
+/// their [`ErrorClass`].
+#[cfg(test)]
+mod test_codes {
+    /// The Produce reached a broker that does not lead the partition, which
+    /// means the routing is stale.
+    pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+    /// The Produce reached a broker that does not lead the partition.
+    pub const NOT_LEADER_OR_FOLLOWER: i16 = 6;
     /// The Produce named a topic id that the receiving broker does not hold.
-    /// Produce v13 and later carry only the id. The cause is a stale id in
-    /// the client cache (the topic was deleted and created again), or a
-    /// leader whose metadata image does not hold the topic yet. Kafka's
-    /// `UnknownTopicIdException` extends `InvalidMetadataException`, so the
-    /// sender refreshes metadata and retries, as it does for
-    /// `NOT_LEADER_OR_FOLLOWER`.
     pub const UNKNOWN_TOPIC_ID: i16 = 100;
 }
 
@@ -164,7 +184,9 @@ pub(crate) struct SenderConfig {
     /// a deterministic in-process broker model. See [`crate::transport`].
     pub transport: Box<dyn ProduceTransport>,
     pub producer_id: i64,
-    pub producer_epoch: i16,
+    /// The idempotent producer epoch, shared with `Producer`. The sender raises
+    /// it where Kafka's idempotent producer bumps its epoch.
+    pub producer_epoch: Arc<AtomicI16>,
     pub acks: Acks,
     pub compression: Compression,
     pub linger: Time,
@@ -233,6 +255,10 @@ struct PipelineState {
     /// from the accumulator, so a resend does NOT count it again. A batch in
     /// this slot means the partition's single in-flight slot is occupied.
     retry: HashMap<(String, i32), PreparedBatch>,
+    /// Per-`(topic, partition)` offset of the last record the broker acked.
+    /// Kafka's `TxnPartitionEntry.lastAckedOffset` holds the same value, and
+    /// `UNKNOWN_PRODUCER_ID` compares it with the log start offset.
+    last_acked_offset: HashMap<(String, i32), i64>,
 }
 
 #[derive(Debug)]
@@ -644,66 +670,176 @@ fn collect_retries(
 }
 
 /// Per-batch verdict that [`send_batches`] consumes in the one-slot model. The
-/// broker durably accepted the batch, or the batch must be resent verbatim, or
-/// it failed terminally with a server code, or it fatally fenced the
-/// producer.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// broker durably accepted the batch, or the batch must be resent, or it failed
+/// with a server code, or it fatally fenced the producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchVerdict {
     /// Durably written, with `NONE`, or already present, with
     /// `DUPLICATE_SEQUENCE_NUMBER`.
     Acked {
         base_offset: i64,
     },
-    /// Resend verbatim on the next cycle, after a transport failure, an
-    /// `OUT_OF_ORDER`, or a routing error.
+    /// Resend verbatim on the next cycle, after a transport failure, a
+    /// retriable code, or a routing error.
     Retry,
-    /// Terminal but non-fatal server error. Fail the records with
-    /// `Server(code)`.
-    Terminal(i16),
-    /// Fatal idempotence failure, `INVALID_PRODUCER_EPOCH`. Fence the
-    /// producer.
-    Fence,
+    /// Raise the idempotent producer epoch, rewrite the batch at the new epoch
+    /// and sequence 0, and resend it. Kafka's idempotent producer does this for
+    /// `OUT_OF_ORDER_SEQUENCE_NUMBER` and `UNKNOWN_PRODUCER_ID`
+    /// (`requestIdempotentEpochBumpForPartition`, then `canRetry` gives
+    /// `true`).
+    BumpEpochAndRetry,
+    /// Rewrite the batch at sequence 0 with the same epoch, and resend it.
+    /// Kafka's transactional producer does this for `UNKNOWN_PRODUCER_ID` after
+    /// the log start moved past its last acked offset
+    /// (`TxnPartitionMap.startSequencesAtBeginning`).
+    RestartSequenceAndRetry,
+    /// Fail the records with `Server(code)`, then repair the partition
+    /// sequence.
+    Terminal {
+        code: i16,
+        repair: SequenceRepair,
+    },
+    /// Fail the records and fence the producer. Kafka's
+    /// `TransactionManager.maybeTransitionToErrorState` makes these codes
+    /// fatal.
+    Fatal(i16),
     RecoveryRequired,
 }
 
+/// How the producer stamped a batch. Kafka's `Sender` handles a failed batch
+/// differently in each mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchMode {
+    /// Idempotence is off, and the batch carries no producer id. Kafka's
+    /// `Sender` has no `TransactionManager` in this mode.
+    Plain,
+    /// The idempotent producer stamped the batch.
+    Idempotent,
+    /// The batch belongs to a transaction.
+    Transactional,
+}
+
+impl BatchMode {
+    fn of(batch: &RecordBatch) -> Self {
+        if batch.attributes.is_transactional() {
+            Self::Transactional
+        } else if batch.producer_id >= 0 {
+            Self::Idempotent
+        } else {
+            Self::Plain
+        }
+    }
+
+    /// The sequence repair after a batch fails with a code that no rule
+    /// retries. Kafka's `Sender.failBatch` calls
+    /// `TransactionManager.handleFailedBatch`, which bumps the epoch of an
+    /// idempotent producer and gives the sequences back in a transaction.
+    const fn repair_after_failure(self) -> SequenceRepair {
+        match self {
+            Self::Plain => SequenceRepair::Keep,
+            Self::Idempotent => SequenceRepair::BumpEpoch,
+            Self::Transactional => SequenceRepair::GiveBack,
+        }
+    }
+}
+
+/// What happens to the partition sequence after the sender fails a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceRepair {
+    /// Keep the sequence. The batch carries no producer id.
+    Keep,
+    /// Raise the idempotent producer epoch, which starts every partition again
+    /// at sequence 0 (`requestIdempotentEpochBumpForPartition`).
+    BumpEpoch,
+    /// Give the sequences of the failed batch back to the partition, so the
+    /// next batch takes them (`TxnPartitionMap.adjustSequencesDueToFailedBatch`).
+    GiveBack,
+    /// Start the partition again at sequence 0 (`resetSequenceForPartition`).
+    Reset,
+}
+
 /// Classification of a per-partition `error_code`. It is either a direct
-/// [`BatchVerdict`], or [`Classification::Routing`] for
-/// `NOT_LEADER_OR_FOLLOWER`, `UNKNOWN_TOPIC_OR_PARTITION` and
-/// `UNKNOWN_TOPIC_ID`. Routing means a retry, plus the leader-hint adoption and
-/// metadata refresh side effects that [`interpret_response`] applies. The classification
-/// is kept separate so the pure code-to-verdict mapping is unit-testable
-/// without a `Client`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// [`BatchVerdict`], or [`Classification::Routing`] for a code whose Kafka
+/// exception extends `InvalidMetadataException`. Routing means a retry, plus
+/// the leader-hint adoption and metadata refresh side effects that
+/// [`interpret_response`] applies. The classification is kept separate so the
+/// pure code-to-verdict mapping is unit-testable without a `Client`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Classification {
     Verdict(BatchVerdict),
     Routing,
 }
 
-/// Map a per-partition `error_code`, and the broker's `base_offset`, to its
-/// [`Classification`]. The function is pure and does no I/O.
-fn classify_verdict(error_code: i16, base_offset: i64) -> Classification {
-    match error_code {
+/// The fields of one partition answer that decide its [`Classification`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartitionAnswer {
+    error_code: i16,
+    base_offset: i64,
+    log_start_offset: i64,
+}
+
+/// Map a per-partition answer to its [`Classification`]. The function is pure
+/// and does no I/O.
+///
+/// The rules follow Kafka's `Sender.completeBatch`, `Sender.canRetry`,
+/// `TransactionManager.canRetry` and `TransactionManager.handleFailedBatch`.
+/// `last_acked_offset` is the offset of the last record the broker acked for
+/// the partition.
+///
+/// With one batch in flight per partition, a batch that gets
+/// `OUT_OF_ORDER_SEQUENCE_NUMBER` is always the next sequence after the last
+/// acked batch. Kafka's "not the next sequence, so retry" case therefore never
+/// applies.
+fn classify_verdict(
+    answer: PartitionAnswer,
+    mode: BatchMode,
+    last_acked_offset: Option<i64>,
+) -> Classification {
+    let code = answer.error_code;
+    let verdict = match (code, mode) {
         // The broker durably wrote the batch (NONE) or already had it
-        // (DUPLICATE_SEQUENCE_NUMBER returns the same base_offset) — ack either.
-        codes::NONE | codes::DUPLICATE_SEQUENCE_NUMBER => {
-            Classification::Verdict(BatchVerdict::Acked { base_offset })
+        // (DUPLICATE_SEQUENCE_NUMBER). `Sender.completeBatch` completes both.
+        (codes::NONE | codes::DUPLICATE_SEQUENCE_NUMBER, _) => BatchVerdict::Acked {
+            base_offset: answer.base_offset,
+        },
+        (
+            codes::CLUSTER_AUTHORIZATION_FAILED
+            | codes::UNSUPPORTED_VERSION
+            | codes::INVALID_PRODUCER_ID_MAPPING
+            | codes::TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+            | codes::PRODUCER_FENCED,
+            BatchMode::Idempotent | BatchMode::Transactional,
+        ) => BatchVerdict::Fatal(code),
+        (codes::OUT_OF_ORDER_SEQUENCE_NUMBER, BatchMode::Idempotent) => {
+            BatchVerdict::BumpEpochAndRetry
         }
-        // A gap from an earlier failed send: resend this batch verbatim (same
-        // base_sequence) once the partition's slot is free. With one in-flight
-        // per partition this is rare, but handled identically to a transport
-        // failure for safety.
-        codes::OUT_OF_ORDER_SEQUENCE_NUMBER => Classification::Verdict(BatchVerdict::Retry),
-        codes::INVALID_PRODUCER_EPOCH => Classification::Verdict(BatchVerdict::Fence),
-        // Kafka's `Sender.completeBatch` retries each `InvalidMetadataException`
-        // and requests a metadata update. These three codes map to subclasses
-        // of that exception.
-        codes::NOT_LEADER_OR_FOLLOWER
-        | codes::UNKNOWN_TOPIC_OR_PARTITION
-        | codes::UNKNOWN_TOPIC_ID => Classification::Routing,
-        // Any other code is terminal-but-not-fatal: fail the records with
-        // Server(code); never fence.
-        code => Classification::Verdict(BatchVerdict::Terminal(code)),
-    }
+        // The broker did not know the log start offset yet. Kafka retries
+        // until it does.
+        (codes::UNKNOWN_PRODUCER_ID, BatchMode::Idempotent | BatchMode::Transactional)
+            if answer.log_start_offset < 0 =>
+        {
+            BatchVerdict::Retry
+        }
+        (codes::UNKNOWN_PRODUCER_ID, BatchMode::Idempotent) => BatchVerdict::BumpEpochAndRetry,
+        (codes::UNKNOWN_PRODUCER_ID, BatchMode::Transactional)
+            if last_acked_offset.unwrap_or(-1) < answer.log_start_offset =>
+        {
+            BatchVerdict::RestartSequenceAndRetry
+        }
+        (codes::UNKNOWN_PRODUCER_ID, BatchMode::Transactional) => BatchVerdict::Terminal {
+            code,
+            repair: SequenceRepair::Reset,
+        },
+        _ => match error_class::class(code) {
+            ErrorClass::InvalidMetadata => return Classification::Routing,
+            ErrorClass::Retriable => BatchVerdict::Retry,
+            ErrorClass::None | ErrorClass::NotRetriable => BatchVerdict::Terminal {
+                code,
+                repair: mode.repair_after_failure(),
+            },
+        },
+    };
+    Classification::Verdict(verdict)
 }
 
 /// Resolve a partition's leader id from the cache.
@@ -825,11 +961,27 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
     fail_recovered_batches(cfg, &mut to_send);
     let mut results: FuturesUnordered<_> = to_send
         .into_iter()
-        .map(|pb| send_one_batch(cfg, pb))
+        .map(|pb| {
+            let last_acked_offset = state
+                .last_acked_offset
+                .get(&(pb.topic.clone(), pb.partition))
+                .copied();
+            send_one_batch(cfg, pb, last_acked_offset)
+        })
         .collect();
 
     let mut needs_refresh = false;
     let mut fenced: Option<Vec<PreparedBatch>> = None;
+    // Kafka's idempotent producer bumps its epoch once for all the partitions
+    // that asked for it (`bumpIdempotentEpochAndResetIdIfNeeded`). The sender
+    // does the same after it has every verdict of the cycle.
+    let mut bump_epoch = false;
+    let mut repairs: Vec<((String, i32), SequenceRepair, i32)> = Vec::new();
+    let mut restarts: Vec<PreparedBatch> = Vec::new();
+    let mut rewrites: Vec<PreparedBatch> = Vec::new();
+    // Failed batches resolve their records after the sequence repair, so a
+    // caller that sees the error already sees the repaired producer.
+    let mut failed: Vec<(PreparedBatch, i16)> = Vec::new();
     while let Some(res) = results.next().await {
         let BatchSendResult {
             mut pb,
@@ -841,26 +993,49 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
         if let Some(to_fail) = &mut fenced {
             match verdict {
                 BatchVerdict::Acked { base_offset } => ack_batch(cfg, pb, base_offset),
-                BatchVerdict::Terminal(code) => terminal_fail_batch(cfg, pb, code),
+                BatchVerdict::Terminal { code, .. } => terminal_fail_batch(cfg, pb, code),
+                BatchVerdict::Fatal(code) => {
+                    fail_batch(pb.records, fatal_error(code));
+                    finish_in_flight(cfg);
+                }
                 BatchVerdict::RecoveryRequired => {
                     fail_batch(pb.records, ProducerError::RecoveryRequired);
                     finish_in_flight(cfg);
                 }
-                BatchVerdict::Retry | BatchVerdict::Fence => to_fail.push(pb),
+                BatchVerdict::Retry
+                | BatchVerdict::BumpEpochAndRetry
+                | BatchVerdict::RestartSequenceAndRetry => to_fail.push(pb),
             }
             continue;
         }
 
         match verdict {
             // Durable: resolve the records with their offsets, free the slot.
-            BatchVerdict::Acked { base_offset } => ack_batch(cfg, pb, base_offset),
-            // Terminal server error: fail the records, free the slot.
-            BatchVerdict::Terminal(code) => terminal_fail_batch(cfg, pb, code),
-            // Retriable (transport / routing / defensive OUT_OF_ORDER): park in
-            // the partition's single retry slot, resent verbatim next cycle. The
-            // batch is still outstanding, so its in-flight slot stays counted —
-            // no `finish_in_flight` here.
-            BatchVerdict::Retry if take_retry(&mut pb, cfg.retries) => {
+            BatchVerdict::Acked { base_offset } => {
+                state.record_ack(&pb, base_offset);
+                ack_batch(cfg, pb, base_offset);
+            }
+            // Terminal server error: fail the records, free the slot, and
+            // repair the partition sequence after the cycle.
+            BatchVerdict::Terminal { code, repair } => {
+                match repair {
+                    SequenceRepair::Keep => {}
+                    SequenceRepair::BumpEpoch => bump_epoch = true,
+                    SequenceRepair::GiveBack | SequenceRepair::Reset => {
+                        repairs.push(((pb.topic.clone(), pb.partition), repair, pb.base_sequence));
+                    }
+                }
+                failed.push((pb, code));
+            }
+            // Transport failure, routing error or retriable code: park in the
+            // partition's single retry slot, resent next cycle. The batch is
+            // still outstanding, so its in-flight slot stays counted, and there
+            // is no `finish_in_flight` here.
+            BatchVerdict::Retry
+            | BatchVerdict::BumpEpochAndRetry
+            | BatchVerdict::RestartSequenceAndRetry
+                if take_retry(&mut pb, cfg.retries) =>
+            {
                 fenced = Some(vec![pb]);
             }
             BatchVerdict::Retry => {
@@ -872,11 +1047,15 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
                 );
                 state.retry.insert((pb.topic.clone(), pb.partition), pb);
             }
-            // Fatal idempotence failure. Fail this batch plus every batch we have
-            // not yet processed (their in-flight slots are counted, so they must
-            // be released), then fence the producer and stop sending.
-            BatchVerdict::Fence => {
-                fenced = Some(vec![pb]);
+            BatchVerdict::BumpEpochAndRetry => rewrites.push(pb),
+            BatchVerdict::RestartSequenceAndRetry => restarts.push(pb),
+            // A fatal error. Fail this batch plus every batch we have not yet
+            // processed (their in-flight slots are counted, so they must be
+            // released), then fence the producer and stop sending.
+            BatchVerdict::Fatal(code) => {
+                fail_batch(pb.records, fatal_error(code));
+                finish_in_flight(cfg);
+                fenced = Some(Vec::new());
             }
             BatchVerdict::RecoveryRequired => {
                 fail_batch(pb.records, ProducerError::RecoveryRequired);
@@ -884,15 +1063,108 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
             }
         }
     }
+    drop(results);
 
-    if let Some(to_fail) = fenced {
+    if let Some(mut to_fail) = fenced {
+        for (pb, code) in failed {
+            terminal_fail_batch(cfg, pb, code);
+        }
+        to_fail.append(&mut restarts);
+        to_fail.append(&mut rewrites);
         fence(cfg, state, to_fail);
         return;
+    }
+
+    if bump_epoch || !rewrites.is_empty() {
+        let Some(epoch) = bump_idempotent_epoch(cfg) else {
+            // Kafka gets a new producer id with `InitProducerId` when the epoch
+            // overflows. This sender cannot send that request, so it fences.
+            tracing::error!("idempotent producer epoch overflow; fencing the producer");
+            for (pb, code) in failed {
+                terminal_fail_batch(cfg, pb, code);
+            }
+            fence(cfg, state, rewrites);
+            return;
+        };
+        for mut pb in rewrites {
+            pb.record_batch.producer_epoch = epoch;
+            restart_sequence(cfg, &mut pb);
+            state.retry.insert((pb.topic.clone(), pb.partition), pb);
+        }
+    }
+    for (key, repair, base_sequence) in repairs {
+        if repair == SequenceRepair::GiveBack {
+            cfg.next_seq.insert(key, base_sequence);
+        } else {
+            cfg.next_seq.remove(&key);
+        }
+    }
+    for mut pb in restarts {
+        restart_sequence(cfg, &mut pb);
+        state.retry.insert((pb.topic.clone(), pb.partition), pb);
+    }
+    for (pb, code) in failed {
+        terminal_fail_batch(cfg, pb, code);
     }
 
     if needs_refresh {
         update_leaders_from_metadata(cfg).await;
     }
+}
+
+impl PipelineState {
+    /// Keep the offset of the last record of an acked batch, as Kafka's
+    /// `TransactionManager.updateLastAckedOffset` does.
+    fn record_ack(&mut self, pb: &PreparedBatch, base_offset: i64) {
+        if base_offset < 0 {
+            return;
+        }
+        let last_offset = base_offset + i64::from(pb.record_batch.last_offset_delta);
+        self.last_acked_offset
+            .entry((pb.topic.clone(), pb.partition))
+            .and_modify(|offset| *offset = (*offset).max(last_offset))
+            .or_insert(last_offset);
+    }
+}
+
+/// The error for the records of a batch that failed with a fatal code.
+const fn fatal_error(code: i16) -> ProducerError {
+    if code == codes::PRODUCER_FENCED {
+        ProducerError::FencedProducer
+    } else {
+        ProducerError::Server(code)
+    }
+}
+
+/// Raise the idempotent producer epoch by one, and start every partition
+/// again at sequence 0. It returns the new epoch, or `None` when the epoch is
+/// at its maximum.
+///
+/// Kafka's `TransactionManager.bumpIdempotentProducerEpoch` raises the epoch
+/// on the client, and `maybeUpdateProducerIdAndEpoch` starts a partition at
+/// sequence 0 once it has no batch in flight. A broker accepts a higher epoch
+/// with sequence 0 from an idempotent producer. This sender keeps at most one
+/// batch per partition in flight, and it builds that batch before this call,
+/// so the next batch it builds for any partition is the first one at the new
+/// epoch.
+fn bump_idempotent_epoch(cfg: &SenderConfig) -> Option<i16> {
+    let epoch = cfg.producer_epoch.load(Ordering::Acquire).checked_add(1)?;
+    cfg.producer_epoch.store(epoch, Ordering::Release);
+    cfg.next_seq.clear();
+    tracing::info!(
+        producer_id = cfg.producer_id,
+        producer_epoch = epoch,
+        "bumped the idempotent producer epoch; sequences start again at 0"
+    );
+    Some(epoch)
+}
+
+/// Rewrite `pb` at sequence 0, and give the partition the sequences after it.
+fn restart_sequence(cfg: &SenderConfig, pb: &mut PreparedBatch) {
+    let count = i32::try_from(pb.records.len()).unwrap_or(i32::MAX);
+    cfg.next_seq.insert((pb.topic.clone(), pb.partition), count);
+    pb.base_sequence = 0;
+    pb.record_batch.base_sequence = 0;
 }
 
 fn take_retry(batch: &mut PreparedBatch, retries: i32) -> bool {
@@ -932,7 +1204,8 @@ fn terminal_fail_batch(cfg: &SenderConfig, pb: PreparedBatch, code: i16) {
 /// This marks `STATE_FENCED` and fails, with `FencedProducer`, `to_fail`, which
 /// holds this cycle's still-live batches, every batch parked in a retry slot,
 /// and everything in the accumulators. It releases each in-flight slot. The
-/// sender calls it on a fatal idempotence failure, `INVALID_PRODUCER_EPOCH`.
+/// sender calls it on a fatal error code, such as `PRODUCER_FENCED`, and when a
+/// batch runs out of retries.
 fn fence(cfg: &SenderConfig, state: &mut PipelineState, to_fail: Vec<PreparedBatch>) {
     cfg.state
         .compare_exchange(
@@ -993,7 +1266,11 @@ fn backoff_deadline(now: Instant, retry_backoff: Time) -> Instant {
         leader = tracing::field::Empty,
     ),
 )]
-async fn send_one_batch(cfg: &SenderConfig, mut pb: PreparedBatch) -> BatchSendResult {
+async fn send_one_batch(
+    cfg: &SenderConfig,
+    mut pb: PreparedBatch,
+    last_acked_offset: Option<i64>,
+) -> BatchSendResult {
     if batch_crosses_recovery_barrier(cfg, pb.transaction_generation) {
         return BatchSendResult {
             pb,
@@ -1089,7 +1366,7 @@ async fn send_one_batch(cfg: &SenderConfig, mut pb: PreparedBatch) -> BatchSendR
         }
     };
 
-    interpret_response(cfg, pb, &resp)
+    interpret_response(cfg, pb, &resp, last_acked_offset)
 }
 
 /// Interpret a single-partition `ProduceResponse` into a [`BatchSendResult`].
@@ -1099,6 +1376,7 @@ fn interpret_response(
     cfg: &SenderConfig,
     mut pb: PreparedBatch,
     resp: &ProduceResponse,
+    last_acked_offset: Option<i64>,
 ) -> BatchSendResult {
     let part_resp = resp
         .responses
@@ -1146,11 +1424,21 @@ fn interpret_response(
             "produce partition rejected"
         );
     }
-    match classify_verdict(part_resp.error_code, part_resp.base_offset) {
+    let answer = PartitionAnswer {
+        error_code: part_resp.error_code,
+        base_offset: part_resp.base_offset,
+        log_start_offset: part_resp.log_start_offset,
+    };
+    match classify_verdict(answer, BatchMode::of(&pb.record_batch), last_acked_offset) {
         Classification::Verdict(verdict) => {
-            // Back off before a verbatim resend (e.g. a defensive OUT_OF_ORDER)
-            // so a partition that keeps rejecting isn't hammered in a tight loop.
-            if matches!(verdict, BatchVerdict::Retry) {
+            // Back off before a resend (e.g. NOT_ENOUGH_REPLICAS) so a
+            // partition that keeps rejecting isn't hammered in a tight loop.
+            if matches!(
+                verdict,
+                BatchVerdict::Retry
+                    | BatchVerdict::BumpEpochAndRetry
+                    | BatchVerdict::RestartSequenceAndRetry
+            ) {
                 pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
             }
             BatchSendResult {
@@ -1371,7 +1659,7 @@ fn build_record_batch(
     // Use the txn pid/epoch when inside a transaction; fall back to the
     // idempotence pid/epoch for non-transactional batches.
     let (producer_id, producer_epoch) =
-        txn_snapshot.unwrap_or((cfg.producer_id, cfg.producer_epoch));
+        txn_snapshot.unwrap_or((cfg.producer_id, cfg.producer_epoch.load(Ordering::Acquire)));
 
     let base_timestamp = batch.records.first().map_or(0, |r| r.timestamp_ms);
     let max_timestamp = batch
@@ -1514,62 +1802,210 @@ mod tests {
         (pb, rx)
     }
 
-    #[test]
-    fn classify_verdict_maps_codes() {
-        for (_name, code, base_offset, want) in [
+    /// The classification of each code that has a rule of its own, in each
+    /// batch mode: `(Plain, Idempotent, Transactional)`.
+    ///
+    /// The answer carries `base_offset` 7 and `log_start_offset` 5, and the
+    /// partition has no acked offset.
+    fn special_code_rows() -> Vec<(&'static str, i16, [Classification; 3])> {
+        use BatchVerdict::{Acked, BumpEpochAndRetry, Fatal, RestartSequenceAndRetry, Terminal};
+        use Classification::Verdict;
+        use SequenceRepair::{BumpEpoch, GiveBack, Keep};
+        let fatal = |code| {
+            [
+                Verdict(Terminal { code, repair: Keep }),
+                Verdict(Fatal(code)),
+                Verdict(Fatal(code)),
+            ]
+        };
+        let failed = |code| {
+            [
+                Verdict(Terminal { code, repair: Keep }),
+                Verdict(Terminal {
+                    code,
+                    repair: BumpEpoch,
+                }),
+                Verdict(Terminal {
+                    code,
+                    repair: GiveBack,
+                }),
+            ]
+        };
+        let acked = Verdict(Acked { base_offset: 7 });
+        vec![
+            ("NONE", codes::NONE, [acked; 3]),
             (
-                "success",
-                codes::NONE,
-                42,
-                Classification::Verdict(BatchVerdict::Acked { base_offset: 42 }),
-            ),
-            // DUPLICATE is acked like a success (broker already wrote it).
-            (
-                "duplicate sequence",
+                "DUPLICATE_SEQUENCE_NUMBER",
                 codes::DUPLICATE_SEQUENCE_NUMBER,
-                7,
-                Classification::Verdict(BatchVerdict::Acked { base_offset: 7 }),
+                [acked; 3],
             ),
             (
-                "out of order",
+                "OUT_OF_ORDER_SEQUENCE_NUMBER",
                 codes::OUT_OF_ORDER_SEQUENCE_NUMBER,
-                0,
-                Classification::Verdict(BatchVerdict::Retry),
+                [
+                    Verdict(Terminal {
+                        code: 45,
+                        repair: Keep,
+                    }),
+                    Verdict(BumpEpochAndRetry),
+                    Verdict(Terminal {
+                        code: 45,
+                        repair: GiveBack,
+                    }),
+                ],
+            ),
+            ("INVALID_PRODUCER_EPOCH", 47, failed(47)),
+            (
+                "UNKNOWN_PRODUCER_ID",
+                codes::UNKNOWN_PRODUCER_ID,
+                [
+                    Verdict(Terminal {
+                        code: 59,
+                        repair: Keep,
+                    }),
+                    Verdict(BumpEpochAndRetry),
+                    Verdict(RestartSequenceAndRetry),
+                ],
             ),
             (
-                "invalid epoch",
-                codes::INVALID_PRODUCER_EPOCH,
-                0,
-                Classification::Verdict(BatchVerdict::Fence),
+                "CLUSTER_AUTHORIZATION_FAILED",
+                codes::CLUSTER_AUTHORIZATION_FAILED,
+                fatal(31),
+            ),
+            ("UNSUPPORTED_VERSION", codes::UNSUPPORTED_VERSION, fatal(35)),
+            (
+                "INVALID_PRODUCER_ID_MAPPING",
+                codes::INVALID_PRODUCER_ID_MAPPING,
+                fatal(49),
             ),
             (
-                "not leader",
-                codes::NOT_LEADER_OR_FOLLOWER,
-                0,
-                Classification::Routing,
+                "TRANSACTIONAL_ID_AUTHORIZATION_FAILED",
+                codes::TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+                fatal(53),
+            ),
+            ("PRODUCER_FENCED", codes::PRODUCER_FENCED, fatal(90)),
+        ]
+    }
+
+    const MODES: [BatchMode; 3] = [
+        BatchMode::Plain,
+        BatchMode::Idempotent,
+        BatchMode::Transactional,
+    ];
+
+    /// Every row of Kafka's `Errors` table maps to the action of Kafka's
+    /// producer in each batch mode. A code without a rule of its own follows
+    /// its exception class: `InvalidMetadataException` refreshes and resends,
+    /// another `RetriableException` resends, and any other code fails the
+    /// batch and repairs the sequence as `TransactionManager.handleFailedBatch`
+    /// does.
+    #[test]
+    fn classify_verdict_follows_kafka_for_every_error_code_and_mode() {
+        let special = special_code_rows();
+        let answer = |error_code| PartitionAnswer {
+            error_code,
+            base_offset: 7,
+            log_start_offset: 5,
+        };
+        for (code, name, class) in crate::error_class::tests::KAFKA_ERRORS {
+            let expected = special
+                .iter()
+                .find(|(_, special_code, _)| *special_code == code)
+                .map_or_else(
+                    || {
+                        MODES.map(|mode| match class {
+                            ErrorClass::InvalidMetadata => Classification::Routing,
+                            ErrorClass::Retriable => Classification::Verdict(BatchVerdict::Retry),
+                            ErrorClass::None | ErrorClass::NotRetriable => {
+                                Classification::Verdict(BatchVerdict::Terminal {
+                                    code,
+                                    repair: mode.repair_after_failure(),
+                                })
+                            }
+                        })
+                    },
+                    |(_, _, classifications)| *classifications,
+                );
+            let actual = MODES.map(|mode| classify_verdict(answer(code), mode, None));
+            assert2::assert!(actual == expected, "{code} {name}");
+        }
+    }
+
+    /// `UNKNOWN_PRODUCER_ID` depends on the log start offset and on the last
+    /// acked offset of the partition (`TransactionManager.canRetry`).
+    #[test]
+    fn unknown_producer_id_follows_the_log_start_offset() {
+        use BatchVerdict::{BumpEpochAndRetry, RestartSequenceAndRetry, Retry, Terminal};
+        use Classification::Verdict;
+        let cases = [
+            (
+                "log start unknown",
+                -1,
+                None,
+                [
+                    Verdict(Terminal {
+                        code: 59,
+                        repair: SequenceRepair::Keep,
+                    }),
+                    Verdict(Retry),
+                    Verdict(Retry),
+                ],
             ),
             (
-                "unknown topic",
-                codes::UNKNOWN_TOPIC_OR_PARTITION,
-                0,
-                Classification::Routing,
+                "log start past the last ack",
+                5,
+                Some(4),
+                [
+                    Verdict(Terminal {
+                        code: 59,
+                        repair: SequenceRepair::Keep,
+                    }),
+                    Verdict(BumpEpochAndRetry),
+                    Verdict(RestartSequenceAndRetry),
+                ],
             ),
             (
-                "unknown topic id",
-                codes::UNKNOWN_TOPIC_ID,
-                0,
-                Classification::Routing,
+                "log start at the last ack",
+                5,
+                Some(5),
+                [
+                    Verdict(Terminal {
+                        code: 59,
+                        repair: SequenceRepair::Keep,
+                    }),
+                    Verdict(BumpEpochAndRetry),
+                    Verdict(Terminal {
+                        code: 59,
+                        repair: SequenceRepair::Reset,
+                    }),
+                ],
             ),
-            // An arbitrary server error (MESSAGE_TOO_LARGE = 10) is terminal-but-
-            // not-fatal: fail the records with Server(10), never fence.
-            (
-                "terminal server error",
-                10,
-                0,
-                Classification::Verdict(BatchVerdict::Terminal(10)),
-            ),
-        ] {
-            assert2::assert!(classify_verdict(code, base_offset) == want);
+        ];
+        for (name, log_start_offset, last_acked_offset, expected) in cases {
+            let answer = PartitionAnswer {
+                error_code: codes::UNKNOWN_PRODUCER_ID,
+                base_offset: -1,
+                log_start_offset,
+            };
+            let actual = MODES.map(|mode| classify_verdict(answer, mode, last_acked_offset));
+            assert2::assert!(actual == expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn batch_mode_follows_the_batch_stamp() {
+        let cases = [
+            ("no producer id", -1, false, BatchMode::Plain),
+            ("idempotent", 1, false, BatchMode::Idempotent),
+            ("transactional", 1, true, BatchMode::Transactional),
+        ];
+        for (name, producer_id, transactional, expected) in cases {
+            let batch = RecordBatch {
+                producer_id,
+                attributes: Attributes::default().with_transactional(transactional),
+                ..Default::default()
+            };
+            assert2::assert!(BatchMode::of(&batch) == expected, "{name}");
         }
     }
 
@@ -1788,6 +2224,10 @@ mod harness {
     /// Per-partition broker sequencing state.
     #[derive(Default)]
     struct PartitionState {
+        /// The producer epoch the partition holds. A batch at a higher epoch
+        /// must start at sequence 0, and a batch at a lower epoch gets
+        /// `INVALID_PRODUCER_EPOCH`, as Kafka's `ProducerAppendInfo` checks.
+        epoch: i16,
         /// Next `base_sequence` the broker accepts. It is strictly increasing
         /// with no gaps, as in the Kafka idempotent producer.
         expected: i32,
@@ -1857,6 +2297,9 @@ mod harness {
         /// The `topic_id` of every `send_produce` call, in order, so a test can
         /// assert which id a resend carried.
         sent_topic_ids: StdMutex<Vec<Uuid>>,
+        /// The `(producer_epoch, base_sequence)` of every `send_produce` call,
+        /// in order.
+        sent_batches: StdMutex<Vec<(i16, i32)>>,
         /// Signals each entry into `send_produce`, including injected failures
         /// before the broker model applies a request.
         send_started: Notify,
@@ -1882,6 +2325,11 @@ mod harness {
         error_code: i16,
         base_offset: i64,
         leader_hint: i32,
+        /// `log_start_offset` of the partition answer. Kafka's default is -1.
+        log_start_offset: i64,
+        /// Drop the producer state of the partition before the answer, as a
+        /// broker does when it answers `UNKNOWN_PRODUCER_ID`.
+        forget_producer_state: bool,
     }
 
     /// Caps the per-request reorder stagger to a bounded number of delay
@@ -1908,6 +2356,7 @@ mod harness {
                 known_brokers: StdMutex::new(HashSet::new()),
                 sent_leaders: StdMutex::new(Vec::new()),
                 sent_topic_ids: StdMutex::new(Vec::new()),
+                sent_batches: StdMutex::new(Vec::new()),
                 send_started: Notify::new(),
                 active_sends: AtomicUsize::new(0),
                 peak_active_sends: AtomicUsize::new(0),
@@ -1949,6 +2398,8 @@ mod harness {
                 error_code,
                 base_offset: -1,
                 leader_hint: -1,
+                log_start_offset: -1,
+                forget_producer_state: false,
             });
         }
 
@@ -1986,6 +2437,11 @@ mod harness {
         /// The `topic_id` of every `send_produce` call, in order.
         fn sent_topic_ids(self: &Arc<Self>) -> Vec<Uuid> {
             self.sent_topic_ids.lock().unwrap().clone()
+        }
+
+        /// The `(producer_epoch, base_sequence)` of every `send_produce` call.
+        fn sent_batches(self: &Arc<Self>) -> Vec<(i16, i32)> {
+            self.sent_batches.lock().unwrap().clone()
         }
 
         /// Total Produce transport calls, including failures before the broker
@@ -2031,7 +2487,25 @@ mod harness {
             let mut parts = self.partitions.lock().unwrap();
             let st = parts.entry(key).or_default();
 
-            let (error_code, base_offset) = if base_sequence == st.expected {
+            let (error_code, base_offset) = if batch.producer_id < 0 {
+                // No producer id: the broker does not check sequences.
+                let base_offset = st.next_offset;
+                st.next_offset += i64::from(count);
+                (codes::NONE, base_offset)
+            } else if batch.producer_epoch < st.epoch {
+                (47, -1)
+            } else if batch.producer_epoch > st.epoch && base_sequence != 0 {
+                (codes::OUT_OF_ORDER_SEQUENCE_NUMBER, -1)
+            } else if batch.producer_epoch > st.epoch {
+                // A higher epoch at sequence 0 replaces the producer state.
+                st.epoch = batch.producer_epoch;
+                st.expected = count;
+                st.accepted.clear();
+                let base_offset = st.next_offset;
+                st.accepted.insert(0, base_offset);
+                st.next_offset += i64::from(count);
+                (codes::NONE, base_offset)
+            } else if base_sequence == st.expected {
                 // In-order: accept, assign offset, advance.
                 let base_offset = st.next_offset;
                 st.accepted.insert(base_sequence, base_offset);
@@ -2086,6 +2560,17 @@ mod harness {
                 .lock()
                 .unwrap()
                 .push(req.topic_data[0].topic_id);
+            if let Some(batch) = req.topic_data[0].partition_data[0]
+                .records
+                .as_ref()
+                .and_then(|p| p.as_v2())
+                .and_then(|b| b.first())
+            {
+                self.sent_batches
+                    .lock()
+                    .unwrap()
+                    .push((batch.producer_epoch, batch.base_sequence));
+            }
             self.send_started.notify_one();
             self.last_timeout_ms
                 .store(i64::from(req.timeout_ms), Ordering::Relaxed);
@@ -2148,6 +2633,16 @@ mod harness {
                 if let Some(inj) = inj {
                     let topic = &req.topic_data[0];
                     let part = &topic.partition_data[0];
+                    if inj.forget_producer_state
+                        && let Some(state) = self
+                            .partitions
+                            .lock()
+                            .unwrap()
+                            .get_mut(&(topic.name.clone(), part.index))
+                    {
+                        state.expected = 0;
+                        state.accepted.clear();
+                    }
                     let current_leader = if inj.leader_hint >= 0 {
                         LeaderIdAndEpoch {
                             leader_id: inj.leader_hint,
@@ -2164,6 +2659,7 @@ mod harness {
                                 index: part.index,
                                 error_code: inj.error_code,
                                 base_offset: inj.base_offset,
+                                log_start_offset: inj.log_start_offset,
                                 current_leader,
                                 ..Default::default()
                             }],
@@ -2224,6 +2720,7 @@ mod harness {
         transport: Arc<MockTransport>,
         recovery_required: Arc<AtomicBool>,
         recovery_generation: Arc<AtomicU64>,
+        producer_epoch: Arc<AtomicI16>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -2278,6 +2775,50 @@ mod harness {
         routing_retry_budget: Time,
         acks: Acks,
     ) -> Harness {
+        spawn_sender_full(
+            transport,
+            max_in_flight,
+            linger,
+            retries,
+            routing_retry_budget,
+            acks,
+            BatchMode::Idempotent,
+        )
+    }
+
+    /// The transactional `(producer_id, producer_epoch)` of a harness in
+    /// [`BatchMode::Transactional`].
+    const TXN_PID_EPOCH: (i64, i16) = (7, 2);
+
+    /// Spawn a sender that stamps its batches in `mode`, with a 1ms linger.
+    ///
+    /// [`BatchMode::Plain`] has no producer id, and
+    /// [`BatchMode::Transactional`] is inside a transaction with
+    /// [`TXN_PID_EPOCH`].
+    fn spawn_sender_in_mode(transport: Arc<MockTransport>, mode: BatchMode) -> Harness {
+        spawn_sender_full(transport, 1, millis(1), i32::MAX, secs(30), Acks::All, mode)
+    }
+
+    fn spawn_sender_full(
+        transport: Arc<MockTransport>,
+        max_in_flight: usize,
+        linger: Time,
+        retries: i32,
+        routing_retry_budget: Time,
+        acks: Acks,
+        mode: BatchMode,
+    ) -> Harness {
+        let (producer_id, producer_epoch) = if mode == BatchMode::Plain {
+            (-1, -1)
+        } else {
+            (1, 0)
+        };
+        let (transactional_id, txn_state) = if mode == BatchMode::Transactional {
+            (Some("txn".to_owned()), TxnState::InTransaction)
+        } else {
+            (None, TxnState::Uninitialized)
+        };
+        let producer_epoch = Arc::new(AtomicI16::new(producer_epoch));
         let accumulators: AccumulatorMap = Arc::new(DashMap::new());
         let next_seq: Arc<DashMap<(String, i32), i32>> = Arc::new(DashMap::new());
         let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(64);
@@ -2296,8 +2837,8 @@ mod harness {
         // test to inspect.
         let cfg = SenderConfig {
             transport: Box::new(ArcTransport(transport.clone())),
-            producer_id: 1,
-            producer_epoch: 0,
+            producer_id,
+            producer_epoch: Arc::clone(&producer_epoch),
             acks,
             compression: Compression::None,
             linger,
@@ -2316,9 +2857,13 @@ mod harness {
             flush_notify: Arc::clone(&flush_notify),
             in_flight: Arc::clone(&in_flight),
             shutdown: shutdown.clone(),
-            transactional_id: None,
-            txn_state: Arc::new(Mutex::new(TxnState::Uninitialized)),
-            txn_pid_epoch: Arc::new(Mutex::new((1, 0))),
+            transactional_id,
+            txn_state: Arc::new(Mutex::new(txn_state)),
+            txn_pid_epoch: Arc::new(Mutex::new(if mode == BatchMode::Transactional {
+                TXN_PID_EPOCH
+            } else {
+                (1, 0)
+            })),
             txn_recovery_required: Arc::clone(&recovery_required),
             txn_recovery_generation: Arc::clone(&recovery_generation),
         };
@@ -2338,6 +2883,7 @@ mod harness {
             transport,
             recovery_required,
             recovery_generation,
+            producer_epoch,
             handle,
         }
     }
@@ -3123,6 +3669,8 @@ mod harness {
                     records: Some(
                         RecordBatch {
                             attributes: Attributes::default(),
+                            producer_id: 1,
+                            producer_epoch: 0,
                             base_sequence,
                             records: vec![Record {
                                 attributes: 0,
@@ -3287,41 +3835,59 @@ mod harness {
         result: Result<i64, Option<i16>>,
         sends: usize,
         refreshes: usize,
+        /// The idempotent producer epoch after the record resolved.
+        epoch: i16,
     }
 
-    /// Each metadata error that Kafka's producer retries (3, 6 and 100)
+    /// A code whose Kafka exception extends `InvalidMetadataException`
     /// refreshes metadata once and resends the batch, which the broker then
-    /// acks. A code that is not retriable fails the record with no refresh and
-    /// no resend.
+    /// acks. Another `RetriableException` resends without a refresh. A code
+    /// that is not retriable fails the record with no resend, and the
+    /// idempotent producer bumps its epoch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn partition_error_codes_retry_metadata_errors_and_fail_others() {
-        const MESSAGE_TOO_LARGE: i16 = 10;
-        let retried = PartitionErrorOutcome {
+    async fn partition_error_codes_follow_kafka_retry_classes() {
+        let refreshed = PartitionErrorOutcome {
             result: Ok(0),
             sends: 2,
             refreshes: 1,
+            epoch: 0,
+        };
+        let resent = PartitionErrorOutcome {
+            refreshes: 0,
+            ..refreshed
+        };
+        let failed = |code| PartitionErrorOutcome {
+            result: Err(Some(code)),
+            sends: 1,
+            refreshes: 0,
+            epoch: 1,
         };
         for (name, error_code, want) in [
             (
-                "unknown topic or partition",
-                codes::UNKNOWN_TOPIC_OR_PARTITION,
-                retried,
+                "UNKNOWN_TOPIC_OR_PARTITION",
+                test_codes::UNKNOWN_TOPIC_OR_PARTITION,
+                refreshed,
             ),
+            ("LEADER_NOT_AVAILABLE", 5, refreshed),
             (
-                "not leader or follower",
-                codes::NOT_LEADER_OR_FOLLOWER,
-                retried,
+                "NOT_LEADER_OR_FOLLOWER",
+                test_codes::NOT_LEADER_OR_FOLLOWER,
+                refreshed,
             ),
-            ("unknown topic id", codes::UNKNOWN_TOPIC_ID, retried),
-            (
-                "message too large",
-                MESSAGE_TOO_LARGE,
-                PartitionErrorOutcome {
-                    result: Err(Some(MESSAGE_TOO_LARGE)),
-                    sends: 1,
-                    refreshes: 0,
-                },
-            ),
+            ("KAFKA_STORAGE_ERROR", 56, refreshed),
+            ("FENCED_LEADER_EPOCH", 74, refreshed),
+            ("UNKNOWN_TOPIC_ID", test_codes::UNKNOWN_TOPIC_ID, refreshed),
+            ("INCONSISTENT_TOPIC_ID", 103, refreshed),
+            ("CORRUPT_MESSAGE", 2, resent),
+            ("REQUEST_TIMED_OUT", 7, resent),
+            ("NOT_ENOUGH_REPLICAS", 19, resent),
+            ("NOT_ENOUGH_REPLICAS_AFTER_APPEND", 20, resent),
+            ("UNKNOWN_LEADER_EPOCH", 75, resent),
+            ("THROTTLING_QUOTA_EXCEEDED", 89, resent),
+            ("MESSAGE_TOO_LARGE", 10, failed(10)),
+            ("TOPIC_AUTHORIZATION_FAILED", 29, failed(29)),
+            ("INVALID_RECORD", 87, failed(87)),
+            ("UNKNOWN_SERVER_ERROR", -1, failed(-1)),
         ] {
             let transport = MockTransport::new(Duration::ZERO);
             transport.inject_code_once(0, error_code);
@@ -3341,10 +3907,243 @@ mod harness {
                 result,
                 sends: transport.send_count(),
                 refreshes: transport.refresh_count(),
+                epoch: h.producer_epoch.load(Ordering::Acquire),
             };
             check!(got == want, "case {name}");
 
             shutdown(h).await;
+        }
+    }
+
+    /// How one record of a scenario resolved.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RecordOutcome {
+        Acked(i64),
+        Server(i16),
+        Fenced,
+        Other,
+    }
+
+    /// The observable result of one idempotence scenario.
+    #[derive(Debug, PartialEq, Eq)]
+    struct IdempotenceOutcome {
+        records: Vec<RecordOutcome>,
+        /// `(producer_epoch, base_sequence)` of each Produce, in order.
+        sent: Vec<(i16, i32)>,
+        idempotent_epoch: i16,
+        fenced: bool,
+    }
+
+    /// Produce `records` records one after the other on one partition. The
+    /// broker gives `inject` once, and the test waits for each record before it
+    /// produces the next.
+    async fn run_idempotence_scenario(
+        mode: BatchMode,
+        records: usize,
+        inject: Inject,
+    ) -> IdempotenceOutcome {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.inject(inject);
+        let h = spawn_sender_in_mode(transport.clone(), mode);
+        let mut outcomes = Vec::with_capacity(records);
+        for _ in 0..records {
+            let rx = produce_burst(&h, "t", 0, 1).await.pop().expect("one rx");
+            let outcome = tokio::time::timeout(Duration::from_secs(10), rx)
+                .await
+                .expect("record resolves")
+                .expect("oneshot dropped");
+            outcomes.push(match outcome {
+                Ok(metadata) => RecordOutcome::Acked(metadata.offset),
+                Err(ProducerError::Server(code)) => RecordOutcome::Server(code),
+                Err(ProducerError::FencedProducer) => RecordOutcome::Fenced,
+                Err(_) => RecordOutcome::Other,
+            });
+        }
+        let outcome = IdempotenceOutcome {
+            records: outcomes,
+            sent: transport.sent_batches(),
+            idempotent_epoch: h.producer_epoch.load(Ordering::Acquire),
+            fenced: h.state.load(Ordering::Acquire) == STATE_FENCED,
+        };
+        shutdown(h).await;
+        outcome
+    }
+
+    /// A one-shot answer with `error_code` to `seq`, with `log_start_offset`.
+    fn answer(seq: i32, error_code: i16, log_start_offset: i64) -> Inject {
+        Inject {
+            seq,
+            name: None,
+            topic_id: None,
+            error_code,
+            base_offset: -1,
+            leader_hint: -1,
+            log_start_offset,
+            forget_producer_state: false,
+        }
+    }
+
+    /// The idempotence codes follow Kafka's `Sender.completeBatch`,
+    /// `TransactionManager.canRetry` and
+    /// `TransactionManager.handleFailedBatch` in each batch mode.
+    ///
+    /// An idempotent producer raises its epoch and starts the sequences again
+    /// at 0 after `OUT_OF_ORDER_SEQUENCE_NUMBER`, `UNKNOWN_PRODUCER_ID` and a
+    /// failed batch. A transactional producer gives the sequences of a failed
+    /// batch back. A fatal code fences the producer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idempotence_errors_follow_kafka_in_each_mode() {
+        use BatchMode::{Idempotent, Plain, Transactional};
+        use RecordOutcome::{Acked, Fenced, Server};
+        let (_, txn) = TXN_PID_EPOCH;
+        let outcome =
+            |records: Vec<RecordOutcome>, sent: Vec<(i16, i32)>, idempotent_epoch, fenced| {
+                IdempotenceOutcome {
+                    records,
+                    sent,
+                    idempotent_epoch,
+                    fenced,
+                }
+            };
+        let cases = [
+            (
+                "idempotent out of order bumps the epoch and resends",
+                Idempotent,
+                2,
+                answer(0, 45, -1),
+                outcome(
+                    vec![Acked(0), Acked(1)],
+                    vec![(0, 0), (1, 0), (1, 1)],
+                    1,
+                    false,
+                ),
+            ),
+            (
+                "idempotent unknown producer id bumps the epoch and resends",
+                Idempotent,
+                2,
+                answer(0, 59, 0),
+                outcome(
+                    vec![Acked(0), Acked(1)],
+                    vec![(0, 0), (1, 0), (1, 1)],
+                    1,
+                    false,
+                ),
+            ),
+            (
+                "unknown producer id without a log start resends",
+                Idempotent,
+                2,
+                answer(0, 59, -1),
+                outcome(
+                    vec![Acked(0), Acked(1)],
+                    vec![(0, 0), (0, 0), (0, 1)],
+                    0,
+                    false,
+                ),
+            ),
+            (
+                "idempotent invalid epoch fails the batch and bumps the epoch",
+                Idempotent,
+                2,
+                answer(0, 47, -1),
+                outcome(vec![Server(47), Acked(0)], vec![(0, 0), (1, 0)], 1, false),
+            ),
+            (
+                "idempotent failed batch bumps the epoch",
+                Idempotent,
+                2,
+                answer(0, 10, -1),
+                outcome(vec![Server(10), Acked(0)], vec![(0, 0), (1, 0)], 1, false),
+            ),
+            (
+                "producer fenced is fatal",
+                Idempotent,
+                2,
+                answer(0, 90, -1),
+                outcome(vec![Fenced, Fenced], vec![(0, 0)], 0, true),
+            ),
+            (
+                "cluster authorization is fatal",
+                Idempotent,
+                2,
+                answer(0, 31, -1),
+                outcome(vec![Server(31), Fenced], vec![(0, 0)], 0, true),
+            ),
+            (
+                "transactional out of order gives the sequence back",
+                Transactional,
+                2,
+                answer(0, 45, -1),
+                outcome(
+                    vec![Server(45), Acked(0)],
+                    vec![(txn, 0), (txn, 0)],
+                    0,
+                    false,
+                ),
+            ),
+            (
+                "transactional invalid epoch gives the sequence back",
+                Transactional,
+                2,
+                answer(0, 47, -1),
+                outcome(
+                    vec![Server(47), Acked(0)],
+                    vec![(txn, 0), (txn, 0)],
+                    0,
+                    false,
+                ),
+            ),
+            (
+                "transactional unknown producer id past the log start restarts at 0",
+                Transactional,
+                2,
+                answer(0, 59, 0),
+                outcome(
+                    vec![Acked(0), Acked(1)],
+                    vec![(txn, 0), (txn, 0), (txn, 1)],
+                    0,
+                    false,
+                ),
+            ),
+            (
+                "transactional unknown producer id at the log start resets the partition",
+                Transactional,
+                3,
+                Inject {
+                    forget_producer_state: true,
+                    ..answer(1, 59, 0)
+                },
+                outcome(
+                    vec![Acked(0), Server(59), Acked(1)],
+                    vec![(txn, 0), (txn, 1), (txn, 0)],
+                    0,
+                    false,
+                ),
+            ),
+            (
+                "transactional producer fenced is fatal",
+                Transactional,
+                2,
+                answer(0, 90, -1),
+                outcome(vec![Fenced, Fenced], vec![(txn, 0)], 0, true),
+            ),
+            (
+                "plain out of order fails the batch and keeps sequences",
+                Plain,
+                2,
+                answer(0, 45, -1),
+                outcome(
+                    vec![Server(45), Acked(0)],
+                    vec![(-1, 0), (-1, 1)],
+                    -1,
+                    false,
+                ),
+            ),
+        ];
+        for (name, mode, records, inject, expected) in cases {
+            let actual = run_idempotence_scenario(mode, records, inject).await;
+            check!(actual == expected, "{name}");
         }
     }
 
@@ -3361,9 +4160,11 @@ mod harness {
             seq: 0,
             name: Some(String::new()),
             topic_id: Some(stale_id),
-            error_code: codes::UNKNOWN_TOPIC_ID,
+            error_code: test_codes::UNKNOWN_TOPIC_ID,
             base_offset: -1,
             leader_hint: -1,
+            log_start_offset: -1,
+            forget_producer_state: false,
         });
         transport.set_refresh_response(MetadataResponse {
             topics: vec![MetadataResponseTopic {
@@ -3411,7 +4212,7 @@ mod harness {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exhausted_retry_fences_before_a_sequence_gap_can_be_sent() {
         let transport = MockTransport::new(Duration::ZERO);
-        transport.inject_code_once(0, codes::NOT_LEADER_OR_FOLLOWER);
+        transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
         let h = spawn_sender_with_retries(transport.clone(), 1, millis(1), 0);
 
         let first = produce_burst(&h, "t", 0, 1).await.pop().expect("first ack");
@@ -3474,7 +4275,7 @@ mod harness {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exhausted_routing_budget_fences_the_producer() {
         let transport = MockTransport::new(Duration::ZERO);
-        transport.inject_code_once(0, codes::NOT_LEADER_OR_FOLLOWER);
+        transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
         let h = spawn_sender_with_policy(transport, 1, millis(1), i32::MAX, millis(1));
 
         let ack = produce_burst(&h, "t", 0, 1).await.pop().expect("ack");
@@ -3518,27 +4319,6 @@ mod harness {
         shutdown(h).await;
     }
 
-    /// A fatal `INVALID_PRODUCER_EPOCH` fences the producer. The record fails
-    /// with `FencedProducer`, and the shared state flips to `STATE_FENCED`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn invalid_producer_epoch_fences_producer() {
-        const INVALID_PRODUCER_EPOCH: i16 = 47;
-        let transport = MockTransport::new(Duration::ZERO);
-        transport.inject_code_once(0, INVALID_PRODUCER_EPOCH);
-        let h = spawn_sender(transport.clone(), 5);
-
-        let rx = produce_burst(&h, "t", 0, 1).await.pop().expect("one rx");
-        let err = tokio::time::timeout(Duration::from_secs(10), rx)
-            .await
-            .expect("record never resolved (HANG)")
-            .expect("oneshot dropped")
-            .expect_err("a fatal epoch error must fail the record, not ack it");
-        assert2::assert!(matches!(err, ProducerError::FencedProducer));
-        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_FENCED);
-
-        shutdown(h).await;
-    }
-
     /// A transport failure to a *known* leader evicts that broker's connection,
     /// so a reconnect targets its current address. The batch then resends and
     /// acks.
@@ -3578,6 +4358,8 @@ mod harness {
             error_code: NOT_LEADER_OR_FOLLOWER,
             base_offset: -1,
             leader_hint: 8,
+            log_start_offset: -1,
+            forget_producer_state: false,
         });
         let h = spawn_sender(transport.clone(), 5);
         h.partition_leaders.insert(("t".to_string(), 0), 5);
@@ -3620,6 +4402,8 @@ mod harness {
             error_code: codes::NONE,
             base_offset: 42,
             leader_hint: -1,
+            log_start_offset: -1,
+            forget_producer_state: false,
         });
         let h = spawn_sender(transport.clone(), 5);
         // Give "t" a non-zero topic_id so the batch carries it.
@@ -3658,6 +4442,8 @@ mod harness {
             error_code: codes::NONE,
             base_offset: 99, // a bogus offset that must NOT be adopted
             leader_hint: -1,
+            log_start_offset: -1,
+            forget_producer_state: false,
         });
         let h = spawn_sender(transport.clone(), 5);
         // No metadata → the batch's topic_id is ZERO.

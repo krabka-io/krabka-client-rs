@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -17,6 +17,7 @@ use krabka_client_core::{
 use krabka_protocol::owned::{
     add_offsets_to_txn_request::AddOffsetsToTxnRequest,
     add_partitions_to_txn_request::{AddPartitionsToTxnRequest, AddPartitionsToTxnTransaction},
+    add_partitions_to_txn_response::AddPartitionsToTxnResponse,
     common::add_partitions_to_txn_request::add_partitions_to_txn_topic::AddPartitionsToTxnTopic,
     end_txn_request::EndTxnRequest,
     find_coordinator_request::FindCoordinatorRequest,
@@ -42,6 +43,7 @@ use crate::{
     record::{ProducerRecord, RecordMetadata},
     sender::DrainIntent,
     transactional::{OwnedTransaction, PreparedTransactionState, Transaction, TxnState},
+    txn_retry::{self, AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,10 +80,12 @@ pub(crate) struct TopicMetadata {
     pub topic_id: krabka_protocol::primitives::uuid::Uuid,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProducerIdentity {
     pub id: i64,
-    pub epoch: i16,
+    /// The idempotent producer epoch. The sender task shares it, and it raises
+    /// the epoch when Kafka's idempotent producer does.
+    pub epoch: Arc<AtomicI16>,
 }
 
 fn wake_sender_after_append(
@@ -138,7 +142,6 @@ pub struct Producer {
     /// An `Arc` shares the cache with the sender task.
     pub(crate) partition_leaders: Arc<DashMap<(String, i32), i32>>,
     pub(crate) accumulators: AccumulatorMap,
-    #[allow(dead_code)]
     pub(crate) next_seq: Arc<DashMap<(String, i32), i32>>,
     pub(crate) partitioner: Arc<UniformStickyPartitioner>,
     pub(crate) state: Arc<AtomicU8>,
@@ -201,8 +204,32 @@ fn minted_identity(pair: (i64, i16)) -> Option<(i64, i16)> {
     (id >= 0 && epoch >= 0).then_some(pair)
 }
 
+/// Read the error code of the one partition in an `AddPartitionsToTxn`
+/// response.
+///
+/// Versions 0 to 3 carry the partition results in
+/// `results_by_topic_v3_and_below`, and versions 4 and later carry them in
+/// `results_by_transaction`. Kafka's `AddPartitionsToTxnResponse.errors` reads
+/// both. A response without a partition row gives the top-level code, which
+/// versions 4 and later carry.
+fn add_partitions_error_code(response: &AddPartitionsToTxnResponse) -> i16 {
+    response
+        .results_by_topic_v3_and_below
+        .first()
+        .or_else(|| {
+            response
+                .results_by_transaction
+                .first()
+                .and_then(|transaction| transaction.topic_results.first())
+        })
+        .and_then(|topic| topic.results_by_partition.first())
+        .map_or(response.error_code, |partition| {
+            partition.partition_error_code
+        })
+}
+
 impl Producer {
-    async fn register_transaction_partition(
+    pub(crate) async fn register_transaction_partition(
         &self,
         topic: &str,
         partition: i32,
@@ -210,7 +237,7 @@ impl Producer {
         let Some(transactional_id) = &self.transactional_id else {
             return Ok(());
         };
-        let coordinator = self.txn_coord_client.lock().await.clone().ok_or(
+        let mut coordinator = self.txn_coord_client.lock().await.clone().ok_or(
             ProducerError::InvalidTransactionState(
                 "no txn coordinator cached — did init_transactions succeed?",
             ),
@@ -221,34 +248,58 @@ impl Producer {
             partitions: vec![partition],
             ..Default::default()
         };
-        let response = coordinator
-            .send(AddPartitionsToTxnRequest {
-                transactions: vec![AddPartitionsToTxnTransaction {
-                    transactional_id: transactional_id.clone(),
-                    producer_id,
-                    producer_epoch,
-                    topics: vec![topic.clone()],
-                    ..Default::default()
-                }],
-                v3_and_below_transactional_id: transactional_id.clone(),
-                v3_and_below_producer_id: producer_id,
-                v3_and_below_producer_epoch: producer_epoch,
-                v3_and_below_topics: vec![topic],
+        let request = AddPartitionsToTxnRequest {
+            transactions: vec![AddPartitionsToTxnTransaction {
+                transactional_id: transactional_id.clone(),
+                producer_id,
+                producer_epoch,
+                topics: vec![topic.clone()],
                 ..Default::default()
-            })
-            .await?;
-        let code = response
-            .results_by_transaction
-            .first()
-            .and_then(|transaction| transaction.topic_results.first())
-            .and_then(|topic| topic.results_by_partition.first())
-            .map_or(response.error_code, |partition| {
-                partition.partition_error_code
-            });
-        match code {
-            0 => Ok(()),
-            47 => Err(ProducerError::FencedProducer),
-            other => Err(ProducerError::Server(other)),
+            }],
+            v3_and_below_transactional_id: transactional_id.clone(),
+            v3_and_below_producer_id: producer_id,
+            v3_and_below_producer_epoch: producer_epoch,
+            v3_and_below_topics: vec![topic],
+            ..Default::default()
+        };
+        // Adding a partition twice has no effect, so a lost request or a
+        // retriable code is safe to retry. Kafka's `AddPartitionsToTxnHandler`
+        // does the same.
+        let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
+        let max_backoff = self.init_max_backoff.to_std();
+        let mut backoff = self.init_retry_backoff.to_std();
+        loop {
+            let (attempt, last_error) = match coordinator.send(request.clone()).await {
+                Ok(response) => {
+                    let code = add_partitions_error_code(&response);
+                    (
+                        CoordinatorAttempt::Answered(code),
+                        ProducerError::Server(code),
+                    )
+                }
+                Err(error) => (CoordinatorAttempt::Lost, ProducerError::Client(error)),
+            };
+            let rediscover = match txn_retry::decide_add_partitions(attempt) {
+                AddPartitionsDecision::Added => return Ok(()),
+                AddPartitionsDecision::Fenced => return Err(ProducerError::FencedProducer),
+                AddPartitionsDecision::Refused(code) => return Err(ProducerError::Server(code)),
+                AddPartitionsDecision::Retry { rediscover } => rediscover,
+            };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(last_error);
+            }
+            tokio::time::sleep(backoff.min(remaining)).await;
+            backoff = backoff.saturating_mul(2).min(max_backoff);
+            if rediscover {
+                match self.reconnect_txn_coordinator(transactional_id).await {
+                    Ok(fresh) => coordinator = fresh,
+                    Err(error) => {
+                        tracing::warn!(%error, "transaction coordinator lookup failed; retrying");
+                        coordinator.reconnect_bootstrap().await;
+                    }
+                }
+            }
         }
     }
 
@@ -259,7 +310,7 @@ impl Producer {
 
     #[must_use]
     pub fn producer_epoch(&self) -> i16 {
-        self.identity.epoch
+        self.identity.epoch.load(Ordering::Acquire)
     }
 
     /// Give the identity that the transaction coordinator minted for this
@@ -462,11 +513,19 @@ impl Producer {
     ///
     /// # Errors
     ///
-    /// - [`ProducerError::NotTransactional`] — `transactional_id` was not set.
-    /// - [`ProducerError::InvalidTransactionState`] — not currently in a transaction.
-    /// - [`ProducerError::FencedProducer`] — broker returned `INVALID_PRODUCER_EPOCH (47)`.
-    /// - [`ProducerError::ConcurrentTransactions`] — broker returned `CONCURRENT_TRANSACTIONS (51)`; caller may retry.
-    /// - [`ProducerError::Server`] — any other broker error code.
+    /// - [`ProducerError::NotTransactional`]: `transactional_id` was not set.
+    /// - [`ProducerError::InvalidTransactionState`]: not currently in a transaction.
+    /// - [`ProducerError::FencedProducer`]: broker returned `INVALID_PRODUCER_EPOCH (47)` or `PRODUCER_FENCED (90)`.
+    /// - [`ProducerError::ConcurrentTransactions`]: broker still returned `CONCURRENT_TRANSACTIONS (51)` when the retry deadline ended; caller may retry.
+    /// - [`ProducerError::Server`]: any other broker error code. For a retriable code, the broker still returned it when the retry deadline ended.
+    /// - [`ProducerError::RecoveryRequired`]: a request was lost in transport,
+    ///   and the retries did not learn the outcome before the deadline.
+    ///
+    /// The producer sends `EndTxn` again after a retriable code, until the
+    /// producer-ID initialization retry timeout ends.
+    ///
+    /// Every error except `RecoveryRequired` means that no request changed the
+    /// transaction.
     #[tracing::instrument(
         level = "info",
         skip_all,
@@ -505,31 +564,20 @@ impl Producer {
 
         let (pid, epoch) = *self.txn_pid_epoch.lock().await;
 
-        // 3. Send EndTxn to the coordinator.
-        let resp = match coord
-            .send(EndTxnRequest {
-                transactional_id: tid,
-                producer_id: pid,
-                producer_epoch: epoch,
-                committed,
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                // The EndTxn result is unknown after a transport failure. A
-                // fresh InitProducerId epoch is required before any reuse.
-                self.require_transaction_recovery();
-                *self.txn_state.lock().await = TxnState::RecoveryRequired;
-                return Err(ProducerError::Client(error));
-            }
+        // 3. Send EndTxn to the coordinator until it gives an answer that
+        //    decides the outcome, or the retry deadline ends.
+        let request = EndTxnRequest {
+            transactional_id: tid,
+            producer_id: pid,
+            producer_epoch: epoch,
+            committed,
+            ..Default::default()
         };
+        let (decision, producer_identity) = self.send_end_txn_until_decided(coord, request).await;
 
-        tracing::Span::current().record("error_code", resp.error_code);
         let mut state = self.txn_state.lock().await;
-        match resp.error_code {
-            0 => {
+        match decision {
+            EndTxnDecision::Complete => {
                 // KIP-890 (transaction.version 2): the coordinator bumps the
                 // producer epoch on transaction completion and returns the new
                 // (producer_id, producer_epoch) in the EndTxn v5 response. Adopt
@@ -537,28 +585,152 @@ impl Producer {
                 // this shared pair) use the un-fenced epoch. A pre-KIP-890
                 // coordinator leaves these at -1, in which case we keep the
                 // current pair unchanged.
-                if resp.producer_id >= 0 {
-                    *self.txn_pid_epoch.lock().await = (resp.producer_id, resp.producer_epoch);
+                if let Some(identity) = producer_identity {
+                    self.adopt_transactional_identity(identity).await;
                 }
                 *self.prepared_transaction_state.lock().await = None;
                 *state = TxnState::Ready;
                 self.resolve_transaction_guard();
                 Ok(())
             }
-            47 /* INVALID_PRODUCER_EPOCH */ => {
+            EndTxnDecision::Fenced => {
                 *state = TxnState::Fenced;
                 self.resolve_transaction_guard();
                 Err(ProducerError::FencedProducer)
             }
-            51 /* CONCURRENT_TRANSACTIONS */ => {
+            EndTxnDecision::ConcurrentTransactions => {
                 *state = previous_state; // Caller can retry the same decision.
                 Err(ProducerError::ConcurrentTransactions)
             }
-            other => {
+            EndTxnDecision::Refused(code) => {
                 *state = previous_state;
-                Err(ProducerError::Server(other))
+                Err(ProducerError::Server(code))
+            }
+            EndTxnDecision::OutcomeUnknown | EndTxnDecision::Retry { .. } => {
+                // A lost attempt may have taken effect. A fresh InitProducerId
+                // epoch is required before any reuse.
+                self.require_transaction_recovery();
+                *state = TxnState::RecoveryRequired;
+                Err(ProducerError::RecoveryRequired)
             }
         }
+    }
+
+    /// Use a new transactional `(producer_id, producer_epoch)`.
+    ///
+    /// A new identity starts every partition again at sequence 0. Kafka's
+    /// `TransactionManager` calls `resetSequenceNumbers` in the same two places,
+    /// after `InitProducerId` and after an `EndTxn` v5 epoch bump. A broker
+    /// that rebuilds producer state from its log sees the transaction-version-2
+    /// end marker raise the epoch and clear the last sequence. It then rejects a
+    /// batch at the new epoch whose sequence is not 0 with
+    /// `OUT_OF_ORDER_SEQUENCE_NUMBER`. Every batch is flushed before either
+    /// call, so no in-flight batch holds a sequence from the old identity.
+    async fn adopt_transactional_identity(&self, identity: (i64, i16)) {
+        let mut current = self.txn_pid_epoch.lock().await;
+        if *current != identity {
+            self.next_seq.clear();
+        }
+        *current = identity;
+    }
+
+    /// Send one `EndTxn` request until its answer decides the outcome.
+    ///
+    /// This follows Kafka's `EndTxnHandler`. A transport failure, or a
+    /// retriable code such as `CONCURRENT_TRANSACTIONS` or
+    /// `COORDINATOR_LOAD_IN_PROGRESS`, causes a retry of the same request with
+    /// the same producer id and epoch. The retry uses capped
+    /// exponential backoff, and the producer-ID initialization retry timeout
+    /// bounds it. A retry after a transport failure first finds the coordinator
+    /// again and opens a new connection, because a broker restart leaves the
+    /// cached connection closed.
+    ///
+    /// It returns the decision, and the producer identity from a `NONE` answer
+    /// when the coordinator sent one.
+    async fn send_end_txn_until_decided(
+        &self,
+        mut coordinator: Client,
+        request: EndTxnRequest,
+    ) -> (EndTxnDecision, Option<(i64, i16)>) {
+        let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
+        let max_backoff = self.init_max_backoff.to_std();
+        let mut backoff = self.init_retry_backoff.to_std();
+        let mut earlier_attempt_lost = false;
+        loop {
+            let (attempt, identity) = match coordinator.send(request.clone()).await {
+                Ok(response) => {
+                    tracing::Span::current().record("error_code", response.error_code);
+                    let identity = (response.producer_id >= 0)
+                        .then_some((response.producer_id, response.producer_epoch));
+                    (CoordinatorAttempt::Answered(response.error_code), identity)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        committed = request.committed,
+                        "EndTxn request lost in transport; retrying to learn the outcome"
+                    );
+                    (CoordinatorAttempt::Lost, None)
+                }
+            };
+            let decision = txn_retry::decide_end_txn(attempt, earlier_attempt_lost);
+            earlier_attempt_lost |= attempt == CoordinatorAttempt::Lost;
+            let EndTxnDecision::Retry { rediscover } = decision else {
+                return (decision, identity);
+            };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return (
+                    txn_retry::decide_end_txn_at_deadline(attempt, earlier_attempt_lost),
+                    None,
+                );
+            }
+            tokio::time::sleep(backoff.min(remaining)).await;
+            backoff = backoff.saturating_mul(2).min(max_backoff);
+            if rediscover {
+                match self
+                    .reconnect_txn_coordinator(&request.transactional_id)
+                    .await
+                {
+                    Ok(fresh) => coordinator = fresh,
+                    Err(error) => {
+                        tracing::warn!(%error, "transaction coordinator lookup failed; retrying");
+                        // The next send on the old client fails fast and
+                        // leads here again.
+                        coordinator.reconnect_bootstrap().await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find the transaction coordinator again and cache a new connection to it.
+    async fn reconnect_txn_coordinator(&self, tid: &str) -> Result<Client, ProducerError> {
+        let address = match self.find_txn_coordinator(tid).await {
+            Ok(address) => address,
+            Err(error @ ProducerError::Client(_)) => {
+                // The bootstrap connection can also be closed by the restart.
+                self.client.reconnect_bootstrap().await;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let coordinator = self.connect_txn_coordinator(address).await?;
+        *self.txn_coord_client.lock().await = Some(coordinator.clone());
+        Ok(coordinator)
+    }
+
+    /// Open a client for the transaction coordinator at `address`.
+    async fn connect_txn_coordinator(&self, address: String) -> Result<Client, ProducerError> {
+        Ok(Client::builder()
+            .bootstrap(address)
+            .client_id(self.client_id.clone())
+            .maybe_security(self.security.clone())
+            .dispatch_queue_capacity(self.dispatch_queue_capacity.get())
+            .frame_max(self.frame_max.size())
+            .request_timeout(self.request_timeout)
+            .build()
+            .await?)
     }
 
     /// Initialize the transactional producer.
@@ -650,15 +822,7 @@ impl Producer {
             let coord_addr = self.find_txn_coordinator(tid).await?;
             tracing::Span::current().record("coordinator", coord_addr.as_str());
 
-            let coord = Client::builder()
-                .bootstrap(coord_addr)
-                .client_id(self.client_id.clone())
-                .maybe_security(self.security.clone())
-                .dispatch_queue_capacity(self.dispatch_queue_capacity.get())
-                .frame_max(self.frame_max.size())
-                .request_timeout(self.request_timeout)
-                .build()
-                .await?;
+            let coord = self.connect_txn_coordinator(coord_addr).await?;
 
             let response = init_producer_id_with_retry(
                 &coord,
@@ -704,7 +868,8 @@ impl Producer {
                 };
                 tracing::Span::current().record("producer_id", resp.producer_id);
                 tracing::Span::current().record("producer_epoch", resp.producer_epoch);
-                *self.txn_pid_epoch.lock().await = (resp.producer_id, resp.producer_epoch);
+                self.adopt_transactional_identity((resp.producer_id, resp.producer_epoch))
+                    .await;
                 *self.txn_coord_client.lock().await = Some(coord);
                 *self.prepared_transaction_state.lock().await = recovered;
                 *self.txn_state.lock().await = if recovered.is_some() {
@@ -1225,7 +1390,7 @@ impl std::fmt::Debug for Producer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Producer")
             .field("producer_id", &self.identity.id)
-            .field("producer_epoch", &self.identity.epoch)
+            .field("producer_epoch", &self.producer_epoch())
             .field("transactional_id", &self.transactional_id)
             .field("compression", &self.compression)
             .finish_non_exhaustive()

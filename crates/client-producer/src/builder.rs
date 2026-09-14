@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize},
+        atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize},
     },
     time::Duration,
 };
@@ -103,6 +103,9 @@ pub const DEFAULT_PRODUCER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Default wall-clock routing retry budget per batch.
 pub const DEFAULT_PRODUCER_ROUTING_RETRY_BUDGET: Duration = Duration::from_secs(30);
 /// Default producer-ID initialization retry timeout.
+///
+/// The same timeout limits the retries of a transaction coordinator request:
+/// `AddPartitionsToTxn`, and an `EndTxn` whose outcome a transport failure hid.
 pub const DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default producer-ID initialization backoff cap.
 pub const DEFAULT_PRODUCER_INIT_MAX_BACKOFF: Duration = Duration::from_secs(1);
@@ -636,6 +639,7 @@ impl Producer {
         let partitioner = Arc::new(UniformStickyPartitioner::new());
         let flush_notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let producer_epoch = Arc::new(AtomicI16::new(producer_epoch));
 
         let txn_state = Arc::new(Mutex::new(TxnState::Uninitialized));
         let txn_recovery_required = Arc::new(AtomicBool::new(false));
@@ -647,7 +651,7 @@ impl Producer {
         let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
             transport: Box::new(ClientTransport::new(client.clone())),
             producer_id,
-            producer_epoch,
+            producer_epoch: Arc::clone(&producer_epoch),
             acks,
             compression,
             linger,

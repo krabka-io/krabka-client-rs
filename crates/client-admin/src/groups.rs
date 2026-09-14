@@ -2,8 +2,7 @@
 //! [`AdminClient::list_consumer_group_offsets`].
 //!
 //! These are thin wrappers over the `ListGroups` (`api_key`=16),
-//! `OffsetCommit` (`api_key`=8) and `OffsetFetch` (`api_key`=9, v8+ grouped
-//! form) RPCs.
+//! `OffsetCommit` (`api_key`=8) and `OffsetFetch` (`api_key`=9) RPCs.
 //!
 //! ## `OffsetCommit` version note
 //!
@@ -14,14 +13,12 @@
 //!
 //! ## `OffsetFetch` version note
 //!
-//! The `Connection` negotiates the highest mutually supported version, which
-//! is v10 at the time of writing. At v10 the response encodes topics by
-//! `topic_id` only, and the wire omits the `name` field. To return the
-//! human-readable `(topic, partition) → offset` map, the client calls
-//! `Metadata` with no filter immediately after, which fetches all topics, and
-//! builds an id→name lookup table.
+//! [`AdminClient::list_consumer_group_offsets`] sends `OffsetFetch` at v2 to
+//! v9, where the response names each topic. Apache Kafka's
+//! `ListConsumerGroupOffsetsHandler` builds its request with
+//! `OffsetFetchRequest.Builder.forTopicNames`, which caps the version at 9.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use bytes::BufMut;
 use krabka_client_core::{CoordinatorKeyType, build_find_coordinator, coordinator_endpoint};
@@ -29,14 +26,13 @@ use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
     owned::{
         list_groups_request::ListGroupsRequest,
-        metadata_request::MetadataRequest,
         offset_commit_request::{
             self, OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
         },
         offset_commit_response::OffsetCommitResponse,
-        offset_fetch_request::{OffsetFetchRequest, OffsetFetchRequestGroup},
+        offset_fetch_request::{self, OffsetFetchRequest, OffsetFetchRequestGroup},
+        offset_fetch_response::OffsetFetchResponse,
     },
-    primitives::uuid::Uuid as WireUuid,
 };
 
 use crate::{
@@ -48,15 +44,6 @@ pub struct ConsumerGroupOffsetOutcome {
     pub topic: String,
     pub partition: i32,
     pub error: Option<KafkaError>,
-}
-
-/// One committed-offset row collected from an `OffsetFetch` response. It keeps
-/// the `topic_id`, so `Metadata` can resolve name-less v10 topics.
-struct Entry {
-    topic_name: String,
-    topic_id: WireUuid,
-    partition: i32,
-    offset: i64,
 }
 
 impl AdminClient {
@@ -120,79 +107,26 @@ impl AdminClient {
     /// Returns `(topic, partition) → committed_offset` for the named group.
     ///
     /// The call requests all topics and partitions (`topics: None`). It skips
-    /// entries with a committed offset < 0, which means no committed offset.
+    /// a partition that has an error code, and a partition with a committed
+    /// offset below 0, which means no committed offset.
     ///
-    /// At `OffsetFetch` v10 the response carries `topic_id` instead of
-    /// `name`, so a `Metadata` round-trip resolves the topic ids to names.
+    /// The response names each topic, so the client negotiates `OffsetFetch`
+    /// v2 to v9, as Apache Kafka's `ListConsumerGroupOffsetsHandler` does.
     ///
     /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
+    /// Returns an error when encoding, transport, or response handling fails.
+    /// Returns [`AdminError::Broker`] when the coordinator answers with a
+    /// group error code. Returns [`ClientError::IncompatibleVersion`] when the
+    /// coordinator does not support `OffsetFetch` v2 to v9.
+    ///
+    /// [`ClientError::IncompatibleVersion`]: krabka_client_core::ClientError::IncompatibleVersion
     pub async fn list_consumer_group_offsets(
         &mut self,
         group: &str,
     ) -> Result<BTreeMap<(String, i32), i64>, AdminError> {
         self.reconnect_group_coordinator(group).await?;
-        let req = OffsetFetchRequest {
-            groups: vec![OffsetFetchRequestGroup {
-                group_id: group.to_string(),
-                member_id: None,
-                member_epoch: -1,
-                topics: None,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let resp = self.conn.send(req).await?;
-
-        // Collect committed offsets, keeping each topic's id for name resolution.
-        let mut raw: Vec<Entry> = Vec::new();
-        for g in resp.groups {
-            if g.error_code != 0 {
-                return Err(AdminError::Broker {
-                    api: "OffsetFetch",
-                    code: g.error_code,
-                    name: kafka_error_name(g.error_code),
-                    message: Some(format!("group={}", g.group_id)),
-                });
-            }
-            for t in g.topics {
-                for p in t.partitions {
-                    if p.committed_offset >= 0 {
-                        raw.push(Entry {
-                            topic_name: t.name.clone(),
-                            topic_id: t.topic_id,
-                            partition: p.partition_index,
-                            offset: p.committed_offset,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Build an id→name map from a `Metadata` round-trip (default request =
-        // all topics). At OffsetFetch v10 the response omits names, so this is
-        // how empty-named entries below recover their topic; at v8/v9 names are
-        // already present and the per-entry resolution simply ignores this map.
-        let id_to_name = self
-            .topic_ids()
-            .await?
-            .into_iter()
-            .map(|(name, id)| (id, name))
-            .collect::<HashMap<_, _>>();
-
-        let mut out = BTreeMap::new();
-        for e in raw {
-            let name = if e.topic_name.is_empty() {
-                match id_to_name.get(&e.topic_id) {
-                    Some(n) => n.clone(),
-                    None => continue, // unknown id — skip
-                }
-            } else {
-                e.topic_name
-            };
-            out.insert((name, e.partition), e.offset);
-        }
-        Ok(out)
+        let response = self.conn.send(offset_fetch_request(group)).await?;
+        committed_offsets(group, response)
     }
 
     async fn reconnect_group_coordinator(&mut self, group: &str) -> Result<(), AdminError> {
@@ -203,23 +137,6 @@ impl AdminClient {
         let coordinator = coordinator_endpoint(group, response)?;
         self.reconnect(&format_host_port(&coordinator.host, coordinator.port))
             .await
-    }
-
-    async fn topic_ids(&self) -> Result<HashMap<String, WireUuid>, AdminError> {
-        Ok(self
-            .conn
-            .send(MetadataRequest::default())
-            .await?
-            .topics
-            .into_iter()
-            .filter_map(|topic| {
-                if topic.topic_id == WireUuid::ZERO {
-                    None
-                } else {
-                    topic.name.map(|name| (name, topic.topic_id))
-                }
-            })
-            .collect())
     }
 }
 
@@ -249,6 +166,140 @@ impl ProtocolRequest for TopicNameOffsetCommit {
     const MAX_VERSION: i16 = 9;
     const FLEXIBLE_MIN: i16 = offset_commit_request::FLEXIBLE_MIN;
     type Response = OffsetCommitResponse;
+}
+
+/// An `OffsetFetch` request that names its topics, limited to v2 to v9.
+///
+/// `OffsetFetch` v10 names each topic by id only. Apache Kafka's
+/// `ListConsumerGroupOffsetsHandler.buildBatchedRequest` uses
+/// `OffsetFetchRequest.Builder.forTopicNames`, which allows v9 at most. The
+/// admin request asks for all topics, and `Builder.build` rejects that request
+/// below v2 (`TOP_LEVEL_ERROR_AND_NULL_TOPICS_MIN_VERSION`). This type gives
+/// the same range to version negotiation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TopicNameOffsetFetch(OffsetFetchRequest);
+
+impl Encode for TopicNameOffsetFetch {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl ProtocolRequest for TopicNameOffsetFetch {
+    const API_KEY: i16 = offset_fetch_request::API_KEY;
+    /// The first `OffsetFetch` version that can ask for all topics.
+    const MIN_VERSION: i16 = 2;
+    /// The last `OffsetFetch` version that carries topic names.
+    const MAX_VERSION: i16 = 9;
+    const FLEXIBLE_MIN: i16 = offset_fetch_request::FLEXIBLE_MIN;
+    type Response = OffsetFetchResponse;
+}
+
+/// Builds the admin `OffsetFetch` request for all topics of `group`.
+///
+/// The request fills the v2 to v7 fields (`group_id`, `topics`) and the v8+
+/// `groups` array, so it is valid at each negotiated version. Kafka's
+/// `OffsetFetchRequest.Builder.maybeDowngrade` moves the group into the v2 to
+/// v7 fields in the same way.
+fn offset_fetch_request(group: &str) -> TopicNameOffsetFetch {
+    TopicNameOffsetFetch(OffsetFetchRequest {
+        group_id: group.into(),
+        topics: None,
+        groups: vec![OffsetFetchRequestGroup {
+            group_id: group.into(),
+            member_id: None,
+            member_epoch: -1,
+            topics: None,
+            ..Default::default()
+        }],
+        require_stable: false,
+        ..Default::default()
+    })
+}
+
+/// Reads the committed offsets of `group` from an `OffsetFetch` response.
+///
+/// v8 and v9 put the group in `groups`. v2 to v7 put the group error code and
+/// the topics at the top level, which Kafka's `OffsetFetchResponse.group`
+/// reads in the same way. As in Kafka's
+/// `ListConsumerGroupOffsetsHandler.handleResponse`, a partition with an error
+/// code gives no row.
+fn committed_offsets(
+    group: &str,
+    response: OffsetFetchResponse,
+) -> Result<BTreeMap<(String, i32), i64>, AdminError> {
+    let (error_code, rows): (i16, Vec<(String, i32, i64, i16)>) = if response.groups.is_empty() {
+        (
+            response.error_code,
+            response
+                .topics
+                .into_iter()
+                .flat_map(|topic| {
+                    let name = topic.name;
+                    topic.partitions.into_iter().map(move |partition| {
+                        (
+                            name.clone(),
+                            partition.partition_index,
+                            partition.committed_offset,
+                            partition.error_code,
+                        )
+                    })
+                })
+                .collect(),
+        )
+    } else {
+        let mut error_code = 0;
+        let mut rows = Vec::new();
+        for entry in response
+            .groups
+            .into_iter()
+            .filter(|entry| entry.group_id == group)
+        {
+            error_code = entry.error_code;
+            for topic in entry.topics {
+                let name = topic.name;
+                rows.extend(topic.partitions.into_iter().map(|partition| {
+                    (
+                        name.clone(),
+                        partition.partition_index,
+                        partition.committed_offset,
+                        partition.error_code,
+                    )
+                }));
+            }
+        }
+        (error_code, rows)
+    };
+    if error_code != 0 {
+        return Err(AdminError::Broker {
+            api: "OffsetFetch",
+            code: error_code,
+            name: kafka_error_name(error_code),
+            message: Some(format!("group={group}")),
+        });
+    }
+    Ok(rows
+        .into_iter()
+        .filter_map(|(topic, partition, offset, partition_error)| {
+            if partition_error != 0 {
+                tracing::warn!(
+                    topic,
+                    partition,
+                    error_code = partition_error,
+                    "skipping the committed offset of a partition with an error"
+                );
+                None
+            } else if offset < 0 {
+                None
+            } else {
+                Some(((topic, partition), offset))
+            }
+        })
+        .collect())
 }
 
 fn offset_commit_request(
@@ -302,12 +353,11 @@ mod tests {
             find_coordinator_request,
             find_coordinator_response::FindCoordinatorResponse,
             metadata_request,
-            metadata_response::{MetadataResponse, MetadataResponseTopic},
+            metadata_response::MetadataResponse,
             offset_commit_response::{OffsetCommitResponsePartition, OffsetCommitResponseTopic},
-            offset_fetch_request,
             offset_fetch_response::{
-                OffsetFetchResponse, OffsetFetchResponseGroup, OffsetFetchResponsePartitions,
-                OffsetFetchResponseTopics,
+                OffsetFetchResponseGroup, OffsetFetchResponsePartition,
+                OffsetFetchResponsePartitions, OffsetFetchResponseTopic, OffsetFetchResponseTopics,
             },
         },
     };
@@ -343,9 +393,16 @@ mod tests {
         bytes.to_vec()
     }
 
-    /// An `ApiVersions` response that advertises `OffsetCommit` in
-    /// `offset_commit_range`.
-    fn api_versions(offset_commit_range: (i16, i16)) -> Vec<u8> {
+    /// The `OffsetCommit` and `OffsetFetch` version ranges that a mock broker
+    /// advertises.
+    #[derive(Clone, Copy)]
+    struct GroupRanges {
+        offset_commit: (i16, i16),
+        offset_fetch: (i16, i16),
+    }
+
+    /// An `ApiVersions` response that advertises `ranges`.
+    fn api_versions(ranges: GroupRanges) -> Vec<u8> {
         encode(
             &ApiVersionsResponse {
                 api_keys: vec![
@@ -363,14 +420,14 @@ mod tests {
                     },
                     ApiVersion {
                         api_key: offset_commit_request::API_KEY,
-                        min_version: offset_commit_range.0,
-                        max_version: offset_commit_range.1,
+                        min_version: ranges.offset_commit.0,
+                        max_version: ranges.offset_commit.1,
                         ..Default::default()
                     },
                     ApiVersion {
                         api_key: offset_fetch_request::API_KEY,
-                        min_version: 10,
-                        max_version: 10,
+                        min_version: ranges.offset_fetch.0,
+                        max_version: ranges.offset_fetch.1,
                         ..Default::default()
                     },
                     ApiVersion {
@@ -387,25 +444,28 @@ mod tests {
         )
     }
 
-    /// Decodes an `OffsetCommit` request body behind its request header.
-    fn decode_offset_commit(mut body: &[u8], version: i16) -> OffsetCommitRequest {
+    /// Decodes a request body of type `R` behind its request header.
+    fn decode_request<R: ProtocolRequest + for<'de> Decode<'de>>(
+        mut body: &[u8],
+        version: i16,
+    ) -> R {
         let client_id_len = body.get_i16();
         body.advance(usize::try_from(client_id_len).expect("client id length"));
-        if version >= offset_commit_request::FLEXIBLE_MIN {
+        if version >= R::FLEXIBLE_MIN {
             body.advance(1);
         }
-        OffsetCommitRequest::decode(&mut body, version).expect("offset commit request decodes")
+        R::decode(&mut body, version).expect("request decodes")
     }
 
     /// A bootstrap broker that sends every group RPC to `coordinator`.
     async fn bootstrap_for(
         coordinator: &MockBroker,
-        offset_commit_range: (i16, i16),
+        ranges: GroupRanges,
         group_rpcs: Arc<AtomicUsize>,
     ) -> MockBroker {
         let coordinator_addr = coordinator.addr;
         MockBroker::start(move |api_key, version, _, _| match api_key {
-            api_versions_request::API_KEY => Some(api_versions(offset_commit_range)),
+            api_versions_request::API_KEY => Some(api_versions(ranges)),
             find_coordinator_request::API_KEY => Some(encode(
                 &FindCoordinatorResponse {
                     node_id: 2,
@@ -492,10 +552,14 @@ mod tests {
         ] {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let requests_in_mock = Arc::clone(&requests);
+            let ranges = GroupRanges {
+                offset_commit: offset_commit_range,
+                offset_fetch: (2, 10),
+            };
             let coordinator = MockBroker::start(move |api_key, version, _, body| match api_key {
-                api_versions_request::API_KEY => Some(api_versions(offset_commit_range)),
+                api_versions_request::API_KEY => Some(api_versions(ranges)),
                 offset_commit_request::API_KEY => {
-                    let request = decode_offset_commit(body, version);
+                    let request: OffsetCommitRequest = decode_request(body, version);
                     let response = OffsetCommitResponse {
                         topics: request
                             .topics
@@ -528,7 +592,7 @@ mod tests {
                 _ => None,
             })
             .await;
-            let bootstrap = bootstrap_for(&coordinator, offset_commit_range, Arc::default()).await;
+            let bootstrap = bootstrap_for(&coordinator, ranges, Arc::default()).await;
             let mut admin = AdminClient::connect(&[bootstrap.addr.to_string()])
                 .await
                 .expect("admin connects");
@@ -560,13 +624,257 @@ mod tests {
         }
     }
 
+    /// The `OffsetFetch` answer of the mock coordinator at `version`: one
+    /// committed offset, one partition with no committed offset, and one
+    /// partition with an error code. v2 to v7 put the topics at the top level.
+    fn offset_fetch_response(version: i16) -> OffsetFetchResponse {
+        let rows = [
+            ("orders", 2, 41, 0),
+            ("orders", 3, -1, 0),
+            ("payments", 0, 5, 3),
+        ];
+        if version < 8 {
+            OffsetFetchResponse {
+                topics: rows
+                    .iter()
+                    .map(|(name, partition_index, committed_offset, error_code)| {
+                        OffsetFetchResponseTopic {
+                            name: (*name).into(),
+                            partitions: vec![OffsetFetchResponsePartition {
+                                partition_index: *partition_index,
+                                committed_offset: *committed_offset,
+                                error_code: *error_code,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        } else {
+            OffsetFetchResponse {
+                groups: vec![OffsetFetchResponseGroup {
+                    group_id: "workers".into(),
+                    topics: rows
+                        .iter()
+                        .map(|(name, partition_index, committed_offset, error_code)| {
+                            OffsetFetchResponseTopics {
+                                name: (*name).into(),
+                                partitions: vec![OffsetFetchResponsePartitions {
+                                    partition_index: *partition_index,
+                                    committed_offset: *committed_offset,
+                                    error_code: *error_code,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+    }
+
+    /// The negotiated `OffsetFetch` version and the result of
+    /// `list_consumer_group_offsets`, with a version error as its ranges.
+    type FetchResult = Result<BTreeMap<(String, i32), i64>, (i16, i16, i16, i16, i16)>;
+
+    /// Apache Kafka's `ListConsumerGroupOffsetsHandler` builds `OffsetFetch`
+    /// with `OffsetFetchRequest.Builder.forTopicNames`, which caps the version
+    /// at 9. A request for all topics also needs v2. The response names each
+    /// topic, so the call sends no `Metadata` request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_consumer_group_offsets_sends_offset_fetch_by_topic_name() {
+        let legacy_request = |version| {
+            vec![(
+                version,
+                OffsetFetchRequest {
+                    group_id: "workers".into(),
+                    topics: None,
+                    ..Default::default()
+                },
+            )]
+        };
+        let grouped_request = |version| {
+            vec![(
+                version,
+                OffsetFetchRequest {
+                    groups: vec![OffsetFetchRequestGroup {
+                        group_id: "workers".into(),
+                        member_id: None,
+                        member_epoch: -1,
+                        topics: None,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )]
+        };
+        let fetched = Ok(BTreeMap::from([(("orders".into(), 2), 41)]));
+        for (name, offset_fetch_range, expected_requests, expected_result) in [
+            (
+                "coordinator stops at v7",
+                (2, 7),
+                legacy_request(7),
+                fetched.clone(),
+            ),
+            (
+                "coordinator stops at v8",
+                (2, 8),
+                grouped_request(8),
+                fetched.clone(),
+            ),
+            (
+                "coordinator stops at v9",
+                (2, 9),
+                grouped_request(9),
+                fetched.clone(),
+            ),
+            (
+                "coordinator supports v10",
+                (2, 10),
+                grouped_request(9),
+                fetched.clone(),
+            ),
+            (
+                "coordinator supports only v10",
+                (10, 10),
+                Vec::new(),
+                Err((offset_fetch_request::API_KEY, 10, 10, 2, 9)),
+            ),
+            (
+                "coordinator supports only v1",
+                (1, 1),
+                Vec::new(),
+                Err((offset_fetch_request::API_KEY, 1, 1, 2, 9)),
+            ),
+        ] {
+            let ranges = GroupRanges {
+                offset_commit: (2, 9),
+                offset_fetch: offset_fetch_range,
+            };
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_in_mock = Arc::clone(&requests);
+            let metadata_requests = Arc::new(AtomicUsize::new(0));
+            let metadata_requests_in_mock = Arc::clone(&metadata_requests);
+            let coordinator = MockBroker::start(move |api_key, version, _, body| match api_key {
+                api_versions_request::API_KEY => Some(api_versions(ranges)),
+                offset_fetch_request::API_KEY => {
+                    let request: OffsetFetchRequest = decode_request(body, version);
+                    requests_in_mock
+                        .lock()
+                        .expect("requests lock")
+                        .push((version, request));
+                    Some(encode(
+                        &offset_fetch_response(version),
+                        version,
+                        version >= offset_fetch_request::FLEXIBLE_MIN,
+                    ))
+                }
+                metadata_request::API_KEY => {
+                    metadata_requests_in_mock.fetch_add(1, Ordering::SeqCst);
+                    Some(encode(&MetadataResponse::default(), version, true))
+                }
+                _ => None,
+            })
+            .await;
+            let bootstrap = bootstrap_for(&coordinator, ranges, Arc::default()).await;
+            let mut admin = AdminClient::connect(&[bootstrap.addr.to_string()])
+                .await
+                .expect("admin connects");
+
+            let result: FetchResult =
+                admin
+                    .list_consumer_group_offsets("workers")
+                    .await
+                    .map_err(|error| match error {
+                        AdminError::Transport(ClientError::IncompatibleVersion {
+                            api_key,
+                            broker_min,
+                            broker_max,
+                            client_min,
+                            client_max,
+                        }) => (api_key, broker_min, broker_max, client_min, client_max),
+                        other => panic!("case {name}: unexpected error {other:?}"),
+                    });
+
+            bootstrap.stop();
+            coordinator.stop();
+            let requests = requests.lock().expect("requests lock").clone();
+            assert!(
+                (requests, metadata_requests.load(Ordering::SeqCst), result)
+                    == (expected_requests, 0, expected_result),
+                "case {name}"
+            );
+        }
+    }
+
+    /// The result of `committed_offsets`, with a broker error as its fields.
+    type OffsetsResult =
+        Result<BTreeMap<(String, i32), i64>, (&'static str, i16, &'static str, Option<String>)>;
+
+    /// Kafka's `OffsetFetchResponse.group` reads the group error code from the
+    /// top level below v8 and from the group entry from v8.
+    #[test]
+    fn committed_offsets_reads_both_response_shapes() {
+        let offsets = BTreeMap::from([(("orders".into(), 2), 41)]);
+        let group_error =
+            |code, name| Err(("OffsetFetch", code, name, Some("group=workers".into())));
+        for (name, response, expected) in [
+            (
+                "v2 to v7 shape",
+                offset_fetch_response(7),
+                Ok(offsets.clone()),
+            ),
+            ("v8 and v9 shape", offset_fetch_response(9), Ok(offsets)),
+            (
+                "v2 to v7 group error",
+                OffsetFetchResponse {
+                    error_code: 15,
+                    ..Default::default()
+                },
+                group_error(15, "COORDINATOR_NOT_AVAILABLE"),
+            ),
+            (
+                "v8 and v9 group error",
+                OffsetFetchResponse {
+                    groups: vec![OffsetFetchResponseGroup {
+                        group_id: "workers".into(),
+                        error_code: 16,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                group_error(16, "NOT_COORDINATOR"),
+            ),
+        ] {
+            let result: OffsetsResult =
+                committed_offsets("workers", response).map_err(|error| match error {
+                    AdminError::Broker {
+                        api,
+                        code,
+                        name,
+                        message,
+                    } => (api, code, name, message),
+                    other => panic!("case {name}: unexpected error {other:?}"),
+                });
+            assert!(result == expected, "case {name}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_offset_rpcs_use_the_group_coordinator() {
-        let topic_id = WireUuid([7; 16]);
+        let ranges = GroupRanges {
+            offset_commit: (2, 10),
+            offset_fetch: (2, 10),
+        };
         let coordinator_group_rpcs = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&coordinator_group_rpcs);
         let coordinator = MockBroker::start(move |api_key, version, _, _| match api_key {
-            api_versions_request::API_KEY => Some(api_versions((2, 10))),
+            api_versions_request::API_KEY => Some(api_versions(ranges)),
             offset_commit_request::API_KEY => {
                 seen.fetch_add(1, Ordering::SeqCst);
                 Some(encode(
@@ -587,46 +895,15 @@ mod tests {
             }
             offset_fetch_request::API_KEY => {
                 seen.fetch_add(1, Ordering::SeqCst);
-                Some(encode(
-                    &OffsetFetchResponse {
-                        groups: vec![OffsetFetchResponseGroup {
-                            group_id: "workers".into(),
-                            topics: vec![OffsetFetchResponseTopics {
-                                topic_id,
-                                partitions: vec![OffsetFetchResponsePartitions {
-                                    partition_index: 2,
-                                    committed_offset: 41,
-                                    ..Default::default()
-                                }],
-                                ..Default::default()
-                            }],
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                    version,
-                    true,
-                ))
+                Some(encode(&offset_fetch_response(version), version, true))
             }
-            metadata_request::API_KEY => Some(encode(
-                &MetadataResponse {
-                    topics: vec![MetadataResponseTopic {
-                        name: Some("orders".into()),
-                        topic_id,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                version,
-                true,
-            )),
             _ => None,
         })
         .await;
 
         let bootstrap_group_rpcs = Arc::new(AtomicUsize::new(0));
         let bootstrap =
-            bootstrap_for(&coordinator, (2, 10), Arc::clone(&bootstrap_group_rpcs)).await;
+            bootstrap_for(&coordinator, ranges, Arc::clone(&bootstrap_group_rpcs)).await;
         let mut admin = AdminClient::connect(&[bootstrap.addr.to_string()])
             .await
             .expect("admin connects");
