@@ -32,6 +32,15 @@ use crate::coordinator::{COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR};
 ///
 /// This function populates both the legacy `group_id`/`topics` fields for v0-7
 /// and the v8+ `groups[]` array, which carries `topic_id` for v10.
+///
+/// The request sets `require_stable`, as Apache Kafka's consumers do
+/// (`CommitRequestManager.OffsetFetchRequestState.toUnsentRequest` and
+/// `ConsumerCoordinator.sendOffsetFetchRequest`). From v7 the coordinator then
+/// answers `UNSTABLE_OFFSET_COMMIT` (88) for a partition with a pending
+/// transactional offset commit, and `send_offset_fetch` asks again. Below v7
+/// the field is not on the wire. Kafka's `OffsetFetchRequest.Builder` also
+/// drops the flag there (`throwIfStableOffsetsUnsupported`), because
+/// `internal.throw.on.fetch.stable.offset.unsupported` defaults to `false`.
 pub(crate) fn build_offset_fetch(
     group_id: &str,
     by_topic: &HashMap<String, Vec<i32>>,
@@ -62,6 +71,7 @@ pub(crate) fn build_offset_fetch(
             topics: Some(group_topics),
             ..Default::default()
         }],
+        require_stable: true,
         ..Default::default()
     }
 }
@@ -365,7 +375,7 @@ mod tests {
                     }]),
                     unknown_tagged_fields: UnknownTaggedFields(vec![]),
                 }],
-                require_stable: false,
+                require_stable: true,
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
             }
         );
