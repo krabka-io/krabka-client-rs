@@ -4672,6 +4672,130 @@ mod harness {
         shutdown(h).await;
     }
 
+    /// Build a one-record idempotent `PreparedBatch` directly, bypassing the
+    /// sender loop, so `expire_batches` can be exercised as a plain function.
+    fn idempotent_batch(
+        topic: &str,
+        partition: i32,
+        base_sequence: i32,
+        producer_epoch: i16,
+    ) -> (
+        PreparedBatch,
+        oneshot::Receiver<Result<RecordMetadata, ProducerError>>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let record = PendingRecord {
+            offset_delta: 0,
+            timestamp_ms: 0,
+            key: None,
+            value: None,
+            headers: Vec::new(),
+            ack: tx,
+        };
+        let pb = PreparedBatch {
+            topic: topic.to_string(),
+            partition,
+            topic_id: Uuid::ZERO,
+            base_sequence,
+            record_batch: RecordBatch {
+                base_offset: 0,
+                partition_leader_epoch: 0,
+                attributes: Attributes::default(),
+                last_offset_delta: 0,
+                base_timestamp: 0,
+                max_timestamp: 0,
+                producer_id: 1,
+                producer_epoch,
+                base_sequence,
+                records: Vec::new(),
+            },
+            records: vec![record],
+            first_sent: None,
+            backoff_until: None,
+            retries_used: 0,
+            last_failure: None,
+            transaction_generation: None,
+        };
+        (pb, rx)
+    }
+
+    /// `expire_batches` must not rewrite the epoch, sequence, or bytes of a
+    /// batch that did not itself run out of its routing budget. Kafka's
+    /// `maybeUpdateProducerIdAndEpoch` moves a partition to the new identity
+    /// only once it has no batch in flight, so an unrelated parked batch keeps
+    /// its original identity: a broker that already durably wrote it must
+    /// still dedup a resend with `DUPLICATE_SEQUENCE_NUMBER`, which a rewrite
+    /// at a new epoch would defeat by making the resend look like a new batch.
+    ///
+    /// This is a plain, synchronous call into `expire_batches` (no sender loop,
+    /// no timing), so the two-partition interleaving that
+    /// `retry_exhaustion_preserves_concurrent_successful_ack` cannot pin
+    /// deterministically is exact and immediate here.
+    #[test]
+    fn expire_batches_does_not_rewrite_an_unrelated_parked_batch() {
+        let transport = MockTransport::new(Duration::ZERO);
+        let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
+        let cfg = SenderConfig {
+            transport: Box::new(ArcTransport(transport)),
+            producer_id: 1,
+            producer_epoch: Arc::new(AtomicI16::new(3)),
+            acks: Acks::All,
+            compression: Compression::None,
+            linger: millis(1),
+            request_timeout_ms: 5_000,
+            retries: i32::MAX,
+            retry_backoff: millis(1),
+            routing_retry_budget: secs(30),
+            max_in_flight: 5,
+            metadata_cache: Arc::new(Mutex::new(HashMap::new())),
+            partition_leaders: Arc::new(DashMap::new()),
+            partitioner: Arc::new(UniformStickyPartitioner::new()),
+            accumulators: Arc::new(DashMap::new()),
+            next_seq: Arc::new(DashMap::new()),
+            state: Arc::new(AtomicU8::new(STATE_ACTIVE)),
+            wake_rx,
+            flush_notify: Arc::new(Notify::new()),
+            in_flight: Arc::new(AtomicUsize::new(2)),
+            shutdown: CancellationToken::new(),
+            transactional_id: None,
+            txn_state: Arc::new(Mutex::new(TxnState::Uninitialized)),
+            txn_pid_epoch: Arc::new(Mutex::new((1, 0))),
+            txn_recovery_required: Arc::new(AtomicBool::new(false)),
+            txn_recovery_generation: Arc::new(AtomicU64::new(0)),
+        };
+        let mut state = PipelineState::default();
+
+        // Partition 0's batch ran out of its routing budget; it is the one
+        // passed as `expired`.
+        let (expired_batch, mut expired_rx) = idempotent_batch("t", 0, 0, 3);
+
+        // Partition 1's batch is unrelated: still within budget, mid-retry,
+        // passed as `to_send`. Its epoch (3) and sequence (16) must survive.
+        let (parked_batch, _parked_rx) = idempotent_batch("t", 1, 16, 3);
+        let original_record_batch = parked_batch.record_batch.clone();
+
+        expire_batches(&cfg, &mut state, vec![expired_batch], vec![parked_batch]);
+
+        // The epoch bump happened (it applies to batches built after this
+        // point)...
+        assert2::assert!(cfg.producer_epoch.load(Ordering::Acquire) == 4);
+        // ...but partition 1's already-built batch was parked byte-identical:
+        // same epoch, same sequence, same encoded bytes as before the call.
+        let reparked = state
+            .retry
+            .get(&("t".to_string(), 1))
+            .expect("partition 1 stays parked, not sent as a fresh batch");
+        assert2::assert!(reparked.record_batch == original_record_batch);
+        assert2::assert!(reparked.base_sequence == 16);
+
+        // Partition 0's record failed with the expiry error, not silently
+        // rewritten and resent.
+        let expired_result = expired_rx
+            .try_recv()
+            .expect("partition 0 is resolved, not parked");
+        assert2::assert!(matches!(expired_result, Err(ProducerError::SendTimeout)));
+    }
+
     /// A batch with several records gives each record
     /// `base_offset + offset_delta`. The other tests use one record per batch,
     /// where `offset_delta` is always 0. This test pins the per-record offset
