@@ -360,13 +360,12 @@ impl Consumer {
             }
         }
 
-                self.end_offsets.lock().await.insert(
+                record_readable_end(
+                    &mut *self.end_offsets.lock().await,
                     key.clone(),
-                    readable_end_offset(
-                        self.isolation_level,
-                        part.high_watermark,
-                        part.last_stable_offset,
-                    ),
+                    self.isolation_level,
+                    part.high_watermark,
+                    part.last_stable_offset,
                 );
 
                 self.process_partition_records(&mut offsets, &key, &topic_name, part, &mut out)
@@ -652,6 +651,19 @@ const fn readable_end_offset(
     }
 }
 
+fn record_readable_end(
+    ends: &mut HashMap<(String, i32), i64>,
+    key: (String, i32),
+    isolation: IsolationLevel,
+    high_watermark: i64,
+    last_stable_offset: i64,
+) {
+    ends.insert(
+        key,
+        readable_end_offset(isolation, high_watermark, last_stable_offset),
+    );
+}
+
 /// The offset to fetch next after consuming `batches`: one past the highest
 /// `base_offset + last_offset_delta` across all decoded batches.
 ///
@@ -913,6 +925,16 @@ mod offset_advance_tests {
     fn readable_end_respects_consumer_isolation() {
         check!(readable_end_offset(IsolationLevel::ReadUncommitted, 12, 9) == 12);
         check!(readable_end_offset(IsolationLevel::ReadCommitted, 12, 9) == 9);
+
+        let mut ends = HashMap::new();
+        record_readable_end(
+            &mut ends,
+            ("topic-a".into(), 0),
+            IsolationLevel::ReadCommitted,
+            12,
+            9,
+        );
+        check!(ends.get(&("topic-a".into(), 0)) == Some(&9));
     }
 
     #[test]
