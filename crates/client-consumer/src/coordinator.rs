@@ -58,8 +58,8 @@ use crate::{
     consumer::{CommitIdentity, ConsumerRetryPolicy, reset_starting_offset, starting_offset},
     error::ConsumerError,
     offset_wire::{
-        OffsetFetchAction, TopicNameOffsetFetch, build_commit_topics, build_offset_fetch,
-        classify_offset_fetch, parse_offset_fetch,
+        OffsetFetchAction, TopicNameOffsetCommit, TopicNameOffsetFetch, build_commit_topics,
+        build_offset_fetch, classify_offset_fetch, parse_offset_fetch,
     },
 };
 
@@ -1003,8 +1003,7 @@ async fn commit_revoked(state: &CoordinatorState, revoked: &[(String, i32)]) {
     if offsets.is_empty() {
         return;
     }
-    let topic_ids = state.topic_ids.lock().await.clone();
-    let topics = build_commit_topics(offsets, &topic_ids);
+    let topics = build_commit_topics(offsets);
     let res = state
         .client
         .broker(state.coordinator_id.load(Ordering::Relaxed))
@@ -1028,21 +1027,23 @@ fn should_commit_revoked_offset(is_revoked: bool, next_offset: i64) -> bool {
     is_revoked && next_offset > 0 && next_offset != i64::MAX
 }
 
+/// Build the revoke-time `OffsetCommit` request. The request names each
+/// topic, so the version is v9 or lower. See [`TopicNameOffsetCommit`].
 fn build_revoked_commit_request(
     group_id: String,
     generation_id: i32,
     member_id: String,
     group_instance_id: Option<String>,
     topics: Vec<krabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic>,
-) -> OffsetCommitRequest {
-    OffsetCommitRequest {
+) -> TopicNameOffsetCommit {
+    TopicNameOffsetCommit(OffsetCommitRequest {
         group_id,
         generation_id_or_member_epoch: generation_id,
         member_id,
         group_instance_id,
         topics,
         ..Default::default()
-    }
+    })
 }
 
 fn build_join_group_request(
@@ -2410,10 +2411,7 @@ mod retry_tests {
             assert2::assert!(should_commit_revoked_offset(is_revoked, next_offset) == expected);
         }
 
-        let topics = build_commit_topics(
-            HashMap::from([(("topic-a".to_string(), 2), (42, 7))]),
-            &HashMap::new(),
-        );
+        let topics = build_commit_topics(HashMap::from([(("topic-a".to_string(), 2), (42, 7))]));
         let req = build_revoked_commit_request(
             "group-a".into(),
             3,
@@ -2423,7 +2421,7 @@ mod retry_tests {
         );
 
         assert2::assert!(
-            req == OffsetCommitRequest {
+            req == TopicNameOffsetCommit(OffsetCommitRequest {
                 group_id: "group-a".into(),
                 generation_id_or_member_epoch: 3,
                 member_id: "member-a".into(),
@@ -2431,7 +2429,7 @@ mod retry_tests {
                 retention_time_ms: -1,
                 topics,
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
-            }
+            })
         );
         assert2::assert!(UNKNOWN_EPOCH == -1);
     }

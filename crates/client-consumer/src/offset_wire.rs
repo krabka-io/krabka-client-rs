@@ -1,16 +1,16 @@
 //! KIP-516 offset wire-shape helpers.
 //!
-//! The consumer sends `OffsetFetch` at v9 or lower, where each topic has its
-//! name. Apache Kafka's classic `ConsumerCoordinator.sendOffsetFetchRequest`
-//! builds the request with `OffsetFetchRequest.Builder.forTopicNames`, which
-//! caps the version at 9. At v8+ `OffsetFetch` carries a per-group `groups[]`
-//! array, and the legacy `group_id` + `topics` fields are v0-7 only.
+//! The consumer sends `OffsetCommit` and `OffsetFetch` at v9 or lower, where
+//! each topic has its name. Apache Kafka's classic `ConsumerCoordinator`
+//! builds both requests with the `forTopicNames` builder, which caps the
+//! version at 9 (`sendOffsetCommitRequest`, `sendOffsetFetchRequest`). At v8+
+//! `OffsetFetch` carries a per-group `groups[]` array, and the legacy
+//! `group_id` + `topics` fields are v0-7 only.
 //!
 //! The builders populate BOTH the legacy and the new fields. The codegen
 //! encodes only the set that is valid for the negotiated version, so one
 //! request works regardless of what the broker negotiated. The parser flattens
-//! an `OffsetFetch` response across either shape. At v10 `OffsetCommit` keys
-//! topics by `topic_id` instead of by name.
+//! an `OffsetFetch` response across either shape.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -18,7 +18,10 @@ use bytes::BufMut;
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
     owned::{
-        offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
+        offset_commit_request::{
+            self, OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+        },
+        offset_commit_response::OffsetCommitResponse,
         offset_fetch_request::{
             self, OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic,
             OffsetFetchRequestTopics,
@@ -291,15 +294,45 @@ fn is_retriable_error(code: i16) -> bool {
     )
 }
 
-/// Build the `topics` for an `OffsetCommit` and tag each one with its
-/// `topic_id`.
+/// An `OffsetCommit` request that names its topics, capped at v9.
 ///
-/// v10 needs the `topic_id`, because the wire drops the topic name there. This
-/// function keeps the name for v0-9. `offsets` maps `(topic, partition)` to
-/// `(committed_offset, committed_leader_epoch)`.
+/// `OffsetCommit` v10 names each topic by id only. Apache Kafka's classic
+/// `ConsumerCoordinator.sendOffsetCommitRequest` uses
+/// `OffsetCommitRequest.Builder.forTopicNames`, which allows
+/// `ApiKeys.OFFSET_COMMIT.oldestVersion()` to 9. This type gives the same
+/// range to version negotiation. When the coordinator supports only v10 or
+/// higher, the send fails with `ClientError::IncompatibleVersion` before the
+/// request goes out. Kafka's builder fails with `UnsupportedVersionException`
+/// in that case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TopicNameOffsetCommit(pub(crate) OffsetCommitRequest);
+
+impl Encode for TopicNameOffsetCommit {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl ProtocolRequest for TopicNameOffsetCommit {
+    const API_KEY: i16 = offset_commit_request::API_KEY;
+    const MIN_VERSION: i16 = offset_commit_request::MIN_VERSION;
+    /// The last `OffsetCommit` version that carries topic names.
+    const MAX_VERSION: i16 = 9;
+    const FLEXIBLE_MIN: i16 = offset_commit_request::FLEXIBLE_MIN;
+    type Response = OffsetCommitResponse;
+}
+
+/// Build the `topics` for an `OffsetCommit`.
+///
+/// Each topic has its name and no topic id, as in Kafka's
+/// `ConsumerCoordinator.sendOffsetCommitRequest`. `offsets` maps `(topic,
+/// partition)` to `(committed_offset, committed_leader_epoch)`.
 pub(crate) fn build_commit_topics(
     offsets: HashMap<(String, i32), (i64, i32)>,
-    topic_ids: &HashMap<String, WireUuid>,
 ) -> Vec<OffsetCommitRequestTopic> {
     let mut by_topic: HashMap<String, Vec<(i32, i64, i32)>> = HashMap::new();
     for ((t, p), (off, epoch)) in offsets {
@@ -308,7 +341,6 @@ pub(crate) fn build_commit_topics(
     by_topic
         .into_iter()
         .map(|(name, parts)| OffsetCommitRequestTopic {
-            topic_id: topic_ids.get(&name).copied().unwrap_or_default(),
             name,
             partitions: parts
                 .into_iter()
@@ -604,17 +636,15 @@ mod tests {
     }
 
     #[test]
-    fn build_commit_topics_tags_topic_id() {
+    fn build_commit_topics_names_each_topic() {
         let mut offsets = HashMap::new();
         offsets.insert(("t".to_string(), 3), (100, 5));
-        let mut ids = HashMap::new();
-        ids.insert("t".to_string(), id(7));
-        let topics = build_commit_topics(offsets, &ids);
+        let topics = build_commit_topics(offsets);
         assert2::assert!(
             topics
                 == vec![OffsetCommitRequestTopic {
                     name: "t".to_string(),
-                    topic_id: id(7),
+                    topic_id: WireUuid::ZERO,
                     partitions: vec![OffsetCommitRequestPartition {
                         partition_index: 3,
                         committed_offset: 100,
@@ -625,12 +655,6 @@ mod tests {
                     unknown_tagged_fields: UnknownTaggedFields(vec![]),
                 }]
         );
-
-        // Missing id → ZERO default.
-        let mut o2 = HashMap::new();
-        o2.insert(("u".to_string(), 0), (1, -1));
-        let t2 = build_commit_topics(o2, &HashMap::new());
-        assert2::assert!(t2[0].topic_id == WireUuid::ZERO);
     }
 
     #[test]

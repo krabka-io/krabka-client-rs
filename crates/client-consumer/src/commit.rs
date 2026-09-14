@@ -5,12 +5,9 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
-use krabka_protocol::{
-    owned::{
-        offset_commit_request::{OffsetCommitRequest, OffsetCommitRequestTopic},
-        offset_commit_response::OffsetCommitResponse,
-    },
-    primitives::uuid::Uuid as WireUuid,
+use krabka_protocol::owned::{
+    offset_commit_request::{OffsetCommitRequest, OffsetCommitRequestTopic},
+    offset_commit_response::OffsetCommitResponse,
 };
 use tokio::sync::Mutex;
 
@@ -21,7 +18,7 @@ use crate::{
         with_coordinator_refind,
     },
     error::ConsumerError,
-    offset_wire::build_commit_topics,
+    offset_wire::{TopicNameOffsetCommit, build_commit_topics},
     position::PartitionPosition,
 };
 
@@ -31,8 +28,8 @@ const ASYNC_COMMIT_DIRTY: u8 = 2;
 
 /// `UNKNOWN_TOPIC_OR_PARTITION`: the coordinator does not know the topic.
 const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
-/// `UNKNOWN_TOPIC_ID`: an `OffsetCommit` v10 topic id that the coordinator does
-/// not hold.
+/// `UNKNOWN_TOPIC_ID`: a topic id that the coordinator does not hold. Kafka's
+/// `CommitRequestManager` retries it as an `InvalidMetadataException`.
 const UNKNOWN_TOPIC_ID: i16 = 100;
 
 /// First non-zero per-partition `error_code` in an `OffsetCommitResponse`, or
@@ -95,7 +92,6 @@ async fn snapshot_commit_topics(
     commit_identity: &Arc<Mutex<CommitIdentity>>,
     offsets: &Arc<Mutex<HashMap<(String, i32), i64>>>,
     positions: &Arc<Mutex<HashMap<(String, i32), PartitionPosition>>>,
-    topic_ids: &Arc<Mutex<HashMap<String, WireUuid>>>,
 ) -> Option<(usize, Vec<OffsetCommitRequestTopic>, (i32, String))> {
     let identity = commit_identity.lock().await.clone();
     let mut raw_offsets = offsets.lock().await.clone();
@@ -107,29 +103,30 @@ async fn snapshot_commit_topics(
     let pos = positions.lock().await;
     let offsets = commit_offsets(raw_offsets, &pos);
     drop(pos);
-    let topic_ids = topic_ids.lock().await.clone();
     Some((
         partitions,
-        build_commit_topics(offsets, &topic_ids),
+        build_commit_topics(offsets),
         (identity.generation, identity.member_id),
     ))
 }
 
+/// Build the `OffsetCommit` request of a commit. The request names each
+/// topic, so the version is v9 or lower. See [`TopicNameOffsetCommit`].
 fn build_commit_request(
     group_id: String,
     generation_id_or_member_epoch: i32,
     member_id: String,
     group_instance_id: Option<String>,
-    topics: Vec<krabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic>,
-) -> OffsetCommitRequest {
-    OffsetCommitRequest {
+    topics: Vec<OffsetCommitRequestTopic>,
+) -> TopicNameOffsetCommit {
+    TopicNameOffsetCommit(OffsetCommitRequest {
         group_id,
         generation_id_or_member_epoch,
         member_id,
         group_instance_id,
         topics,
         ..Default::default()
-    }
+    })
 }
 
 /// Map an `OffsetCommit` response to a result, from the response and from
@@ -156,7 +153,7 @@ fn commit_response_result(
     resp: &OffsetCommitResponse,
     coordinator_alive: bool,
 ) -> Result<(), ConsumerError> {
-    commit_response_outcome(resp, coordinator_alive, &HashMap::new()).map(|_| ())
+    commit_response_outcome(resp, coordinator_alive).map(|_| ())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,24 +175,15 @@ enum CommitOutcome {
 fn commit_response_outcome(
     resp: &OffsetCommitResponse,
     coordinator_alive: bool,
-    topic_names: &HashMap<WireUuid, String>,
 ) -> Result<CommitOutcome, ConsumerError> {
     let mut deferred = None;
     let mut retriable = None;
     let mut acknowledged = HashSet::new();
     for topic in &resp.topics {
-        let name = if topic.name.is_empty() {
-            topic_names
-                .get(&topic.topic_id)
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            topic.name.clone()
-        };
         for partition in &topic.partitions {
             match partition.error_code {
                 0 => {
-                    acknowledged.insert((name.clone(), partition.partition_index));
+                    acknowledged.insert((topic.name.clone(), partition.partition_index));
                 }
                 code @ (22 | 25 | 27) if coordinator_alive => {
                     deferred.get_or_insert(code);
@@ -324,8 +312,7 @@ impl Consumer {
                     .collect(),
                 &position_epochs,
             );
-            let topic_ids = self.topic_ids.lock().await.clone();
-            let topics = build_commit_topics(offsets, &topic_ids);
+            let topics = build_commit_topics(offsets);
             match self
                 .commit_topics_once(topics, (identity.generation, identity.member_id.clone()))
                 .await?
@@ -365,9 +352,7 @@ impl Consumer {
                 CommitOutcome::Retriable { code, acknowledged } => {
                     // Kafka's `CommitRequestManager.commitSyncWithRetries` sends
                     // the commit again while it fails with a retriable error and
-                    // the deadline has not passed. The next round reads
-                    // `topic_ids` again, so a topic id that a metadata refresh
-                    // replaced goes out on the resend.
+                    // the deadline has not passed.
                     pending.retain(|partition, _| !acknowledged.contains(partition));
                     if pending.is_empty() {
                         return Ok(());
@@ -392,10 +377,6 @@ impl Consumer {
         topics: Vec<OffsetCommitRequestTopic>,
         identity: (i32, String),
     ) -> Result<CommitOutcome, ConsumerError> {
-        let topic_names = topics
-            .iter()
-            .map(|topic| (topic.topic_id, topic.name.clone()))
-            .collect::<HashMap<_, _>>();
         // OffsetCommit is a coordinator RPC: route it to the coordinator broker
         // (discovered at build time, kept current by the coordinator task), and
         // re-discover on a cold/relocating-coordinator code so a coordinator
@@ -442,7 +423,7 @@ impl Consumer {
             .coordinator_handle
             .as_ref()
             .is_none_or(|h| !h.is_finished());
-        let outcome = commit_response_outcome(&resp, coordinator_alive, &topic_names)?;
+        let outcome = commit_response_outcome(&resp, coordinator_alive)?;
         if let CommitOutcome::Deferred { code, .. } = outcome {
             tracing::warn!(
                 group = %self.group_id,
@@ -513,7 +494,6 @@ impl Consumer {
         let group_instance_id = self.group_instance_id.clone();
         let offsets = Arc::clone(&self.next_offsets);
         let positions = Arc::clone(&self.positions);
-        let topic_ids = Arc::clone(&self.topic_ids);
         let coordinator_id = Arc::clone(&self.coordinator_id);
         let commit_async_state = Arc::clone(&self.commit_async_state);
         let retry_policy = self.retry_policy;
@@ -525,8 +505,7 @@ impl Consumer {
                     // current offsets, so collapse them into this request.
                     commit_async_state.store(ASYNC_COMMIT_RUNNING, Ordering::Release);
                     if let Some((_, topics, (generation, member_id))) =
-                        snapshot_commit_topics(&commit_identity, &offsets, &positions, &topic_ids)
-                            .await
+                        snapshot_commit_topics(&commit_identity, &offsets, &positions).await
                     {
                         // Route to the coordinator broker. If it returns a moved/cold
                         // coordinator code (or the socket is gone), re-discover once and
@@ -656,7 +635,9 @@ mod tests {
         buf.to_vec()
     }
 
-    fn api_versions() -> Vec<u8> {
+    /// An `ApiVersions` response that advertises `OffsetCommit` in
+    /// `offset_commit_range`.
+    fn api_versions_for_offset_commit(offset_commit_range: (i16, i16)) -> Vec<u8> {
         let response = ApiVersionsResponse {
             error_code: 0,
             api_keys: vec![
@@ -668,8 +649,8 @@ mod tests {
                 },
                 ApiVersion {
                     api_key: offset_commit_request::API_KEY,
-                    min_version: 2,
-                    max_version: 2,
+                    min_version: offset_commit_range.0,
+                    max_version: offset_commit_range.1,
                     ..Default::default()
                 },
             ],
@@ -769,7 +750,7 @@ mod tests {
         let seen_offsets_in_mock = Arc::clone(&seen_offsets);
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
             if api_key == api_versions_request::API_KEY {
-                return Some(api_versions());
+                return Some(api_versions_for_offset_commit((2, 2)));
             }
             if api_key != offset_commit_request::API_KEY {
                 return None;
@@ -936,9 +917,8 @@ mod tests {
         let identity = commit_identity(7, "member-a");
         let offsets = Arc::new(Mutex::new(HashMap::new()));
         let positions = Arc::new(Mutex::new(HashMap::new()));
-        let topic_ids = Arc::new(Mutex::new(HashMap::new()));
 
-        let snapshot = snapshot_commit_topics(&identity, &offsets, &positions, &topic_ids).await;
+        let snapshot = snapshot_commit_topics(&identity, &offsets, &positions).await;
 
         assert2::assert!(snapshot.is_none());
     }
@@ -961,11 +941,8 @@ mod tests {
                 ..Default::default()
             },
         )])));
-        let topic_id = Uuid([1; 16]);
-        let topic_ids = Arc::new(Mutex::new(HashMap::from([("alpha".to_string(), topic_id)])));
-
         let (partition_count, topics, seen_identity) =
-            snapshot_commit_topics(&identity, &offsets, &positions, &topic_ids)
+            snapshot_commit_topics(&identity, &offsets, &positions)
                 .await
                 .expect("non-empty offsets are snapshotted");
         let mut topics = topics;
@@ -977,7 +954,7 @@ mod tests {
                     2,
                     vec![OffsetCommitRequestTopic {
                         name: "alpha".into(),
-                        topic_id,
+                        topic_id: Uuid::ZERO,
                         partitions: vec![
                             OffsetCommitRequestPartition {
                                 partition_index: 0,
@@ -1027,7 +1004,7 @@ mod tests {
         );
 
         assert2::assert!(
-            req == OffsetCommitRequest {
+            req == TopicNameOffsetCommit(OffsetCommitRequest {
                 group_id: "group-a".into(),
                 generation_id_or_member_epoch: 42,
                 member_id: "member-a".into(),
@@ -1035,7 +1012,7 @@ mod tests {
                 retention_time_ms: -1,
                 topics,
                 unknown_tagged_fields: UnknownTaggedFields::default(),
-            }
+            })
         );
     }
 
@@ -1108,13 +1085,127 @@ mod tests {
                 Err(42),
             ),
         ] {
-            let actual = commit_response_outcome(&response(errors), true, &HashMap::new()).map_err(
-                |error| match error {
+            let actual =
+                commit_response_outcome(&response(errors), true).map_err(|error| match error {
                     ConsumerError::Server(code) => code,
                     other => panic!("case {name}: unexpected error {other:?}"),
-                },
-            );
+                });
             check!(actual == expected, "case {name}");
+        }
+    }
+
+    /// The negotiated `OffsetCommit` version and the request that the
+    /// coordinator decoded at that version.
+    type SentOffsetCommits = Vec<(i16, OffsetCommitRequest)>;
+
+    /// The result of `commit_offsets_sync`, with a version error as its
+    /// ranges.
+    type CommitResult = Result<(), (i16, i16, i16, i16, i16)>;
+
+    /// Apache Kafka's classic `ConsumerCoordinator.sendOffsetCommitRequest`
+    /// builds `OffsetCommit` with `OffsetCommitRequest.Builder.forTopicNames`,
+    /// which caps the version at 9. The request names each topic and carries
+    /// no topic id at every negotiated version.
+    #[tokio::test]
+    async fn commit_sends_offset_commit_by_topic_name_at_v9_or_lower() {
+        let sent_request = |version| {
+            vec![(
+                version,
+                OffsetCommitRequest {
+                    group_id: "group-a".into(),
+                    generation_id_or_member_epoch: 7,
+                    member_id: "member-a".into(),
+                    group_instance_id: None,
+                    retention_time_ms: -1,
+                    topics: vec![OffsetCommitRequestTopic {
+                        name: "topic".into(),
+                        topic_id: Uuid::ZERO,
+                        partitions: vec![OffsetCommitRequestPartition {
+                            partition_index: 0,
+                            committed_offset: 12,
+                            committed_leader_epoch: -1,
+                            committed_metadata: Some(String::new()),
+                            unknown_tagged_fields: UnknownTaggedFields::default(),
+                        }],
+                        unknown_tagged_fields: UnknownTaggedFields::default(),
+                    }],
+                    unknown_tagged_fields: UnknownTaggedFields::default(),
+                },
+            )]
+        };
+        for (name, offset_commit_range, expected_requests, expected_result) in [
+            ("coordinator stops at v7", (2, 7), sent_request(7), Ok(())),
+            ("coordinator stops at v9", (2, 9), sent_request(9), Ok(())),
+            ("coordinator supports v10", (2, 10), sent_request(9), Ok(())),
+            (
+                "coordinator supports only v10",
+                (10, 10),
+                Vec::new(),
+                Err((offset_commit_request::API_KEY, 10, 10, 2, 9)),
+            ),
+        ] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let requests_in_mock = Arc::clone(&requests);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(api_versions_for_offset_commit(offset_commit_range));
+                }
+                if api_key != offset_commit_request::API_KEY {
+                    return None;
+                }
+                let client_id_len = bytes::Buf::get_i16(&mut body);
+                bytes::Buf::advance(
+                    &mut body,
+                    usize::try_from(client_id_len).expect("client id length"),
+                );
+                if version >= offset_commit_request::FLEXIBLE_MIN {
+                    bytes::Buf::advance(&mut body, 1);
+                }
+                let request = krabka_protocol::Decode::decode(&mut body, version)
+                    .expect("offset commit request decodes");
+                requests_in_mock
+                    .lock()
+                    .expect("requests lock")
+                    .push((version, request));
+                let mut body = Vec::new();
+                if version >= offset_commit_request::FLEXIBLE_MIN {
+                    // The flexible response header carries empty tagged fields.
+                    body.push(0);
+                }
+                body.extend(encode_response(&response(&[0]), version));
+                Some(body)
+            })
+            .await;
+            let consumer = commit_consumer(
+                &mock,
+                commit_identity(7, "member-a"),
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(AtomicI32::new(7)),
+            )
+            .await;
+
+            let result: CommitResult = consumer
+                .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+                .await
+                .map_err(|error| match error {
+                    ConsumerError::Client(
+                        krabka_client_core::ClientError::IncompatibleVersion {
+                            api_key,
+                            broker_min,
+                            broker_max,
+                            client_min,
+                            client_max,
+                        },
+                    ) => (api_key, broker_min, broker_max, client_min, client_max),
+                    other => panic!("case {name}: unexpected error {other:?}"),
+                });
+
+            mock.stop();
+            let requests: SentOffsetCommits = requests.lock().expect("requests lock").clone();
+            check!(
+                (requests, result) == (expected_requests, expected_result),
+                "case {name}"
+            );
         }
     }
 
@@ -1154,7 +1245,7 @@ mod tests {
             let requests_in_mock = Arc::clone(&requests);
             let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
                 if api_key == api_versions_request::API_KEY {
-                    return Some(api_versions());
+                    return Some(api_versions_for_offset_commit((2, 2)));
                 }
                 if api_key != offset_commit_request::API_KEY {
                     return None;
@@ -1194,33 +1285,6 @@ mod tests {
                 "case {name}"
             );
         }
-    }
-
-    #[test]
-    fn commit_response_resolves_v10_topic_ids_before_matching_acknowledgements() {
-        let topic_id = Uuid([7; 16]);
-        let response = OffsetCommitResponse {
-            topics: vec![OffsetCommitResponseTopic {
-                name: String::new(),
-                topic_id,
-                partitions: vec![OffsetCommitResponsePartition {
-                    partition_index: 3,
-                    error_code: 0,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        let outcome = commit_response_outcome(
-            &response,
-            true,
-            &HashMap::from([(topic_id, "topic".to_string())]),
-        )
-        .expect("v10 acknowledgement is successful");
-
-        assert2::assert!(outcome == CommitOutcome::Acked(HashSet::from([("topic".into(), 3)])));
     }
 
     #[tokio::test]
@@ -1346,10 +1410,10 @@ mod tests {
         changed_identity.generation = 8;
         drop(changed_identity);
         generation.store(8, Ordering::Relaxed);
-        let topics = build_commit_topics(
-            commit_offsets(HashMap::from([(("topic".into(), 0), 12)]), &HashMap::new()),
+        let topics = build_commit_topics(commit_offsets(
+            HashMap::from([(("topic".into(), 0), 12)]),
             &HashMap::new(),
-        );
+        ));
 
         let outcome = consumer
             .commit_topics_once(topics, (7, "member-a".into()))
@@ -1516,7 +1580,7 @@ mod tests {
     #[test]
     fn selected_commit_topics_exclude_unrequested_assignment_positions() {
         let selected = commit_offsets(HashMap::from([(("topic".into(), 0), 12)]), &HashMap::new());
-        let topics = build_commit_topics(selected, &HashMap::new());
+        let topics = build_commit_topics(selected);
 
         assert2::assert!(topics.len() == 1);
         assert2::assert!(topics[0].partitions.len() == 1);
