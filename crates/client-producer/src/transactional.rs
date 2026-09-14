@@ -2,9 +2,62 @@
 //! `init_transactions` / `begin` / `commit` / `abort` / `send_offsets_to_transaction`
 //! flow.
 
-use std::{fmt, str::FromStr, sync::Arc};
+use std::{
+    fmt,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
+};
 
 use crate::{error::ProducerError, producer::Producer};
+
+/// The slot holds no abortable error. An error code fits in an `i16`, and
+/// `-1` is `UNKNOWN_SERVER_ERROR`, so the empty value is outside that range.
+const NO_ABORTABLE_ERROR: i32 = i32::MIN;
+
+/// The error code that makes the current transaction abort-only.
+///
+/// Apache Kafka's `TransactionManager` moves to the `ABORTABLE_ERROR` state
+/// when a batch of the transaction fails, or when a coordinator answers with a
+/// code that only an abort can clear (`abortableError`). Every later
+/// `commitTransaction` then fails with the stored error
+/// (`maybeFailWithError`), and only `abortTransaction` clears the state.
+///
+/// The sender task writes this slot from a synchronous context, so it holds an
+/// atomic rather than a mutex.
+#[derive(Debug)]
+pub(crate) struct AbortableErrorSlot(AtomicI32);
+
+impl Default for AbortableErrorSlot {
+    fn default() -> Self {
+        Self(AtomicI32::new(NO_ABORTABLE_ERROR))
+    }
+}
+
+impl AbortableErrorSlot {
+    /// Store `code` as the error that the application must abort. A later
+    /// error replaces an earlier one, as Kafka's `transitionTo` replaces
+    /// `lastError`.
+    pub(crate) fn set(&self, code: i16) {
+        self.0.store(i32::from(code), Ordering::Release);
+    }
+
+    /// The stored error code, or `None` when the transaction can still
+    /// commit.
+    pub(crate) fn get(&self) -> Option<i16> {
+        let code = self.0.load(Ordering::Acquire);
+        (code != NO_ABORTABLE_ERROR).then(|| i16::try_from(code).unwrap_or(i16::MIN))
+    }
+
+    /// Forget the stored error. An abort and a new producer identity both
+    /// clear it, as Kafka's `resetTransactionState` and `InitProducerIdHandler`
+    /// clear `lastError`.
+    pub(crate) fn clear(&self) {
+        self.0.store(NO_ABORTABLE_ERROR, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -321,12 +374,14 @@ mod tests {
     };
 
     use bytes::BytesMut;
-    use krabka_client_core::MockBroker;
+    use krabka_client_core::{ClientError, MockBroker};
     use krabka_protocol::{
         Encode,
         owned::{
+            add_offsets_to_txn_request,
+            add_offsets_to_txn_response::AddOffsetsToTxnResponse,
             add_partitions_to_txn_request,
-            add_partitions_to_txn_response::AddPartitionsToTxnResponse,
+            add_partitions_to_txn_response::{self, AddPartitionsToTxnResponse},
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             common::add_partitions_to_txn_response::{
@@ -339,6 +394,20 @@ mod tests {
             find_coordinator_response::FindCoordinatorResponse,
             init_producer_id_request,
             init_producer_id_response::{self, InitProducerIdResponse},
+            metadata_request,
+            metadata_response::{
+                MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
+                MetadataResponseTopic,
+            },
+            produce_request,
+            produce_response::{
+                self, PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
+            },
+            txn_offset_commit_request,
+            txn_offset_commit_response::{
+                TxnOffsetCommitResponse, TxnOffsetCommitResponsePartition,
+                TxnOffsetCommitResponseTopic,
+            },
         },
     };
 
@@ -720,6 +789,12 @@ mod tests {
         requests: usize,
     }
 
+    impl Default for Script {
+        fn default() -> Self {
+            Self::new(&[], Reply::Code(0))
+        }
+    }
+
     impl Script {
         fn new(replies: &[Reply], exhausted: Reply) -> Self {
             Self {
@@ -735,12 +810,21 @@ mod tests {
         }
     }
 
-    /// The scripts of a mock transaction coordinator.
-    #[derive(Debug)]
+    /// The scripts of a mock transaction coordinator. The same mock is the
+    /// group coordinator and the partition leader.
+    #[derive(Debug, Default)]
     struct Coordinator {
         end_txn: Script,
         add_partitions: Script,
+        add_offsets: Script,
+        txn_offset_commit: Script,
+        produce: Script,
         find_coordinator_requests: usize,
+        /// The negotiated version of each `AddPartitionsToTxn` request.
+        add_partitions_versions: Vec<i16>,
+        /// The `AddPartitionsToTxn` version range that the mock advertises.
+        /// A Kafka broker advertises 0 to 5.
+        add_partitions_range: Option<(i16, i16)>,
     }
 
     type SharedCoordinator = Arc<std::sync::Mutex<Coordinator>>;
@@ -753,6 +837,9 @@ mod tests {
         ConcurrentTransactions,
         Server(i16),
         OutcomeUnknown,
+        /// The broker supports no version that the client sends. The fields
+        /// are the broker range and the client range.
+        IncompatibleVersion((i16, i16), (i16, i16)),
         Other(String),
     }
 
@@ -764,6 +851,15 @@ mod tests {
                 Err(ProducerError::ConcurrentTransactions) => Self::ConcurrentTransactions,
                 Err(ProducerError::Server(code)) => Self::Server(code),
                 Err(ProducerError::RecoveryRequired) => Self::OutcomeUnknown,
+                Err(ProducerError::Client(ClientError::IncompatibleVersion {
+                    broker_min,
+                    broker_max,
+                    client_min,
+                    client_max,
+                    ..
+                })) => {
+                    Self::IncompatibleVersion((broker_min, broker_max), (client_min, client_max))
+                }
                 Err(other) => Self::Other(other.to_string()),
             }
         }
@@ -778,11 +874,109 @@ mod tests {
         let handler_port = Arc::clone(&port_cell);
         let shared = Arc::new(std::sync::Mutex::new(coordinator));
         let handler_shared = Arc::clone(&shared);
-        let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
+        let add_partitions_range = shared
+            .lock()
+            .expect("scripted coordinator")
+            .add_partitions_range
+            .unwrap_or((0, 5));
+        let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
             if api_key == api_versions_request::API_KEY {
-                return Some(encode_v0(&ApiVersionsResponse::default()));
+                return Some(encode_v0(&ApiVersionsResponse {
+                    api_keys: vec![
+                        ApiVersion {
+                            api_key: add_partitions_to_txn_request::API_KEY,
+                            min_version: add_partitions_range.0,
+                            max_version: add_partitions_range.1,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: metadata_request::API_KEY,
+                            min_version: 0,
+                            max_version: 12,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: produce_request::API_KEY,
+                            min_version: 3,
+                            max_version: 13,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }));
             }
             let mut coordinator = handler_shared.lock().expect("scripted coordinator");
+            if api_key == metadata_request::API_KEY {
+                return Some(encode_v0(&MetadataResponse {
+                    brokers: vec![MetadataResponseBroker {
+                        node_id: 1,
+                        host: "127.0.0.1".into(),
+                        port: i32::from(handler_port.load(Ordering::SeqCst)),
+                        ..Default::default()
+                    }],
+                    topics: vec![MetadataResponseTopic {
+                        name: Some("topic".into()),
+                        partitions: vec![MetadataResponsePartition {
+                            partition_index: 0,
+                            leader_id: 1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }));
+            }
+            if api_key == produce_request::API_KEY {
+                let Reply::Code(error_code) = coordinator.produce.next() else {
+                    return None;
+                };
+                let response = ProduceResponse {
+                    responses: vec![TopicProduceResponse {
+                        name: "topic".into(),
+                        partition_responses: vec![PartitionProduceResponse {
+                            index: 0,
+                            error_code,
+                            base_offset: 0,
+                            log_start_offset: -1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                if version >= produce_response::FLEXIBLE_MIN {
+                    buf.extend_from_slice(&[0]);
+                }
+                response.encode(&mut buf, version).expect("encode Produce");
+                return Some(buf.to_vec());
+            }
+            if api_key == add_offsets_to_txn_request::API_KEY {
+                return match coordinator.add_offsets.next() {
+                    Reply::Silent => None,
+                    Reply::Code(error_code) => Some(encode_v0(&AddOffsetsToTxnResponse {
+                        error_code,
+                        ..Default::default()
+                    })),
+                };
+            }
+            if api_key == txn_offset_commit_request::API_KEY {
+                return match coordinator.txn_offset_commit.next() {
+                    Reply::Silent => None,
+                    Reply::Code(error_code) => Some(encode_v0(&TxnOffsetCommitResponse {
+                        topics: vec![TxnOffsetCommitResponseTopic {
+                            name: "topic".into(),
+                            partitions: vec![TxnOffsetCommitResponsePartition {
+                                partition_index: 0,
+                                error_code,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                };
+            }
             if api_key == find_coordinator_request::API_KEY {
                 coordinator.find_coordinator_requests += 1;
                 return Some(encode_v0(&FindCoordinatorResponse {
@@ -811,10 +1005,11 @@ mod tests {
                 };
             }
             if api_key == add_partitions_to_txn_request::API_KEY {
+                coordinator.add_partitions_versions.push(version);
                 return match coordinator.add_partitions.next() {
                     Reply::Silent => None,
                     Reply::Code(partition_error_code) => {
-                        Some(encode_v0(&AddPartitionsToTxnResponse {
+                        let response = AddPartitionsToTxnResponse {
                             results_by_topic_v3_and_below: vec![AddPartitionsToTxnTopicResult {
                                 name: "topic".into(),
                                 results_by_partition: vec![AddPartitionsToTxnPartitionResult {
@@ -825,7 +1020,15 @@ mod tests {
                                 ..Default::default()
                             }],
                             ..Default::default()
-                        }))
+                        };
+                        let mut buf = BytesMut::new();
+                        if version >= add_partitions_to_txn_response::FLEXIBLE_MIN {
+                            buf.extend_from_slice(&[0]);
+                        }
+                        response
+                            .encode(&mut buf, version)
+                            .expect("encode AddPartitionsToTxn");
+                        Some(buf.to_vec())
                     }
                 };
             }
@@ -863,8 +1066,7 @@ mod tests {
     ) -> (MockBroker, Producer, SharedCoordinator) {
         scripted_producer(Coordinator {
             end_txn: Script::new(script, exhausted),
-            add_partitions: Script::new(&[], Reply::Code(0)),
-            find_coordinator_requests: 0,
+            ..Coordinator::default()
         })
         .await
     }
@@ -1131,9 +1333,8 @@ mod tests {
         ];
         for (name, script, result, add_partitions_requests, coordinator_lookups) in cases {
             let (mock, producer, coordinator) = scripted_producer(Coordinator {
-                end_txn: Script::new(&[], Reply::Code(0)),
                 add_partitions: Script::new(&script, Code(0)),
-                find_coordinator_requests: 0,
+                ..Coordinator::default()
             })
             .await;
             let outcome = producer.register_transaction_partition("topic", 0).await;
@@ -1153,6 +1354,333 @@ mod tests {
             assert2::assert!(actual == expected, "{name}");
             mock.stop();
         }
+    }
+
+    /// The observable result of one scripted `AddPartitionsToTxn` version
+    /// negotiation.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ScriptedAddPartitionsVersion {
+        result: TxnResult,
+        versions: Vec<i16>,
+    }
+
+    /// Apache Kafka's client builds `AddPartitionsToTxn` with
+    /// `AddPartitionsToTxnRequest.Builder.forClient`, which allows v3 at most.
+    /// v4 and later carry the broker-to-broker form, which a broker answers
+    /// only for a principal with `CLUSTER_ACTION`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_partitions_to_txn_stops_at_the_last_client_version() {
+        let cases = [
+            ("broker stops at v3", (0, 3), TxnResult::Ok, vec![3]),
+            ("broker supports v5", (0, 5), TxnResult::Ok, vec![3]),
+            (
+                "broker supports only the broker versions",
+                (4, 5),
+                TxnResult::IncompatibleVersion((4, 5), (0, 3)),
+                Vec::new(),
+            ),
+        ];
+        for (name, range, result, versions) in cases {
+            let (mock, producer, coordinator) = scripted_producer(Coordinator {
+                add_partitions_range: Some(range),
+                ..Coordinator::default()
+            })
+            .await;
+            let outcome = producer.register_transaction_partition("topic", 0).await;
+            let actual = {
+                let coordinator = coordinator.lock().expect("scripted coordinator");
+                ScriptedAddPartitionsVersion {
+                    result: outcome.into(),
+                    versions: coordinator.add_partitions_versions.clone(),
+                }
+            };
+            assert2::assert!(
+                actual == ScriptedAddPartitionsVersion { result, versions },
+                "{name}"
+            );
+            mock.stop();
+        }
+    }
+
+    /// The observable result of one scripted `send_offsets_to_transaction`.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ScriptedSendOffsets {
+        result: TxnResult,
+        add_offsets_requests: usize,
+        txn_offset_commit_requests: usize,
+        coordinator_lookups: usize,
+        abortable_error: Option<i16>,
+    }
+
+    /// Kafka's `AddOffsetsToTxnHandler` and `TxnOffsetCommitHandler` send the
+    /// request again after a transport loss and after every retriable code,
+    /// and they find the coordinator again for 15, 16 and, for
+    /// `TxnOffsetCommit`, `REQUEST_TIMED_OUT`. An abortable code stops the
+    /// transaction from committing, and 47 and 90 fence the producer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_offsets_to_transaction_retries_the_codes_that_kafka_retries() {
+        use Reply::{Code, Silent};
+        use TxnResult::{Fenced, Server};
+        let group = krabka_client_consumer::ConsumerGroupMetadata {
+            group_id: "group-a".into(),
+            generation_id: 3,
+            member_id: "member-a".into(),
+            group_instance_id: None,
+        };
+        // (name, add offsets script, offset commit script, result, add offsets
+        // requests, offset commit requests, coordinator lookups, abortable)
+        let cases = [
+            (
+                "committed",
+                vec![Code(0)],
+                vec![Code(0)],
+                TxnResult::Ok,
+                1,
+                1,
+                1,
+                None,
+            ),
+            (
+                "add offsets loading, then committed",
+                vec![Code(14), Code(0)],
+                vec![Code(0)],
+                TxnResult::Ok,
+                2,
+                1,
+                1,
+                None,
+            ),
+            (
+                "add offsets moved, then committed",
+                vec![Code(16), Code(0)],
+                vec![Code(0)],
+                TxnResult::Ok,
+                2,
+                1,
+                2,
+                None,
+            ),
+            (
+                "add offsets lost, then committed",
+                vec![Silent, Code(0)],
+                vec![Code(0)],
+                TxnResult::Ok,
+                2,
+                1,
+                2,
+                None,
+            ),
+            (
+                "add offsets fenced",
+                vec![Code(90)],
+                vec![Code(0)],
+                Fenced,
+                1,
+                0,
+                0,
+                None,
+            ),
+            (
+                "add offsets abortable",
+                vec![Code(120)],
+                vec![Code(0)],
+                Server(120),
+                1,
+                0,
+                0,
+                Some(120),
+            ),
+            (
+                "add offsets refused",
+                vec![Code(48)],
+                vec![Code(0)],
+                Server(48),
+                1,
+                0,
+                0,
+                None,
+            ),
+            (
+                "offset commit unknown topic, then committed",
+                vec![Code(0)],
+                vec![Code(3), Code(0)],
+                TxnResult::Ok,
+                1,
+                2,
+                1,
+                None,
+            ),
+            (
+                "offset commit timed out, then committed",
+                vec![Code(0)],
+                vec![Code(7), Code(0)],
+                TxnResult::Ok,
+                1,
+                2,
+                2,
+                None,
+            ),
+            (
+                "offset commit moved, then committed",
+                vec![Code(0)],
+                vec![Code(16), Code(0)],
+                TxnResult::Ok,
+                1,
+                2,
+                2,
+                None,
+            ),
+            (
+                "offset commit group metadata mismatch",
+                vec![Code(0)],
+                vec![Code(22)],
+                Server(22),
+                1,
+                1,
+                1,
+                Some(22),
+            ),
+            (
+                "offset commit fenced",
+                vec![Code(0)],
+                vec![Code(47)],
+                Fenced,
+                1,
+                1,
+                1,
+                None,
+            ),
+        ];
+        for (
+            name,
+            add_offsets,
+            txn_offset_commit,
+            result,
+            add_offsets_requests,
+            txn_offset_commit_requests,
+            coordinator_lookups,
+            abortable_error,
+        ) in cases
+        {
+            let (mock, producer, coordinator) = scripted_producer(Coordinator {
+                add_offsets: Script::new(&add_offsets, Code(0)),
+                txn_offset_commit: Script::new(&txn_offset_commit, Code(0)),
+                ..Coordinator::default()
+            })
+            .await;
+            let transaction = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction");
+            let outcome = producer
+                .send_offsets_to_transaction([(("topic".to_owned(), 0), 42)], &group)
+                .await;
+            drop(transaction);
+            let actual = {
+                let coordinator = coordinator.lock().expect("scripted coordinator");
+                ScriptedSendOffsets {
+                    result: outcome.into(),
+                    add_offsets_requests: coordinator.add_offsets.requests,
+                    txn_offset_commit_requests: coordinator.txn_offset_commit.requests,
+                    coordinator_lookups: coordinator.find_coordinator_requests,
+                    abortable_error: producer.txn_abortable_error.get(),
+                }
+            };
+            let expected = ScriptedSendOffsets {
+                result,
+                add_offsets_requests,
+                txn_offset_commit_requests,
+                coordinator_lookups,
+                abortable_error,
+            };
+            assert2::assert!(actual == expected, "{name}");
+            mock.stop();
+        }
+    }
+
+    /// The observable result of a commit after a failed transactional batch.
+    #[derive(Debug, PartialEq, Eq)]
+    struct CommitAfterFailedBatch {
+        record: TxnResult,
+        commit: TxnResult,
+        end_txn_requests: usize,
+        abort: TxnResult,
+        abortable_error_after_abort: Option<i16>,
+        next_transaction: TxnResult,
+    }
+
+    /// Kafka's `Sender.failBatch` calls
+    /// `TransactionManager.handleFailedBatch`, which moves a transactional
+    /// producer to `ABORTABLE_ERROR`. `commitTransaction` then fails in
+    /// `maybeFailWithError`, and it sends no `EndTxn`. Only
+    /// `abortTransaction` clears the state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_transactional_batch_stops_a_later_commit() {
+        let (mock, producer, coordinator) = scripted_producer(Coordinator {
+            // 42 is INVALID_REQUEST, which Kafka does not retry.
+            produce: Script::new(&[Reply::Code(42)], Reply::Code(0)),
+            ..Coordinator::default()
+        })
+        .await;
+        let transaction = producer
+            .begin_transaction()
+            .await
+            .expect("begin transaction");
+        let record = producer
+            .send(ProducerRecord {
+                topic: "topic".to_owned(),
+                partition: Some(0),
+                value: Some(bytes::Bytes::from_static(b"v")),
+                ..Default::default()
+            })
+            .await
+            .await
+            .expect("the record is resolved");
+
+        let commit = transaction.commit().await;
+        let (commit_result, transaction) = match commit {
+            Ok(()) => (TxnResult::Ok, None),
+            Err(error) => (TxnResult::from(Err(error.source)), Some(error.transaction)),
+        };
+        let end_txn_requests = coordinator
+            .lock()
+            .expect("scripted coordinator")
+            .end_txn
+            .requests;
+        let abort = match transaction {
+            Some(transaction) => {
+                TxnResult::from(transaction.abort().await.map_err(|error| error.source))
+            }
+            None => TxnResult::Other("the commit succeeded".to_owned()),
+        };
+        let abortable_error_after_abort = producer.txn_abortable_error.get();
+        let next_transaction = match producer.begin_transaction().await {
+            Ok(transaction) => {
+                TxnResult::from(transaction.abort().await.map_err(|error| error.source))
+            }
+            Err(error) => TxnResult::from(Err(error)),
+        };
+
+        let actual = CommitAfterFailedBatch {
+            record: TxnResult::from(record.map(drop)),
+            commit: commit_result,
+            end_txn_requests,
+            abort,
+            abortable_error_after_abort,
+            next_transaction,
+        };
+        assert2::assert!(
+            actual
+                == CommitAfterFailedBatch {
+                    record: TxnResult::Server(42),
+                    commit: TxnResult::Server(42),
+                    end_txn_requests: 0,
+                    abort: TxnResult::Ok,
+                    abortable_error_after_abort: None,
+                    next_transaction: TxnResult::Ok,
+                }
+        );
+        mock.stop();
     }
 
     /// The producer state after a commit whose `EndTxn` v5 answer carried an

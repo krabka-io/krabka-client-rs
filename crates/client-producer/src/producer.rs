@@ -9,21 +9,27 @@ use std::{
     },
 };
 
+use bytes::BufMut;
 use dashmap::DashMap;
 use krabka_client_consumer::ConsumerGroupMetadata;
 use krabka_client_core::{
-    Client, ClientFrameMax, ConnectionDispatchQueueCapacity, security::ClientSecurity,
+    Client, ClientError, ClientFrameMax, ConnectionDispatchQueueCapacity, security::ClientSecurity,
 };
-use krabka_protocol::owned::{
-    add_offsets_to_txn_request::AddOffsetsToTxnRequest,
-    add_partitions_to_txn_request::{AddPartitionsToTxnRequest, AddPartitionsToTxnTransaction},
-    add_partitions_to_txn_response::AddPartitionsToTxnResponse,
-    common::add_partitions_to_txn_request::add_partitions_to_txn_topic::AddPartitionsToTxnTopic,
-    end_txn_request::EndTxnRequest,
-    find_coordinator_request::FindCoordinatorRequest,
-    init_producer_id_request::InitProducerIdRequest,
-    txn_offset_commit_request::{
-        TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+use krabka_protocol::{
+    Encode, ProtocolError, ProtocolRequest,
+    owned::{
+        add_offsets_to_txn_request::AddOffsetsToTxnRequest,
+        add_partitions_to_txn_request::{self, AddPartitionsToTxnRequest},
+        add_partitions_to_txn_response::AddPartitionsToTxnResponse,
+        common::add_partitions_to_txn_request::add_partitions_to_txn_topic::AddPartitionsToTxnTopic,
+        end_txn_request::EndTxnRequest,
+        find_coordinator_request::FindCoordinatorRequest,
+        init_producer_id_request::InitProducerIdRequest,
+        init_producer_id_response::InitProducerIdResponse,
+        txn_offset_commit_request::{
+            TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+        },
+        txn_offset_commit_response::TxnOffsetCommitResponse,
     },
 };
 use krabka_units::{Time, convert::TimeExt};
@@ -36,15 +42,106 @@ use tracing::Instrument as _;
 
 use crate::{
     accumulator::{Accumulator, AccumulatorMap, AppendResult},
-    builder::{ProducerFlushTimeout, init_producer_id_with_retry},
+    builder::{ProducerFlushTimeout, send_init_producer_id},
     compression::Compression,
     error::ProducerError,
     partitioner::UniformStickyPartitioner,
     record::{ProducerRecord, RecordMetadata},
     sender::DrainIntent,
-    transactional::{OwnedTransaction, PreparedTransactionState, Transaction, TxnState},
-    txn_retry::{self, AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision},
+    transactional::{
+        AbortableErrorSlot, OwnedTransaction, PreparedTransactionState, Transaction, TxnState,
+    },
+    txn_retry::{
+        self, AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision, TxnRequestDecision,
+    },
 };
+
+/// The last `AddPartitionsToTxn` version that a client sends.
+const ADD_PARTITIONS_LAST_CLIENT_VERSION: i16 = 3;
+
+/// An `AddPartitionsToTxn` request from a client, capped at v3.
+///
+/// v4 and later carry the broker-to-broker form of the request, which a Kafka
+/// broker answers only for a principal with `CLUSTER_ACTION` on the cluster.
+/// Apache Kafka's client builds every such request with
+/// `AddPartitionsToTxnRequest.Builder.forClient`, which allows
+/// `ApiKeys.ADD_PARTITIONS_TO_TXN.oldestVersion()` to `LAST_CLIENT_VERSION`
+/// (3), and fills only the `v3_and_below` fields. This type gives the same cap
+/// to version negotiation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClientAddPartitionsToTxn(AddPartitionsToTxnRequest);
+
+impl Encode for ClientAddPartitionsToTxn {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl ProtocolRequest for ClientAddPartitionsToTxn {
+    const API_KEY: i16 = add_partitions_to_txn_request::API_KEY;
+    const MIN_VERSION: i16 = add_partitions_to_txn_request::MIN_VERSION;
+    const MAX_VERSION: i16 = ADD_PARTITIONS_LAST_CLIENT_VERSION;
+    const FLEXIBLE_MIN: i16 = add_partitions_to_txn_request::FLEXIBLE_MIN;
+    type Response = AddPartitionsToTxnResponse;
+}
+
+/// The deadline and the backoff of the retries of one coordinator request.
+struct CoordinatorRetry {
+    deadline: tokio::time::Instant,
+    backoff: std::time::Duration,
+    max_backoff: std::time::Duration,
+}
+
+impl CoordinatorRetry {
+    /// Wait before the next attempt, and give `false` when the deadline has
+    /// passed. The wait doubles up to the maximum backoff.
+    async fn wait(&mut self) -> bool {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(self.backoff.min(remaining)).await;
+        self.backoff = self.backoff.saturating_mul(2).min(self.max_backoff);
+        true
+    }
+}
+
+/// The partition error code that decides a `TxnOffsetCommit` answer.
+///
+/// A code that no rule retries decides the answer, even when an earlier row
+/// carries a retriable code. Kafka's `TxnOffsetCommitHandler` also leaves the
+/// loop at such a row, and it retries only when every failed row is retriable.
+fn txn_offset_commit_error_code(response: &TxnOffsetCommitResponse) -> i16 {
+    let codes = response
+        .topics
+        .iter()
+        .flat_map(|topic| {
+            topic
+                .partitions
+                .iter()
+                .map(|partition| partition.error_code)
+        })
+        .filter(|code| *code != 0);
+    let mut first = 0;
+    for code in codes {
+        if !matches!(
+            txn_retry::decide_txn_offset_commit(CoordinatorAttempt::Answered(code)),
+            TxnRequestDecision::Retry { .. }
+        ) {
+            return code;
+        }
+        if first == 0 {
+            first = code;
+        }
+    }
+    first
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Acks {
@@ -185,6 +282,13 @@ pub struct Producer {
     /// flow. `init_transactions` sets it, and the sender reads it when it
     /// builds transactional `ProduceRequest`s.
     pub(crate) txn_pid_epoch: Arc<Mutex<(i64, i16)>>,
+    /// The error code that makes the current transaction abort-only. The
+    /// sender sets it when a transactional batch fails, and a coordinator
+    /// answer of an abortable code sets it too. `commit` and
+    /// `send_offsets_to_transaction` then fail until the application aborts
+    /// the transaction. Kafka's `TransactionManager` keeps the same state in
+    /// `ABORTABLE_ERROR` with `lastError`.
+    pub(crate) txn_abortable_error: Arc<AbortableErrorSlot>,
     /// Identity of the transaction that was prepared locally or recovered via
     /// `InitProducerId(keepPreparedTxn=true)`. Recovery deliberately keeps this
     /// separate from `txn_pid_epoch`, which is the newly staged identity used
@@ -248,26 +352,17 @@ impl Producer {
             partitions: vec![partition],
             ..Default::default()
         };
-        let request = AddPartitionsToTxnRequest {
-            transactions: vec![AddPartitionsToTxnTransaction {
-                transactional_id: transactional_id.clone(),
-                producer_id,
-                producer_epoch,
-                topics: vec![topic.clone()],
-                ..Default::default()
-            }],
+        let request = ClientAddPartitionsToTxn(AddPartitionsToTxnRequest {
             v3_and_below_transactional_id: transactional_id.clone(),
             v3_and_below_producer_id: producer_id,
             v3_and_below_producer_epoch: producer_epoch,
             v3_and_below_topics: vec![topic],
             ..Default::default()
-        };
+        });
         // Adding a partition twice has no effect, so a lost request or a
         // retriable code is safe to retry. Kafka's `AddPartitionsToTxnHandler`
         // does the same.
-        let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
-        let max_backoff = self.init_max_backoff.to_std();
-        let mut backoff = self.init_retry_backoff.to_std();
+        let mut retry = self.coordinator_retry();
         loop {
             let (attempt, last_error) = match coordinator.send(request.clone()).await {
                 Ok(response) => {
@@ -282,23 +377,19 @@ impl Producer {
             let rediscover = match txn_retry::decide_add_partitions(attempt) {
                 AddPartitionsDecision::Added => return Ok(()),
                 AddPartitionsDecision::Fenced => return Err(ProducerError::FencedProducer),
+                AddPartitionsDecision::Abortable(code) => {
+                    return Err(self.abortable_error(code));
+                }
                 AddPartitionsDecision::Refused(code) => return Err(ProducerError::Server(code)),
                 AddPartitionsDecision::Retry { rediscover } => rediscover,
             };
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
+            if !retry.wait().await {
                 return Err(last_error);
             }
-            tokio::time::sleep(backoff.min(remaining)).await;
-            backoff = backoff.saturating_mul(2).min(max_backoff);
             if rediscover {
-                match self.reconnect_txn_coordinator(transactional_id).await {
-                    Ok(fresh) => coordinator = fresh,
-                    Err(error) => {
-                        tracing::warn!(%error, "transaction coordinator lookup failed; retrying");
-                        coordinator.reconnect_bootstrap().await;
-                    }
-                }
+                coordinator = self
+                    .rediscovered_txn_coordinator(transactional_id, coordinator)
+                    .await;
             }
         }
     }
@@ -526,6 +617,13 @@ impl Producer {
     ///
     /// Every error except `RecoveryRequired` means that no request changed the
     /// transaction.
+    ///
+    /// A commit fails with the stored error when a batch of the transaction
+    /// failed, or when a coordinator answered with an abortable code. The
+    /// transaction stays open, and the application must abort it. Kafka's
+    /// `TransactionManager` keeps the same rule: a batch failure moves it to
+    /// `ABORTABLE_ERROR` (`handleFailedBatch`), and `beginCommit` then fails
+    /// in `maybeFailWithError`.
     #[tracing::instrument(
         level = "info",
         skip_all,
@@ -541,6 +639,12 @@ impl Producer {
         // 1. Flush all in-flight records (block until acks).
         self.flush().await?;
 
+        // 2. A failed batch, or an abortable coordinator answer, stops a
+        //    commit. Only an abort can clear it.
+        if committed && let Some(error) = self.abortable_error_state() {
+            return Err(error);
+        }
+
         let mut state = self.txn_state.lock().await;
         let previous_state = *state;
         if !matches!(previous_state, TxnState::InTransaction | TxnState::Prepared) {
@@ -551,7 +655,7 @@ impl Producer {
         *state = TxnState::CommittingOrAborting;
         drop(state);
 
-        // 2. Retrieve the cached coordinator connection.
+        // 3. Retrieve the cached coordinator connection.
         let coord_guard = self.txn_coord_client.lock().await;
         let Some(coord) = coord_guard.as_ref().cloned() else {
             drop(coord_guard);
@@ -564,7 +668,7 @@ impl Producer {
 
         let (pid, epoch) = *self.txn_pid_epoch.lock().await;
 
-        // 3. Send EndTxn to the coordinator until it gives an answer that
+        // 4. Send EndTxn to the coordinator until it gives an answer that
         //    decides the outcome, or the retry deadline ends.
         let request = EndTxnRequest {
             transactional_id: tid,
@@ -589,6 +693,7 @@ impl Producer {
                     self.adopt_transactional_identity(identity).await;
                 }
                 *self.prepared_transaction_state.lock().await = None;
+                self.txn_abortable_error.clear();
                 *state = TxnState::Ready;
                 self.resolve_transaction_guard();
                 Ok(())
@@ -601,6 +706,11 @@ impl Producer {
             EndTxnDecision::ConcurrentTransactions => {
                 *state = previous_state; // Caller can retry the same decision.
                 Err(ProducerError::ConcurrentTransactions)
+            }
+            EndTxnDecision::Abortable(code) => {
+                *state = previous_state;
+                drop(state);
+                Err(self.abortable_error(code))
             }
             EndTxnDecision::Refused(code) => {
                 *state = previous_state;
@@ -824,21 +934,18 @@ impl Producer {
 
             let coord = self.connect_txn_coordinator(coord_addr).await?;
 
-            let response = init_producer_id_with_retry(
-                &coord,
-                InitProducerIdRequest {
+            self.init_producer_id_on_coordinator(
+                tid,
+                &InitProducerIdRequest {
                     transactional_id: Some(tid.to_owned()),
                     transaction_timeout_ms: self.transaction_timeout_ms,
                     enable2_pc: self.two_phase_commit_enabled,
                     keep_prepared_txn: keep_prepared,
                     ..Default::default()
                 },
-                self.init_retry_timeout,
-                self.init_retry_backoff,
-                self.init_max_backoff,
+                coord,
             )
-            .await?;
-            Ok::<_, ProducerError>((coord, response))
+            .await
         }
         .await;
         let (coord, resp) = match initialized {
@@ -870,6 +977,7 @@ impl Producer {
                 tracing::Span::current().record("producer_epoch", resp.producer_epoch);
                 self.adopt_transactional_identity((resp.producer_id, resp.producer_epoch))
                     .await;
+                self.txn_abortable_error.clear();
                 *self.txn_coord_client.lock().await = Some(coord);
                 *self.prepared_transaction_state.lock().await = recovered;
                 *self.txn_state.lock().await = if recovered.is_some() {
@@ -889,6 +997,51 @@ impl Producer {
             other => {
                 *self.txn_state.lock().await = previous_state;
                 Err(ProducerError::Server(other))
+            }
+        }
+    }
+
+    /// Send `InitProducerId` to the transaction coordinator until it answers,
+    /// or until the retry deadline ends. It gives back the coordinator that
+    /// answered, which is a new connection after a coordinator move.
+    ///
+    /// The retries follow Kafka's `InitProducerIdHandler`. A transport loss,
+    /// `COORDINATOR_NOT_AVAILABLE` and `NOT_COORDINATOR` find the coordinator
+    /// again. Every other retriable code sends the request again on the same
+    /// connection. The caller reads the error code of the answer.
+    async fn init_producer_id_on_coordinator(
+        &self,
+        transactional_id: &str,
+        request: &InitProducerIdRequest,
+        coordinator: Client,
+    ) -> Result<(Client, InitProducerIdResponse), ProducerError> {
+        let mut coordinator = coordinator;
+        let mut retry = self.coordinator_retry();
+        loop {
+            let (attempt, last_outcome) = match send_init_producer_id(&coordinator, request).await {
+                Ok(response) => (
+                    CoordinatorAttempt::Answered(response.error_code),
+                    Ok(response),
+                ),
+                Err(error @ ClientError::Disconnected) => (CoordinatorAttempt::Lost, Err(error)),
+                Err(error) => return Err(ProducerError::Client(error)),
+            };
+            let TxnRequestDecision::Retry { rediscover } =
+                txn_retry::decide_init_producer_id(attempt)
+            else {
+                return last_outcome
+                    .map(|response| (coordinator, response))
+                    .map_err(ProducerError::Client);
+            };
+            if !retry.wait().await {
+                return last_outcome
+                    .map(|response| (coordinator, response))
+                    .map_err(ProducerError::Client);
+            }
+            if rediscover {
+                coordinator = self
+                    .rediscovered_txn_coordinator(transactional_id, coordinator)
+                    .await;
             }
         }
     }
@@ -943,14 +1096,22 @@ impl Producer {
     ///    instance of `group_meta`, so the coordinator can fence stale
     ///    producers.
     ///
+    /// Each request goes out again after a transport loss and after a
+    /// retriable code, until the producer-ID initialization retry timeout
+    /// ends. A code that shows the coordinator moved also finds the
+    /// coordinator again. The rules follow Kafka's `AddOffsetsToTxnHandler`
+    /// and `TxnOffsetCommitHandler`.
+    ///
     /// # Errors
     ///
     /// - [`ProducerError::NotTransactional`] — `transactional_id` was not set.
     /// - [`ProducerError::InvalidTransactionState`] — there is no cached
     ///   transaction coordinator. Call [`init_transactions`] first.
-    /// - [`ProducerError::Server`] — any broker error code. This is checked at
-    ///   the `AddOffsetsToTxn` level, and per partition for
-    ///   `TxnOffsetCommit`.
+    /// - [`ProducerError::FencedProducer`] — the coordinator answered
+    ///   `INVALID_PRODUCER_EPOCH (47)` or `PRODUCER_FENCED (90)`.
+    /// - [`ProducerError::Server`] — any other broker error code. A code that
+    ///   Kafka calls abortable also makes every later commit fail, so the
+    ///   application must abort the transaction.
     /// - [`ProducerError::Client`] — transport-level failure.
     ///
     /// [`init_transactions`]: Self::init_transactions
@@ -985,70 +1146,152 @@ impl Producer {
         }
         let offsets_vec: Vec<_> = offsets.into_iter().collect();
         tracing::Span::current().record("offset_count", offsets_vec.len());
+        if let Some(error) = self.abortable_error_state() {
+            return Err(error);
+        }
 
         let (pid, epoch) = *self.txn_pid_epoch.lock().await;
 
         // 1. AddOffsetsToTxn → transaction coordinator.
-        let coord_guard = self.txn_coord_client.lock().await;
-        let coord = coord_guard
-            .as_ref()
-            .ok_or(ProducerError::InvalidTransactionState(
-                "no txn coordinator cached — did init_transactions succeed?",
-            ))?
-            .clone();
-        drop(coord_guard);
-
-        let r1 = coord
-            .send(AddOffsetsToTxnRequest {
-                transactional_id: tid.clone(),
-                producer_id: pid,
-                producer_epoch: epoch,
-                group_id: group_meta.group_id.clone(),
-                ..Default::default()
-            })
+        self.add_offsets_to_txn(&tid, pid, epoch, &group_meta.group_id)
             .await?;
-        if r1.error_code != 0 {
-            return Err(ProducerError::Server(r1.error_code));
-        }
 
-        // 2. FindCoordinator(group_id, key_type=0 GROUP) for the group coordinator.
-        let group_addr = self.find_group_coordinator(&group_meta.group_id).await?;
-        let group_client = Client::builder()
+        // 2. FindCoordinator(group_id, key_type=0 GROUP), then TxnOffsetCommit
+        //    → group coordinator, carrying the consumer group metadata
+        //    (generation id / member id / instance id) so the coordinator can
+        //    fence zombie producers through the group's own state rather than
+        //    requiring one producer per input partition (KIP-447).
+        self.txn_offset_commit(&tid, pid, epoch, group_meta, &offsets_vec)
+            .await
+    }
+
+    /// Send `AddOffsetsToTxn` to the transaction coordinator until it answers,
+    /// or until the retry deadline ends.
+    ///
+    /// The retries follow Kafka's `AddOffsetsToTxnHandler`. A transport loss,
+    /// `COORDINATOR_NOT_AVAILABLE` and `NOT_COORDINATOR` find the coordinator
+    /// again. Every other retriable code sends the request again on the same
+    /// connection. The coordinator adds the offsets topic partition to the
+    /// transaction once, so a retry is safe.
+    async fn add_offsets_to_txn(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: &str,
+    ) -> Result<(), ProducerError> {
+        let mut coordinator = self.txn_coord_client.lock().await.clone().ok_or(
+            ProducerError::InvalidTransactionState(
+                "no txn coordinator cached — did init_transactions succeed?",
+            ),
+        )?;
+        let request = AddOffsetsToTxnRequest {
+            transactional_id: transactional_id.to_owned(),
+            producer_id,
+            producer_epoch,
+            group_id: group_id.to_owned(),
+            ..Default::default()
+        };
+        let mut retry = self.coordinator_retry();
+        loop {
+            let (attempt, last_error) = match coordinator.send(request.clone()).await {
+                Ok(response) => (
+                    CoordinatorAttempt::Answered(response.error_code),
+                    ProducerError::Server(response.error_code),
+                ),
+                Err(error) => (CoordinatorAttempt::Lost, ProducerError::Client(error)),
+            };
+            let rediscover = match txn_retry::decide_add_offsets_to_txn(attempt) {
+                TxnRequestDecision::Done => return Ok(()),
+                TxnRequestDecision::Fenced => return Err(ProducerError::FencedProducer),
+                TxnRequestDecision::Abortable(code) => return Err(self.abortable_error(code)),
+                TxnRequestDecision::Refused(code) => return Err(ProducerError::Server(code)),
+                TxnRequestDecision::Retry { rediscover } => rediscover,
+            };
+            if !retry.wait().await {
+                return Err(last_error);
+            }
+            if rediscover {
+                coordinator = self
+                    .rediscovered_txn_coordinator(transactional_id, coordinator)
+                    .await;
+            }
+        }
+    }
+
+    /// Send `TxnOffsetCommit` to the group coordinator until it answers, or
+    /// until the retry deadline ends.
+    ///
+    /// The retries follow Kafka's `TxnOffsetCommitHandler`. A transport loss,
+    /// `COORDINATOR_NOT_AVAILABLE`, `NOT_COORDINATOR` and `REQUEST_TIMED_OUT`
+    /// find the group coordinator again. Every other retriable code sends the
+    /// request again on the same connection. Kafka sends only the partitions
+    /// that failed with a retriable code; this producer sends the whole
+    /// request again, and the coordinator writes the same offsets.
+    async fn txn_offset_commit(
+        &self,
+        transactional_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_meta: &ConsumerGroupMetadata,
+        offsets: &[((String, i32), i64)],
+    ) -> Result<(), ProducerError> {
+        let request = TxnOffsetCommitRequest {
+            transactional_id: transactional_id.to_owned(),
+            producer_id,
+            producer_epoch,
+            group_id: group_meta.group_id.clone(),
+            generation_id: group_meta.generation_id,
+            member_id: group_meta.member_id.clone(),
+            group_instance_id: group_meta.group_instance_id.clone(),
+            topics: build_topics_payload(offsets),
+            ..Default::default()
+        };
+        let mut group_client = self.connect_group_coordinator(&group_meta.group_id).await?;
+        let mut retry = self.coordinator_retry();
+        loop {
+            let (attempt, last_error) = match group_client.send(request.clone()).await {
+                Ok(response) => {
+                    let code = txn_offset_commit_error_code(&response);
+                    (
+                        CoordinatorAttempt::Answered(code),
+                        ProducerError::Server(code),
+                    )
+                }
+                Err(error) => (CoordinatorAttempt::Lost, ProducerError::Client(error)),
+            };
+            let rediscover = match txn_retry::decide_txn_offset_commit(attempt) {
+                TxnRequestDecision::Done => return Ok(()),
+                TxnRequestDecision::Fenced => return Err(ProducerError::FencedProducer),
+                TxnRequestDecision::Abortable(code) => return Err(self.abortable_error(code)),
+                TxnRequestDecision::Refused(code) => return Err(ProducerError::Server(code)),
+                TxnRequestDecision::Retry { rediscover } => rediscover,
+            };
+            if !retry.wait().await {
+                return Err(last_error);
+            }
+            if rediscover {
+                match self.connect_group_coordinator(&group_meta.group_id).await {
+                    Ok(fresh) => group_client = fresh,
+                    Err(error) => {
+                        tracing::warn!(%error, "group coordinator lookup failed; retrying");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Connect to the group coordinator of `group_id`.
+    async fn connect_group_coordinator(&self, group_id: &str) -> Result<Client, ProducerError> {
+        let group_addr = self.find_group_coordinator(group_id).await?;
+        Ok(Client::builder()
             .bootstrap(group_addr)
             .client_id(self.client_id.clone())
             .maybe_security(self.security.clone())
             .dispatch_queue_capacity(self.dispatch_queue_capacity.get())
             .frame_max(self.frame_max.size())
             .build()
-            .await?;
-
-        // 3. TxnOffsetCommit → group coordinator, carrying the consumer group
-        //    metadata (generation id / member id / instance id) so the
-        //    coordinator can fence zombie producers via the group's own state
-        //    rather than requiring one producer per input partition (KIP-447).
-        let r2 = group_client
-            .send(TxnOffsetCommitRequest {
-                transactional_id: tid,
-                producer_id: pid,
-                producer_epoch: epoch,
-                group_id: group_meta.group_id.clone(),
-                generation_id: group_meta.generation_id,
-                member_id: group_meta.member_id.clone(),
-                group_instance_id: group_meta.group_instance_id.clone(),
-                topics: build_topics_payload(&offsets_vec),
-                ..Default::default()
-            })
-            .await?;
-
-        // Check per-partition error codes.
-        for topic in &r2.topics {
-            for p in &topic.partitions {
-                if p.error_code != 0 {
-                    return Err(ProducerError::Server(p.error_code));
-                }
-            }
-        }
-        Ok(())
+            .await?)
     }
 
     /// Discover the group coordinator for `group_id` with `FindCoordinator`
@@ -1065,6 +1308,51 @@ impl Producer {
     }
 
     // ── Internal lifecycle ───────────────────────────────────────────────────
+
+    /// The retry limits of a coordinator request. The producer-ID
+    /// initialization retry timeout limits every such loop.
+    fn coordinator_retry(&self) -> CoordinatorRetry {
+        CoordinatorRetry {
+            deadline: tokio::time::Instant::now() + self.init_retry_timeout.to_std(),
+            backoff: self.init_retry_backoff.to_std(),
+            max_backoff: self.init_max_backoff.to_std(),
+        }
+    }
+
+    /// Find the transaction coordinator again and connect to it. It gives
+    /// `current` back when the lookup fails, after it reconnects the bootstrap
+    /// connection.
+    async fn rediscovered_txn_coordinator(
+        &self,
+        transactional_id: &str,
+        current: Client,
+    ) -> Client {
+        match self.reconnect_txn_coordinator(transactional_id).await {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                tracing::warn!(%error, "transaction coordinator lookup failed; retrying");
+                current.reconnect_bootstrap().await;
+                current
+            }
+        }
+    }
+
+    /// Record `code` as the error that only an abort can clear, and give the
+    /// error to report. Kafka's `TransactionManager.abortableError` does the
+    /// same.
+    fn abortable_error(&self, code: i16) -> ProducerError {
+        self.txn_abortable_error.set(code);
+        tracing::warn!(
+            error_code = code,
+            "the transaction can no longer commit; abort it"
+        );
+        ProducerError::Server(code)
+    }
+
+    /// The error that a commit reports while the transaction is abort-only.
+    fn abortable_error_state(&self) -> Option<ProducerError> {
+        self.txn_abortable_error.get().map(ProducerError::Server)
+    }
 
     pub(crate) fn is_active(&self) -> Result<(), ProducerError> {
         match self.state.load(Ordering::Acquire) {

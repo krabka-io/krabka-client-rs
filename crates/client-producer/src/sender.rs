@@ -80,7 +80,7 @@ use crate::{
     partitioner::UniformStickyPartitioner,
     producer::{Acks, STATE_ACTIVE, STATE_FENCED, TopicMetadata, UNRESOLVED_TOPIC_PARTITION_COUNT},
     record::RecordMetadata,
-    transactional::TxnState,
+    transactional::{AbortableErrorSlot, TxnState},
     transport::ProduceTransport,
 };
 
@@ -235,6 +235,11 @@ pub(crate) struct SenderConfig {
     pub txn_pid_epoch: Arc<Mutex<(i64, i16)>>,
     pub txn_recovery_required: Arc<AtomicBool>,
     pub txn_recovery_generation: Arc<AtomicU64>,
+    /// Shared with `Producer`. The sender sets it when a batch of the
+    /// transaction fails, so a later commit fails and the application must
+    /// abort. Kafka's `TransactionManager.handleFailedBatch` moves to
+    /// `ABORTABLE_ERROR` in the same place.
+    pub txn_abortable_error: Arc<AbortableErrorSlot>,
 }
 
 /// Mutable per-partition pipeline state, owned by [`run`] and threaded into
@@ -1195,6 +1200,13 @@ fn ack_batch(cfg: &SenderConfig, pb: PreparedBatch, base_offset: i64) {
 /// code. It resolves the batch's records with `Server(code)` and releases the
 /// in-flight slot. It is the single owner of the slot release for the batch.
 fn terminal_fail_batch(cfg: &SenderConfig, pb: PreparedBatch, code: i16) {
+    if BatchMode::of(&pb.record_batch) == BatchMode::Transactional {
+        // Kafka's `Sender.failBatch` calls
+        // `TransactionManager.handleFailedBatch`, which moves a transactional
+        // producer to `ABORTABLE_ERROR`. The application must abort the
+        // transaction; `commit` fails until it does.
+        cfg.txn_abortable_error.set(code);
+    }
     fail_batch(pb.records, ProducerError::Server(code));
     finish_in_flight(cfg);
 }
@@ -2832,6 +2844,7 @@ mod harness {
         let state = Arc::new(AtomicU8::new(STATE_ACTIVE));
         let recovery_required = Arc::new(AtomicBool::new(false));
         let recovery_generation = Arc::new(AtomicU64::new(0));
+        let abortable_error = Arc::new(AbortableErrorSlot::default());
 
         // Box the same Arc<MockTransport> for the sender; keep a clone for the
         // test to inspect.
@@ -2866,6 +2879,7 @@ mod harness {
             })),
             txn_recovery_required: Arc::clone(&recovery_required),
             txn_recovery_generation: Arc::clone(&recovery_generation),
+            txn_abortable_error: Arc::clone(&abortable_error),
         };
 
         let handle = tokio::spawn(run(cfg));

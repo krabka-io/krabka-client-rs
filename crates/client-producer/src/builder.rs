@@ -37,18 +37,12 @@ use crate::{
     partitioner::UniformStickyPartitioner,
     producer::{Acks, Producer, ProducerIdentity},
     sender,
-    transactional::TxnState,
+    transactional::{AbortableErrorSlot, TxnState},
     transport::ClientTransport,
+    txn_retry::{self, CoordinatorAttempt, TxnRequestDecision},
 };
 
-/// Retriable cold-coordinator error codes for `InitProducerId`. The broker is
-/// loading its coordinator state, code `14`. The coordinator is not yet
-/// available, code `15`. The coordinator has moved to another broker, code
-/// `16`. At cluster startup a conformant client retries these with backoff
-/// instead of failing the build.
-const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
-const COORDINATOR_NOT_AVAILABLE: i16 = 15;
-const NOT_COORDINATOR: i16 = 16;
+/// The first `InitProducerId` version that holds the two-phase-commit fields.
 const INIT_PRODUCER_ID_2PC_MIN_VERSION: i16 = 6;
 /// The last released `InitProducerId` version.
 const INIT_PRODUCER_ID_STABLE_MAX_VERSION: i16 = 5;
@@ -376,13 +370,6 @@ fn protocol_milliseconds(value: Duration) -> i32 {
     i32::try_from(value.as_millis()).expect("validated protocol duration")
 }
 
-fn is_retriable_coordinator_code(code: i16) -> bool {
-    matches!(
-        code,
-        COORDINATOR_LOAD_IN_PROGRESS | COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR
-    )
-}
-
 // cargo-mutants: protocol-default InitProducerId shape, so `-> Default` is equivalent.
 #[cfg_attr(test, mutants::skip)]
 fn build_init_producer_id_request() -> InitProducerIdRequest {
@@ -421,12 +408,36 @@ fn producer_identity_from_init(init: &InitProducerIdResponse) -> Result<(i64, i1
     Ok((init.producer_id, init.producer_epoch))
 }
 
-/// Send `InitProducerId`, and retry on the cold-coordinator codes 14, 15 and
-/// 16, and on transient `Disconnected` transport errors, with capped
-/// exponential backoff until the deadline elapses.
+/// Send one `InitProducerId` request.
 ///
-/// This mirrors the shape of the consumer crate's `with_coordinator_retry`. On
-/// the deadline it returns the last response, so the caller's
+/// A request that carries a two-phase-commit field needs v6, which holds those
+/// fields. Every other request negotiates a released version, which is v5 at
+/// most. See [`StableInitProducerId`].
+pub(crate) async fn send_init_producer_id(
+    client: &Client,
+    request: &InitProducerIdRequest,
+) -> Result<InitProducerIdResponse, ClientError> {
+    if request.enable2_pc || request.keep_prepared_txn {
+        client
+            .send_at_least(request.clone(), INIT_PRODUCER_ID_2PC_MIN_VERSION)
+            .await
+    } else {
+        client.send(StableInitProducerId(request.clone())).await
+    }
+}
+
+/// Send `InitProducerId`, and retry every code that Kafka's
+/// `InitProducerIdHandler` retries, and a transient `Disconnected` transport
+/// error, with capped exponential backoff until the deadline elapses.
+///
+/// Kafka's handler finds the coordinator again for `COORDINATOR_NOT_AVAILABLE`
+/// and `NOT_COORDINATOR`, and after a disconnect. This producer has no
+/// transaction coordinator for the idempotent `InitProducerId`, which goes to
+/// the bootstrap connection, so it reconnects that connection instead.
+/// [`Producer::init_transactions`] has a coordinator, and it runs its own loop
+/// that finds the coordinator again.
+///
+/// On the deadline it returns the last response, so the caller's
 /// `error_code != 0` handling runs. If the final attempt disconnected, it
 /// surfaces the transport error instead.
 #[tracing::instrument(level = "info", skip_all, err)]
@@ -437,7 +448,6 @@ pub(crate) async fn init_producer_id_with_retry(
     initial_backoff: Time,
     max_backoff: Time,
 ) -> Result<InitProducerIdResponse, ProducerError> {
-    let requires_v6 = request.enable2_pc || request.keep_prepared_txn;
     let deadline = tokio::time::Instant::now()
         .checked_add(retry_timeout.to_std())
         .ok_or_else(|| {
@@ -446,26 +456,24 @@ pub(crate) async fn init_producer_id_with_retry(
     let mut backoff = initial_backoff.to_std();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let response = tokio::time::timeout(remaining, async {
-            if requires_v6 {
-                client
-                    .send_at_least(request.clone(), INIT_PRODUCER_ID_2PC_MIN_VERSION)
-                    .await
-            } else {
-                client.send(StableInitProducerId(request.clone())).await
-            }
-        })
-        .await
-        .map_err(|_| ProducerError::Client(ClientError::Timeout(retry_timeout)))?;
-        let last_outcome = match response {
-            Ok(resp) if !is_retriable_coordinator_code(resp.error_code) => return Ok(resp),
-            Ok(resp) => Ok(resp),
-            Err(error @ ClientError::Disconnected) => Err(error),
+        let response = tokio::time::timeout(remaining, send_init_producer_id(client, &request))
+            .await
+            .map_err(|_| ProducerError::Client(ClientError::Timeout(retry_timeout)))?;
+        let (attempt, last_outcome) = match response {
+            Ok(resp) => (CoordinatorAttempt::Answered(resp.error_code), Ok(resp)),
+            Err(error @ ClientError::Disconnected) => (CoordinatorAttempt::Lost, Err(error)),
             Err(e) => return Err(ProducerError::Client(e)),
+        };
+        let TxnRequestDecision::Retry { rediscover } = txn_retry::decide_init_producer_id(attempt)
+        else {
+            return last_outcome.map_err(ProducerError::Client);
         };
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return last_outcome.map_err(ProducerError::Client);
+        }
+        if rediscover {
+            client.reconnect_bootstrap().await;
         }
         let sleep_for = backoff.min(remaining);
         tokio::time::sleep(sleep_for).await;
@@ -647,6 +655,7 @@ impl Producer {
         let txn_guard_generation = Arc::new(AtomicU64::new(0));
         let txn_pid_epoch = Arc::new(Mutex::new(initial_txn_pid_epoch()));
         let prepared_transaction_state = Arc::new(Mutex::new(None));
+        let txn_abortable_error = Arc::new(AbortableErrorSlot::default());
 
         let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
             transport: Box::new(ClientTransport::new(client.clone())),
@@ -675,6 +684,7 @@ impl Producer {
             txn_pid_epoch: Arc::clone(&txn_pid_epoch),
             txn_recovery_required: Arc::clone(&txn_recovery_required),
             txn_recovery_generation: Arc::clone(&txn_recovery_generation),
+            txn_abortable_error: Arc::clone(&txn_abortable_error),
         }));
 
         Ok(Producer {
@@ -717,6 +727,7 @@ impl Producer {
             txn_guard_generation,
             txn_coord_client: Mutex::new(None),
             txn_pid_epoch,
+            txn_abortable_error,
             prepared_transaction_state,
         })
     }
@@ -751,19 +762,6 @@ mod security_arg_tests {
         let mut bytes = BytesMut::new();
         response.encode(&mut bytes, 0).expect("encode response");
         bytes.to_vec()
-    }
-
-    #[test]
-    fn coordinator_retry_classifier_matches_cold_start_codes_only() {
-        for (_name, code, want) in [
-            ("loading", COORDINATOR_LOAD_IN_PROGRESS, true),
-            ("unavailable", COORDINATOR_NOT_AVAILABLE, true),
-            ("not coordinator", NOT_COORDINATOR, true),
-            ("success", 0, false),
-            ("invalid request", 42, false),
-        ] {
-            assert2::assert!(is_retriable_coordinator_code(code) == want);
-        }
     }
 
     #[test]
@@ -1221,7 +1219,7 @@ mod security_arg_tests {
             if api_key == init_producer_id_request::API_KEY {
                 observed.fetch_add(1, Ordering::Relaxed);
                 return Some(encode_v0(&InitProducerIdResponse {
-                    error_code: COORDINATOR_LOAD_IN_PROGRESS,
+                    error_code: 14, // COORDINATOR_LOAD_IN_PROGRESS
                     ..Default::default()
                 }));
             }
@@ -1242,10 +1240,8 @@ mod security_arg_tests {
             .expect_err("cold coordinator must remain an error");
 
         mock.stop();
-        assert2::assert!(matches!(
-            error,
-            ProducerError::Server(COORDINATOR_LOAD_IN_PROGRESS)
-        ));
+        // 14 is COORDINATOR_LOAD_IN_PROGRESS.
+        assert2::assert!(matches!(error, ProducerError::Server(14)));
         assert2::assert!(attempts.load(Ordering::Relaxed) >= 1);
     }
 
