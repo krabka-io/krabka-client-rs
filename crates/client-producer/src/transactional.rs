@@ -334,7 +334,7 @@ mod tests {
                 add_partitions_to_txn_topic_result::AddPartitionsToTxnTopicResult,
             },
             end_txn_request,
-            end_txn_response::EndTxnResponse,
+            end_txn_response::{self, EndTxnResponse},
             find_coordinator_request,
             find_coordinator_response::FindCoordinatorResponse,
             init_producer_id_request,
@@ -655,11 +655,14 @@ mod tests {
         );
 
         end_txn_silent.store(false, Ordering::SeqCst);
+        producer.next_seq.insert(("topic".to_owned(), 0), 5);
         producer
             .init_transactions()
             .await
             .expect("reinitialization obtains a new epoch");
         assert2::assert!(*producer.txn_pid_epoch.lock().await == (7, 4));
+        // Kafka's `TransactionManager` starts the sequences again at a new epoch.
+        assert2::assert!(producer.next_seq.is_empty());
         assert2::assert!(producer.transactional_identity().await == Some((7, 4)));
         producer
             .begin_transaction()
@@ -1146,6 +1149,109 @@ mod tests {
                 result,
                 add_partitions_requests,
                 coordinator_lookups,
+            };
+            assert2::assert!(actual == expected, "{name}");
+            mock.stop();
+        }
+    }
+
+    /// The producer state after a commit whose `EndTxn` v5 answer carried an
+    /// identity.
+    #[derive(Debug, PartialEq, Eq)]
+    struct IdentityAfterCommit {
+        identity: (i64, i16),
+        sequences: Vec<((String, i32), i32)>,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_producer_identity_resets_sequence_numbers() {
+        let kept = vec![(("topic".to_owned(), 0), 5)];
+        let cases = [
+            ("epoch bump", (7, 4), (7, 4), vec![]),
+            ("new producer id", (8, 0), (8, 0), vec![]),
+            ("same identity", (7, 3), (7, 3), kept.clone()),
+            ("no identity in the answer", (-1, -1), (7, 3), kept),
+        ];
+        for (name, answered, identity, sequences) in cases {
+            let port_cell = Arc::new(AtomicU16::new(0));
+            let handler_port = Arc::clone(&port_cell);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(encode_v0(&ApiVersionsResponse {
+                        api_keys: vec![ApiVersion {
+                            api_key: end_txn_request::API_KEY,
+                            min_version: 0,
+                            max_version: 5,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }));
+                }
+                if api_key == find_coordinator_request::API_KEY {
+                    return Some(encode_v0(&FindCoordinatorResponse {
+                        error_code: 0,
+                        node_id: 1,
+                        host: "127.0.0.1".into(),
+                        port: i32::from(handler_port.load(Ordering::SeqCst)),
+                        ..Default::default()
+                    }));
+                }
+                if api_key == init_producer_id_request::API_KEY {
+                    return Some(encode_v0(&InitProducerIdResponse {
+                        error_code: 0,
+                        producer_id: 7,
+                        producer_epoch: 3,
+                        ..Default::default()
+                    }));
+                }
+                if api_key == end_txn_request::API_KEY {
+                    let mut buf = BytesMut::new();
+                    if version >= end_txn_response::FLEXIBLE_MIN {
+                        buf.extend_from_slice(&[0]);
+                    }
+                    EndTxnResponse {
+                        error_code: 0,
+                        producer_id: answered.0,
+                        producer_epoch: answered.1,
+                        ..Default::default()
+                    }
+                    .encode(&mut buf, version)
+                    .expect("encode EndTxn response");
+                    return Some(buf.to_vec());
+                }
+                None
+            })
+            .await;
+            port_cell.store(mock.addr.port(), Ordering::SeqCst);
+            let producer = Producer::builder()
+                .bootstrap(mock.addr.to_string())
+                .enable_idempotence(false)
+                .transactional_id("test-txn")
+                .request_timeout(Duration::from_millis(100))
+                .build()
+                .await
+                .expect("producer connects to the mock");
+            producer
+                .init_transactions()
+                .await
+                .expect("init_transactions against the mock coordinator");
+            let transaction = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction");
+            producer.next_seq.insert(("topic".to_owned(), 0), 5);
+            transaction.commit().await.expect("commit");
+            let actual = IdentityAfterCommit {
+                identity: *producer.txn_pid_epoch.lock().await,
+                sequences: producer
+                    .next_seq
+                    .iter()
+                    .map(|entry| (entry.key().clone(), *entry.value()))
+                    .collect(),
+            };
+            let expected = IdentityAfterCommit {
+                identity,
+                sequences,
             };
             assert2::assert!(actual == expected, "{name}");
             mock.stop();
