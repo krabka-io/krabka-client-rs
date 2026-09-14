@@ -36,7 +36,6 @@ use krabka_protocol::{
         join_group_response::JoinGroupResponse,
         leave_group_request::{LeaveGroupRequest, MemberIdentity},
         offset_commit_request::OffsetCommitRequest,
-        offset_fetch_request::OffsetFetchRequest,
         offset_fetch_response::OffsetFetchResponse,
         sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment},
         sync_group_response::SyncGroupResponse,
@@ -59,8 +58,8 @@ use crate::{
     consumer::{CommitIdentity, ConsumerRetryPolicy, reset_starting_offset, starting_offset},
     error::ConsumerError,
     offset_wire::{
-        OffsetFetchAction, build_commit_topics, build_offset_fetch, classify_offset_fetch,
-        id_to_name, parse_offset_fetch, request_topic_names,
+        OffsetFetchAction, TopicNameOffsetFetch, build_commit_topics, build_offset_fetch,
+        classify_offset_fetch, parse_offset_fetch,
     },
 };
 
@@ -1425,7 +1424,6 @@ async fn prime_offsets(
     for (t, p) in partitions {
         by_topic.entry(t.clone()).or_default().push(*p);
     }
-    let topic_ids = state.topic_ids.lock().await.clone();
     // OffsetFetch is a coordinator RPC. `prime_offsets` only runs right after a
     // successful join/sync (which just discovered/refreshed `coordinator_id`),
     // so the id is fresh; route straight to it.
@@ -1433,17 +1431,15 @@ async fn prime_offsets(
         &state.client,
         &state.group_id,
         &state.coordinator_id,
-        &build_offset_fetch(&state.group_id, &by_topic, &topic_ids),
+        &build_offset_fetch(&state.group_id, &by_topic),
         state.retry_policy,
     )
     .await?;
 
-    let id_to_name = id_to_name(&topic_ids);
     let mut offsets = state.next_offsets.lock().await;
     let mut positions = state.positions.lock().await;
     let mut seen: HashSet<(String, i32)> = HashSet::new();
-    for (name, partition_index, committed, committed_epoch) in parse_offset_fetch(&of, &id_to_name)
-    {
+    for (name, partition_index, committed, committed_epoch) in parse_offset_fetch(&of) {
         let starting = starting_offset(committed, state.auto_offset_reset);
         let key = (name, partition_index);
         seen.insert(key.clone());
@@ -1482,14 +1478,16 @@ async fn prime_offsets(
 /// - Other codes fail at once with [`ConsumerError::GroupAuthorizationFailed`],
 ///   [`ConsumerError::TopicAuthorizationFailed`] or
 ///   [`ConsumerError::OffsetFetchFailed`].
+///
+/// The request names each topic, so the version is v9 or lower. See
+/// [`TopicNameOffsetFetch`].
 pub(crate) async fn send_offset_fetch(
     client: &Client,
     group_id: &str,
     coordinator_id: &AtomicI32,
-    request: &OffsetFetchRequest,
+    request: &TopicNameOffsetFetch,
     retry: CoordinatorRetryPolicy,
 ) -> Result<OffsetFetchResponse, ConsumerError> {
-    let topic_names = request_topic_names(request);
     let start = tokio::time::Instant::now();
     let mut backoff = retry.initial_backoff;
     loop {
@@ -1498,7 +1496,7 @@ pub(crate) async fn send_offset_fetch(
             .send(request.clone())
             .await?;
         let deadline_elapsed = retry_deadline_elapsed(start, retry.timeout);
-        match classify_offset_fetch(&response, &topic_names) {
+        match classify_offset_fetch(&response) {
             OffsetFetchAction::Complete => return Ok(response),
             OffsetFetchAction::RetryUnknownTopic(code) => {
                 if deadline_elapsed {
@@ -1575,7 +1573,8 @@ mod retry_tests {
             find_coordinator_request, leave_group_request, metadata_request,
             metadata_response::MetadataResponse,
             offset_fetch_request::{
-                self, OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
+                self, OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic,
+                OffsetFetchRequestTopics,
             },
             offset_fetch_response::{
                 OffsetFetchResponseGroup, OffsetFetchResponsePartition,
@@ -1587,9 +1586,9 @@ mod retry_tests {
 
     use super::*;
 
-    const ORDERS_ID: WireUuid = WireUuid([7; 16]);
+    const ORDERS: &str = "orders";
 
-    const PAYMENTS_ID: WireUuid = WireUuid([9; 16]);
+    const PAYMENTS: &str = "payments";
 
     /// An `ApiVersions` response that advertises `OffsetFetch` in
     /// `offset_fetch_range`.
@@ -1631,34 +1630,25 @@ mod retry_tests {
         buffer.to_vec()
     }
 
-    /// One scripted `OffsetFetch` v10 answer: the group error code and, for
-    /// partition 0 of each topic id, the partition error code and the
-    /// committed offset.
+    /// One scripted `OffsetFetch` answer: the group error code and, for
+    /// partition 0 of each topic, the partition error code and the committed
+    /// offset.
     struct Answer {
         group_error: i16,
-        rows: Vec<(WireUuid, i16, i64)>,
+        rows: Vec<(&'static str, i16, i64)>,
     }
 
-    fn answer(group_error: i16, rows: &[(WireUuid, i16, i64)]) -> Answer {
+    fn answer(group_error: i16, rows: &[(&'static str, i16, i64)]) -> Answer {
         Answer {
             group_error,
             rows: rows.to_vec(),
         }
     }
 
-    /// The topic name of `topic_id` in the scripted answers.
-    fn topic_name(topic_id: WireUuid) -> String {
-        if topic_id == ORDERS_ID {
-            "orders".into()
-        } else {
-            "payments".into()
-        }
-    }
-
     /// The `OffsetFetch` response body for `answer` at `version`, behind the
     /// flexible response header's empty tagged fields from v6. v2 to v7 put the
-    /// group error code and the topics at the top level. v8 and v9 name each
-    /// topic, and v10 gives each topic id.
+    /// group error code and the topics at the top level. v8 and v9 put them in
+    /// the group entry.
     fn offset_fetch_response(answer: &Answer, version: i16) -> Vec<u8> {
         let partition = |error_code: i16, committed_offset: i64| OffsetFetchResponsePartitions {
             partition_index: 0,
@@ -1674,8 +1664,8 @@ mod retry_tests {
                     .rows
                     .iter()
                     .map(
-                        |(topic_id, error_code, committed_offset)| OffsetFetchResponseTopic {
-                            name: topic_name(*topic_id),
+                        |(topic, error_code, committed_offset)| OffsetFetchResponseTopic {
+                            name: (*topic).into(),
                             partitions: vec![OffsetFetchResponsePartition {
                                 partition_index: 0,
                                 committed_offset: *committed_offset,
@@ -1697,19 +1687,13 @@ mod retry_tests {
                     topics: answer
                         .rows
                         .iter()
-                        .map(|(topic_id, error_code, committed_offset)| {
-                            let (name, topic_id) = if version < 10 {
-                                (topic_name(*topic_id), WireUuid::ZERO)
-                            } else {
-                                (String::new(), *topic_id)
-                            };
-                            OffsetFetchResponseTopics {
-                                name,
-                                topic_id,
+                        .map(
+                            |(topic, error_code, committed_offset)| OffsetFetchResponseTopics {
+                                name: (*topic).into(),
                                 partitions: vec![partition(*error_code, *committed_offset)],
                                 ..Default::default()
-                            }
-                        })
+                            },
+                        )
                         .collect(),
                     ..Default::default()
                 }],
@@ -1734,15 +1718,14 @@ mod retry_tests {
         GroupAuthorizationFailed(String),
         TopicAuthorizationFailed(BTreeSet<String>),
         OffsetFetchFailed(i16),
+        /// The coordinator supports no `OffsetFetch` version from the client's
+        /// minimum to 9. The fields are the broker range and the client range.
+        IncompatibleVersion((i16, i16), (i16, i16)),
     }
 
-    fn outcome(
-        result: Result<OffsetFetchResponse, ConsumerError>,
-        topic_ids: &HashMap<String, WireUuid>,
-        name: &str,
-    ) -> Outcome {
+    fn outcome(result: Result<OffsetFetchResponse, ConsumerError>, name: &str) -> Outcome {
         match result {
-            Ok(response) => Outcome::Offsets(parse_offset_fetch(&response, &id_to_name(topic_ids))),
+            Ok(response) => Outcome::Offsets(parse_offset_fetch(&response)),
             Err(ConsumerError::Server(code)) => Outcome::Server(code),
             Err(ConsumerError::GroupAuthorizationFailed(group)) => {
                 Outcome::GroupAuthorizationFailed(group)
@@ -1751,6 +1734,13 @@ mod retry_tests {
                 Outcome::TopicAuthorizationFailed(topics)
             }
             Err(ConsumerError::OffsetFetchFailed(code)) => Outcome::OffsetFetchFailed(code),
+            Err(ConsumerError::Client(krabka_client_core::ClientError::IncompatibleVersion {
+                api_key: offset_fetch_request::API_KEY,
+                broker_min,
+                broker_max,
+                client_min,
+                client_max,
+            })) => Outcome::IncompatibleVersion((broker_min, broker_max), (client_min, client_max)),
             Err(error) => panic!("case {name}: unexpected error {error:?}"),
         }
     }
@@ -1764,7 +1754,7 @@ mod retry_tests {
     async fn offset_fetch_error_codes_map_to_kafka_consumer_actions() {
         for (name, answers, timeout, expected) in offset_fetch_cases() {
             let (outcome, requests, find_coordinators) =
-                run_offset_fetch((10, 10), &["orders", "payments"], answers, timeout, name).await;
+                run_offset_fetch((1, 10), &["orders", "payments"], answers, timeout, name).await;
             check!(
                 (outcome, requests.len(), find_coordinators) == expected,
                 "case {name}"
@@ -1772,14 +1762,17 @@ mod retry_tests {
         }
     }
 
-    /// Apache Kafka's consumers set `requireStable` on each `OffsetFetch`
+    /// Apache Kafka's classic `ConsumerCoordinator.sendOffsetFetchRequest`
+    /// builds `OffsetFetch` with `OffsetFetchRequest.Builder.forTopicNames`,
+    /// which caps the version at 9, so each topic has its name. Kafka's
+    /// consumers also set `requireStable`
     /// (`CommitRequestManager.OffsetFetchRequestState.toUnsentRequest`,
     /// `ConsumerCoordinator.sendOffsetFetchRequest`). The field exists from
     /// v7. Below v7 `OffsetFetchRequest.Builder.throwIfStableOffsetsUnsupported`
     /// drops it. A coordinator with a pending transactional offset commit
     /// answers `UNSTABLE_OFFSET_COMMIT` (88), and the consumer asks again.
     #[tokio::test]
-    async fn offset_fetch_requires_stable_offsets_at_each_version() {
+    async fn offset_fetch_names_topics_at_v9_or_lower_and_requires_stable_offsets() {
         let by_name_before_v8 = |require_stable| OffsetFetchRequest {
             group_id: "group-a".into(),
             topics: Some(vec![OffsetFetchRequestTopic {
@@ -1790,14 +1783,14 @@ mod retry_tests {
             require_stable,
             ..Default::default()
         };
-        let grouped = |name: &str, topic_id| OffsetFetchRequest {
+        let grouped = || OffsetFetchRequest {
             groups: vec![OffsetFetchRequestGroup {
                 group_id: "group-a".into(),
                 member_id: None,
                 member_epoch: -1,
                 topics: Some(vec![OffsetFetchRequestTopics {
-                    name: name.into(),
-                    topic_id,
+                    name: "orders".into(),
+                    topic_id: WireUuid::ZERO,
                     partition_indexes: vec![0],
                     ..Default::default()
                 }]),
@@ -1807,40 +1800,46 @@ mod retry_tests {
             ..Default::default()
         };
         let committed = || Outcome::Offsets(vec![("orders".to_string(), 0, 42, -1)]);
-        let ok = || answer(0, &[(ORDERS_ID, 0, 42)]);
-        for (name, offset_fetch_range, answers, expected_requests) in [
+        let ok = || answer(0, &[(ORDERS, 0, 42)]);
+        for (name, offset_fetch_range, answers, expected) in [
             (
                 "v6 has no require_stable field",
                 (1, 6),
                 vec![ok()],
-                vec![(6, by_name_before_v8(false))],
+                (committed(), vec![(6, by_name_before_v8(false))]),
             ),
             (
                 "v7 requires stable offsets",
                 (1, 7),
                 vec![ok()],
-                vec![(7, by_name_before_v8(true))],
+                (committed(), vec![(7, by_name_before_v8(true))]),
             ),
             (
-                "v9 requires stable offsets",
+                "v9 names the topic",
                 (1, 9),
                 vec![ok()],
-                vec![(9, grouped("orders", WireUuid::ZERO))],
+                (committed(), vec![(9, grouped())]),
             ),
             (
-                "v10 requires stable offsets",
+                "a coordinator with v10 gets v9",
                 (1, 10),
                 vec![ok()],
-                vec![(10, grouped("", ORDERS_ID))],
+                (committed(), vec![(9, grouped())]),
+            ),
+            (
+                "a coordinator with only v10 gets no request",
+                (10, 10),
+                vec![ok()],
+                (Outcome::IncompatibleVersion((10, 10), (1, 9)), Vec::new()),
             ),
             (
                 "a pending transaction answers 88 and the consumer asks again",
                 (1, 10),
-                vec![answer(0, &[(ORDERS_ID, 88, -1)]), ok()],
-                vec![(10, grouped("", ORDERS_ID)), (10, grouped("", ORDERS_ID))],
+                vec![answer(0, &[(ORDERS, 88, -1)]), ok()],
+                (committed(), vec![(9, grouped()), (9, grouped())]),
             ),
         ] {
-            let result = run_offset_fetch(
+            let (outcome, requests, find_coordinators) = run_offset_fetch(
                 offset_fetch_range,
                 &["orders"],
                 answers,
@@ -1848,7 +1847,10 @@ mod retry_tests {
                 name,
             )
             .await;
-            check!(result == (committed(), expected_requests, 0), "case {name}");
+            check!(
+                ((outcome, requests), find_coordinators) == (expected, 0),
+                "case {name}"
+            );
         }
     }
 
@@ -1866,9 +1868,9 @@ mod retry_tests {
                 ("payments".to_string(), 0, payments, -1),
             ])
         };
-        let ok = || answer(0, &[(ORDERS_ID, 0, 42), (PAYMENTS_ID, 0, 7)]);
+        let ok = || answer(0, &[(ORDERS, 0, 42), (PAYMENTS, 0, 7)]);
         let partition_error = |orders: i16, payments: i16| {
-            answer(0, &[(ORDERS_ID, orders, -1), (PAYMENTS_ID, payments, -1)])
+            answer(0, &[(ORDERS, orders, -1), (PAYMENTS, payments, -1)])
         };
         let topics = |names: &[&str]| {
             Outcome::TopicAuthorizationFailed(names.iter().map(|n| (*n).to_string()).collect())
@@ -1942,7 +1944,7 @@ mod retry_tests {
             ),
             (
                 "a group code hides the partition codes",
-                vec![answer(14, &[(ORDERS_ID, 29, -1)]), ok()],
+                vec![answer(14, &[(ORDERS, 29, -1)]), ok()],
                 LONG,
                 (committed(42, 7), 2, 0),
             ),
@@ -2073,17 +2075,12 @@ mod retry_tests {
             .build()
             .await
             .expect("client");
-        let topic_ids = HashMap::from([
-            ("orders".to_string(), ORDERS_ID),
-            ("payments".to_string(), PAYMENTS_ID),
-        ]);
         let request = build_offset_fetch(
             "group-a",
             &topics
                 .iter()
                 .map(|topic| ((*topic).to_string(), vec![0]))
                 .collect(),
-            &topic_ids,
         );
         let coordinator_id = AtomicI32::new(0);
 
@@ -2107,7 +2104,7 @@ mod retry_tests {
         mock.stop();
         let sent = offset_fetches.lock().expect("requests lock").clone();
         (
-            outcome(result, &topic_ids, name),
+            outcome(result, name),
             sent,
             find_coordinators.load(Ordering::SeqCst),
         )

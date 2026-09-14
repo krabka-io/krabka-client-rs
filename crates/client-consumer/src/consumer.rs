@@ -1084,13 +1084,12 @@ async fn finish_startup(
             &client,
             &group_id,
             &coordinator_id,
-            &crate::offset_wire::build_offset_fetch(&group_id, &by_topic, &topic_ids),
+            &crate::offset_wire::build_offset_fetch(&group_id, &by_topic),
             coordinator_retry,
         )
         .await?;
-        let id_to_name = crate::offset_wire::id_to_name(&topic_ids);
         for (name, partition_index, committed, committed_epoch) in
-            crate::offset_wire::parse_offset_fetch(&of, &id_to_name)
+            crate::offset_wire::parse_offset_fetch(&of)
         {
             let starting = starting_offset(committed, auto_offset_reset);
             next_offsets.insert((name.clone(), partition_index), starting);
