@@ -547,13 +547,26 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
     //    once).
     fail_recovered_accumulator_batches(cfg).await;
     fail_recovered_retry_slots(cfg, &mut state.retry);
-    let (mut to_send, expired) = collect_retries(
+    let (mut to_send, mut expired) = collect_retries(
         &mut state.retry,
         now,
         cfg.routing_retry_budget,
         cfg.max_in_flight,
     );
     if !expired.is_empty() {
+        // A transactional batch that fails must stop the transaction from
+        // committing. Kafka's `TransactionManager.handleFailedBatch` moves the
+        // producer to `ABORTABLE_ERROR` there. This producer has no such
+        // state yet (#43), so a transactional batch still fences, which keeps
+        // a commit from leaving the failed records out.
+        if expired
+            .iter()
+            .any(|pb| BatchMode::of(&pb.record_batch) == BatchMode::Transactional)
+        {
+            expired.append(&mut to_send);
+            fence(cfg, state, expired);
+            return;
+        }
         expire_batches(cfg, state, expired, to_send);
         return;
     }
@@ -649,9 +662,11 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
 /// Kafka's `Sender.sendProducerData` fails an expired batch with a
 /// `TimeoutException` and calls `TransactionManager.handleFailedBatch`, which
 /// raises the epoch of an idempotent producer. It does not fence the producer.
-/// The epoch bump starts every partition again at sequence 0, so each parked
-/// batch is written again at the new epoch, as the
-/// `OUT_OF_ORDER_SEQUENCE_NUMBER` path does.
+/// The epoch bump starts at the next batch that the sender builds: Kafka's
+/// `maybeUpdateProducerIdAndEpoch` moves a partition to the new identity only
+/// while it has no batch in flight.
+///
+/// The caller passes only batches of a producer that carries no transaction.
 fn expire_batches(
     cfg: &SenderConfig,
     state: &mut PipelineState,
@@ -672,23 +687,17 @@ fn expire_batches(
         );
         failed.push(pb);
     }
-    if bump_epoch {
-        let Some(epoch) = bump_idempotent_epoch(cfg) else {
-            // Kafka gets a new producer id with `InitProducerId` when the epoch
-            // overflows. This sender cannot send that request, so it fences.
-            tracing::error!("idempotent producer epoch overflow; fencing the producer");
-            for pb in failed {
-                terminal_fail_batch(cfg, pb, ProducerError::SendTimeout);
-            }
-            fence(cfg, state, to_send);
-            return;
-        };
-        for mut pb in to_send {
-            pb.record_batch.producer_epoch = epoch;
-            restart_sequence(cfg, &mut pb);
-            state.retry.insert((pb.topic.clone(), pb.partition), pb);
+    if bump_epoch && bump_idempotent_epoch(cfg).is_none() {
+        // Kafka gets a new producer id with `InitProducerId` when the epoch
+        // overflows. This sender cannot send that request, so it fences.
+        tracing::error!("idempotent producer epoch overflow; fencing the producer");
+        for pb in failed {
+            terminal_fail_batch(cfg, pb, ProducerError::SendTimeout);
         }
-    } else {
+        fence(cfg, state, to_send);
+        return;
+    }
+    if !bump_epoch {
         for (key, repair, base_sequence) in repairs {
             if repair == SequenceRepair::GiveBack {
                 cfg.next_seq.insert(key, base_sequence);
@@ -696,9 +705,14 @@ fn expire_batches(
                 cfg.next_seq.remove(&key);
             }
         }
-        for pb in to_send {
-            state.retry.insert((pb.topic.clone(), pb.partition), pb);
-        }
+    }
+    // Every other batch of the cycle keeps its epoch, its sequence and its
+    // bytes, and it goes back into its retry slot. A batch whose answer was
+    // lost can already be on the log, and the broker dedups only a resend that
+    // carries the same identity. The epoch bump applies to the batches that
+    // the sender builds after it.
+    for pb in to_send {
+        state.retry.insert((pb.topic.clone(), pb.partition), pb);
     }
     for pb in failed {
         terminal_fail_batch(cfg, pb, ProducerError::SendTimeout);
@@ -1142,6 +1156,18 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
             // the records and calls `TransactionManager.handleFailedBatch`,
             // which raises the epoch of an idempotent producer. It does not
             // fence.
+            BatchVerdict::Retry
+            | BatchVerdict::BumpEpochAndRetry
+            | BatchVerdict::RestartSequenceAndRetry
+                if take_retry(&mut pb, cfg.retries)
+                    && BatchMode::of(&pb.record_batch) == BatchMode::Transactional =>
+            {
+                // A transactional batch that fails must stop the transaction
+                // from committing. Kafka moves the producer to
+                // `ABORTABLE_ERROR` there, and this producer has no such state
+                // yet (#43), so it still fences.
+                fenced = Some(vec![pb]);
+            }
             BatchVerdict::Retry
             | BatchVerdict::BumpEpochAndRetry
             | BatchVerdict::RestartSequenceAndRetry
@@ -4507,6 +4533,38 @@ mod harness {
         // the new epoch, which starts the partition again at sequence 0.
         assert2::assert!(transport.sent_batches() == vec![(0, 0), (1, 0)]);
 
+        shutdown(h).await;
+    }
+
+    /// A transactional batch that has no retry left still fences. Kafka moves
+    /// the producer to `ABORTABLE_ERROR` there
+    /// (`TransactionManager.handleFailedBatch`), so that a later
+    /// `commitTransaction` fails and the application aborts. This producer has
+    /// no such state yet (#43), and a fence keeps a commit from leaving the
+    /// failed records out of the transaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transactional_batch_with_no_retry_left_still_fences() {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
+        let h = spawn_sender_full(
+            transport.clone(),
+            1,
+            millis(1),
+            0,
+            secs(30),
+            Acks::All,
+            BatchMode::Transactional,
+        );
+
+        let ack = produce_burst(&h, "t", 0, 1).await.pop().expect("ack");
+        let error = tokio::time::timeout(Duration::from_secs(1), ack)
+            .await
+            .expect("ack resolves")
+            .expect("sender remains")
+            .expect_err("the exhausted batch must fail");
+
+        assert2::assert!(matches!(error, ProducerError::FencedProducer), "{error:?}");
+        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_FENCED);
         shutdown(h).await;
     }
 
