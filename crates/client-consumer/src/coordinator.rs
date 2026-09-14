@@ -1565,17 +1565,21 @@ mod retry_tests {
     };
 
     use assert2::check;
+    use bytes::Buf;
     use krabka_client_core::MockBroker;
     use krabka_protocol::{
-        Encode, UnknownTaggedFields,
+        Decode, Encode, UnknownTaggedFields,
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             find_coordinator_request, leave_group_request, metadata_request,
             metadata_response::MetadataResponse,
-            offset_fetch_request,
+            offset_fetch_request::{
+                self, OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
+            },
             offset_fetch_response::{
-                OffsetFetchResponseGroup, OffsetFetchResponsePartitions, OffsetFetchResponseTopics,
+                OffsetFetchResponseGroup, OffsetFetchResponsePartition,
+                OffsetFetchResponsePartitions, OffsetFetchResponseTopic, OffsetFetchResponseTopics,
             },
         },
     };
@@ -1587,7 +1591,9 @@ mod retry_tests {
 
     const PAYMENTS_ID: WireUuid = WireUuid([9; 16]);
 
-    fn api_versions_for_offset_fetch() -> Vec<u8> {
+    /// An `ApiVersions` response that advertises `OffsetFetch` in
+    /// `offset_fetch_range`.
+    fn api_versions_for_offset_fetch(offset_fetch_range: (i16, i16)) -> Vec<u8> {
         let response = ApiVersionsResponse {
             error_code: 0,
             api_keys: vec![
@@ -1599,8 +1605,8 @@ mod retry_tests {
                 },
                 ApiVersion {
                     api_key: offset_fetch_request::API_KEY,
-                    min_version: 10,
-                    max_version: 10,
+                    min_version: offset_fetch_range.0,
+                    max_version: offset_fetch_range.1,
                     ..Default::default()
                 },
                 ApiVersion {
@@ -1640,20 +1646,37 @@ mod retry_tests {
         }
     }
 
-    /// The `OffsetFetch` v10 response body for `answer`, behind the flexible
-    /// response header's empty tagged fields.
-    fn offset_fetch_v10(answer: &Answer) -> Vec<u8> {
-        let response = OffsetFetchResponse {
-            groups: vec![OffsetFetchResponseGroup {
-                group_id: "group-a".into(),
+    /// The topic name of `topic_id` in the scripted answers.
+    fn topic_name(topic_id: WireUuid) -> String {
+        if topic_id == ORDERS_ID {
+            "orders".into()
+        } else {
+            "payments".into()
+        }
+    }
+
+    /// The `OffsetFetch` response body for `answer` at `version`, behind the
+    /// flexible response header's empty tagged fields from v6. v2 to v7 put the
+    /// group error code and the topics at the top level. v8 and v9 name each
+    /// topic, and v10 gives each topic id.
+    fn offset_fetch_response(answer: &Answer, version: i16) -> Vec<u8> {
+        let partition = |error_code: i16, committed_offset: i64| OffsetFetchResponsePartitions {
+            partition_index: 0,
+            committed_offset,
+            committed_leader_epoch: -1,
+            error_code,
+            ..Default::default()
+        };
+        let response = if version < 8 {
+            OffsetFetchResponse {
                 error_code: answer.group_error,
                 topics: answer
                     .rows
                     .iter()
                     .map(
-                        |(topic_id, error_code, committed_offset)| OffsetFetchResponseTopics {
-                            topic_id: *topic_id,
-                            partitions: vec![OffsetFetchResponsePartitions {
+                        |(topic_id, error_code, committed_offset)| OffsetFetchResponseTopic {
+                            name: topic_name(*topic_id),
+                            partitions: vec![OffsetFetchResponsePartition {
                                 partition_index: 0,
                                 committed_offset: *committed_offset,
                                 committed_leader_epoch: -1,
@@ -1665,12 +1688,40 @@ mod retry_tests {
                     )
                     .collect(),
                 ..Default::default()
-            }],
-            ..Default::default()
+            }
+        } else {
+            OffsetFetchResponse {
+                groups: vec![OffsetFetchResponseGroup {
+                    group_id: "group-a".into(),
+                    error_code: answer.group_error,
+                    topics: answer
+                        .rows
+                        .iter()
+                        .map(|(topic_id, error_code, committed_offset)| {
+                            let (name, topic_id) = if version < 10 {
+                                (topic_name(*topic_id), WireUuid::ZERO)
+                            } else {
+                                (String::new(), *topic_id)
+                            };
+                            OffsetFetchResponseTopics {
+                                name,
+                                topic_id,
+                                partitions: vec![partition(*error_code, *committed_offset)],
+                                ..Default::default()
+                            }
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
         };
-        let mut buffer = bytes::BytesMut::from(&[0u8][..]);
+        let mut buffer = bytes::BytesMut::new();
+        if version >= offset_fetch_request::FLEXIBLE_MIN {
+            buffer.extend_from_slice(&[0]);
+        }
         response
-            .encode(&mut buffer, 10)
+            .encode(&mut buffer, version)
             .expect("encode offset fetch");
         buffer.to_vec()
     }
@@ -1712,10 +1763,92 @@ mod retry_tests {
     #[tokio::test]
     async fn offset_fetch_error_codes_map_to_kafka_consumer_actions() {
         for (name, answers, timeout, expected) in offset_fetch_cases() {
+            let (outcome, requests, find_coordinators) =
+                run_offset_fetch((10, 10), &["orders", "payments"], answers, timeout, name).await;
             check!(
-                run_offset_fetch(answers, timeout, name).await == expected,
+                (outcome, requests.len(), find_coordinators) == expected,
                 "case {name}"
             );
+        }
+    }
+
+    /// Apache Kafka's consumers set `requireStable` on each `OffsetFetch`
+    /// (`CommitRequestManager.OffsetFetchRequestState.toUnsentRequest`,
+    /// `ConsumerCoordinator.sendOffsetFetchRequest`). The field exists from
+    /// v7. Below v7 `OffsetFetchRequest.Builder.throwIfStableOffsetsUnsupported`
+    /// drops it. A coordinator with a pending transactional offset commit
+    /// answers `UNSTABLE_OFFSET_COMMIT` (88), and the consumer asks again.
+    #[tokio::test]
+    async fn offset_fetch_requires_stable_offsets_at_each_version() {
+        let by_name_before_v8 = |require_stable| OffsetFetchRequest {
+            group_id: "group-a".into(),
+            topics: Some(vec![OffsetFetchRequestTopic {
+                name: "orders".into(),
+                partition_indexes: vec![0],
+                ..Default::default()
+            }]),
+            require_stable,
+            ..Default::default()
+        };
+        let grouped = |name: &str, topic_id| OffsetFetchRequest {
+            groups: vec![OffsetFetchRequestGroup {
+                group_id: "group-a".into(),
+                member_id: None,
+                member_epoch: -1,
+                topics: Some(vec![OffsetFetchRequestTopics {
+                    name: name.into(),
+                    topic_id,
+                    partition_indexes: vec![0],
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }],
+            require_stable: true,
+            ..Default::default()
+        };
+        let committed = || Outcome::Offsets(vec![("orders".to_string(), 0, 42, -1)]);
+        let ok = || answer(0, &[(ORDERS_ID, 0, 42)]);
+        for (name, offset_fetch_range, answers, expected_requests) in [
+            (
+                "v6 has no require_stable field",
+                (1, 6),
+                vec![ok()],
+                vec![(6, by_name_before_v8(false))],
+            ),
+            (
+                "v7 requires stable offsets",
+                (1, 7),
+                vec![ok()],
+                vec![(7, by_name_before_v8(true))],
+            ),
+            (
+                "v9 requires stable offsets",
+                (1, 9),
+                vec![ok()],
+                vec![(9, grouped("orders", WireUuid::ZERO))],
+            ),
+            (
+                "v10 requires stable offsets",
+                (1, 10),
+                vec![ok()],
+                vec![(10, grouped("", ORDERS_ID))],
+            ),
+            (
+                "a pending transaction answers 88 and the consumer asks again",
+                (1, 10),
+                vec![answer(0, &[(ORDERS_ID, 88, -1)]), ok()],
+                vec![(10, grouped("", ORDERS_ID)), (10, grouped("", ORDERS_ID))],
+            ),
+        ] {
+            let result = run_offset_fetch(
+                offset_fetch_range,
+                &["orders"],
+                answers,
+                Duration::from_secs(5),
+                name,
+            )
+            .await;
+            check!(result == (committed(), expected_requests, 0), "case {name}");
         }
     }
 
@@ -1877,25 +2010,46 @@ mod retry_tests {
         ]
     }
 
-    /// Run `send_offset_fetch` against a mock coordinator that answers from
-    /// `answers`, and return the outcome with the `OffsetFetch` and
-    /// `FindCoordinator` request counts.
+    /// The decoded `OffsetFetch` requests that a mock coordinator received,
+    /// each with its version.
+    type SentOffsetFetches = Vec<(i16, OffsetFetchRequest)>;
+
+    /// Run `send_offset_fetch` for partition 0 of each of `topics` against a
+    /// mock coordinator that advertises `offset_fetch_range` and answers from
+    /// `answers`. Return the outcome, the decoded `OffsetFetch` requests, and
+    /// the `FindCoordinator` request count.
     async fn run_offset_fetch(
+        offset_fetch_range: (i16, i16),
+        topics: &[&str],
         answers: Vec<Answer>,
         timeout: Duration,
         name: &str,
-    ) -> (Outcome, usize, usize) {
-        let offset_fetches = Arc::new(AtomicUsize::new(0));
+    ) -> (Outcome, SentOffsetFetches, usize) {
+        let offset_fetches = Arc::new(std::sync::Mutex::new(Vec::new()));
         let find_coordinators = Arc::new(AtomicUsize::new(0));
         let offset_fetches_in_mock = Arc::clone(&offset_fetches);
         let find_coordinators_in_mock = Arc::clone(&find_coordinators);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+        let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
             let mut buffer = bytes::BytesMut::new();
             match api_key {
-                api_versions_request::API_KEY => Some(api_versions_for_offset_fetch()),
+                api_versions_request::API_KEY => {
+                    Some(api_versions_for_offset_fetch(offset_fetch_range))
+                }
                 offset_fetch_request::API_KEY => {
-                    let attempt = offset_fetches_in_mock.fetch_add(1, Ordering::SeqCst);
-                    Some(offset_fetch_v10(&answers[attempt.min(answers.len() - 1)]))
+                    let client_id_len = body.get_i16();
+                    body.advance(usize::try_from(client_id_len).expect("client id length"));
+                    if version >= offset_fetch_request::FLEXIBLE_MIN {
+                        body.advance(1);
+                    }
+                    let request = OffsetFetchRequest::decode(&mut body, version)
+                        .expect("offset fetch request decodes");
+                    let mut sent = offset_fetches_in_mock.lock().expect("requests lock");
+                    let attempt = sent.len();
+                    sent.push((version, request));
+                    Some(offset_fetch_response(
+                        &answers[attempt.min(answers.len() - 1)],
+                        version,
+                    ))
                 }
                 find_coordinator_request::API_KEY => {
                     find_coordinators_in_mock.fetch_add(1, Ordering::SeqCst);
@@ -1925,10 +2079,10 @@ mod retry_tests {
         ]);
         let request = build_offset_fetch(
             "group-a",
-            &HashMap::from([
-                ("orders".to_string(), vec![0]),
-                ("payments".to_string(), vec![0]),
-            ]),
+            &topics
+                .iter()
+                .map(|topic| ((*topic).to_string(), vec![0]))
+                .collect(),
             &topic_ids,
         );
         let coordinator_id = AtomicI32::new(0);
@@ -1951,9 +2105,10 @@ mod retry_tests {
         .unwrap_or_else(|_| panic!("case {name}: offset fetch never finished"));
 
         mock.stop();
+        let sent = offset_fetches.lock().expect("requests lock").clone();
         (
             outcome(result, &topic_ids, name),
-            offset_fetches.load(Ordering::SeqCst),
+            sent,
             find_coordinators.load(Ordering::SeqCst),
         )
     }
