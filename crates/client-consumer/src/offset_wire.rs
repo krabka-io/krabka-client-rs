@@ -108,6 +108,28 @@ pub(crate) fn parse_offset_fetch(
     out
 }
 
+/// The first `UNKNOWN_TOPIC_OR_PARTITION` (3) or `UNKNOWN_TOPIC_ID` (100)
+/// partition error in an `OffsetFetch` response, or `None`.
+///
+/// Kafka's `CommitRequestManager` treats these two partition codes as the only
+/// retriable ones. It sends the `OffsetFetch` again until the deadline. After
+/// the deadline it gives such a partition no committed offset, so the reset
+/// policy picks the position.
+pub(crate) fn retriable_offset_fetch_error(resp: &OffsetFetchResponse) -> Option<i16> {
+    let legacy = resp
+        .topics
+        .iter()
+        .flat_map(|t| &t.partitions)
+        .map(|p| p.error_code);
+    let grouped = resp
+        .groups
+        .iter()
+        .flat_map(|g| &g.topics)
+        .flat_map(|t| &t.partitions)
+        .map(|p| p.error_code);
+    legacy.chain(grouped).find(|code| matches!(code, 3 | 100))
+}
+
 /// Build the `topics` for an `OffsetCommit` and tag each one with its
 /// `topic_id`.
 ///
@@ -200,6 +222,60 @@ mod tests {
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
             }
         );
+    }
+
+    #[test]
+    fn retriable_offset_fetch_error_finds_only_unknown_topic_codes() {
+        let grouped = |errors: &[i16]| OffsetFetchResponse {
+            groups: vec![OffsetFetchResponseGroup {
+                group_id: "g".into(),
+                topics: vec![OffsetFetchResponseTopics {
+                    topic_id: id(7),
+                    partitions: errors
+                        .iter()
+                        .zip(0..)
+                        .map(
+                            |(error_code, partition_index)| OffsetFetchResponsePartitions {
+                                partition_index,
+                                committed_offset: -1,
+                                error_code: *error_code,
+                                ..Default::default()
+                            },
+                        )
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (name, response, expected) in [
+            ("no error", grouped(&[0, 0]), None),
+            ("unknown topic or partition", grouped(&[0, 3]), Some(3)),
+            ("not leader or follower", grouped(&[6]), None),
+            ("unknown topic id", grouped(&[100]), Some(100)),
+            ("topic authorization failed", grouped(&[29]), None),
+            (
+                "legacy topics",
+                OffsetFetchResponse {
+                    topics: vec![OffsetFetchResponseTopic {
+                        name: "t".into(),
+                        partitions: vec![OffsetFetchResponsePartition {
+                            error_code: 3,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                Some(3),
+            ),
+        ] {
+            assert2::check!(
+                retriable_offset_fetch_error(&response) == expected,
+                "case {name}"
+            );
+        }
     }
 
     #[test]

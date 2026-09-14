@@ -77,6 +77,48 @@ fn is_transient_poll_error(e: &ConsumerError) -> bool {
     matches!(e, ConsumerError::Client(client) if is_transient_transport_error(client))
 }
 
+/// What [`Consumer::poll`] does with one partition row of a `Fetch` response,
+/// chosen by the row's `error_code`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FetchPartitionAction {
+    /// `NONE`: decode the records.
+    Records,
+    /// `OFFSET_OUT_OF_RANGE`: resolve a new position with the reset policy.
+    ResetOffset,
+    /// `NOT_LEADER_OR_FOLLOWER`: adopt the leader hint, or refresh metadata.
+    Reroute,
+    /// `FENCED_LEADER_EPOCH` or `UNKNOWN_LEADER_EPOCH`: validate the position
+    /// against fresher metadata.
+    RevalidateEpoch,
+    /// `UNKNOWN_TOPIC_OR_PARTITION` or `UNKNOWN_TOPIC_ID`: skip the row and
+    /// refresh metadata. The next poll fetches the partition again.
+    RefreshMetadata,
+    /// Any other code: fail the poll with `ConsumerError::Server(code)`.
+    Fail(i16),
+}
+
+/// Map a `Fetch` partition `error_code` to its [`FetchPartitionAction`].
+///
+/// Kafka's `FetchCollector.handleInitializeErrors` requests a metadata update
+/// for `UNKNOWN_TOPIC_OR_PARTITION` (3) and for `UNKNOWN_TOPIC_ID` (100), and
+/// does not raise an error to the application. A Fetch v13 or later names the
+/// topic by id only. The broker answers 100 when its metadata image does not
+/// hold that id yet, or when the topic was deleted and created again.
+fn classify_fetch_partition_error(error_code: i16) -> FetchPartitionAction {
+    match error_code {
+        0 => FetchPartitionAction::Records,
+        1 /* OFFSET_OUT_OF_RANGE */ => FetchPartitionAction::ResetOffset,
+        6 /* NOT_LEADER_OR_FOLLOWER */ => FetchPartitionAction::Reroute,
+        74 /* FENCED_LEADER_EPOCH */ | 75 /* UNKNOWN_LEADER_EPOCH */ => {
+            FetchPartitionAction::RevalidateEpoch
+        }
+        3 /* UNKNOWN_TOPIC_OR_PARTITION */ | 100 /* UNKNOWN_TOPIC_ID */ => {
+            FetchPartitionAction::RefreshMetadata
+        }
+        other => FetchPartitionAction::Fail(other),
+    }
+}
+
 fn aborted_txn_started(first_offset: i64, batch_base_offset: i64) -> bool {
     first_offset <= batch_base_offset
 }
@@ -280,85 +322,98 @@ impl Consumer {
                     continue;
                 }
                 // Error-first: inspect the partition error_code before decoding.
-                match part.error_code {
-            0 => {}
-            1 /* OFFSET_OUT_OF_RANGE */ => {
-                // The response cannot say where the log now starts. Apache
-                // Kafka builds an errored partition with `log_start_offset`,
-                // `high_watermark` and `last_stable_offset` all set to -1, so
-                // `part.log_start_offset` is -1 here whatever the real log
-                // start is. Reading it and fetching from it wedges the
-                // partition: every following Fetch asks for -1 and gets
-                // OFFSET_OUT_OF_RANGE again. A hardcoded 0 wedges it the same
-                // way once retention has moved the log start past 0.
-                //
-                // So every policy resolves its position with a ListOffsets
-                // instead. Earliest and Latest plant a sentinel that
-                // `resolve_reset_sentinels` replaces before the next Fetch.
-                // None reports the error, and `deferred_out_of_range` carries
-                // it out of this loop so the true log start can be read once
-                // the offsets guard is released.
-                match self.auto_offset_reset {
-                    AutoOffsetReset::Latest => {
-                        offsets.insert(key.clone(), LATEST_SENTINEL);
+                match classify_fetch_partition_error(part.error_code) {
+                    FetchPartitionAction::Records => {}
+                    FetchPartitionAction::ResetOffset => {
+                        // The response cannot say where the log now starts. Apache
+                        // Kafka builds an errored partition with `log_start_offset`,
+                        // `high_watermark` and `last_stable_offset` all set to -1, so
+                        // `part.log_start_offset` is -1 here whatever the real log
+                        // start is. Reading it and fetching from it wedges the
+                        // partition: every following Fetch asks for -1 and gets
+                        // OFFSET_OUT_OF_RANGE again. A hardcoded 0 wedges it the same
+                        // way once retention has moved the log start past 0.
+                        //
+                        // So every policy resolves its position with a ListOffsets
+                        // instead. Earliest and Latest plant a sentinel that
+                        // `resolve_reset_sentinels` replaces before the next Fetch.
+                        // None reports the error, and `deferred_out_of_range` carries
+                        // it out of this loop so the true log start can be read once
+                        // the offsets guard is released.
+                        match self.auto_offset_reset {
+                            AutoOffsetReset::Latest => {
+                                offsets.insert(key.clone(), LATEST_SENTINEL);
+                            }
+                            AutoOffsetReset::Earliest | AutoOffsetReset::None => {
+                                let fetch_offset = fetch_offset_or_unknown(&offsets, &key);
+                                out_of_range.push((key.clone(), fetch_offset));
+                            }
+                        }
+                        continue;
                     }
-                    AutoOffsetReset::Earliest | AutoOffsetReset::None => {
-                        let fetch_offset = fetch_offset_or_unknown(&offsets, &key);
-                        out_of_range.push((key.clone(), fetch_offset));
+                    FetchPartitionAction::Reroute => {
+                        // A routing miss, NOT a truncation: we sent the Fetch to
+                        // a broker that no longer leads this partition (e.g. a
+                        // leadership change since the last metadata refresh).
+                        // Re-target the leader so the next poll routes correctly;
+                        // do NOT set awaiting_validation (nothing diverged).
+                        let mut positions = self.positions.lock().await;
+                        if part.current_leader.leader_id >= 0 {
+                            // The broker handed us the new leader inline (KIP-320
+                            // current_leader hint). Adopt it immediately.
+                            let p = positions.entry(key.clone()).or_default();
+                            p.leader_id = part.current_leader.leader_id;
+                            // Wrap the KIP-320 current-leader hint (raw wire
+                            // `int32`) at the Fetch-response decode boundary.
+                            p.leader_epoch = LeaderEpoch(part.current_leader.leader_epoch);
+                        } else {
+                            // No hint: force a metadata refresh after this loop
+                            // so the next poll learns the new leader. Reset the
+                            // stale leader id so the bootstrap fallback (and a
+                            // re-flag, if metadata advances the epoch) kicks in.
+                            if let Some(p) = positions.get_mut(&key) {
+                                p.leader_id = UNKNOWN_LEADER_ID;
+                            }
+                            drop(positions);
+                            refresh_after_processing = true;
+                        }
+                        continue;
+                    }
+                    FetchPartitionAction::RevalidateEpoch => {
+                        let mut positions = self.positions.lock().await;
+                        if let Some(p) = positions.get_mut(&key) {
+                            // Force refresh_leader_epochs to re-flag against
+                            // fresher metadata next poll (any real epoch >= 0 > -1).
+                            p.leader_epoch = LeaderEpoch(UNKNOWN_LEADER_ID);
+                            // Only gate on validation when we have a consumed epoch
+                            // to validate against. A never-consumed partition
+                            // (offset_epoch < 0) has nothing to validate; flagging it
+                            // would wedge it — validate_positions skips offset_epoch
+                            // < 0, and the fetch builder skips awaiting_validation.
+                            if p.offset_epoch.is_known() {
+                                p.awaiting_validation = true;
+                            }
+                        }
+                        continue;
+                    }
+                    FetchPartitionAction::RefreshMetadata => {
+                        // The broker does not know the topic or the topic id. Skip the
+                        // row and refresh metadata, as Kafka's consumer does. The
+                        // refresh at the start of the next poll also stores a new
+                        // topic id for a topic that was created again.
+                        tracing::warn!(
+                            topic = %topic_name,
+                            partition = part.partition_index,
+                            error_code = part.error_code,
+                            "fetch partition names a topic the broker does not know; refreshing metadata"
+                        );
+                        refresh_after_processing = true;
+                        continue;
+                    }
+                    FetchPartitionAction::Fail(code) => {
+                        return Err(ConsumerError::Server(code));
                     }
                 }
-                continue;
-            }
-            6 /* NOT_LEADER_OR_FOLLOWER */ => {
-                // A routing miss, NOT a truncation: we sent the Fetch to
-                // a broker that no longer leads this partition (e.g. a
-                // leadership change since the last metadata refresh).
-                // Re-target the leader so the next poll routes correctly;
-                // do NOT set awaiting_validation (nothing diverged).
-                let mut positions = self.positions.lock().await;
-                if part.current_leader.leader_id >= 0 {
-                    // The broker handed us the new leader inline (KIP-320
-                    // current_leader hint). Adopt it immediately.
-                    let p = positions.entry(key.clone()).or_default();
-                    p.leader_id = part.current_leader.leader_id;
-                    // Wrap the KIP-320 current-leader hint (raw wire
-                    // `int32`) at the Fetch-response decode boundary.
-                    p.leader_epoch = LeaderEpoch(part.current_leader.leader_epoch);
-                } else {
-                    // No hint: force a metadata refresh after this loop
-                    // so the next poll learns the new leader. Reset the
-                    // stale leader id so the bootstrap fallback (and a
-                    // re-flag, if metadata advances the epoch) kicks in.
-                    if let Some(p) = positions.get_mut(&key) {
-                        p.leader_id = UNKNOWN_LEADER_ID;
-                    }
-                    drop(positions);
-                    refresh_after_processing = true;
-                }
-                continue;
-            }
-            74 /* FENCED_LEADER_EPOCH */
-            | 75 /* UNKNOWN_LEADER_EPOCH */ => {
-                let mut positions = self.positions.lock().await;
-                if let Some(p) = positions.get_mut(&key) {
-                    // Force refresh_leader_epochs to re-flag against
-                    // fresher metadata next poll (any real epoch >= 0 > -1).
-                    p.leader_epoch = LeaderEpoch(UNKNOWN_LEADER_ID);
-                    // Only gate on validation when we have a consumed epoch
-                    // to validate against. A never-consumed partition
-                    // (offset_epoch < 0) has nothing to validate; flagging it
-                    // would wedge it — validate_positions skips offset_epoch
-                    // < 0, and the fetch builder skips awaiting_validation.
-                    if p.offset_epoch.is_known() {
-                        p.awaiting_validation = true;
-                    }
-                }
-                continue;
-            }
-            other => {
-                return Err(ConsumerError::Server(other));
-            }
-        }
 
                 record_readable_end(
                     &mut *self.end_offsets.lock().await,
@@ -382,8 +437,9 @@ impl Consumer {
         if refresh_after_processing {
             // Best-effort: a NOT_LEADER_OR_FOLLOWER without a current_leader
             // hint means our cached leader is stale; learn the new one so the
-            // next poll routes correctly. A failure is non-fatal — the next
-            // refresh_leader_epochs pass retries.
+            // next poll routes correctly. UNKNOWN_TOPIC_OR_PARTITION and
+            // UNKNOWN_TOPIC_ID mean our topic metadata is stale. A failure is
+            // non-fatal — the next refresh_leader_epochs pass retries.
             let _ = self.client.refresh_metadata().await;
         }
         Ok(out)
@@ -899,6 +955,45 @@ mod offset_advance_tests {
     }
 
     #[test]
+    fn fetch_partition_error_codes_map_to_kafka_consumer_actions() {
+        for (name, error_code, expected) in [
+            ("none", 0, FetchPartitionAction::Records),
+            ("offset out of range", 1, FetchPartitionAction::ResetOffset),
+            (
+                "unknown topic or partition",
+                3,
+                FetchPartitionAction::RefreshMetadata,
+            ),
+            ("not leader or follower", 6, FetchPartitionAction::Reroute),
+            (
+                "fenced leader epoch",
+                74,
+                FetchPartitionAction::RevalidateEpoch,
+            ),
+            (
+                "unknown leader epoch",
+                75,
+                FetchPartitionAction::RevalidateEpoch,
+            ),
+            (
+                "unknown topic id",
+                100,
+                FetchPartitionAction::RefreshMetadata,
+            ),
+            (
+                "topic authorization failed",
+                29,
+                FetchPartitionAction::Fail(29),
+            ),
+        ] {
+            check!(
+                classify_fetch_partition_error(error_code) == expected,
+                "case {name}"
+            );
+        }
+    }
+
+    #[test]
     fn fetch_leader_id_uses_known_non_negative_leader_or_bootstrap() {
         check!(BOOTSTRAP_LEADER == -1);
         check!(UNKNOWN_LEADER_ID == -1);
@@ -1246,5 +1341,237 @@ mod offset_advance_tests {
     fn advance_target_none_for_empty() {
         let payload = RecordsPayload::V2(vec![]);
         assert2::assert!(super::next_offset_after(payload.as_v2().unwrap()) == None);
+    }
+}
+
+#[cfg(test)]
+mod partition_error_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering},
+    };
+
+    use assert2::check;
+    use krabka_client_core::{Client, MockBroker};
+    use krabka_protocol::{
+        Encode,
+        owned::{
+            api_versions_request,
+            api_versions_response::{ApiVersion, ApiVersionsResponse},
+            fetch_response::{
+                EpochEndOffset, FetchResponse, FetchableTopicResponse, LeaderIdAndEpoch,
+                PartitionData,
+            },
+            metadata_request,
+            metadata_response::MetadataResponse,
+        },
+        primitives::uuid::Uuid as WireUuid,
+    };
+    use krabka_units::secs;
+    use tokio::sync::{Mutex, Notify};
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::{
+        Assignor,
+        consumer::{CommitIdentity, ConsumerRetryPolicy},
+    };
+
+    const TOPIC_ID: WireUuid = WireUuid([7; 16]);
+
+    fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
+        let mut buf = bytes::BytesMut::new();
+        response.encode(&mut buf, version).unwrap();
+        buf.to_vec()
+    }
+
+    /// A mock broker that answers `ApiVersions` and a non-flexible `Metadata`,
+    /// and counts the `Metadata` requests.
+    async fn metadata_counting_broker(metadata_requests: Arc<AtomicUsize>) -> MockBroker {
+        MockBroker::start(move |api_key, version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                let versions = ApiVersionsResponse {
+                    error_code: 0,
+                    api_keys: vec![
+                        ApiVersion {
+                            api_key: api_versions_request::API_KEY,
+                            min_version: 0,
+                            max_version: 3,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: metadata_request::API_KEY,
+                            min_version: 0,
+                            max_version: 8,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                };
+                return Some(encode(&versions, 0));
+            }
+            if api_key == metadata_request::API_KEY {
+                metadata_requests.fetch_add(1, Ordering::SeqCst);
+                return Some(encode(&MetadataResponse::default(), version));
+            }
+            None
+        })
+        .await
+    }
+
+    async fn consumer_on(broker: &MockBroker) -> Consumer {
+        let client = Client::builder()
+            .bootstrap(broker.addr.to_string())
+            .build()
+            .await
+            .unwrap();
+        Consumer {
+            client,
+            group_id: "group-a".into(),
+            coordinator_id: Arc::new(AtomicI32::new(0)),
+            retry_policy: ConsumerRetryPolicy::default().into(),
+            member_id: "member-a".into(),
+            commit_identity: Arc::new(Mutex::new(CommitIdentity {
+                generation: 1,
+                member_id: "member-a".into(),
+                ownership_ids: HashMap::from([(("orders".into(), 0), 1)]),
+            })),
+            commit_serialization: Arc::new(Mutex::new(())),
+            commit_async_state: Arc::new(AtomicU8::new(0)),
+            group_instance_id: None,
+            current_generation: Arc::new(AtomicI32::new(1)),
+            subscribed_topics: vec!["orders".into()],
+            assigned: Arc::new(Mutex::new(vec![("orders".into(), 0)])),
+            assignment_changed: Arc::new(Notify::new()),
+            next_offsets: Arc::new(Mutex::new(HashMap::from([(("orders".into(), 0), 5)]))),
+            end_offsets: Arc::new(Mutex::new(HashMap::new())),
+            positions: Arc::new(Mutex::new(HashMap::new())),
+            pending_seeks: Arc::new(Mutex::new(HashMap::new())),
+            topic_ids: Arc::new(Mutex::new(HashMap::from([("orders".into(), TOPIC_ID)]))),
+            session_timeout: secs(45),
+            heartbeat_interval: secs(3),
+            assignor: Assignor::Range,
+            coordinator_shutdown: CancellationToken::new(),
+            coordinator_handle: None,
+            isolation_level: IsolationLevel::ReadUncommitted,
+            fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
+            fetch_max: DEFAULT_FETCH_MAX,
+            fetch_partition_max: DEFAULT_FETCH_PARTITION_MAX,
+            auto_offset_reset: AutoOffsetReset::Latest,
+        }
+    }
+
+    /// A Fetch v13 response row: the topic by id only, one partition with
+    /// `error_code`, no records and no leader hint.
+    fn fetch_response(error_code: i16) -> FetchResponse {
+        FetchResponse {
+            responses: vec![FetchableTopicResponse {
+                topic: String::new(),
+                topic_id: TOPIC_ID,
+                partitions: vec![PartitionData {
+                    partition_index: 0,
+                    error_code,
+                    high_watermark: -1,
+                    last_stable_offset: -1,
+                    log_start_offset: -1,
+                    diverging_epoch: EpochEndOffset {
+                        epoch: -1,
+                        end_offset: -1,
+                        ..Default::default()
+                    },
+                    current_leader: LeaderIdAndEpoch {
+                        leader_id: -1,
+                        leader_epoch: -1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// How one poll handled a partition error row.
+    #[derive(Debug, PartialEq)]
+    struct PollOutcome {
+        /// `Ok(record_count)`, `Err(Some(code))` for
+        /// `ConsumerError::Server(code)`, or `Err(None)` for any other error.
+        result: Result<usize, Option<i16>>,
+        metadata_requests: usize,
+        next_offset: Option<i64>,
+    }
+
+    /// Kafka's `FetchCollector.handleInitializeErrors` requests a metadata
+    /// update for 3, 6 and 100 and does not raise an error. The poll returns
+    /// no records, keeps the fetch position, and refreshes metadata. Any code
+    /// that Kafka does not handle fails the poll.
+    #[tokio::test]
+    async fn fetch_partition_errors_refresh_metadata_or_fail_the_poll() {
+        for (name, error_code, expected) in [
+            (
+                "unknown topic or partition",
+                3,
+                PollOutcome {
+                    result: Ok(0),
+                    metadata_requests: 1,
+                    next_offset: Some(5),
+                },
+            ),
+            (
+                "not leader or follower",
+                6,
+                PollOutcome {
+                    result: Ok(0),
+                    metadata_requests: 1,
+                    next_offset: Some(5),
+                },
+            ),
+            (
+                "unknown topic id",
+                100,
+                PollOutcome {
+                    result: Ok(0),
+                    metadata_requests: 1,
+                    next_offset: Some(5),
+                },
+            ),
+            (
+                "topic authorization failed",
+                29,
+                PollOutcome {
+                    result: Err(Some(29)),
+                    metadata_requests: 0,
+                    next_offset: Some(5),
+                },
+            ),
+        ] {
+            let metadata_requests = Arc::new(AtomicUsize::new(0));
+            let broker = metadata_counting_broker(Arc::clone(&metadata_requests)).await;
+            let mut consumer = consumer_on(&broker).await;
+            let topic_ids = consumer.topic_ids.lock().await.clone();
+
+            let result = consumer
+                .process_fetch_responses(vec![fetch_response(error_code)], &topic_ids)
+                .await
+                .map(|records| records.len())
+                .map_err(|error| match error {
+                    ConsumerError::Server(code) => Some(code),
+                    _ => None,
+                });
+            let outcome = PollOutcome {
+                result,
+                metadata_requests: metadata_requests.load(Ordering::SeqCst),
+                next_offset: consumer
+                    .next_offsets
+                    .lock()
+                    .await
+                    .get(&("orders".to_string(), 0))
+                    .copied(),
+            };
+
+            broker.stop();
+            check!(outcome == expected, "case {name}");
+        }
     }
 }

@@ -16,7 +16,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     consumer::{CommitIdentity, Consumer},
-    coordinator::{find_coordinator, is_retriable_transport_error, with_coordinator_refind},
+    coordinator::{
+        find_coordinator, is_retriable_transport_error, next_backoff, retry_deadline_elapsed,
+        with_coordinator_refind,
+    },
     error::ConsumerError,
     offset_wire::build_commit_topics,
     position::PartitionPosition,
@@ -25,6 +28,12 @@ use crate::{
 const ASYNC_COMMIT_IDLE: u8 = 0;
 const ASYNC_COMMIT_RUNNING: u8 = 1;
 const ASYNC_COMMIT_DIRTY: u8 = 2;
+
+/// `UNKNOWN_TOPIC_OR_PARTITION`: the coordinator does not know the topic.
+const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+/// `UNKNOWN_TOPIC_ID`: an `OffsetCommit` v10 topic id that the coordinator does
+/// not hold.
+const UNKNOWN_TOPIC_ID: i16 = 100;
 
 /// First non-zero per-partition `error_code` in an `OffsetCommitResponse`, or
 /// `0` if every partition committed cleanly.
@@ -137,7 +146,11 @@ fn build_commit_request(
 /// If the coordinator task has EXITED it can never republish a fresh
 /// generation, so deferral would silently never advance. This function then
 /// surfaces those codes as fatal, so the process restarts and rejoins from
-/// scratch. Any other non-zero code is always fatal.
+/// scratch.
+///
+/// `UNKNOWN_TOPIC_OR_PARTITION (3)` and `UNKNOWN_TOPIC_ID (100)` are retriable.
+/// The synchronous commit loop sends them again until the coordinator retry
+/// timeout elapses. Any other non-zero code is always fatal.
 #[cfg(test)]
 fn commit_response_result(
     resp: &OffsetCommitResponse,
@@ -153,6 +166,13 @@ enum CommitOutcome {
         code: i16,
         acknowledged: HashSet<(String, i32)>,
     },
+    /// The coordinator does not know the topic or the topic id of a partition.
+    /// Kafka's `CommitRequestManager` retries these codes until the commit
+    /// deadline.
+    Retriable {
+        code: i16,
+        acknowledged: HashSet<(String, i32)>,
+    },
 }
 
 fn commit_response_outcome(
@@ -161,6 +181,7 @@ fn commit_response_outcome(
     topic_names: &HashMap<WireUuid, String>,
 ) -> Result<CommitOutcome, ConsumerError> {
     let mut deferred = None;
+    let mut retriable = None;
     let mut acknowledged = HashSet::new();
     for topic in &resp.topics {
         let name = if topic.name.is_empty() {
@@ -179,13 +200,17 @@ fn commit_response_outcome(
                 code @ (22 | 25 | 27) if coordinator_alive => {
                     deferred.get_or_insert(code);
                 }
+                code @ (UNKNOWN_TOPIC_OR_PARTITION | UNKNOWN_TOPIC_ID) => {
+                    retriable.get_or_insert(code);
+                }
                 code => return Err(ConsumerError::Server(code)),
             }
         }
     }
-    Ok(match deferred {
-        Some(code) => CommitOutcome::Deferred { code, acknowledged },
-        None => CommitOutcome::Acked(acknowledged),
+    Ok(match (deferred, retriable) {
+        (Some(code), _) => CommitOutcome::Deferred { code, acknowledged },
+        (None, Some(code)) => CommitOutcome::Retriable { code, acknowledged },
+        (None, None) => CommitOutcome::Acked(acknowledged),
     })
 }
 
@@ -280,6 +305,8 @@ impl Consumer {
         &self,
         mut pending: HashMap<(String, i32), (i64, u64)>,
     ) -> Result<(), ConsumerError> {
+        let retry_start = tokio::time::Instant::now();
+        let mut retry_backoff = self.retry_policy.initial_backoff;
         loop {
             let identity = self.commit_identity.lock().await.clone();
             retain_continuously_owned(&mut pending, &identity.ownership_ids);
@@ -334,6 +361,27 @@ impl Consumer {
                             }
                         }
                     }
+                }
+                CommitOutcome::Retriable { code, acknowledged } => {
+                    // Kafka's `CommitRequestManager.commitSyncWithRetries` sends
+                    // the commit again while it fails with a retriable error and
+                    // the deadline has not passed. The next round reads
+                    // `topic_ids` again, so a topic id that a metadata refresh
+                    // replaced goes out on the resend.
+                    pending.retain(|partition, _| !acknowledged.contains(partition));
+                    if pending.is_empty() {
+                        return Ok(());
+                    }
+                    if retry_deadline_elapsed(retry_start, self.retry_policy.timeout) {
+                        return Err(ConsumerError::Server(code));
+                    }
+                    tracing::warn!(
+                        group = %self.group_id,
+                        error_code = code,
+                        "offset commit names a topic the coordinator does not know; retrying",
+                    );
+                    tokio::time::sleep(retry_backoff).await;
+                    retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
                 }
             }
         }
@@ -552,7 +600,10 @@ impl Consumer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicI32, AtomicUsize};
+    use std::{
+        sync::atomic::{AtomicI32, AtomicUsize},
+        time::Duration,
+    };
 
     use assert2::check;
     use krabka_client_core::{Client, MockBroker};
@@ -571,7 +622,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::{Assignor, AutoOffsetReset, IsolationLevel, consumer::ConsumerRetryPolicy};
+    use crate::{
+        Assignor, AutoOffsetReset, IsolationLevel, consumer::ConsumerRetryPolicy,
+        coordinator::CoordinatorRetryPolicy,
+    };
 
     fn response(errors: &[i16]) -> OffsetCommitResponse {
         OffsetCommitResponse {
@@ -757,6 +811,19 @@ mod tests {
             }
         })
         .await;
+        let consumer =
+            commit_consumer(&mock, commit_identity, assignment_changed, generation).await;
+        (consumer, mock, seen_offsets)
+    }
+
+    /// A consumer whose client talks to `mock`, which owns each partition of
+    /// `commit_identity` at next offset 12.
+    async fn commit_consumer(
+        mock: &MockBroker,
+        commit_identity: Arc<Mutex<CommitIdentity>>,
+        assignment_changed: Arc<tokio::sync::Notify>,
+        generation: Arc<AtomicI32>,
+    ) -> Consumer {
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
             .build()
@@ -769,7 +836,7 @@ mod tests {
             .cloned()
             .map(|partition| (partition, 12))
             .collect();
-        let consumer = Consumer {
+        Consumer {
             client,
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(0)),
@@ -798,8 +865,7 @@ mod tests {
             fetch_max: crate::poll::DEFAULT_FETCH_MAX,
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
             auto_offset_reset: AutoOffsetReset::Latest,
-        };
-        (consumer, mock, seen_offsets)
+        }
     }
 
     #[test]
@@ -1004,6 +1070,128 @@ mod tests {
                 Err(other) => panic!("case {name}: unexpected error {other:?}"),
             };
             check!(actual_error == expected_error, "case {name}");
+        }
+    }
+
+    #[test]
+    fn commit_partition_error_codes_map_to_kafka_commit_actions() {
+        for (name, errors, expected) in [
+            (
+                "unknown topic or partition is retriable",
+                &[0, 3][..],
+                Ok(CommitOutcome::Retriable {
+                    code: 3,
+                    acknowledged: HashSet::from([("topic".into(), 0)]),
+                }),
+            ),
+            ("not leader or follower is fatal", &[6][..], Err(6)),
+            (
+                "unknown topic id is retriable",
+                &[100][..],
+                Ok(CommitOutcome::Retriable {
+                    code: 100,
+                    acknowledged: HashSet::new(),
+                }),
+            ),
+            (
+                "rebalance deferral takes precedence over a retriable code",
+                &[100, 27][..],
+                Ok(CommitOutcome::Deferred {
+                    code: 27,
+                    acknowledged: HashSet::new(),
+                }),
+            ),
+            (
+                "fatal error takes precedence over a retriable code",
+                &[100, 42][..],
+                Err(42),
+            ),
+        ] {
+            let actual = commit_response_outcome(&response(errors), true, &HashMap::new()).map_err(
+                |error| match error {
+                    ConsumerError::Server(code) => code,
+                    other => panic!("case {name}: unexpected error {other:?}"),
+                },
+            );
+            check!(actual == expected, "case {name}");
+        }
+    }
+
+    /// `commit_offsets_sync` sends the commit again after a retriable topic
+    /// error and succeeds when the coordinator acks, as Kafka's
+    /// `CommitRequestManager.commitSyncWithRetries` does. A fatal code fails at
+    /// once, and a retriable code fails when the retry timeout has elapsed.
+    #[tokio::test]
+    async fn commit_sync_retries_unknown_topic_errors_until_the_deadline() {
+        for (name, responses, timeout, expected) in [
+            (
+                "unknown topic id then success",
+                vec![vec![100], vec![0]],
+                Duration::from_secs(5),
+                (Ok(()), 2),
+            ),
+            (
+                "unknown topic or partition then success",
+                vec![vec![3], vec![0]],
+                Duration::from_secs(5),
+                (Ok(()), 2),
+            ),
+            (
+                "not leader or follower fails at once",
+                vec![vec![6]],
+                Duration::from_secs(5),
+                (Err(Some(6)), 1),
+            ),
+            (
+                "unknown topic id past the deadline",
+                vec![vec![100]],
+                Duration::ZERO,
+                (Err(Some(100)), 1),
+            ),
+        ] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let requests_in_mock = Arc::clone(&requests);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(api_versions());
+                }
+                if api_key != offset_commit_request::API_KEY {
+                    return None;
+                }
+                let attempt = requests_in_mock.fetch_add(1, Ordering::SeqCst);
+                let errors = &responses[attempt.min(responses.len() - 1)];
+                Some(encode_response(&response(errors), version))
+            })
+            .await;
+            let mut consumer = commit_consumer(
+                &mock,
+                commit_identity(7, "member-a"),
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(AtomicI32::new(7)),
+            )
+            .await;
+            consumer.retry_policy = CoordinatorRetryPolicy {
+                timeout,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            };
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                consumer.commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)])),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("case {name}: commit never finished"))
+            .map_err(|error| match error {
+                ConsumerError::Server(code) => Some(code),
+                _ => None,
+            });
+
+            mock.stop();
+            check!(
+                (result, requests.load(Ordering::SeqCst)) == expected,
+                "case {name}"
+            );
         }
     }
 
