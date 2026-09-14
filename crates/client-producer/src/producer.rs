@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -80,10 +80,12 @@ pub(crate) struct TopicMetadata {
     pub topic_id: krabka_protocol::primitives::uuid::Uuid,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProducerIdentity {
     pub id: i64,
-    pub epoch: i16,
+    /// The idempotent producer epoch. The sender task shares it, and it raises
+    /// the epoch when Kafka's idempotent producer does.
+    pub epoch: Arc<AtomicI16>,
 }
 
 fn wake_sender_after_append(
@@ -308,7 +310,7 @@ impl Producer {
 
     #[must_use]
     pub fn producer_epoch(&self) -> i16 {
-        self.identity.epoch
+        self.identity.epoch.load(Ordering::Acquire)
     }
 
     /// Give the identity that the transaction coordinator minted for this
@@ -1388,7 +1390,7 @@ impl std::fmt::Debug for Producer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Producer")
             .field("producer_id", &self.identity.id)
-            .field("producer_epoch", &self.identity.epoch)
+            .field("producer_epoch", &self.producer_epoch())
             .field("transactional_id", &self.transactional_id)
             .field("compression", &self.compression)
             .finish_non_exhaustive()

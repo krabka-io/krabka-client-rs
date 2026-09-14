@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize},
+        atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize},
     },
     time::Duration,
 };
@@ -602,6 +602,7 @@ impl Producer {
         let partitioner = Arc::new(UniformStickyPartitioner::new());
         let flush_notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let producer_epoch = Arc::new(AtomicI16::new(producer_epoch));
 
         let txn_state = Arc::new(Mutex::new(TxnState::Uninitialized));
         let txn_recovery_required = Arc::new(AtomicBool::new(false));
@@ -613,7 +614,7 @@ impl Producer {
         let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
             transport: Box::new(ClientTransport::new(client.clone())),
             producer_id,
-            producer_epoch,
+            producer_epoch: Arc::clone(&producer_epoch),
             acks,
             compression,
             linger,
