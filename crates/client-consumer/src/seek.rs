@@ -78,10 +78,10 @@ impl Consumer {
         }
         let topic = topic.into();
         tracing::Span::current().record("topic", tracing::field::display(&topic));
-        self.pending_seeks
-            .lock()
-            .await
-            .insert((topic, partition), offset);
+        let key = (topic, partition);
+        self.pending_seeks.lock().await.insert(key.clone(), offset);
+        // The cached high watermark described the pre-seek position.
+        self.end_offsets.lock().await.remove(&key);
         Ok(())
     }
 
