@@ -23,7 +23,7 @@
 //! It keeps only what a deadlock can depend on: **which task holds which
 //! `tokio::sync::Mutex` and where each task is suspended.**
 //!
-//! ## The seven shared `tokio::sync::Mutex`es
+//! ## The eight shared `tokio::sync::Mutex`es
 //!
 //! `Consumer` declares them in `consumer.rs`, in the `Consumer` mutex fields,
 //! and shares them into `CoordinatorState` with `Arc::clone`:
@@ -37,6 +37,7 @@
 //! | 4  | `topic_ids`    | T      |
 //! | 5  | `commit_identity` | CI  |
 //! | 6  | `commit_serialization` | CS |
+//! | 7  | `end_offsets`  | E      |
 //!
 //! ## Modeled lock-holding regions (sequences where >1 guard is alive at once,
 //! plus single-lock regions for completeness). Citations are to the real code.
@@ -64,7 +65,8 @@
 //!   *second* at each per-partition site, that is **N→P every time** ("offsets
 //!   is already locked, positions acquired second"). VERIFIED: there is **no
 //!   P→N inversion** on the post-fetch path. N released before the metadata
-//!   refresh `.await`.
+//!   refresh `.await`. Updating the fetched high watermark adds **N→E**.
+//! - `at_log_end` (consumer.rs): **A→N→E**.
 //!
 //! ### coordinator task (`coordinator.rs`)
 //! - `rejoin`: A alone for assignment snapshots. `publish_assignment` holds
@@ -89,7 +91,7 @@
 //! ## The lock hierarchy these regions imply
 //!
 //! Collecting every "hold L1 while acquiring L2" edge actually observed:
-//!   PS → N, N → P, A → CI, CS → CI, CI → N, CS → P, CS → T.
+//!   PS → N, N → P, N → E, A → N, A → CI, CS → CI, CI → N, CS → P, CS → T.
 //! The resulting partial order is acyclic: `A < CI < N < P`,
 //! `CS < CI < N < P`, `PS < N < P`, and `CS < T`.
 //! This is acyclic ⇒ the prediction is **deadlock-free**, and the model proves
@@ -108,7 +110,8 @@ const P: u8 = 3; // positions
 const T: u8 = 4; // topic_ids
 const CI: u8 = 5; // commit_identity
 const CS: u8 = 6; // commit_serialization
-const NUM_LOCKS: usize = 7;
+const E: u8 = 7; // end_offsets
+const NUM_LOCKS: usize = 8;
 
 /// A single lock operation in a task's program. `Acquire` is a suspension
 /// point, a `.lock().await`. `Release` drops a guard at the end of a scope or
@@ -231,7 +234,20 @@ fn poll_program() -> Vec<Op> {
         Acquire(N),
         Acquire(P),
         Release(P),
+        Acquire(E),
+        Release(E),
         Release(N),
+    ]
+}
+
+fn at_log_end_program() -> Vec<Op> {
+    vec![
+        Acquire(A),
+        Acquire(N),
+        Acquire(E),
+        Release(E),
+        Release(N),
+        Release(A),
     ]
 }
 
@@ -472,6 +488,7 @@ mod tests {
     fn classic_consumer_lock_protocol_is_deadlock_free() {
         let checker = run_model(vec![
             ("poll", poll_program()),
+            ("at-log-end", at_log_end_program()),
             ("coordinator", coordinator_program()),
             ("commit-sync", commit_program()),
             ("commit-async", async_commit_program()),

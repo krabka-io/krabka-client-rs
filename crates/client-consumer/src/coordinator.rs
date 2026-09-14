@@ -379,6 +379,7 @@ pub(crate) struct CoordinatorState {
     pub assignment_changed: Arc<Notify>,
     pub next_ownership_id: u64,
     pub next_offsets: Arc<Mutex<HashMap<(String, i32), i64>>>,
+    pub end_offsets: Arc<Mutex<HashMap<(String, i32), i64>>>,
     pub positions: Arc<Mutex<HashMap<(String, i32), crate::position::PartitionPosition>>>,
     pub topic_ids: Arc<Mutex<HashMap<String, WireUuid>>>,
     pub session_timeout: Time,
@@ -434,6 +435,9 @@ async fn publish_assignment(
     identity.member_id.clone_from(&state.member_id);
     drop(identity);
     drop(assigned);
+    // A high watermark belongs to an ownership snapshot.  Re-learn it from
+    // the next successful fetch after any assignment publication.
+    state.end_offsets.lock().await.clear();
     state.next_ownership_id = next_id;
     set_generation(state, generation_id);
     state.assignment_changed.notify_waiters();
@@ -1547,6 +1551,7 @@ mod retry_tests {
             assignment_changed: Arc::new(Notify::new()),
             next_ownership_id: 1,
             next_offsets: Arc::new(Mutex::new(HashMap::new())),
+            end_offsets: Arc::new(Mutex::new(HashMap::new())),
             positions: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
             session_timeout: secs(45),

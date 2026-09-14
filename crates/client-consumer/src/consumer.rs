@@ -1348,6 +1348,7 @@ async fn spawn_consumer(
         assignment_changed: Arc::clone(&assignment_changed),
         next_ownership_id,
         next_offsets: Arc::clone(&next_offsets),
+        end_offsets: Arc::clone(&end_offsets),
         positions: Arc::clone(&positions),
         topic_ids: Arc::clone(&topic_ids),
         session_timeout,
@@ -2279,6 +2280,9 @@ mod security_arg_tests {
             .await
             .insert(("orders".into(), 0), 12);
         assert2::assert!(consumer.at_log_end().await);
+
+        consumer.seek("orders", 0, 0).await.unwrap();
+        assert2::assert!(!consumer.at_log_end().await);
     }
 
     /// Regression: the generation that the commit path stamps must track the
