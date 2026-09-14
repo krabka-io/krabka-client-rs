@@ -1410,6 +1410,7 @@ mod tests {
         txn_offset_commit_requests: usize,
         coordinator_lookups: usize,
         abortable_error: Option<i16>,
+        state: TxnState,
     }
 
     /// Kafka's `AddOffsetsToTxnHandler` and `TxnOffsetCommitHandler` send the
@@ -1428,7 +1429,8 @@ mod tests {
             group_instance_id: None,
         };
         // (name, add offsets script, offset commit script, result, add offsets
-        // requests, offset commit requests, coordinator lookups, abortable)
+        // requests, offset commit requests, coordinator lookups, abortable,
+        // transaction state)
         let cases = [
             (
                 "committed",
@@ -1439,6 +1441,7 @@ mod tests {
                 1,
                 1,
                 None,
+                TxnState::InTransaction,
             ),
             (
                 "add offsets loading, then committed",
@@ -1449,6 +1452,7 @@ mod tests {
                 1,
                 1,
                 None,
+                TxnState::InTransaction,
             ),
             (
                 "add offsets moved, then committed",
@@ -1459,6 +1463,7 @@ mod tests {
                 1,
                 2,
                 None,
+                TxnState::InTransaction,
             ),
             (
                 "add offsets lost, then committed",
@@ -1469,6 +1474,7 @@ mod tests {
                 1,
                 2,
                 None,
+                TxnState::InTransaction,
             ),
             (
                 "add offsets fenced",
@@ -1479,6 +1485,7 @@ mod tests {
                 0,
                 0,
                 None,
+                TxnState::Fenced,
             ),
             (
                 "add offsets abortable",
@@ -1489,6 +1496,7 @@ mod tests {
                 0,
                 0,
                 Some(120),
+                TxnState::InTransaction,
             ),
             (
                 "add offsets refused",
@@ -1499,6 +1507,7 @@ mod tests {
                 0,
                 0,
                 None,
+                TxnState::InTransaction,
             ),
             (
                 "offset commit unknown topic, then committed",
@@ -1509,6 +1518,7 @@ mod tests {
                 2,
                 1,
                 None,
+                TxnState::InTransaction,
             ),
             (
                 "offset commit timed out, then committed",
@@ -1519,6 +1529,7 @@ mod tests {
                 2,
                 2,
                 None,
+                TxnState::InTransaction,
             ),
             (
                 "offset commit moved, then committed",
@@ -1529,6 +1540,7 @@ mod tests {
                 2,
                 2,
                 None,
+                TxnState::InTransaction,
             ),
             (
                 "offset commit group metadata mismatch",
@@ -1539,6 +1551,7 @@ mod tests {
                 1,
                 1,
                 Some(22),
+                TxnState::InTransaction,
             ),
             (
                 "offset commit fenced",
@@ -1549,6 +1562,7 @@ mod tests {
                 1,
                 1,
                 None,
+                TxnState::Fenced,
             ),
         ];
         for (
@@ -1560,6 +1574,7 @@ mod tests {
             txn_offset_commit_requests,
             coordinator_lookups,
             abortable_error,
+            expected_state,
         ) in cases
         {
             let (mock, producer, coordinator) = scripted_producer(Coordinator {
@@ -1575,6 +1590,7 @@ mod tests {
             let outcome = producer
                 .send_offsets_to_transaction([(("topic".to_owned(), 0), 42)], &group)
                 .await;
+            let state = *producer.txn_state.lock().await;
             drop(transaction);
             let actual = {
                 let coordinator = coordinator.lock().expect("scripted coordinator");
@@ -1584,6 +1600,7 @@ mod tests {
                     txn_offset_commit_requests: coordinator.txn_offset_commit.requests,
                     coordinator_lookups: coordinator.find_coordinator_requests,
                     abortable_error: producer.txn_abortable_error.get(),
+                    state,
                 }
             };
             let expected = ScriptedSendOffsets {
@@ -1592,6 +1609,7 @@ mod tests {
                 txn_offset_commit_requests,
                 coordinator_lookups,
                 abortable_error,
+                state: expected_state,
             };
             assert2::assert!(actual == expected, "{name}");
             mock.stop();

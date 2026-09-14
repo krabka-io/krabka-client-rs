@@ -98,7 +98,8 @@ struct CoordinatorRetry {
 
 impl CoordinatorRetry {
     /// Wait before the next attempt, and give `false` when the deadline has
-    /// passed. The wait doubles up to the maximum backoff.
+    /// passed. The wait doubles up to the maximum backoff. A wait that reaches
+    /// the deadline gives `false`, so no attempt starts after it.
     async fn wait(&mut self) -> bool {
         let remaining = self
             .deadline
@@ -108,15 +109,28 @@ impl CoordinatorRetry {
         }
         tokio::time::sleep(self.backoff.min(remaining)).await;
         self.backoff = self.backoff.saturating_mul(2).min(self.max_backoff);
-        true
+        tokio::time::Instant::now() < self.deadline
     }
+}
+
+/// Whether a request can have reached the broker, so the producer can send it
+/// again. A failure before the send, such as a version error or a codec error,
+/// repeats on every attempt, so the caller reports it at once.
+fn request_may_have_reached_the_broker(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Disconnected | ClientError::Timeout(_) | ClientError::Io(_)
+    )
 }
 
 /// The partition error code that decides a `TxnOffsetCommit` answer.
 ///
-/// A code that no rule retries decides the answer, even when an earlier row
-/// carries a retriable code. Kafka's `TxnOffsetCommitHandler` also leaves the
-/// loop at such a row, and it retries only when every failed row is retriable.
+/// A code that no rule retries decides the answer, wherever its row is.
+/// Kafka's `TxnOffsetCommitHandler` leaves its loop at such a row, and it
+/// sends the request again only when every failed row is retriable. Among
+/// retriable rows, a row that asks for the coordinator again wins, because one
+/// such row makes Kafka's handler look the coordinator up for the whole
+/// request.
 fn txn_offset_commit_error_code(response: &TxnOffsetCommitResponse) -> i16 {
     let codes = response
         .topics
@@ -128,19 +142,20 @@ fn txn_offset_commit_error_code(response: &TxnOffsetCommitResponse) -> i16 {
                 .map(|partition| partition.error_code)
         })
         .filter(|code| *code != 0);
-    let mut first = 0;
+    let mut rediscover = None;
+    let mut resend = None;
     for code in codes {
-        if !matches!(
-            txn_retry::decide_txn_offset_commit(CoordinatorAttempt::Answered(code)),
-            TxnRequestDecision::Retry { .. }
-        ) {
-            return code;
-        }
-        if first == 0 {
-            first = code;
+        match txn_retry::decide_txn_offset_commit(CoordinatorAttempt::Answered(code)) {
+            TxnRequestDecision::Retry { rediscover: true } => {
+                rediscover.get_or_insert(code);
+            }
+            TxnRequestDecision::Retry { rediscover: false } => {
+                resend.get_or_insert(code);
+            }
+            _ => return code,
         }
     }
-    first
+    rediscover.or(resend).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1199,11 +1214,14 @@ impl Producer {
                     CoordinatorAttempt::Answered(response.error_code),
                     ProducerError::Server(response.error_code),
                 ),
-                Err(error) => (CoordinatorAttempt::Lost, ProducerError::Client(error)),
+                Err(error) if request_may_have_reached_the_broker(&error) => {
+                    (CoordinatorAttempt::Lost, ProducerError::Client(error))
+                }
+                Err(error) => return Err(ProducerError::Client(error)),
             };
             let rediscover = match txn_retry::decide_add_offsets_to_txn(attempt) {
                 TxnRequestDecision::Done => return Ok(()),
-                TxnRequestDecision::Fenced => return Err(ProducerError::FencedProducer),
+                TxnRequestDecision::Fenced => return Err(self.fence_transaction().await),
                 TxnRequestDecision::Abortable(code) => return Err(self.abortable_error(code)),
                 TxnRequestDecision::Refused(code) => return Err(ProducerError::Server(code)),
                 TxnRequestDecision::Retry { rediscover } => rediscover,
@@ -1258,11 +1276,14 @@ impl Producer {
                         ProducerError::Server(code),
                     )
                 }
-                Err(error) => (CoordinatorAttempt::Lost, ProducerError::Client(error)),
+                Err(error) if request_may_have_reached_the_broker(&error) => {
+                    (CoordinatorAttempt::Lost, ProducerError::Client(error))
+                }
+                Err(error) => return Err(ProducerError::Client(error)),
             };
             let rediscover = match txn_retry::decide_txn_offset_commit(attempt) {
                 TxnRequestDecision::Done => return Ok(()),
-                TxnRequestDecision::Fenced => return Err(ProducerError::FencedProducer),
+                TxnRequestDecision::Fenced => return Err(self.fence_transaction().await),
                 TxnRequestDecision::Abortable(code) => return Err(self.abortable_error(code)),
                 TxnRequestDecision::Refused(code) => return Err(ProducerError::Server(code)),
                 TxnRequestDecision::Retry { rediscover } => rediscover,
@@ -1275,6 +1296,9 @@ impl Producer {
                     Ok(fresh) => group_client = fresh,
                     Err(error) => {
                         tracing::warn!(%error, "group coordinator lookup failed; retrying");
+                        // `FindCoordinator` goes out on the bootstrap
+                        // connection, which the same restart can have closed.
+                        self.client.reconnect_bootstrap().await;
                     }
                 }
             }
@@ -1335,6 +1359,16 @@ impl Producer {
                 current
             }
         }
+    }
+
+    /// Mark the transaction fenced, and give the error to report. A newer
+    /// epoch owns the transactional id, so no request of this producer can
+    /// change the transaction. Kafka's `TransactionManager.fatalError` leaves
+    /// the producer in the same place.
+    async fn fence_transaction(&self) -> ProducerError {
+        *self.txn_state.lock().await = TxnState::Fenced;
+        self.resolve_transaction_guard();
+        ProducerError::FencedProducer
     }
 
     /// Record `code` as the error that only an abort can clear, and give the
@@ -1738,7 +1772,11 @@ mod tests {
         },
     };
 
-    use super::{DrainIntent, Producer, minted_identity, wake_sender_after_append};
+    use super::{
+        DrainIntent, Producer, TxnOffsetCommitResponse, minted_identity,
+        request_may_have_reached_the_broker, txn_offset_commit_error_code,
+        wake_sender_after_append,
+    };
     use crate::{
         accumulator::{Accumulator, AppendResult},
         error::ProducerError,
@@ -2037,5 +2075,87 @@ mod tests {
             .expect("flush must not wait for another notification")
             .expect("empty producer flushes");
         mock.stop();
+    }
+
+    /// A `TxnOffsetCommit` answer of several rows gives one code. A code that
+    /// no rule retries wins. Among retriable rows, a row that asks for the
+    /// coordinator again wins, because Kafka's `TxnOffsetCommitHandler` looks
+    /// the coordinator up for the whole request at such a row.
+    #[test]
+    fn txn_offset_commit_reads_the_code_that_decides_the_answer() {
+        use krabka_protocol::owned::txn_offset_commit_response::{
+            TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic,
+        };
+        let response = |codes: &[i16]| TxnOffsetCommitResponse {
+            topics: vec![TxnOffsetCommitResponseTopic {
+                name: "topic".into(),
+                partitions: codes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, error_code)| TxnOffsetCommitResponsePartition {
+                        partition_index: i32::try_from(index).expect("partition index"),
+                        error_code: *error_code,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (name, codes, expected) in [
+            ("every row committed", &[0, 0][..], 0),
+            ("one retriable row", &[0, 14][..], 14),
+            ("the coordinator moved", &[14, 16][..], 16),
+            ("a timed out row asks for the coordinator", &[3, 7][..], 7),
+            ("a code that no rule retries wins", &[16, 48][..], 48),
+            ("an abortable code wins", &[14, 22][..], 22),
+            ("the first row that resends stands", &[3, 14][..], 3),
+        ] {
+            assert2::assert!(
+                txn_offset_commit_error_code(&response(codes)) == expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// The producer sends a coordinator request again only when the request
+    /// can have reached the broker. A failure before the send repeats on every
+    /// attempt.
+    #[test]
+    fn only_a_transport_failure_can_have_reached_the_broker() {
+        use krabka_client_core::ClientError;
+        use krabka_units::secs;
+        for (name, error, expected) in [
+            ("closed connection", ClientError::Disconnected, true),
+            ("request timeout", ClientError::Timeout(secs(1)), true),
+            (
+                "io failure",
+                ClientError::Io(std::io::Error::other("broken pipe")),
+                true,
+            ),
+            (
+                "incompatible version",
+                ClientError::IncompatibleVersion {
+                    api_key: 25,
+                    broker_min: 4,
+                    broker_max: 5,
+                    client_min: 0,
+                    client_max: 3,
+                },
+                false,
+            ),
+            (
+                "no coordinator",
+                ClientError::NoCoordinator {
+                    key: "group-a".into(),
+                },
+                false,
+            ),
+        ] {
+            assert2::assert!(
+                request_may_have_reached_the_broker(&error) == expected,
+                "{name}"
+            );
+        }
     }
 }
