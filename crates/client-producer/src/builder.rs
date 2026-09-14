@@ -9,15 +9,19 @@ use std::{
     time::Duration,
 };
 
+use bytes::BufMut;
 use dashmap::DashMap;
 use krabka_client_core::{
     Client, ClientDnsTimeout, ClientError, ClientFrameMax, ConnectionDispatchQueueCapacity,
     DEFAULT_CLIENT_DNS_TIMEOUT, DEFAULT_CLIENT_FRAME_MAX,
     DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY,
 };
-use krabka_protocol::owned::{
-    init_producer_id_request::InitProducerIdRequest,
-    init_producer_id_response::InitProducerIdResponse,
+use krabka_protocol::{
+    Encode, ProtocolError, ProtocolRequest,
+    owned::{
+        init_producer_id_request::{self, InitProducerIdRequest},
+        init_producer_id_response::InitProducerIdResponse,
+    },
 };
 use krabka_units::{
     ByteSize, Time,
@@ -46,6 +50,39 @@ const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
 const COORDINATOR_NOT_AVAILABLE: i16 = 15;
 const NOT_COORDINATOR: i16 = 16;
 const INIT_PRODUCER_ID_2PC_MIN_VERSION: i16 = 6;
+/// The last released `InitProducerId` version.
+const INIT_PRODUCER_ID_STABLE_MAX_VERSION: i16 = 5;
+
+/// An `InitProducerId` request that negotiates released versions only.
+///
+/// `InitProducerIdRequest.json` marks v6 (KIP-939) as
+/// `"latestVersionUnstable": true`. Apache Kafka's producer builds the request
+/// with `InitProducerIdRequest.Builder(data)`, which calls
+/// `AbstractRequest.Builder(ApiKeys.INIT_PRODUCER_ID)`. That constructor uses
+/// `latestVersion(false)`, which leaves out the unstable v6. The generated
+/// `InitProducerIdRequest` allows v6, so this type gives the cap to version
+/// negotiation. A request that needs the two-phase commit fields still sends
+/// v6.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StableInitProducerId(InitProducerIdRequest);
+
+impl Encode for StableInitProducerId {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl ProtocolRequest for StableInitProducerId {
+    const API_KEY: i16 = init_producer_id_request::API_KEY;
+    const MIN_VERSION: i16 = init_producer_id_request::MIN_VERSION;
+    const MAX_VERSION: i16 = INIT_PRODUCER_ID_STABLE_MAX_VERSION;
+    const FLEXIBLE_MIN: i16 = init_producer_id_request::FLEXIBLE_MIN;
+    type Response = InitProducerIdResponse;
+}
 
 /// Default producer compression.
 pub const DEFAULT_PRODUCER_COMPRESSION: Compression = Compression::None;
@@ -415,7 +452,7 @@ pub(crate) async fn init_producer_id_with_retry(
                     .send_at_least(request.clone(), INIT_PRODUCER_ID_2PC_MIN_VERSION)
                     .await
             } else {
-                client.send(request.clone()).await
+                client.send(StableInitProducerId(request.clone())).await
             }
         })
         .await
@@ -698,11 +735,11 @@ mod security_arg_tests {
         security::{ClientSecurity, SaslCredentials},
     };
     use krabka_protocol::{
-        Encode,
+        Decode,
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
-            init_producer_id_request,
+            init_producer_id_response,
         },
     };
     use krabka_security::ListenerProtocol;
@@ -1273,6 +1310,102 @@ mod security_arg_tests {
                 })
             ));
             assert2::assert!(attempts.load(Ordering::Relaxed) == 0, "{name}");
+            mock.stop();
+        }
+    }
+
+    /// A request without the two-phase commit fields negotiates v5 at most, as
+    /// Kafka's producer does. A two-phase commit request still sends v6.
+    #[tokio::test]
+    async fn init_producer_id_sends_the_unstable_version_only_for_two_phase_commit() {
+        const CLIENT_ID: &str = "p";
+        let transactional = InitProducerIdRequest {
+            transactional_id: Some("txn".into()),
+            transaction_timeout_ms: 60_000,
+            ..Default::default()
+        };
+        let two_phase = InitProducerIdRequest {
+            enable2_pc: true,
+            ..transactional.clone()
+        };
+        let cases = [
+            (
+                "idempotent, broker max 3",
+                build_init_producer_id_request(),
+                3,
+                3,
+            ),
+            (
+                "idempotent, broker max 5",
+                build_init_producer_id_request(),
+                5,
+                5,
+            ),
+            (
+                "idempotent, broker max 6",
+                build_init_producer_id_request(),
+                6,
+                5,
+            ),
+            ("transactional, broker max 6", transactional, 6, 5),
+            ("two-phase commit, broker max 6", two_phase, 6, 6),
+        ];
+        for (name, request, broker_max, expected_version) in cases {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let handler_seen = Arc::clone(&seen);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(encode_v0(&ApiVersionsResponse {
+                        api_keys: vec![ApiVersion {
+                            api_key: init_producer_id_request::API_KEY,
+                            min_version: 0,
+                            max_version: broker_max,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }));
+                }
+                if api_key == init_producer_id_request::API_KEY {
+                    let flexible = version >= init_producer_id_request::FLEXIBLE_MIN;
+                    let mut request_body = &body[2 + CLIENT_ID.len() + usize::from(flexible)..];
+                    let decoded = InitProducerIdRequest::decode(&mut request_body, version)
+                        .expect("decode InitProducerId");
+                    handler_seen.lock().unwrap().push((version, decoded));
+                    let mut response = BytesMut::new();
+                    if version >= init_producer_id_response::FLEXIBLE_MIN {
+                        response.extend_from_slice(&[0]);
+                    }
+                    InitProducerIdResponse {
+                        producer_id: 1,
+                        ..Default::default()
+                    }
+                    .encode(&mut response, version)
+                    .expect("encode InitProducerId response");
+                    return Some(response.to_vec());
+                }
+                None
+            })
+            .await;
+            let client = Client::builder()
+                .bootstrap(mock.addr.to_string())
+                .client_id(CLIENT_ID)
+                .request_timeout(millis(500))
+                .build()
+                .await
+                .unwrap();
+
+            init_producer_id_with_retry(
+                &client,
+                request.clone(),
+                millis(500),
+                millis(1),
+                millis(1),
+            )
+            .await
+            .expect(name);
+
+            let sent = seen.lock().unwrap().clone();
+            assert2::assert!(sent == vec![(expected_version, request)], "{name}");
             mock.stop();
         }
     }
