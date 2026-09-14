@@ -1,23 +1,26 @@
 //! KIP-516 offset wire-shape helpers.
 //!
-//! The broker advertises `OffsetCommit` v10 and `OffsetFetch` v8+, so the
-//! client negotiates up to those versions. At v8+ `OffsetFetch` carries a
-//! per-group `groups[]` array, and the legacy `group_id` + `topics` fields are
-//! v0-7 only. At v10 both APIs key topics by `topic_id` instead of by name.
+//! The consumer sends `OffsetFetch` at v9 or lower, where each topic has its
+//! name. Apache Kafka's classic `ConsumerCoordinator.sendOffsetFetchRequest`
+//! builds the request with `OffsetFetchRequest.Builder.forTopicNames`, which
+//! caps the version at 9. At v8+ `OffsetFetch` carries a per-group `groups[]`
+//! array, and the legacy `group_id` + `topics` fields are v0-7 only.
 //!
-//! These builders populate BOTH the legacy and the new fields. The codegen
+//! The builders populate BOTH the legacy and the new fields. The codegen
 //! encodes only the set that is valid for the negotiated version, so one
 //! request works regardless of what the broker negotiated. The parser flattens
-//! an `OffsetFetch` response across either shape and resolves `topic_id` back
-//! to a name, because the wire drops the name at v10.
+//! an `OffsetFetch` response across either shape. At v10 `OffsetCommit` keys
+//! topics by `topic_id` instead of by name.
 
 use std::collections::{BTreeSet, HashMap};
 
+use bytes::BufMut;
 use krabka_protocol::{
+    Encode, ProtocolError, ProtocolRequest,
     owned::{
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
         offset_fetch_request::{
-            OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic,
+            self, OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic,
             OffsetFetchRequestTopics,
         },
         offset_fetch_response::OffsetFetchResponse,
@@ -27,11 +30,44 @@ use krabka_protocol::{
 
 use crate::coordinator::{COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR};
 
-/// Build an `OffsetFetch` request that covers `by_topic` and is valid at any
-/// negotiated version.
+/// An `OffsetFetch` request that names its topics, capped at v9.
+///
+/// `OffsetFetch` v10 names each topic by id only. Apache Kafka's classic
+/// `ConsumerCoordinator.sendOffsetFetchRequest` uses
+/// `OffsetFetchRequest.Builder.forTopicNames`, which allows
+/// `ApiKeys.OFFSET_FETCH.oldestVersion()` to `TOPIC_ID_MIN_VERSION - 1` (9).
+/// This type gives the same range to version negotiation. When the coordinator
+/// supports only v10 or higher, the send fails with
+/// `ClientError::IncompatibleVersion` before the request goes out. Kafka's
+/// builder fails with `UnsupportedVersionException` in that case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TopicNameOffsetFetch(pub(crate) OffsetFetchRequest);
+
+impl Encode for TopicNameOffsetFetch {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl ProtocolRequest for TopicNameOffsetFetch {
+    const API_KEY: i16 = offset_fetch_request::API_KEY;
+    const MIN_VERSION: i16 = offset_fetch_request::MIN_VERSION;
+    /// The last `OffsetFetch` version that carries topic names.
+    const MAX_VERSION: i16 = 9;
+    const FLEXIBLE_MIN: i16 = offset_fetch_request::FLEXIBLE_MIN;
+    type Response = OffsetFetchResponse;
+}
+
+/// Build an `OffsetFetch` request that covers `by_topic` and is valid at each
+/// version from v1 to v9.
 ///
 /// This function populates both the legacy `group_id`/`topics` fields for v0-7
-/// and the v8+ `groups[]` array, which carries `topic_id` for v10.
+/// and the v8+ `groups[]` array. Each topic has its name and no topic id, as
+/// in Kafka's `ConsumerCoordinator.sendOffsetFetchRequest`.
 ///
 /// The request sets `require_stable`, as Apache Kafka's consumers do
 /// (`CommitRequestManager.OffsetFetchRequestState.toUnsentRequest` and
@@ -44,8 +80,7 @@ use crate::coordinator::{COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR};
 pub(crate) fn build_offset_fetch(
     group_id: &str,
     by_topic: &HashMap<String, Vec<i32>>,
-    topic_ids: &HashMap<String, WireUuid>,
-) -> OffsetFetchRequest {
+) -> TopicNameOffsetFetch {
     let legacy_topics: Vec<OffsetFetchRequestTopic> = by_topic
         .iter()
         .map(|(name, parts)| OffsetFetchRequestTopic {
@@ -58,12 +93,11 @@ pub(crate) fn build_offset_fetch(
         .iter()
         .map(|(name, parts)| OffsetFetchRequestTopics {
             name: name.clone(),
-            topic_id: topic_ids.get(name).copied().unwrap_or_default(),
             partition_indexes: parts.clone(),
             ..Default::default()
         })
         .collect();
-    OffsetFetchRequest {
+    TopicNameOffsetFetch(OffsetFetchRequest {
         group_id: group_id.to_string(),
         topics: Some(legacy_topics),
         groups: vec![OffsetFetchRequestGroup {
@@ -73,19 +107,14 @@ pub(crate) fn build_offset_fetch(
         }],
         require_stable: true,
         ..Default::default()
-    }
+    })
 }
 
 /// Flatten an `OffsetFetch` response into `(topic_name, partition,
 /// committed_offset, committed_leader_epoch)` tuples.
 ///
-/// v8+ data lives in `groups`, and v0-7 data lives in `topics`. At v10 the
-/// per-topic name is empty, so this function resolves it from `topic_id` with
-/// `id_to_name`.
-pub(crate) fn parse_offset_fetch(
-    resp: &OffsetFetchResponse,
-    id_to_name: &HashMap<WireUuid, String>,
-) -> Vec<(String, i32, i64, i32)> {
+/// v8 and v9 data lives in `groups`, and v0-7 data lives in `topics`.
+pub(crate) fn parse_offset_fetch(resp: &OffsetFetchResponse) -> Vec<(String, i32, i64, i32)> {
     let mut out = Vec::new();
     if resp.groups.is_empty() {
         for t in &resp.topics {
@@ -101,14 +130,9 @@ pub(crate) fn parse_offset_fetch(
     } else {
         for g in &resp.groups {
             for t in &g.topics {
-                let name = if t.name.is_empty() {
-                    id_to_name.get(&t.topic_id).cloned().unwrap_or_default()
-                } else {
-                    t.name.clone()
-                };
                 for p in &t.partitions {
                     out.push((
-                        name.clone(),
+                        t.name.clone(),
                         p.partition_index,
                         p.committed_offset,
                         p.committed_leader_epoch,
@@ -172,12 +196,9 @@ pub(crate) enum OffsetFetchAction {
 /// then 88 makes it retriable, then 3 and 100 make it retriable with partial
 /// results.
 ///
-/// v8+ data lives in `groups`, and v0-7 data lives in the top-level fields. At
-/// v10 the topic name is empty, so `id_to_name` resolves it from `topic_id`.
-pub(crate) fn classify_offset_fetch(
-    resp: &OffsetFetchResponse,
-    id_to_name: &HashMap<WireUuid, String>,
-) -> OffsetFetchAction {
+/// v8 and v9 data lives in `groups`, and v0-7 data lives in the top-level
+/// fields.
+pub(crate) fn classify_offset_fetch(resp: &OffsetFetchResponse) -> OffsetFetchAction {
     let group_error = std::iter::once(resp.error_code)
         .chain(resp.groups.iter().map(|g| g.error_code))
         .find(|code| *code != 0);
@@ -191,12 +212,9 @@ pub(crate) fn classify_offset_fetch(
             .map(move |p| (t.name.as_str(), p.error_code))
     });
     let grouped = resp.groups.iter().flat_map(|g| &g.topics).flat_map(|t| {
-        let name = if t.name.is_empty() {
-            id_to_name.get(&t.topic_id).map_or("", String::as_str)
-        } else {
-            t.name.as_str()
-        };
-        t.partitions.iter().map(move |p| (name, p.error_code))
+        t.partitions
+            .iter()
+            .map(move |p| (t.name.as_str(), p.error_code))
     });
     let mut unauthorized_topics = BTreeSet::new();
     let mut unstable = false;
@@ -273,20 +291,6 @@ fn is_retriable_error(code: i16) -> bool {
     )
 }
 
-/// The `topic_id → name` map of the topics in an `OffsetFetch` request.
-///
-/// A v10 response names topics by id only. Kafka's `OffsetFetchRequestState`
-/// keeps the same map (`topicNamesCache`) when it builds the request.
-pub(crate) fn request_topic_names(request: &OffsetFetchRequest) -> HashMap<WireUuid, String> {
-    request
-        .groups
-        .iter()
-        .flat_map(|g| g.topics.iter().flatten())
-        .filter(|t| t.topic_id != WireUuid::ZERO)
-        .map(|t| (t.topic_id, t.name.clone()))
-        .collect()
-}
-
 /// Build the `topics` for an `OffsetCommit` and tag each one with its
 /// `topic_id`.
 ///
@@ -322,7 +326,8 @@ pub(crate) fn build_commit_topics(
 }
 
 /// Build the `topic_id → name` reverse map from the consumer's `name →
-/// topic_id` table. The parser uses it to resolve `OffsetFetch` v10 responses.
+/// topic_id` table. The fetch path uses it to resolve `Fetch` v13+ responses,
+/// which name each topic by id only.
 pub(crate) fn id_to_name(topic_ids: &HashMap<String, WireUuid>) -> HashMap<WireUuid, String> {
     topic_ids.iter().map(|(n, id)| (*id, n.clone())).collect()
 }
@@ -350,13 +355,11 @@ mod tests {
     fn build_offset_fetch_populates_legacy_and_groups() {
         let mut by_topic = HashMap::new();
         by_topic.insert("t".to_string(), vec![0, 1]);
-        let mut ids = HashMap::new();
-        ids.insert("t".to_string(), id(7));
 
-        let req = build_offset_fetch("g", &by_topic, &ids);
-        // Legacy single-group fields (v0-7) AND v8+ groups[] with topic_id (v10).
+        let req = build_offset_fetch("g", &by_topic);
+        // Legacy single-group fields (v0-7) AND v8+ groups[] by topic name.
         assert2::assert!(
-            req == OffsetFetchRequest {
+            req == TopicNameOffsetFetch(OffsetFetchRequest {
                 group_id: "g".to_string(),
                 topics: Some(vec![OffsetFetchRequestTopic {
                     name: "t".to_string(),
@@ -369,7 +372,7 @@ mod tests {
                     member_epoch: -1,
                     topics: Some(vec![OffsetFetchRequestTopics {
                         name: "t".to_string(),
-                        topic_id: id(7),
+                        topic_id: WireUuid::ZERO,
                         partition_indexes: vec![0, 1],
                         unknown_tagged_fields: UnknownTaggedFields(vec![]),
                     }]),
@@ -377,12 +380,21 @@ mod tests {
                 }],
                 require_stable: true,
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
-            }
+            })
         );
     }
 
-    /// A v10 response for group `g`. Each row is `(topic id byte, partition
-    /// error code)`.
+    /// The topic name of `n` in the `grouped` rows.
+    fn topic_name(n: u8) -> String {
+        match n {
+            1 => "orders".into(),
+            2 => "payments".into(),
+            _ => "shipments".into(),
+        }
+    }
+
+    /// A v8 or v9 response for group `g`. Each row is `(topic number, partition
+    /// error code)`, and `topic_name` gives the name of the topic number.
     fn grouped(group_error: i16, rows: &[(u8, i16)]) -> OffsetFetchResponse {
         OffsetFetchResponse {
             groups: vec![OffsetFetchResponseGroup {
@@ -391,7 +403,7 @@ mod tests {
                 topics: rows
                     .iter()
                     .map(|(topic, error_code)| OffsetFetchResponseTopics {
-                        topic_id: id(*topic),
+                        name: topic_name(*topic),
                         partitions: vec![OffsetFetchResponsePartitions {
                             committed_offset: -1,
                             error_code: *error_code,
@@ -478,7 +490,7 @@ mod tests {
             (
                 "topic authorization failed names each topic",
                 grouped(0, &[(1, 29), (2, 29), (3, 29)]),
-                topics(&["orders", "payments", ""]),
+                topics(&["orders", "payments", "shipments"]),
             ),
             (
                 "unstable offset commit",
@@ -532,14 +544,7 @@ mod tests {
                 RetryUnknownTopic(3),
             ),
         ] {
-            let id_to_name = HashMap::from([
-                (id(1), "orders".to_string()),
-                (id(2), "payments".to_string()),
-            ]);
-            assert2::check!(
-                classify_offset_fetch(&response, &id_to_name) == expected,
-                "case {name}"
-            );
+            assert2::check!(classify_offset_fetch(&response) == expected, "case {name}");
         }
     }
 
@@ -558,37 +563,12 @@ mod tests {
     }
 
     #[test]
-    fn request_topic_names_reads_the_grouped_topics_with_an_id() {
-        let request = build_offset_fetch(
-            "g",
-            &HashMap::from([
-                ("orders".to_string(), vec![0]),
-                ("new".to_string(), vec![1]),
-            ]),
-            &HashMap::from([("orders".to_string(), id(7))]),
-        );
-        assert2::assert!(
-            request_topic_names(&request) == HashMap::from([(id(7), "orders".to_string())])
-        );
-    }
-
-    #[test]
-    fn build_offset_fetch_defaults_topic_id_when_unknown() {
-        let mut by_topic = HashMap::new();
-        by_topic.insert("t".to_string(), vec![0]);
-        let req = build_offset_fetch("g", &by_topic, &HashMap::new());
-        let gtops = req.groups[0].topics.as_ref().unwrap();
-        assert2::assert!(gtops[0].topic_id == WireUuid::ZERO);
-    }
-
-    #[test]
     fn parse_offset_fetch_reads_groups_with_name() {
         let resp = OffsetFetchResponse {
             groups: vec![OffsetFetchResponseGroup {
                 group_id: "g".into(),
                 topics: vec![OffsetFetchResponseTopics {
                     name: "t".into(),
-                    topic_id: id(7),
                     partitions: vec![OffsetFetchResponsePartitions {
                         partition_index: 3,
                         committed_offset: 42,
@@ -600,34 +580,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let out = parse_offset_fetch(&resp, &HashMap::new());
+        let out = parse_offset_fetch(&resp);
         assert2::assert!(out == vec![("t".to_string(), 3, 42, -1)]);
-    }
-
-    #[test]
-    fn parse_offset_fetch_resolves_topic_id_when_name_empty() {
-        // v10: response topic carries only topic_id; name resolved via map.
-        let resp = OffsetFetchResponse {
-            groups: vec![OffsetFetchResponseGroup {
-                group_id: "g".into(),
-                topics: vec![OffsetFetchResponseTopics {
-                    name: String::new(),
-                    topic_id: id(9),
-                    partitions: vec![OffsetFetchResponsePartitions {
-                        partition_index: 0,
-                        committed_offset: 5,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let mut id_map = HashMap::new();
-        id_map.insert(id(9), "named".to_string());
-        let out = parse_offset_fetch(&resp, &id_map);
-        assert2::assert!(out == vec![("named".to_string(), 0, 5, -1)]);
     }
 
     #[test]
@@ -645,7 +599,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let out = parse_offset_fetch(&resp, &HashMap::new());
+        let out = parse_offset_fetch(&resp);
         assert2::assert!(out == vec![("legacy".to_string(), 1, 11, -1)]);
     }
 
