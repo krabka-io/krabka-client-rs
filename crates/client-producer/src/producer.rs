@@ -49,7 +49,8 @@ use crate::{
     record::{ProducerRecord, RecordMetadata},
     sender::DrainIntent,
     transactional::{
-        AbortableErrorSlot, OwnedTransaction, PreparedTransactionState, Transaction, TxnState,
+        AbortableError, AbortableErrorSlot, OwnedTransaction, PreparedTransactionState,
+        Transaction, TxnState,
     },
     txn_retry::{
         self, AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision, TxnRequestDecision,
@@ -1385,7 +1386,10 @@ impl Producer {
 
     /// The error that a commit reports while the transaction is abort-only.
     fn abortable_error_state(&self) -> Option<ProducerError> {
-        self.txn_abortable_error.get().map(ProducerError::Server)
+        self.txn_abortable_error.get().map(|error| match error {
+            AbortableError::Server(code) => ProducerError::Server(code),
+            AbortableError::Timeout => ProducerError::SendTimeout,
+        })
     }
 
     pub(crate) fn is_active(&self) -> Result<(), ProducerError> {

@@ -547,26 +547,13 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
     //    once).
     fail_recovered_accumulator_batches(cfg).await;
     fail_recovered_retry_slots(cfg, &mut state.retry);
-    let (mut to_send, mut expired) = collect_retries(
+    let (mut to_send, expired) = collect_retries(
         &mut state.retry,
         now,
         cfg.routing_retry_budget,
         cfg.max_in_flight,
     );
     if !expired.is_empty() {
-        // A transactional batch that fails must stop the transaction from
-        // committing. Kafka's `TransactionManager.handleFailedBatch` moves the
-        // producer to `ABORTABLE_ERROR` there. This producer has no such
-        // state yet (#43), so a transactional batch still fences, which keeps
-        // a commit from leaving the failed records out.
-        if expired
-            .iter()
-            .any(|pb| BatchMode::of(&pb.record_batch) == BatchMode::Transactional)
-        {
-            expired.append(&mut to_send);
-            fence(cfg, state, expired);
-            return;
-        }
         expire_batches(cfg, state, expired, to_send);
         return;
     }
@@ -661,12 +648,12 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
 ///
 /// Kafka's `Sender.sendProducerData` fails an expired batch with a
 /// `TimeoutException` and calls `TransactionManager.handleFailedBatch`, which
-/// raises the epoch of an idempotent producer. It does not fence the producer.
-/// The epoch bump starts at the next batch that the sender builds: Kafka's
-/// `maybeUpdateProducerIdAndEpoch` moves a partition to the new identity only
-/// while it has no batch in flight.
-///
-/// The caller passes only batches of a producer that carries no transaction.
+/// raises the epoch of an idempotent producer, gives the sequences of a
+/// transactional batch back, and moves a transactional producer to
+/// `ABORTABLE_ERROR` (applied by `terminal_fail_batch`). It does not fence the
+/// producer. The epoch bump starts at the next batch that the sender builds:
+/// Kafka's `maybeUpdateProducerIdAndEpoch` moves a partition to the new
+/// identity only while it has no batch in flight.
 fn expire_batches(
     cfg: &SenderConfig,
     state: &mut PipelineState,
@@ -1152,22 +1139,13 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
             // partition's single retry slot, resent next cycle. The batch is
             // still outstanding, so its in-flight slot stays counted, and there
             // is no `finish_in_flight` here.
+            //
             // The batch has no retry left. Kafka's `Sender.failBatch` fails
             // the records and calls `TransactionManager.handleFailedBatch`,
-            // which raises the epoch of an idempotent producer. It does not
-            // fence.
-            BatchVerdict::Retry
-            | BatchVerdict::BumpEpochAndRetry
-            | BatchVerdict::RestartSequenceAndRetry
-                if take_retry(&mut pb, cfg.retries)
-                    && BatchMode::of(&pb.record_batch) == BatchMode::Transactional =>
-            {
-                // A transactional batch that fails must stop the transaction
-                // from committing. Kafka moves the producer to
-                // `ABORTABLE_ERROR` there, and this producer has no such state
-                // yet (#43), so it still fences.
-                fenced = Some(vec![pb]);
-            }
+            // which raises the epoch of an idempotent producer, gives the
+            // sequences of a transactional batch back, and moves a
+            // transactional producer to `ABORTABLE_ERROR` (applied by
+            // `terminal_fail_batch`). It does not fence the producer.
             BatchVerdict::Retry
             | BatchVerdict::BumpEpochAndRetry
             | BatchVerdict::RestartSequenceAndRetry
@@ -1348,14 +1326,17 @@ fn ack_batch(cfg: &SenderConfig, pb: PreparedBatch, base_offset: i64) {
 /// releases the in-flight slot. It is the single owner of the slot release for
 /// the batch.
 fn terminal_fail_batch(cfg: &SenderConfig, pb: PreparedBatch, error: ProducerError) {
-    if BatchMode::of(&pb.record_batch) == BatchMode::Transactional
-        && let ProducerError::Server(code) = error
-    {
+    if BatchMode::of(&pb.record_batch) == BatchMode::Transactional {
         // Kafka's `Sender.failBatch` calls
         // `TransactionManager.handleFailedBatch`, which moves a transactional
         // producer to `ABORTABLE_ERROR`. The application must abort the
-        // transaction; `commit` fails until it does.
-        cfg.txn_abortable_error.set(code);
+        // transaction; `commit` fails until it does. A broker answer stores
+        // its code, and a batch that timed out with no answer stores that it
+        // timed out, as Kafka stores the raised `TimeoutException` there.
+        match error {
+            ProducerError::Server(code) => cfg.txn_abortable_error.set(code),
+            _ => cfg.txn_abortable_error.set_timeout(),
+        }
     }
     fail_batch(pb.records, error);
     finish_in_flight(cfg);
@@ -2469,7 +2450,7 @@ mod harness {
     use crate::{
         accumulator::Accumulator,
         producer::{STATE_ACTIVE, STATE_FENCED, TopicMetadata},
-        transactional::TxnState,
+        transactional::{AbortableError, TxnState},
     };
 
     /// Adapter that lets a sender own a `Box<dyn ProduceTransport>` while the
@@ -3003,6 +2984,7 @@ mod harness {
         recovery_required: Arc<AtomicBool>,
         recovery_generation: Arc<AtomicU64>,
         producer_epoch: Arc<AtomicI16>,
+        txn_abortable_error: Arc<AbortableErrorSlot>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -3168,6 +3150,7 @@ mod harness {
             recovery_required,
             recovery_generation,
             producer_epoch,
+            txn_abortable_error: abortable_error,
             handle,
         }
     }
@@ -4536,14 +4519,16 @@ mod harness {
         shutdown(h).await;
     }
 
-    /// A transactional batch that has no retry left still fences. Kafka moves
-    /// the producer to `ABORTABLE_ERROR` there
-    /// (`TransactionManager.handleFailedBatch`), so that a later
-    /// `commitTransaction` fails and the application aborts. This producer has
-    /// no such state yet (#43), and a fence keeps a commit from leaving the
-    /// failed records out of the transaction.
+    /// A transactional batch that has no retry left moves the producer to the
+    /// abortable-error state, not to a fence. Kafka's
+    /// `Sender.failBatch` calls `TransactionManager.handleFailedBatch`, which
+    /// moves a transactional producer to `ABORTABLE_ERROR` there, so that a
+    /// later `commitTransaction` fails and the application must abort. The
+    /// producer itself stays active: it is the transaction, not the producer,
+    /// that can no longer commit, and Kafka's idempotent producer never fences
+    /// on a plain failed-batch retry exhaustion either.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_transactional_batch_with_no_retry_left_still_fences() {
+    async fn a_transactional_batch_with_no_retry_left_sets_the_abortable_error() {
         let transport = MockTransport::new(Duration::ZERO);
         transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
         let h = spawn_sender_full(
@@ -4563,8 +4548,51 @@ mod harness {
             .expect("sender remains")
             .expect_err("the exhausted batch must fail");
 
-        assert2::assert!(matches!(error, ProducerError::FencedProducer), "{error:?}");
-        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_FENCED);
+        // NOT_LEADER_OR_FOLLOWER (6) is the code the mock injected; the
+        // records get it, not a synthesized error.
+        assert2::assert!(matches!(error, ProducerError::Server(6)), "{error:?}");
+        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE);
+        assert2::assert!(h.txn_abortable_error.get() == Some(AbortableError::Server(6)));
+
+        // The producer itself is not fenced: a later send from a fresh
+        // partition still goes through the sender and gets acknowledged.
+        let next = produce_burst(&h, "t", 1, 1).await.pop().expect("next ack");
+        let metadata = tokio::time::timeout(Duration::from_secs(1), next)
+            .await
+            .expect("next ack resolves")
+            .expect("sender remains")
+            .expect("the sender keeps accepting sends after the abortable error");
+        assert2::assert!(metadata.partition == 1);
+        shutdown(h).await;
+    }
+
+    /// The same rule for a batch that ran out of its routing budget with no
+    /// broker code at all: the abortable slot stores that the transaction
+    /// timed out, since there is no code to report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transactional_batch_that_times_out_sets_the_abortable_timeout() {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
+        let h = spawn_sender_full(
+            transport.clone(),
+            1,
+            millis(1),
+            i32::MAX,
+            millis(1),
+            Acks::All,
+            BatchMode::Transactional,
+        );
+
+        let ack = produce_burst(&h, "t", 0, 1).await.pop().expect("ack");
+        let error = tokio::time::timeout(Duration::from_secs(1), ack)
+            .await
+            .expect("ack resolves")
+            .expect("sender remains")
+            .expect_err("the expired batch must fail");
+
+        assert2::assert!(matches!(error, ProducerError::SendTimeout), "{error:?}");
+        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE);
+        assert2::assert!(h.txn_abortable_error.get() == Some(AbortableError::Timeout));
         shutdown(h).await;
     }
 
@@ -4762,6 +4790,7 @@ mod harness {
             txn_pid_epoch: Arc::new(Mutex::new((1, 0))),
             txn_recovery_required: Arc::new(AtomicBool::new(false)),
             txn_recovery_generation: Arc::new(AtomicU64::new(0)),
+            txn_abortable_error: Arc::new(AbortableErrorSlot::default()),
         };
         let mut state = PipelineState::default();
 
