@@ -545,6 +545,11 @@ impl Consumer {
     }
 
     async fn prepare_poll(&mut self) -> Result<bool, ConsumerError> {
+        // Kafka's consumer raises a fatal `OffsetFetch` error from `poll()`.
+        // A rejoin in the coordinator task leaves such an error here.
+        if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
+            return Err(error);
+        }
         self.apply_pending_seeks().await;
         if let Err(error) = self.resolve_latest_sentinels().await {
             if is_transient_poll_error(&error) {
@@ -1458,6 +1463,7 @@ mod partition_error_tests {
             fetch_max: DEFAULT_FETCH_MAX,
             fetch_partition_max: DEFAULT_FETCH_PARTITION_MAX,
             auto_offset_reset: AutoOffsetReset::Latest,
+            poll_error: crate::coordinator::PollErrorSlot::default(),
         }
     }
 
@@ -1500,6 +1506,32 @@ mod partition_error_tests {
         result: Result<usize, Option<i16>>,
         metadata_requests: usize,
         next_offset: Option<i64>,
+    }
+
+    /// Kafka's consumer raises a fatal `OffsetFetch` error from `poll()`. A
+    /// rejoin leaves the error for `poll`, which returns it once. The next poll
+    /// runs as usual.
+    #[tokio::test]
+    async fn poll_returns_a_fatal_rejoin_error_once() {
+        let broker = metadata_counting_broker(Arc::default()).await;
+        let mut consumer = consumer_on(&broker).await;
+        let topics = std::collections::BTreeSet::from(["orders".to_string()]);
+        crate::coordinator::report_rejoin_error(
+            &consumer.poll_error,
+            ConsumerError::TopicAuthorizationFailed(topics.clone()),
+        );
+
+        let first = consumer.prepare_poll().await.map_err(|error| match error {
+            ConsumerError::TopicAuthorizationFailed(topics) => Some(topics),
+            _ => None,
+        });
+        let second = consumer
+            .prepare_poll()
+            .await
+            .map_err(|_| None::<std::collections::BTreeSet<String>>);
+
+        broker.stop();
+        assert2::assert!((first, second) == (Err(Some(topics)), Ok(true)));
     }
 
     /// Kafka's `FetchCollector.handleInitializeErrors` requests a metadata

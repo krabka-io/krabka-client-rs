@@ -1,5 +1,7 @@
 //! Error type for `krabka-client-consumer`.
 
+use std::collections::BTreeSet;
+
 use thiserror::Error;
 
 /// Errors returned by [`Consumer`](crate::Consumer).
@@ -45,6 +47,38 @@ pub enum ConsumerError {
 
     #[error("broker error_code {0}")]
     Server(i16),
+
+    /// The coordinator answered `GROUP_AUTHORIZATION_FAILED` (30) for the
+    /// group. Kafka's consumer raises `GroupAuthorizationException`.
+    #[error("not authorized to access group: {0}")]
+    GroupAuthorizationFailed(String),
+
+    /// The coordinator answered `TOPIC_AUTHORIZATION_FAILED` (29) for
+    /// partitions of these topics. Kafka's consumer raises
+    /// `TopicAuthorizationException`.
+    #[error(
+        "not authorized to access topics: [{}]",
+        .0.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+    )]
+    TopicAuthorizationFailed(BTreeSet<String>),
+
+    /// An `OffsetFetch` response carried an error code that Kafka's consumer
+    /// does not retry.
+    #[error("unexpected error in offset fetch response: error_code {0}")]
+    OffsetFetchFailed(i16),
+}
+
+impl ConsumerError {
+    /// Whether this is an `OffsetFetch` error that Kafka's consumer does not
+    /// retry, so the application must see it.
+    pub(crate) fn is_fatal_offset_fetch_error(&self) -> bool {
+        matches!(
+            self,
+            Self::GroupAuthorizationFailed(_)
+                | Self::TopicAuthorizationFailed(_)
+                | Self::OffsetFetchFailed(_)
+        )
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +95,24 @@ mod tests {
                 "not subscribed to any topic",
             ),
             ("server", ConsumerError::Server(25), "broker error_code 25"),
+            (
+                "group authorization failed",
+                ConsumerError::GroupAuthorizationFailed("workers".into()),
+                "not authorized to access group: workers",
+            ),
+            (
+                "topic authorization failed",
+                ConsumerError::TopicAuthorizationFailed(BTreeSet::from([
+                    "orders".to_string(),
+                    "payments".to_string(),
+                ])),
+                "not authorized to access topics: [orders, payments]",
+            ),
+            (
+                "offset fetch failed",
+                ConsumerError::OffsetFetchFailed(6),
+                "unexpected error in offset fetch response: error_code 6",
+            ),
             (
                 "log truncation",
                 ConsumerError::LogTruncation {
