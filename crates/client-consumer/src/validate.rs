@@ -9,6 +9,9 @@
 use std::collections::HashMap;
 
 use krabka_ids::LeaderEpoch;
+use krabka_protocol::{
+    owned::metadata_response::MetadataResponse, primitives::uuid::Uuid as WireUuid,
+};
 
 use crate::{
     consumer::Consumer,
@@ -55,6 +58,30 @@ fn response_has_error(error_code: i16) -> bool {
     error_code != 0
 }
 
+/// Store the topic id that `metadata` reports for each topic that `topic_ids`
+/// already tracks.
+///
+/// A topic that was deleted and created again keeps its name and gets a new
+/// id. Fetch v13 and later, and `OffsetCommit` and `OffsetFetch` v10, carry
+/// only the id, so a stale id makes the broker answer `UNKNOWN_TOPIC_ID` until
+/// the consumer stores the new one. Kafka's `Metadata.update` replaces the
+/// topic ids on each metadata response in the same way. This function skips a
+/// topic row with an error or with the zero id, and it does not add topics.
+fn refresh_tracked_topic_ids(
+    topic_ids: &mut HashMap<String, WireUuid>,
+    metadata: &MetadataResponse,
+) {
+    for topic in &metadata.topics {
+        let Some(name) = &topic.name else { continue };
+        if response_has_error(topic.error_code) || topic.topic_id == WireUuid::ZERO {
+            continue;
+        }
+        if let Some(topic_id) = topic_ids.get_mut(name) {
+            *topic_id = topic.topic_id;
+        }
+    }
+}
+
 fn mark_validation_error(pos: &mut PartitionPosition) {
     pos.leader_epoch = LeaderEpoch(-1);
     pos.awaiting_validation = true;
@@ -93,6 +120,8 @@ impl Consumer {
                 update_leader_epoch(entry, LeaderEpoch(p.leader_epoch));
             }
         }
+        drop(positions);
+        refresh_tracked_topic_ids(&mut *self.topic_ids.lock().await, &md);
         Ok(())
     }
 
@@ -234,6 +263,7 @@ impl Consumer {
 #[cfg(test)]
 mod tests {
     use assert2::check;
+    use krabka_protocol::owned::metadata_response::MetadataResponseTopic;
 
     use super::*;
 
@@ -325,6 +355,49 @@ mod tests {
     fn zero_error_code_is_success_and_nonzero_is_error() {
         for (_name, code, expected) in [("success", 0, false), ("error", 74, true)] {
             assert2::assert!(response_has_error(code) == expected);
+        }
+    }
+
+    #[test]
+    fn metadata_refresh_replaces_only_tracked_topic_ids() {
+        let old_id = WireUuid([1; 16]);
+        let new_id = WireUuid([2; 16]);
+        let other_id = WireUuid([3; 16]);
+        let topic = |name: &str, error_code: i16, topic_id: WireUuid| MetadataResponseTopic {
+            error_code,
+            name: Some(name.into()),
+            topic_id,
+            ..Default::default()
+        };
+        for (name, row, expected) in [
+            (
+                "tracked topic gets the new id",
+                topic("orders", 0, new_id),
+                HashMap::from([("orders".to_string(), new_id)]),
+            ),
+            (
+                "row with an error keeps the old id",
+                topic("orders", 3, new_id),
+                HashMap::from([("orders".to_string(), old_id)]),
+            ),
+            (
+                "row with the zero id keeps the old id",
+                topic("orders", 0, WireUuid::ZERO),
+                HashMap::from([("orders".to_string(), old_id)]),
+            ),
+            (
+                "untracked topic is not added",
+                topic("payments", 0, other_id),
+                HashMap::from([("orders".to_string(), old_id)]),
+            ),
+        ] {
+            let mut topic_ids = HashMap::from([("orders".to_string(), old_id)]);
+            let metadata = MetadataResponse {
+                topics: vec![row],
+                ..Default::default()
+            };
+            refresh_tracked_topic_ids(&mut topic_ids, &metadata);
+            check!(topic_ids == expected, "case {name}");
         }
     }
 

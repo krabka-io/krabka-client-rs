@@ -36,6 +36,8 @@ use krabka_protocol::{
         join_group_response::JoinGroupResponse,
         leave_group_request::{LeaveGroupRequest, MemberIdentity},
         offset_commit_request::OffsetCommitRequest,
+        offset_fetch_request::OffsetFetchRequest,
+        offset_fetch_response::OffsetFetchResponse,
         sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment},
         sync_group_response::SyncGroupResponse,
     },
@@ -56,7 +58,10 @@ use crate::{
     },
     consumer::{CommitIdentity, ConsumerRetryPolicy, reset_starting_offset, starting_offset},
     error::ConsumerError,
-    offset_wire::{build_commit_topics, build_offset_fetch, id_to_name, parse_offset_fetch},
+    offset_wire::{
+        build_commit_topics, build_offset_fetch, id_to_name, parse_offset_fetch,
+        retriable_offset_fetch_error,
+    },
 };
 
 /// Retriable group-coordinator error codes. The coordinator is loading its
@@ -195,11 +200,11 @@ fn build_find_coordinator_request(group_id: String) -> FindCoordinatorRequest {
     }
 }
 
-fn retry_deadline_elapsed(start: tokio::time::Instant, timeout: Duration) -> bool {
+pub(crate) fn retry_deadline_elapsed(start: tokio::time::Instant, timeout: Duration) -> bool {
     start.elapsed() >= timeout
 }
 
-fn next_backoff(backoff: Duration, max_backoff: Duration) -> Duration {
+pub(crate) fn next_backoff(backoff: Duration, max_backoff: Duration) -> Duration {
     (backoff * 2).min(max_backoff)
 }
 
@@ -1397,11 +1402,13 @@ async fn prime_offsets(
     // OffsetFetch is a coordinator RPC. `prime_offsets` only runs right after a
     // successful join/sync (which just discovered/refreshed `coordinator_id`),
     // so the id is fresh; route straight to it.
-    let of = state
-        .client
-        .broker(state.coordinator_id.load(Ordering::Relaxed))
-        .send(build_offset_fetch(&state.group_id, &by_topic, &topic_ids))
-        .await?;
+    let of = send_offset_fetch(
+        &state.client,
+        state.coordinator_id.load(Ordering::Relaxed),
+        &build_offset_fetch(&state.group_id, &by_topic, &topic_ids),
+        state.retry_policy,
+    )
+    .await?;
 
     let id_to_name = id_to_name(&topic_ids);
     let mut offsets = state.next_offsets.lock().await;
@@ -1429,6 +1436,44 @@ async fn prime_offsets(
     Ok(())
 }
 
+/// Send an `OffsetFetch` to the coordinator, and send it again while a
+/// partition answers `UNKNOWN_TOPIC_OR_PARTITION` or `UNKNOWN_TOPIC_ID` and
+/// `retry.timeout` has not elapsed.
+///
+/// This follows Kafka's `CommitRequestManager.fetchOffsets`. After the deadline
+/// the function returns the last response. Its errored partitions carry
+/// committed offset -1, so the caller starts them from the reset policy, as
+/// Kafka's `OffsetFetchResult.toOffsetMapWithNulls` does.
+pub(crate) async fn send_offset_fetch(
+    client: &Client,
+    coordinator_id: i32,
+    request: &OffsetFetchRequest,
+    retry: CoordinatorRetryPolicy,
+) -> Result<OffsetFetchResponse, ConsumerError> {
+    let start = tokio::time::Instant::now();
+    let mut backoff = retry.initial_backoff;
+    loop {
+        let response = client.broker(coordinator_id).send(request.clone()).await?;
+        let Some(code) = retriable_offset_fetch_error(&response) else {
+            return Ok(response);
+        };
+        if retry_deadline_elapsed(start, retry.timeout) {
+            tracing::warn!(
+                error_code = code,
+                "offset fetch still names a topic the coordinator does not know; \
+                 using the reset policy for those partitions"
+            );
+            return Ok(response);
+        }
+        tracing::debug!(
+            error_code = code,
+            "offset fetch names an unknown topic; retrying"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = next_backoff(backoff, retry.max_backoff);
+    }
+}
+
 fn should_prime_missing_partition(seen: bool) -> bool {
     !seen
 }
@@ -1441,18 +1486,163 @@ mod retry_tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
+    use assert2::check;
     use krabka_client_core::MockBroker;
     use krabka_protocol::{
         Encode, UnknownTaggedFields,
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
-            leave_group_request,
+            leave_group_request, offset_fetch_request,
+            offset_fetch_response::{
+                OffsetFetchResponseGroup, OffsetFetchResponsePartitions, OffsetFetchResponseTopics,
+            },
         },
     };
     use krabka_units::{millis, minutes, secs};
 
     use super::*;
+
+    const ORDERS_ID: WireUuid = WireUuid([7; 16]);
+
+    fn api_versions_for_offset_fetch() -> Vec<u8> {
+        let response = ApiVersionsResponse {
+            error_code: 0,
+            api_keys: vec![
+                ApiVersion {
+                    api_key: api_versions_request::API_KEY,
+                    min_version: 0,
+                    max_version: 3,
+                    ..Default::default()
+                },
+                ApiVersion {
+                    api_key: offset_fetch_request::API_KEY,
+                    min_version: 10,
+                    max_version: 10,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut buffer = bytes::BytesMut::new();
+        response
+            .encode(&mut buffer, 0)
+            .expect("encode API versions");
+        buffer.to_vec()
+    }
+
+    /// An `OffsetFetch` v10 response body for partition 0 of the topic with id
+    /// `ORDERS_ID`, behind the flexible response header's empty tagged fields.
+    fn offset_fetch_v10(error_code: i16, committed_offset: i64) -> Vec<u8> {
+        let response = OffsetFetchResponse {
+            groups: vec![OffsetFetchResponseGroup {
+                group_id: "group-a".into(),
+                topics: vec![OffsetFetchResponseTopics {
+                    topic_id: ORDERS_ID,
+                    partitions: vec![OffsetFetchResponsePartitions {
+                        partition_index: 0,
+                        committed_offset,
+                        committed_leader_epoch: -1,
+                        error_code,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut buffer = bytes::BytesMut::from(&[0u8][..]);
+        response
+            .encode(&mut buffer, 10)
+            .expect("encode offset fetch");
+        buffer.to_vec()
+    }
+
+    /// Kafka's `CommitRequestManager` sends an `OffsetFetch` again while a
+    /// partition answers 3 or 100, and stops at the deadline. Other partition
+    /// codes do not retry.
+    #[tokio::test]
+    async fn offset_fetch_retries_unknown_topic_errors_until_the_deadline() {
+        for (name, responses, timeout, expected) in [
+            (
+                "unknown topic id then committed offset",
+                vec![(100, -1), (0, 42)],
+                Duration::from_secs(5),
+                (vec![("orders".to_string(), 0, 42, -1)], 2),
+            ),
+            (
+                "unknown topic or partition then committed offset",
+                vec![(3, -1), (0, 42)],
+                Duration::from_secs(5),
+                (vec![("orders".to_string(), 0, 42, -1)], 2),
+            ),
+            (
+                "not leader or follower is not retried",
+                vec![(6, -1)],
+                Duration::from_secs(5),
+                (vec![("orders".to_string(), 0, -1, -1)], 1),
+            ),
+            (
+                "unknown topic id past the deadline gives no committed offset",
+                vec![(100, -1)],
+                Duration::ZERO,
+                (vec![("orders".to_string(), 0, -1, -1)], 1),
+            ),
+        ] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let requests_in_mock = Arc::clone(&requests);
+            let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(api_versions_for_offset_fetch());
+                }
+                if api_key != offset_fetch_request::API_KEY {
+                    return None;
+                }
+                let attempt = requests_in_mock.fetch_add(1, Ordering::SeqCst);
+                let (error_code, committed_offset) = responses[attempt.min(responses.len() - 1)];
+                Some(offset_fetch_v10(error_code, committed_offset))
+            })
+            .await;
+            let client = Client::builder()
+                .bootstrap(mock.addr.to_string())
+                .build()
+                .await
+                .expect("client");
+            let topic_ids = HashMap::from([("orders".to_string(), ORDERS_ID)]);
+            let request = build_offset_fetch(
+                "group-a",
+                &HashMap::from([("orders".to_string(), vec![0])]),
+                &topic_ids,
+            );
+
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                send_offset_fetch(
+                    &client,
+                    0,
+                    &request,
+                    CoordinatorRetryPolicy {
+                        timeout,
+                        initial_backoff: Duration::from_millis(1),
+                        max_backoff: Duration::from_millis(1),
+                    },
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("case {name}: offset fetch never finished"))
+            .unwrap_or_else(|error| panic!("case {name}: offset fetch failed: {error:?}"));
+
+            mock.stop();
+            check!(
+                (
+                    parse_offset_fetch(&response, &id_to_name(&topic_ids)),
+                    requests.load(Ordering::SeqCst)
+                ) == expected,
+                "case {name}"
+            );
+        }
+    }
 
     fn retry(timeout: Duration) -> CoordinatorRetryPolicy {
         CoordinatorRetryPolicy {

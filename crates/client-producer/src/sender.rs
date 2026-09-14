@@ -88,6 +88,14 @@ mod codes {
     pub const DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
     /// `INVALID_PRODUCER_EPOCH` per the canonical Apache Kafka table (code 47).
     pub const INVALID_PRODUCER_EPOCH: i16 = 47;
+    /// The Produce named a topic id that the receiving broker does not hold.
+    /// Produce v13 and later carry only the id. The cause is a stale id in
+    /// the client cache (the topic was deleted and created again), or a
+    /// leader whose metadata image does not hold the topic yet. Kafka's
+    /// `UnknownTopicIdException` extends `InvalidMetadataException`, so the
+    /// sender refreshes metadata and retries, as it does for
+    /// `NOT_LEADER_OR_FOLLOWER`.
+    pub const UNKNOWN_TOPIC_ID: i16 = 100;
 }
 
 /// Synthetic leader id that means the leader is unknown, so the sender uses the
@@ -659,9 +667,10 @@ enum BatchVerdict {
 }
 
 /// Classification of a per-partition `error_code`. It is either a direct
-/// [`BatchVerdict`], or [`Classification::Routing`] for `NOT_LEADER` and
-/// `UNKNOWN`. Routing means a retry, plus the leader-hint adoption and metadata
-/// refresh side effects that [`interpret_response`] applies. The classification
+/// [`BatchVerdict`], or [`Classification::Routing`] for
+/// `NOT_LEADER_OR_FOLLOWER`, `UNKNOWN_TOPIC_OR_PARTITION` and
+/// `UNKNOWN_TOPIC_ID`. Routing means a retry, plus the leader-hint adoption and
+/// metadata refresh side effects that [`interpret_response`] applies. The classification
 /// is kept separate so the pure code-to-verdict mapping is unit-testable
 /// without a `Client`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -685,9 +694,12 @@ fn classify_verdict(error_code: i16, base_offset: i64) -> Classification {
         // failure for safety.
         codes::OUT_OF_ORDER_SEQUENCE_NUMBER => Classification::Verdict(BatchVerdict::Retry),
         codes::INVALID_PRODUCER_EPOCH => Classification::Verdict(BatchVerdict::Fence),
-        codes::NOT_LEADER_OR_FOLLOWER | codes::UNKNOWN_TOPIC_OR_PARTITION => {
-            Classification::Routing
-        }
+        // Kafka's `Sender.completeBatch` retries each `InvalidMetadataException`
+        // and requests a metadata update. These three codes map to subclasses
+        // of that exception.
+        codes::NOT_LEADER_OR_FOLLOWER
+        | codes::UNKNOWN_TOPIC_OR_PARTITION
+        | codes::UNKNOWN_TOPIC_ID => Classification::Routing,
         // Any other code is terminal-but-not-fatal: fail the records with
         // Server(code); never fence.
         code => Classification::Verdict(BatchVerdict::Terminal(code)),
@@ -989,21 +1001,25 @@ async fn send_one_batch(cfg: &SenderConfig, mut pb: PreparedBatch) -> BatchSendR
             refresh_needed: false,
         };
     }
-    // A batch prepared before its topic existed (cold-boot race: the WAL topic's
-    // leadership is still settling) carries a ZERO `topic_id`. Produce v≥13 keys
-    // topics by id and drops the name on the wire, so a ZERO id makes the broker
-    // return an un-correlatable UNKNOWN_TOPIC response that the sender retries
-    // forever. Re-resolve the id from the metadata cache (which `partitions_for`
-    // backfills once the topic exists) before each (verbatim) resend, so the
-    // SAME batch converges in place — same `base_sequence`, so the idempotent
-    // sequence stays gap-free and no records are dropped.
-    if pb.topic_id == Uuid::ZERO
-        && let Some(resolved) = cfg
-            .metadata_cache
-            .lock()
-            .await
-            .get(&pb.topic)
-            .map(|m| m.topic_id)
+    // Produce v13 and later key topics by id and drop the name on the wire, so
+    // each send must carry the id that the metadata cache holds now. Kafka's
+    // `Sender.topicIdsForBatches` reads the id from the current metadata for
+    // every request in the same way.
+    //
+    // Two cases need this. A batch prepared before its topic existed carries a
+    // ZERO `topic_id`, and `partitions_for` backfills the cache once the topic
+    // exists. A batch whose topic was deleted and created again carries the old
+    // id, and the broker answers UNKNOWN_TOPIC_ID until the resend carries the
+    // id that `update_leaders_from_metadata` stored. The batch resends in
+    // place with the same `base_sequence`, so the idempotent sequence stays
+    // gap-free and no records are dropped.
+    if let Some(resolved) = cfg
+        .metadata_cache
+        .lock()
+        .await
+        .get(&pb.topic)
+        .map(|m| m.topic_id)
+        && resolved != Uuid::ZERO
     {
         pb.topic_id = resolved;
     }
@@ -1538,6 +1554,12 @@ mod tests {
                 0,
                 Classification::Routing,
             ),
+            (
+                "unknown topic id",
+                codes::UNKNOWN_TOPIC_ID,
+                0,
+                Classification::Routing,
+            ),
             // An arbitrary server error (MESSAGE_TOO_LARGE = 10) is terminal-but-
             // not-fatal: fail the records with Server(10), never fence.
             (
@@ -1832,6 +1854,9 @@ mod harness {
         /// The `leader` argument of every `send_produce` call, in order, so a
         /// test can assert how a batch was routed.
         sent_leaders: StdMutex<Vec<Option<i32>>>,
+        /// The `topic_id` of every `send_produce` call, in order, so a test can
+        /// assert which id a resend carried.
+        sent_topic_ids: StdMutex<Vec<Uuid>>,
         /// Signals each entry into `send_produce`, including injected failures
         /// before the broker model applies a request.
         send_started: Notify,
@@ -1882,6 +1907,7 @@ mod harness {
                 refresh_response: StdMutex::new(MetadataResponse::default()),
                 known_brokers: StdMutex::new(HashSet::new()),
                 sent_leaders: StdMutex::new(Vec::new()),
+                sent_topic_ids: StdMutex::new(Vec::new()),
                 send_started: Notify::new(),
                 active_sends: AtomicUsize::new(0),
                 peak_active_sends: AtomicUsize::new(0),
@@ -1955,6 +1981,11 @@ mod harness {
         /// The `leader` argument of every `send_produce` call, in order.
         fn sent_leaders(self: &Arc<Self>) -> Vec<Option<i32>> {
             self.sent_leaders.lock().unwrap().clone()
+        }
+
+        /// The `topic_id` of every `send_produce` call, in order.
+        fn sent_topic_ids(self: &Arc<Self>) -> Vec<Uuid> {
+            self.sent_topic_ids.lock().unwrap().clone()
         }
 
         /// Total Produce transport calls, including failures before the broker
@@ -2051,6 +2082,10 @@ mod harness {
             self.peak_active_sends.fetch_max(active, Ordering::AcqRel);
             let _active_send = ActiveSend(&self.active_sends);
             self.sent_leaders.lock().unwrap().push(leader);
+            self.sent_topic_ids
+                .lock()
+                .unwrap()
+                .push(req.topic_data[0].topic_id);
             self.send_started.notify_one();
             self.last_timeout_ms
                 .store(i64::from(req.timeout_ms), Ordering::Relaxed);
@@ -3240,6 +3275,135 @@ mod harness {
         })
         .await;
         assert2::assert!(drained.is_ok());
+
+        shutdown(h).await;
+    }
+
+    /// How one record resolved, and what the sender did on the way.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct PartitionErrorOutcome {
+        /// `Ok(offset)` for an acked record, `Err(Some(code))` for
+        /// `ProducerError::Server(code)`, and `Err(None)` for any other error.
+        result: Result<i64, Option<i16>>,
+        sends: usize,
+        refreshes: usize,
+    }
+
+    /// Each metadata error that Kafka's producer retries (3, 6 and 100)
+    /// refreshes metadata once and resends the batch, which the broker then
+    /// acks. A code that is not retriable fails the record with no refresh and
+    /// no resend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_error_codes_retry_metadata_errors_and_fail_others() {
+        const MESSAGE_TOO_LARGE: i16 = 10;
+        let retried = PartitionErrorOutcome {
+            result: Ok(0),
+            sends: 2,
+            refreshes: 1,
+        };
+        for (name, error_code, want) in [
+            (
+                "unknown topic or partition",
+                codes::UNKNOWN_TOPIC_OR_PARTITION,
+                retried,
+            ),
+            (
+                "not leader or follower",
+                codes::NOT_LEADER_OR_FOLLOWER,
+                retried,
+            ),
+            ("unknown topic id", codes::UNKNOWN_TOPIC_ID, retried),
+            (
+                "message too large",
+                MESSAGE_TOO_LARGE,
+                PartitionErrorOutcome {
+                    result: Err(Some(MESSAGE_TOO_LARGE)),
+                    sends: 1,
+                    refreshes: 0,
+                },
+            ),
+        ] {
+            let transport = MockTransport::new(Duration::ZERO);
+            transport.inject_code_once(0, error_code);
+            let h = spawn_sender(transport.clone(), 5);
+
+            let rx = produce_burst(&h, "t", 0, 1).await.pop().expect("one rx");
+            let result = tokio::time::timeout(Duration::from_secs(10), rx)
+                .await
+                .unwrap_or_else(|_| panic!("case {name}: record never resolved"))
+                .expect("oneshot dropped")
+                .map(|md| md.offset)
+                .map_err(|error| match error {
+                    ProducerError::Server(code) => Some(code),
+                    _ => None,
+                });
+            let got = PartitionErrorOutcome {
+                result,
+                sends: transport.send_count(),
+                refreshes: transport.refresh_count(),
+            };
+            check!(got == want, "case {name}");
+
+            shutdown(h).await;
+        }
+    }
+
+    /// A topic that was deleted and created again keeps its name and gets a
+    /// new id. The leader answers `UNKNOWN_TOPIC_ID` to the old id. The sender
+    /// refreshes metadata, and the resend carries the new id, which the broker
+    /// acks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_topic_id_resends_with_the_refreshed_topic_id() {
+        let stale_id = Uuid([1u8; 16]);
+        let fresh_id = Uuid([2u8; 16]);
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.inject(Inject {
+            seq: 0,
+            name: Some(String::new()),
+            topic_id: Some(stale_id),
+            error_code: codes::UNKNOWN_TOPIC_ID,
+            base_offset: -1,
+            leader_hint: -1,
+        });
+        transport.set_refresh_response(MetadataResponse {
+            topics: vec![MetadataResponseTopic {
+                error_code: codes::NONE,
+                name: Some("t".to_string()),
+                topic_id: fresh_id,
+                partitions: vec![MetadataResponsePartition {
+                    error_code: codes::NONE,
+                    partition_index: 0,
+                    leader_id: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let h = spawn_sender(transport.clone(), 5);
+        h.metadata_cache.lock().await.insert(
+            "t".to_string(),
+            TopicMetadata {
+                num_partitions: 1,
+                topic_id: stale_id,
+            },
+        );
+
+        let rx = produce_burst(&h, "t", 0, 1).await.pop().expect("one rx");
+        let offset = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("record never resolved")
+            .expect("oneshot dropped")
+            .expect("acked Ok after the refresh and resend")
+            .offset;
+
+        check!(
+            (
+                offset,
+                transport.sent_topic_ids(),
+                transport.refresh_count()
+            ) == (0, vec![stale_id, fresh_id], 1)
+        );
 
         shutdown(h).await;
     }

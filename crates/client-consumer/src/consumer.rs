@@ -1077,12 +1077,13 @@ async fn finish_startup(
         }
         // OffsetFetch is a coordinator RPC — route it to the coordinator
         // broker (its id is fresh from the join/sync above).
-        let of = client
-            .broker(coordinator_id.load(Ordering::Relaxed))
-            .send(crate::offset_wire::build_offset_fetch(
-                &group_id, &by_topic, &topic_ids,
-            ))
-            .await?;
+        let of = crate::coordinator::send_offset_fetch(
+            &client,
+            coordinator_id.load(Ordering::Relaxed),
+            &crate::offset_wire::build_offset_fetch(&group_id, &by_topic, &topic_ids),
+            coordinator_retry,
+        )
+        .await?;
         let id_to_name = crate::offset_wire::id_to_name(&topic_ids);
         for (name, partition_index, committed, committed_epoch) in
             crate::offset_wire::parse_offset_fetch(&of, &id_to_name)

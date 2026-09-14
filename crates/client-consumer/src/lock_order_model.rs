@@ -55,7 +55,7 @@
 //!   `ListOffsets` `.await`. The region takes no second lock, so it cannot be
 //!   half of a cycle. Modeled as N-alone.
 //! - `refresh_leader_epochs` (validate.rs): **P alone** (after the metadata
-//!   `.await`).
+//!   `.await`), released; then **T alone** (the tracked `topic_ids` update).
 //! - `validate_positions` (validate.rs): **N→P** snapshot held together,
 //!   released before the RPC; then **P alone** in the post-RPC apply.
 //! - `poll` fetch-build (poll.rs, the `by_leader` snapshot): **N→P** held
@@ -183,7 +183,7 @@ struct Step {
 /// already dropped:
 ///   1. `apply_pending_seeks` (seek.rs)   : PS, N, P  (PS→N→P held)
 ///   2. `resolve_latest_sentinels` (poll.rs): N       [across await, alone]
-///   3. `refresh_leader_epochs` (validate.rs): P      (P alone)
+///   3. `refresh_leader_epochs` (validate.rs): P  then  T  (each alone)
 ///   4. `validate_positions` (validate.rs): N, P  then  P  (N→P snapshot, then P alone)
 ///   5. `poll` fetch-build (poll.rs)      : N, P      (N→P snapshot)
 ///   6. `poll` post-fetch loop (poll.rs)  : N  then (N,P)…  (N held, P second)
@@ -207,9 +207,12 @@ fn poll_program() -> Vec<Op> {
         //     ListOffsets await; no second lock taken in the region. ---
         Acquire(N),
         Release(N),
-        // --- refresh_leader_epochs (validate.rs): P alone. ---
+        // --- refresh_leader_epochs (validate.rs): P alone, then T alone
+        //     (`topic_ids` update after `positions` is dropped). ---
         Acquire(P),
         Release(P),
+        Acquire(T),
+        Release(T),
         // --- validate_positions (validate.rs): N→P snapshot … ---
         Acquire(N),
         Acquire(P),
