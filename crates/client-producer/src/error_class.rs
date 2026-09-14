@@ -58,7 +58,7 @@ pub(crate) const fn class(code: i16) -> ErrorClass {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use assert2::assert;
 
     use super::{ErrorClass, class};
@@ -69,7 +69,7 @@ mod tests {
     /// The rows come from `clients/src/main/java/org/apache/kafka/common/`
     /// `protocol/Errors.java` and the `extends` clause of each exception in
     /// `common/errors/`, at trunk `f87be33`.
-    const KAFKA_ERRORS: [(i16, &str, ErrorClass); 138] = {
+    pub(crate) const KAFKA_ERRORS: [(i16, &str, ErrorClass); 138] = {
         use ErrorClass::{InvalidMetadata as M, None as Ok, NotRetriable as N, Retriable as R};
         [
             (-1, "UNKNOWN_SERVER_ERROR", N),
