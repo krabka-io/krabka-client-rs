@@ -69,8 +69,41 @@ pub(crate) trait ProduceTransport: Send + Sync {
 /// The last Produce version that carries topic names.
 const PRODUCE_TOPIC_NAME_MAX_VERSION: i16 = 12;
 
-/// A Produce request that negotiates v12 at most, because v13 names each topic
-/// by id only.
+/// The last Produce version before transaction version 2.
+const PRODUCE_TRANSACTION_V1_MAX_VERSION: i16 = 11;
+
+/// A Produce request that negotiates `MAX` at most.
+///
+/// [`produce_cap`] gives the cap of one request.
+#[derive(Clone, Debug, PartialEq)]
+struct CappedProduce<const MAX: i16>(ProduceRequest);
+
+impl<const MAX: i16> From<ProduceRequest> for CappedProduce<MAX> {
+    fn from(req: ProduceRequest) -> Self {
+        Self(req)
+    }
+}
+
+impl<const MAX: i16> Encode for CappedProduce<MAX> {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl<const MAX: i16> ProtocolRequest for CappedProduce<MAX> {
+    const API_KEY: i16 = produce_request::API_KEY;
+    const MIN_VERSION: i16 = produce_request::MIN_VERSION;
+    const MAX_VERSION: i16 = MAX;
+    const FLEXIBLE_MIN: i16 = produce_request::FLEXIBLE_MIN;
+    type Response = ProduceResponse;
+}
+
+/// A Produce request that names its topics, because v13 names each topic by id
+/// only.
 ///
 /// The producer has no topic id for a topic that its metadata cache does not
 /// hold yet. A v13 request with a zero id names no topic, so the broker cannot
@@ -81,32 +114,58 @@ const PRODUCE_TOPIC_NAME_MAX_VERSION: i16 = 12;
 /// gives the same wire result without the block. Kafka's
 /// `TransactionManager.txnOffsetCommitHandler` caps `TxnOffsetCommit` in the
 /// same way: it uses `forTopicNames` when an id is missing.
-#[derive(Clone, Debug, PartialEq)]
-struct TopicNameProduce(ProduceRequest);
+type TopicNameProduce = CappedProduce<PRODUCE_TOPIC_NAME_MAX_VERSION>;
 
-impl Encode for TopicNameProduce {
-    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
-        self.0.encode(buf, version)
-    }
+/// A Produce request of a transaction that follows transaction version 1.
+///
+/// This producer sends `AddPartitionsToTxn` for each partition of a
+/// transaction, which is the transaction version 1 protocol. With transaction
+/// version 2 (KIP-890) the broker adds the partition itself when it sees a
+/// transactional Produce at v12 or higher, and the producer sends no
+/// `AddPartitionsToTxn`. The version of the Produce request tells the broker
+/// which protocol the producer follows, so a v12 or higher request from this
+/// producer would make the broker use the wrong one.
+///
+/// Apache Kafka's producer makes the same choice from the finalized feature
+/// `transaction.version`: `Sender.sendProduceRequest` passes
+/// `useTransactionV1Version = !transactionManager.isTransactionV2Enabled()`,
+/// and `ProduceRequest.builder` then caps the version at
+/// `LAST_STABLE_VERSION_BEFORE_TRANSACTION_V2` (11). This producer does not
+/// implement transaction version 2, so the cap holds for every transactional
+/// request.
+type TransactionV1Produce = CappedProduce<PRODUCE_TRANSACTION_V1_MAX_VERSION>;
 
-    fn encoded_len(&self, version: i16) -> usize {
-        self.0.encoded_len(version)
-    }
+/// The Produce version cap of one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProduceCap {
+    /// The request carries a transactional id. It follows transaction version
+    /// 1, so it stops at v11.
+    TransactionV1,
+    /// A topic of the request has no topic id, so the request stops at v12,
+    /// which names each topic.
+    TopicNames,
+    /// Every topic has an id, so the request can use the latest version.
+    Latest,
 }
 
-impl ProtocolRequest for TopicNameProduce {
-    const API_KEY: i16 = produce_request::API_KEY;
-    const MIN_VERSION: i16 = produce_request::MIN_VERSION;
-    const MAX_VERSION: i16 = PRODUCE_TOPIC_NAME_MAX_VERSION;
-    const FLEXIBLE_MIN: i16 = produce_request::FLEXIBLE_MIN;
-    type Response = ProduceResponse;
-}
-
-/// Tell if a topic in `req` has no topic id, so the request must name topics.
-fn needs_topic_names(req: &ProduceRequest) -> bool {
-    req.topic_data
+/// Give the version cap of `req`. A transactional request takes the lowest
+/// cap: it names its topics too, because v11 is below v12.
+fn produce_cap(req: &ProduceRequest) -> ProduceCap {
+    if req
+        .transactional_id
+        .as_ref()
+        .is_some_and(|id| !id.is_empty())
+    {
+        ProduceCap::TransactionV1
+    } else if req
+        .topic_data
         .iter()
         .any(|topic| topic.topic_id == Uuid::ZERO)
+    {
+        ProduceCap::TopicNames
+    } else {
+        ProduceCap::Latest
+    }
 }
 
 /// Production [`ProduceTransport`] backed by a real [`Client`].
@@ -118,6 +177,37 @@ impl ClientTransport {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
     }
+
+    /// Send `req` to `leader`, which is a broker id, or to the bootstrap
+    /// connection when `leader` is `None`.
+    async fn send_capped<R>(
+        &self,
+        leader: Option<i32>,
+        req: R,
+    ) -> Result<ProduceResponse, ClientError>
+    where
+        R: ProtocolRequest<Response = ProduceResponse> + Encode + Send + Sync,
+    {
+        match leader {
+            Some(id) => self.client.broker(id).send(req).await,
+            None => self.client.send(req).await,
+        }
+    }
+
+    /// Enqueue `req`, for which the broker sends no response.
+    async fn send_capped_no_response<R>(
+        &self,
+        leader: Option<i32>,
+        req: R,
+    ) -> Result<(), ClientError>
+    where
+        R: ProtocolRequest<Response = ProduceResponse> + Encode + Send + Sync,
+    {
+        match leader {
+            Some(id) => self.client.broker(id).send_no_response(req).await,
+            None => self.client.send_no_response(req).await,
+        }
+    }
 }
 
 #[async_trait]
@@ -128,11 +218,13 @@ impl ProduceTransport for ClientTransport {
         leader: Option<i32>,
         req: ProduceRequest,
     ) -> Result<ProduceResponse, ClientError> {
-        match (leader, needs_topic_names(&req)) {
-            (Some(id), true) => self.client.broker(id).send(TopicNameProduce(req)).await,
-            (Some(id), false) => self.client.broker(id).send(req).await,
-            (None, true) => self.client.send(TopicNameProduce(req)).await,
-            (None, false) => self.client.send(req).await,
+        match produce_cap(&req) {
+            ProduceCap::TransactionV1 => {
+                self.send_capped(leader, TransactionV1Produce::from(req))
+                    .await
+            }
+            ProduceCap::TopicNames => self.send_capped(leader, TopicNameProduce::from(req)).await,
+            ProduceCap::Latest => self.send_capped(leader, req).await,
         }
     }
 
@@ -141,16 +233,16 @@ impl ProduceTransport for ClientTransport {
         leader: Option<i32>,
         req: ProduceRequest,
     ) -> Result<(), ClientError> {
-        match (leader, needs_topic_names(&req)) {
-            (Some(id), true) => {
-                self.client
-                    .broker(id)
-                    .send_no_response(TopicNameProduce(req))
+        match produce_cap(&req) {
+            ProduceCap::TransactionV1 => {
+                self.send_capped_no_response(leader, TransactionV1Produce::from(req))
                     .await
             }
-            (Some(id), false) => self.client.broker(id).send_no_response(req).await,
-            (None, true) => self.client.send_no_response(TopicNameProduce(req)).await,
-            (None, false) => self.client.send_no_response(req).await,
+            ProduceCap::TopicNames => {
+                self.send_capped_no_response(leader, TopicNameProduce::from(req))
+                    .await
+            }
+            ProduceCap::Latest => self.send_capped_no_response(leader, req).await,
         }
     }
 
@@ -421,13 +513,15 @@ mod tests {
 
     /// A request whose topics all have ids goes out at v13, which names topics
     /// by id only. A request with a topic that has no id goes out at v12, which
-    /// names topics. Each row compares the version and the whole request that
-    /// the broker decoded.
+    /// names topics. A request of a transaction goes out at v11, the last
+    /// version before transaction version 2. Each row compares the version and
+    /// the whole request that the broker decoded.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn produce_without_a_topic_id_names_the_topic_at_v12() {
+    async fn produce_version_follows_the_cap_of_the_request() {
         let known = Uuid([7u8; 16]);
         let other = Uuid([8u8; 16]);
-        let request = |topics| ProduceRequest {
+        let request = |transactional_id: Option<&str>, topics| ProduceRequest {
+            transactional_id: transactional_id.map(str::to_owned),
             acks: -1,
             timeout_ms: 1_000,
             topic_data: topics,
@@ -436,29 +530,44 @@ mod tests {
         let cases = [
             (
                 "every id known",
+                None,
                 vec![topic("a", known), topic("b", other)],
-                (13, request(vec![topic("", known), topic("", other)])),
+                (13, request(None, vec![topic("", known), topic("", other)])),
             ),
             (
                 "one id unknown",
+                None,
                 vec![topic("a", known), topic("b", Uuid::ZERO)],
                 (
                     12,
-                    request(vec![topic("a", Uuid::ZERO), topic("b", Uuid::ZERO)]),
+                    request(None, vec![topic("a", Uuid::ZERO), topic("b", Uuid::ZERO)]),
                 ),
             ),
             (
                 "no id known",
+                None,
                 vec![topic("a", Uuid::ZERO)],
-                (12, request(vec![topic("a", Uuid::ZERO)])),
+                (12, request(None, vec![topic("a", Uuid::ZERO)])),
+            ),
+            (
+                "a transaction with every id known",
+                Some("tx-1"),
+                vec![topic("a", known)],
+                (11, request(Some("tx-1"), vec![topic("a", Uuid::ZERO)])),
+            ),
+            (
+                "a transaction without a topic id",
+                Some("tx-1"),
+                vec![topic("a", Uuid::ZERO)],
+                (11, request(Some("tx-1"), vec![topic("a", Uuid::ZERO)])),
             ),
         ];
-        for (name, topics, expected) in cases {
+        for (name, transactional_id, topics, expected) in cases {
             for leader in [Some(1), None] {
                 let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
                 let (mock, transport) = produce_recording_broker(Arc::clone(&seen)).await;
                 transport
-                    .send_produce(leader, request(topics.clone()))
+                    .send_produce(leader, request(transactional_id, topics.clone()))
                     .await
                     .expect("send_produce");
                 let sent = seen.lock().unwrap().clone();
@@ -468,24 +577,52 @@ mod tests {
         }
     }
 
+    /// The cap of a Produce request: a transaction stops at v11, a topic
+    /// without an id stops at v12, and every other request uses the latest
+    /// version.
     #[test]
-    fn a_request_needs_topic_names_when_any_topic_id_is_zero() {
+    fn a_produce_request_takes_the_cap_of_its_contents() {
         let known = Uuid([7u8; 16]);
         let cases = [
-            ("no topics", vec![], false),
-            ("every id known", vec![topic("a", known)], false),
+            ("no topics", None, vec![], ProduceCap::Latest),
+            (
+                "every id known",
+                None,
+                vec![topic("a", known)],
+                ProduceCap::Latest,
+            ),
             (
                 "one id zero",
+                None,
                 vec![topic("a", known), topic("b", Uuid::ZERO)],
-                true,
+                ProduceCap::TopicNames,
+            ),
+            (
+                "transactional",
+                Some("tx-1"),
+                vec![topic("a", known)],
+                ProduceCap::TransactionV1,
+            ),
+            (
+                "transactional without a topic id",
+                Some("tx-1"),
+                vec![topic("a", Uuid::ZERO)],
+                ProduceCap::TransactionV1,
+            ),
+            (
+                "empty transactional id",
+                Some(""),
+                vec![topic("a", known)],
+                ProduceCap::Latest,
             ),
         ];
-        for (name, topics, expected) in cases {
+        for (name, transactional_id, topics, expected) in cases {
             let request = ProduceRequest {
+                transactional_id: transactional_id.map(str::to_owned),
                 topic_data: topics,
                 ..Default::default()
             };
-            assert2::assert!(needs_topic_names(&request) == expected, "{name}");
+            assert2::assert!(produce_cap(&request) == expected, "{name}");
         }
     }
 }
