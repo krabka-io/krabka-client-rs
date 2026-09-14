@@ -66,6 +66,9 @@ pub const DEFAULT_PRODUCER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Default wall-clock routing retry budget per batch.
 pub const DEFAULT_PRODUCER_ROUTING_RETRY_BUDGET: Duration = Duration::from_secs(30);
 /// Default producer-ID initialization retry timeout.
+///
+/// The same timeout limits the retries of a transaction coordinator request:
+/// `AddPartitionsToTxn`, and an `EndTxn` whose outcome a transport failure hid.
 pub const DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default producer-ID initialization backoff cap.
 pub const DEFAULT_PRODUCER_INIT_MAX_BACKOFF: Duration = Duration::from_secs(1);

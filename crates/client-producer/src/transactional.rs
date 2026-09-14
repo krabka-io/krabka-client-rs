@@ -505,6 +505,9 @@ mod tests {
             .transactional_id("test-txn")
             .transaction_two_phase_commit_enable(two_phase_commit_enabled)
             .request_timeout(std::time::Duration::from_millis(100))
+            .retry_backoff(Duration::from_millis(1))
+            .init_retry_timeout(Duration::from_millis(400))
+            .init_max_backoff(Duration::from_millis(20))
             .build()
             .await
             .expect("producer connects to the mock");
@@ -632,26 +635,25 @@ mod tests {
             .expect("begin transaction")
             .commit()
             .await
-            .expect_err("silent EndTxn has an uncertain outcome");
-        assert!(matches!(error.source, ProducerError::Client(_)));
+            .expect_err(
+                "EndTxn that stays silent past the retry deadline has an uncertain outcome",
+            );
+        assert2::assert!(let ProducerError::RecoveryRequired = error.source);
         drop(error.transaction);
 
-        assert!(matches!(
-            producer.begin_transaction().await,
-            Err(ProducerError::RecoveryRequired)
-        ));
+        assert2::assert!(let Err(ProducerError::RecoveryRequired) = producer.begin_transaction().await);
         let acknowledgement = producer.send(ProducerRecord::default()).await;
-        assert!(matches!(
-            acknowledgement.await.expect("recovery error is delivered"),
-            Err(ProducerError::RecoveryRequired)
-        ));
+        assert2::assert!(
+            let Err(ProducerError::RecoveryRequired) =
+                acknowledgement.await.expect("recovery error is delivered")
+        );
 
         end_txn_silent.store(false, Ordering::SeqCst);
         producer
             .init_transactions()
             .await
             .expect("reinitialization obtains a new epoch");
-        assert_eq!(*producer.txn_pid_epoch.lock().await, (7, 4));
+        assert2::assert!(*producer.txn_pid_epoch.lock().await == (7, 4));
         assert2::assert!(producer.transactional_identity().await == Some((7, 4)));
         producer
             .begin_transaction()
@@ -689,6 +691,262 @@ mod tests {
             .abort()
             .await
             .expect("abort after recovery");
+        mock.stop();
+    }
+
+    /// One scripted `EndTxn` answer from the mock coordinator.
+    #[derive(Debug, Clone, Copy)]
+    enum EndTxnReply {
+        /// Send no response, so the request times out in transport.
+        Silent,
+        /// Answer with this error code.
+        Code(i16),
+    }
+
+    /// How `commit` ended, in a form that tests can compare.
+    #[derive(Debug, PartialEq, Eq)]
+    enum CommitResult {
+        Committed,
+        Fenced,
+        ConcurrentTransactions,
+        Server(i16),
+        OutcomeUnknown,
+        Other(String),
+    }
+
+    impl From<Result<(), ProducerError>> for CommitResult {
+        fn from(result: Result<(), ProducerError>) -> Self {
+            match result {
+                Ok(()) => Self::Committed,
+                Err(ProducerError::FencedProducer) => Self::Fenced,
+                Err(ProducerError::ConcurrentTransactions) => Self::ConcurrentTransactions,
+                Err(ProducerError::Server(code)) => Self::Server(code),
+                Err(ProducerError::RecoveryRequired) => Self::OutcomeUnknown,
+                Err(other) => Self::Other(other.to_string()),
+            }
+        }
+    }
+
+    /// The observable result of one scripted commit.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ScriptedCommit {
+        result: CommitResult,
+        end_txn_requests: usize,
+        state: TxnState,
+    }
+
+    /// Boot a mock coordinator that answers `EndTxn` from `script`, and then
+    /// with `exhausted` when the script is empty.
+    async fn scripted_end_txn_producer(
+        script: &[EndTxnReply],
+        exhausted: EndTxnReply,
+    ) -> (MockBroker, Producer, Arc<std::sync::Mutex<usize>>) {
+        let port_cell = Arc::new(AtomicU16::new(0));
+        let handler_port = Arc::clone(&port_cell);
+        let replies = Arc::new(std::sync::Mutex::new(
+            script
+                .iter()
+                .copied()
+                .collect::<std::collections::VecDeque<_>>(),
+        ));
+        let requests = Arc::new(std::sync::Mutex::new(0_usize));
+        let handler_requests = Arc::clone(&requests);
+        let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(encode_v0(&ApiVersionsResponse::default()));
+            }
+            if api_key == find_coordinator_request::API_KEY {
+                return Some(encode_v0(&FindCoordinatorResponse {
+                    error_code: 0,
+                    node_id: 1,
+                    host: "127.0.0.1".into(),
+                    port: i32::from(handler_port.load(Ordering::SeqCst)),
+                    ..Default::default()
+                }));
+            }
+            if api_key == init_producer_id_request::API_KEY {
+                return Some(encode_v0(&InitProducerIdResponse {
+                    error_code: 0,
+                    producer_id: 7,
+                    producer_epoch: 3,
+                    ..Default::default()
+                }));
+            }
+            if api_key == end_txn_request::API_KEY {
+                *handler_requests.lock().expect("request counter") += 1;
+                let reply = replies
+                    .lock()
+                    .expect("scripted replies")
+                    .pop_front()
+                    .unwrap_or(exhausted);
+                return match reply {
+                    EndTxnReply::Silent => None,
+                    EndTxnReply::Code(error_code) => Some(encode_v0(&EndTxnResponse {
+                        error_code,
+                        ..Default::default()
+                    })),
+                };
+            }
+            None
+        })
+        .await;
+        port_cell.store(mock.addr.port(), Ordering::SeqCst);
+        let producer = Producer::builder()
+            .bootstrap(mock.addr.to_string())
+            .enable_idempotence(false)
+            .transactional_id("test-txn")
+            .request_timeout(Duration::from_millis(100))
+            .retry_backoff(Duration::from_millis(1))
+            .init_retry_timeout(Duration::from_millis(1500))
+            .init_max_backoff(Duration::from_millis(20))
+            .build()
+            .await
+            .expect("producer connects to the mock");
+        producer
+            .init_transactions()
+            .await
+            .expect("init_transactions against the mock coordinator");
+        (mock, producer, requests)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_learns_the_outcome_of_a_lost_end_txn() {
+        use CommitResult::{Committed, ConcurrentTransactions, Fenced, OutcomeUnknown, Server};
+        use EndTxnReply::{Code, Silent};
+        let cases = [
+            ("answered", vec![Code(0)], Committed, 1, TxnState::Ready),
+            (
+                "lost then committed",
+                vec![Silent, Code(0)],
+                Committed,
+                2,
+                TxnState::Ready,
+            ),
+            (
+                "lost, prepare in progress, then committed",
+                vec![Silent, Code(51), Code(51), Code(0)],
+                Committed,
+                4,
+                TxnState::Ready,
+            ),
+            (
+                "lost, coordinator loading, then committed",
+                vec![Silent, Code(14), Code(15), Code(16), Code(0)],
+                Committed,
+                5,
+                TxnState::Ready,
+            ),
+            (
+                "loading then committed",
+                vec![Code(14), Code(0)],
+                Committed,
+                2,
+                TxnState::Ready,
+            ),
+            ("fenced", vec![Code(47)], Fenced, 1, TxnState::Fenced),
+            (
+                "producer fenced",
+                vec![Code(90)],
+                Fenced,
+                1,
+                TxnState::Fenced,
+            ),
+            (
+                "concurrent without a loss",
+                vec![Code(51)],
+                ConcurrentTransactions,
+                1,
+                TxnState::InTransaction,
+            ),
+            (
+                "refused",
+                vec![Code(48)],
+                Server(48),
+                1,
+                TxnState::InTransaction,
+            ),
+            (
+                "lost then fenced",
+                vec![Silent, Code(47)],
+                OutcomeUnknown,
+                2,
+                TxnState::RecoveryRequired,
+            ),
+            (
+                "lost then producer fenced",
+                vec![Silent, Code(90)],
+                OutcomeUnknown,
+                2,
+                TxnState::RecoveryRequired,
+            ),
+            (
+                "lost then invalid state",
+                vec![Silent, Code(48)],
+                OutcomeUnknown,
+                2,
+                TxnState::RecoveryRequired,
+            ),
+        ];
+        for (name, script, result, end_txn_requests, state) in cases {
+            let (mock, producer, requests) = scripted_end_txn_producer(&script, Code(0)).await;
+            let outcome = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction")
+                .commit()
+                .await
+                .map_err(|error| error.source);
+            let state_after = *producer.txn_state.lock().await;
+            let actual = ScriptedCommit {
+                result: outcome.into(),
+                end_txn_requests: *requests.lock().expect("request counter"),
+                state: state_after,
+            };
+            let expected = ScriptedCommit {
+                result,
+                end_txn_requests,
+                state,
+            };
+            assert2::assert!(actual == expected, "{name}");
+            mock.stop();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_after_a_lost_end_txn_permits_the_next_transaction() {
+        let (mock, producer, requests) =
+            scripted_end_txn_producer(&[EndTxnReply::Silent], EndTxnReply::Code(0)).await;
+        producer
+            .begin_transaction()
+            .await
+            .expect("begin first transaction")
+            .commit()
+            .await
+            .expect("retry learns that the first transaction committed");
+        producer
+            .begin_transaction()
+            .await
+            .expect("no reinitialization is needed after a learned outcome")
+            .commit()
+            .await
+            .expect("second transaction commits");
+        assert2::assert!(*requests.lock().expect("request counter") == 3);
+        mock.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_txn_that_stays_lost_reports_an_unknown_outcome_at_the_deadline() {
+        let (mock, producer, requests) = scripted_end_txn_producer(&[], EndTxnReply::Silent).await;
+        let error = producer
+            .begin_transaction()
+            .await
+            .expect("begin transaction")
+            .commit()
+            .await
+            .expect_err("no answer before the deadline");
+        assert2::assert!(let ProducerError::RecoveryRequired = error.source);
+        assert2::assert!(*requests.lock().expect("request counter") > 1);
+        assert2::assert!(*producer.txn_state.lock().await == TxnState::RecoveryRequired);
         mock.stop();
     }
 }

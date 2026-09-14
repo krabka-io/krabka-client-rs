@@ -60,6 +60,7 @@ mod builder;
 #[cfg(test)]
 mod client_failover_model;
 mod compression;
+mod end_txn;
 mod error;
 mod partitioner;
 mod producer;
