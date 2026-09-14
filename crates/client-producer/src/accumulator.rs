@@ -90,6 +90,26 @@ impl Accumulator {
         }
     }
 
+    /// Put `records` back at the front of the ready queue as one batch.
+    ///
+    /// The sender calls this for each part of a batch that the broker rejected
+    /// with `MESSAGE_TOO_LARGE`, so the parts go out before any newer batch of
+    /// the partition. Kafka's `RecordAccumulator.splitAndReenqueue` puts the
+    /// parts at the front of the same deque.
+    pub fn push_front(&mut self, records: Vec<PendingRecord>, transaction_generation: Option<u64>) {
+        let mut batch = InProgressBatch::new(transaction_generation);
+        for (index, mut record) in records.into_iter().enumerate() {
+            record.offset_delta = i32::try_from(index).unwrap_or(i32::MAX);
+            batch.size_bytes += approx_record_size(
+                record.key.as_deref(),
+                record.value.as_deref(),
+                &record.headers,
+            );
+            batch.records.push(record);
+        }
+        self.ready.push_front(batch);
+    }
+
     #[tracing::instrument(
         level = "trace",
         skip_all,

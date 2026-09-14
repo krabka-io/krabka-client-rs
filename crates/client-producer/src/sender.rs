@@ -87,6 +87,9 @@ use crate::{
 /// Wire error codes referenced when interpreting `PartitionProduceResponse`.
 mod codes {
     pub const NONE: i16 = 0;
+    /// `MESSAGE_TOO_LARGE`. Kafka splits a batch of more than one record and
+    /// sends the parts again.
+    pub const MESSAGE_TOO_LARGE: i16 = 10;
     /// `CLUSTER_AUTHORIZATION_FAILED`. Kafka's `TransactionManager` makes it
     /// fatal for an idempotent producer.
     pub const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
@@ -473,7 +476,32 @@ struct PreparedBatch {
     backoff_until: Option<Instant>,
     /// Resends already admitted after the initial send.
     retries_used: i32,
+    /// Why the last send did not ack the batch. It becomes the error of the
+    /// records when the retries or the routing budget run out.
+    last_failure: Option<SendFailure>,
     transaction_generation: Option<u64>,
+}
+
+/// Why one send of a batch did not ack it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFailure {
+    /// The broker answered with this error code.
+    Code(i16),
+    /// The request did not reach the broker, or its answer did not name the
+    /// partition.
+    Transport,
+}
+
+impl SendFailure {
+    /// The error that the records of a batch get when its retries run out.
+    /// Kafka's `Sender.failBatch` gives the records the last error, and its
+    /// expiry path gives them a `TimeoutException`.
+    const fn error(self) -> ProducerError {
+        match self {
+            Self::Code(code) => ProducerError::Server(code),
+            Self::Transport => ProducerError::SendTimeout,
+        }
+    }
 }
 
 /// One drain cycle.
@@ -519,15 +547,14 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
     //    once).
     fail_recovered_accumulator_batches(cfg).await;
     fail_recovered_retry_slots(cfg, &mut state.retry);
-    let (mut to_send, mut expired) = collect_retries(
+    let (mut to_send, expired) = collect_retries(
         &mut state.retry,
         now,
         cfg.routing_retry_budget,
         cfg.max_in_flight,
     );
     if !expired.is_empty() {
-        expired.append(&mut to_send);
-        fence(cfg, state, expired);
+        expire_batches(cfg, state, expired, to_send);
         return;
     }
     fail_recovered_batches(cfg, &mut to_send);
@@ -614,6 +641,68 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
 
     // 3. Send every batch concurrently, then apply each verdict to its window.
     send_batches(cfg, state, to_send).await;
+}
+
+/// Fail every batch whose routing budget ended, and park the rest of this
+/// cycle's send list for the next cycle.
+///
+/// Kafka's `Sender.sendProducerData` fails an expired batch with a
+/// `TimeoutException` and calls `TransactionManager.handleFailedBatch`, which
+/// raises the epoch of an idempotent producer. It does not fence the producer.
+/// The epoch bump starts every partition again at sequence 0, so each parked
+/// batch is written again at the new epoch, as the
+/// `OUT_OF_ORDER_SEQUENCE_NUMBER` path does.
+fn expire_batches(
+    cfg: &SenderConfig,
+    state: &mut PipelineState,
+    expired: Vec<PreparedBatch>,
+    to_send: Vec<PreparedBatch>,
+) {
+    let mut bump_epoch = false;
+    let mut repairs: Vec<((String, i32), SequenceRepair, i32)> = Vec::new();
+    let mut failed: Vec<PreparedBatch> = Vec::new();
+    for pb in expired {
+        let repair = BatchMode::of(&pb.record_batch).repair_after_failure();
+        record_repair(&mut bump_epoch, &mut repairs, &pb, repair);
+        tracing::warn!(
+            topic = %pb.topic,
+            partition = pb.partition,
+            base_sequence = pb.base_sequence,
+            "the routing retry budget of the batch ended; failing its records",
+        );
+        failed.push(pb);
+    }
+    if bump_epoch {
+        let Some(epoch) = bump_idempotent_epoch(cfg) else {
+            // Kafka gets a new producer id with `InitProducerId` when the epoch
+            // overflows. This sender cannot send that request, so it fences.
+            tracing::error!("idempotent producer epoch overflow; fencing the producer");
+            for pb in failed {
+                terminal_fail_batch(cfg, pb, ProducerError::SendTimeout);
+            }
+            fence(cfg, state, to_send);
+            return;
+        };
+        for mut pb in to_send {
+            pb.record_batch.producer_epoch = epoch;
+            restart_sequence(cfg, &mut pb);
+            state.retry.insert((pb.topic.clone(), pb.partition), pb);
+        }
+    } else {
+        for (key, repair, base_sequence) in repairs {
+            if repair == SequenceRepair::GiveBack {
+                cfg.next_seq.insert(key, base_sequence);
+            } else {
+                cfg.next_seq.remove(&key);
+            }
+        }
+        for pb in to_send {
+            state.retry.insert((pb.topic.clone(), pb.partition), pb);
+        }
+    }
+    for pb in failed {
+        terminal_fail_batch(cfg, pb, ProducerError::SendTimeout);
+    }
 }
 
 /// Drain the per-partition retry slots into an ordered send list, in the
@@ -704,6 +793,12 @@ enum BatchVerdict {
         code: i16,
         repair: SequenceRepair,
     },
+    /// Split the batch in two, put both parts back at the front of the
+    /// accumulator, and send them again. Kafka's `Sender.completeBatch` splits
+    /// a batch of more than one record that gets `MESSAGE_TOO_LARGE`
+    /// (`RecordAccumulator.splitAndReenqueue`), and it does not count the
+    /// attempt.
+    Split,
     /// Fail the records and fence the producer. Kafka's
     /// `TransactionManager.maybeTransitionToErrorState` makes these codes
     /// fatal.
@@ -784,7 +879,8 @@ struct PartitionAnswer {
 }
 
 /// Map a per-partition answer to its [`Classification`]. The function is pure
-/// and does no I/O.
+/// and does no I/O. `records_in_batch` is the number of records of the batch,
+/// which decides whether `MESSAGE_TOO_LARGE` splits it.
 ///
 /// The rules follow Kafka's `Sender.completeBatch`, `Sender.canRetry`,
 /// `TransactionManager.canRetry` and `TransactionManager.handleFailedBatch`.
@@ -799,9 +895,13 @@ fn classify_verdict(
     answer: PartitionAnswer,
     mode: BatchMode,
     last_acked_offset: Option<i64>,
+    records_in_batch: usize,
 ) -> Classification {
     let code = answer.error_code;
     let verdict = match (code, mode) {
+        // A batch of more than one record splits, and the parts go out again.
+        // A single-record batch fails, because no split can make it smaller.
+        (codes::MESSAGE_TOO_LARGE, _) if records_in_batch > 1 => BatchVerdict::Split,
         // The broker durably wrote the batch (NONE) or already had it
         // (DUPLICATE_SEQUENCE_NUMBER). `Sender.completeBatch` completes both.
         (codes::NONE | codes::DUPLICATE_SEQUENCE_NUMBER, _) => BatchVerdict::Acked {
@@ -933,6 +1033,7 @@ async fn prepare_batch(
         first_sent: None,
         backoff_until: None,
         retries_used: 0,
+        last_failure: None,
         transaction_generation: batch.transaction_generation,
     }
 }
@@ -984,9 +1085,10 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
     let mut repairs: Vec<((String, i32), SequenceRepair, i32)> = Vec::new();
     let mut restarts: Vec<PreparedBatch> = Vec::new();
     let mut rewrites: Vec<PreparedBatch> = Vec::new();
+    let mut splits: Vec<PreparedBatch> = Vec::new();
     // Failed batches resolve their records after the sequence repair, so a
     // caller that sees the error already sees the repaired producer.
-    let mut failed: Vec<(PreparedBatch, i16)> = Vec::new();
+    let mut failed: Vec<(PreparedBatch, ProducerError)> = Vec::new();
     while let Some(res) = results.next().await {
         let BatchSendResult {
             mut pb,
@@ -998,7 +1100,9 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
         if let Some(to_fail) = &mut fenced {
             match verdict {
                 BatchVerdict::Acked { base_offset } => ack_batch(cfg, pb, base_offset),
-                BatchVerdict::Terminal { code, .. } => terminal_fail_batch(cfg, pb, code),
+                BatchVerdict::Terminal { code, .. } => {
+                    terminal_fail_batch(cfg, pb, ProducerError::Server(code));
+                }
                 BatchVerdict::Fatal(code) => {
                     fail_batch(pb.records, fatal_error(code));
                     finish_in_flight(cfg);
@@ -1009,7 +1113,8 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
                 }
                 BatchVerdict::Retry
                 | BatchVerdict::BumpEpochAndRetry
-                | BatchVerdict::RestartSequenceAndRetry => to_fail.push(pb),
+                | BatchVerdict::RestartSequenceAndRetry
+                | BatchVerdict::Split => to_fail.push(pb),
             }
             continue;
         }
@@ -1023,25 +1128,35 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
             // Terminal server error: fail the records, free the slot, and
             // repair the partition sequence after the cycle.
             BatchVerdict::Terminal { code, repair } => {
-                match repair {
-                    SequenceRepair::Keep => {}
-                    SequenceRepair::BumpEpoch => bump_epoch = true,
-                    SequenceRepair::GiveBack | SequenceRepair::Reset => {
-                        repairs.push(((pb.topic.clone(), pb.partition), repair, pb.base_sequence));
-                    }
-                }
-                failed.push((pb, code));
+                record_repair(&mut bump_epoch, &mut repairs, &pb, repair);
+                failed.push((pb, ProducerError::Server(code)));
             }
+            // The broker rejected the batch as too large. Split it, and send
+            // the parts again.
+            BatchVerdict::Split => splits.push(pb),
             // Transport failure, routing error or retriable code: park in the
             // partition's single retry slot, resent next cycle. The batch is
             // still outstanding, so its in-flight slot stays counted, and there
             // is no `finish_in_flight` here.
+            // The batch has no retry left. Kafka's `Sender.failBatch` fails
+            // the records and calls `TransactionManager.handleFailedBatch`,
+            // which raises the epoch of an idempotent producer. It does not
+            // fence.
             BatchVerdict::Retry
             | BatchVerdict::BumpEpochAndRetry
             | BatchVerdict::RestartSequenceAndRetry
                 if take_retry(&mut pb, cfg.retries) =>
             {
-                fenced = Some(vec![pb]);
+                let repair = BatchMode::of(&pb.record_batch).repair_after_failure();
+                record_repair(&mut bump_epoch, &mut repairs, &pb, repair);
+                let error = pb.last_failure.unwrap_or(SendFailure::Transport).error();
+                tracing::warn!(
+                    topic = %pb.topic,
+                    partition = pb.partition,
+                    base_sequence = pb.base_sequence,
+                    "batch has no retry left; failing its records",
+                );
+                failed.push((pb, error));
             }
             BatchVerdict::Retry => {
                 tracing::debug!(
@@ -1071,26 +1186,30 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
     drop(results);
 
     if let Some(mut to_fail) = fenced {
-        for (pb, code) in failed {
-            terminal_fail_batch(cfg, pb, code);
+        for (pb, error) in failed {
+            terminal_fail_batch(cfg, pb, error);
         }
         to_fail.append(&mut restarts);
         to_fail.append(&mut rewrites);
+        to_fail.append(&mut splits);
         fence(cfg, state, to_fail);
         return;
     }
 
+    let mut epoch_bumped = false;
     if bump_epoch || !rewrites.is_empty() {
         let Some(epoch) = bump_idempotent_epoch(cfg) else {
             // Kafka gets a new producer id with `InitProducerId` when the epoch
             // overflows. This sender cannot send that request, so it fences.
             tracing::error!("idempotent producer epoch overflow; fencing the producer");
-            for (pb, code) in failed {
-                terminal_fail_batch(cfg, pb, code);
+            for (pb, error) in failed {
+                terminal_fail_batch(cfg, pb, error);
             }
+            rewrites.append(&mut splits);
             fence(cfg, state, rewrites);
             return;
         };
+        epoch_bumped = true;
         for mut pb in rewrites {
             pb.record_batch.producer_epoch = epoch;
             restart_sequence(cfg, &mut pb);
@@ -1108,8 +1227,11 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
         restart_sequence(cfg, &mut pb);
         state.retry.insert((pb.topic.clone(), pb.partition), pb);
     }
-    for (pb, code) in failed {
-        terminal_fail_batch(cfg, pb, code);
+    for pb in splits {
+        split_and_requeue(cfg, pb, epoch_bumped).await;
+    }
+    for (pb, error) in failed {
+        terminal_fail_batch(cfg, pb, error);
     }
 
     if needs_refresh {
@@ -1196,18 +1318,91 @@ fn ack_batch(cfg: &SenderConfig, pb: PreparedBatch, base_offset: i64) {
     finish_in_flight(cfg);
 }
 
-/// Terminally fail a batch that the broker rejected with an unmodeled error
-/// code. It resolves the batch's records with `Server(code)` and releases the
-/// in-flight slot. It is the single owner of the slot release for the batch.
-fn terminal_fail_batch(cfg: &SenderConfig, pb: PreparedBatch, code: i16) {
-    if BatchMode::of(&pb.record_batch) == BatchMode::Transactional {
+/// Terminally fail a batch. It resolves the batch's records with `error` and
+/// releases the in-flight slot. It is the single owner of the slot release for
+/// the batch.
+fn terminal_fail_batch(cfg: &SenderConfig, pb: PreparedBatch, error: ProducerError) {
+    if BatchMode::of(&pb.record_batch) == BatchMode::Transactional
+        && let ProducerError::Server(code) = error
+    {
         // Kafka's `Sender.failBatch` calls
         // `TransactionManager.handleFailedBatch`, which moves a transactional
         // producer to `ABORTABLE_ERROR`. The application must abort the
         // transaction; `commit` fails until it does.
         cfg.txn_abortable_error.set(code);
     }
-    fail_batch(pb.records, ProducerError::Server(code));
+    fail_batch(pb.records, error);
+    finish_in_flight(cfg);
+}
+
+/// Note the sequence repair of a failed batch, so the cycle applies it after
+/// every answer is in.
+fn record_repair(
+    bump_epoch: &mut bool,
+    repairs: &mut Vec<((String, i32), SequenceRepair, i32)>,
+    pb: &PreparedBatch,
+    repair: SequenceRepair,
+) {
+    match repair {
+        SequenceRepair::Keep => {}
+        SequenceRepair::BumpEpoch => *bump_epoch = true,
+        SequenceRepair::GiveBack | SequenceRepair::Reset => {
+            repairs.push(((pb.topic.clone(), pb.partition), repair, pb.base_sequence));
+        }
+    }
+}
+
+/// Split a batch that the broker rejected as too large, and put both parts
+/// back at the front of its accumulator.
+///
+/// Kafka's `RecordAccumulator.splitAndReenqueue` splits the batch at the
+/// configured batch size. This sender seals a batch at that size already, so a
+/// rejected batch is at most one batch size, and the same rule would give the
+/// same batch back. It splits the records in half instead, so each rejection
+/// halves the parts until each part holds one record. A single-record batch
+/// fails with `MESSAGE_TOO_LARGE`, as it does in Kafka.
+///
+/// The partition takes the sequences of the batch back, so the parts get them
+/// again when the sender drains them. An epoch bump in the same cycle already
+/// started every partition at sequence 0, and then the parts take the
+/// sequences of the new epoch.
+async fn split_and_requeue(cfg: &SenderConfig, pb: PreparedBatch, epoch_bumped: bool) {
+    let key = (pb.topic.clone(), pb.partition);
+    let mode = BatchMode::of(&pb.record_batch);
+    if mode != BatchMode::Plain && !epoch_bumped {
+        cfg.next_seq.insert(key.clone(), pb.base_sequence);
+    }
+    let records = pb.records;
+    let middle = records.len() / 2;
+    let mut records = records;
+    let second = records.split_off(middle);
+    tracing::warn!(
+        topic = %pb.topic,
+        partition = pb.partition,
+        base_sequence = pb.base_sequence,
+        parts = 2,
+        first_part_records = records.len(),
+        "the broker rejected the batch as too large; splitting it",
+    );
+    let Some(accumulator) = cfg
+        .accumulators
+        .get(&key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        fail_batch(records, ProducerError::Server(codes::MESSAGE_TOO_LARGE));
+        fail_batch(second, ProducerError::Server(codes::MESSAGE_TOO_LARGE));
+        finish_in_flight(cfg);
+        return;
+    };
+    {
+        let mut accumulator = accumulator.lock().await;
+        // The front of the queue takes the parts in reverse, so the first part
+        // ends up first.
+        accumulator.push_front(second, pb.transaction_generation);
+        accumulator.push_front(records, pb.transaction_generation);
+    }
+    // The batch itself is no longer in flight. Each part counts itself when
+    // the sender drains it.
     finish_in_flight(cfg);
 }
 
@@ -1342,6 +1537,7 @@ async fn send_one_batch(
                     "acks=0 produce enqueue failed; will re-route",
                 );
                 pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+                pb.last_failure = Some(SendFailure::Transport);
                 BatchSendResult {
                     pb,
                     verdict: BatchVerdict::Retry,
@@ -1370,6 +1566,7 @@ async fn send_one_batch(
             // Park the batch for a verbatim resend after backoff, and refresh
             // metadata so the resend targets the current leader.
             pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+            pb.last_failure = Some(SendFailure::Transport);
             return BatchSendResult {
                 pb,
                 verdict: BatchVerdict::Retry,
@@ -1414,6 +1611,7 @@ fn interpret_response(
             "produce response carried no matching partition; resending"
         );
         pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+        pb.last_failure = Some(SendFailure::Transport);
         return BatchSendResult {
             pb,
             verdict: BatchVerdict::Retry,
@@ -1441,7 +1639,12 @@ fn interpret_response(
         base_offset: part_resp.base_offset,
         log_start_offset: part_resp.log_start_offset,
     };
-    match classify_verdict(answer, BatchMode::of(&pb.record_batch), last_acked_offset) {
+    match classify_verdict(
+        answer,
+        BatchMode::of(&pb.record_batch),
+        last_acked_offset,
+        pb.records.len(),
+    ) {
         Classification::Verdict(verdict) => {
             // Back off before a resend (e.g. NOT_ENOUGH_REPLICAS) so a
             // partition that keeps rejecting isn't hammered in a tight loop.
@@ -1452,6 +1655,7 @@ fn interpret_response(
                     | BatchVerdict::RestartSequenceAndRetry
             ) {
                 pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+                pb.last_failure = Some(SendFailure::Code(answer.error_code));
             }
             BatchSendResult {
                 pb,
@@ -1478,6 +1682,7 @@ fn interpret_response(
             // leaving the producer stuck (observed: traces/logs WAL never advances
             // on some cold boots). Backing off lets the partition become ready.
             pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+            pb.last_failure = Some(SendFailure::Code(part_resp.error_code));
             BatchSendResult {
                 pb,
                 verdict: BatchVerdict::Retry,
@@ -1731,6 +1936,7 @@ fn fail_batch(records: Vec<PendingRecord>, err: ProducerError) {
             ProducerError::RecoveryRequired => Some(ProducerError::RecoveryRequired),
             ProducerError::Closed => Some(ProducerError::Closed),
             ProducerError::FlushTimeout => Some(ProducerError::FlushTimeout),
+            ProducerError::SendTimeout => Some(ProducerError::SendTimeout),
             ProducerError::BufferFull => Some(ProducerError::BufferFull),
             ProducerError::BatchTooLarge { batch_size } => Some(ProducerError::BatchTooLarge {
                 batch_size: *batch_size,
@@ -1809,6 +2015,7 @@ mod tests {
             first_sent,
             backoff_until: None,
             retries_used: 0,
+            last_failure: None,
             transaction_generation: None,
         };
         (pb, rx)
@@ -1938,8 +2145,45 @@ mod tests {
                     },
                     |(_, _, classifications)| *classifications,
                 );
-            let actual = MODES.map(|mode| classify_verdict(answer(code), mode, None));
+            // One record in the batch, so `MESSAGE_TOO_LARGE` cannot split.
+            let actual = MODES.map(|mode| classify_verdict(answer(code), mode, None, 1));
             assert2::assert!(actual == expected, "{code} {name}");
+        }
+    }
+
+    /// Kafka's `Sender.completeBatch` splits a batch of more than one record
+    /// that gets `MESSAGE_TOO_LARGE`, and it fails a single-record batch.
+    #[test]
+    fn message_too_large_splits_only_a_batch_of_more_than_one_record() {
+        let answer = PartitionAnswer {
+            error_code: codes::MESSAGE_TOO_LARGE,
+            base_offset: 7,
+            log_start_offset: 5,
+        };
+        for (name, records_in_batch, expected) in [
+            (
+                "one record fails",
+                1,
+                MODES.map(|mode| {
+                    Classification::Verdict(BatchVerdict::Terminal {
+                        code: codes::MESSAGE_TOO_LARGE,
+                        repair: mode.repair_after_failure(),
+                    })
+                }),
+            ),
+            (
+                "two records split",
+                2,
+                MODES.map(|_| Classification::Verdict(BatchVerdict::Split)),
+            ),
+            (
+                "many records split",
+                17,
+                MODES.map(|_| Classification::Verdict(BatchVerdict::Split)),
+            ),
+        ] {
+            let actual = MODES.map(|mode| classify_verdict(answer, mode, None, records_in_batch));
+            assert2::assert!(actual == expected, "{name}");
         }
     }
 
@@ -1999,7 +2243,7 @@ mod tests {
                 base_offset: -1,
                 log_start_offset,
             };
-            let actual = MODES.map(|mode| classify_verdict(answer, mode, last_acked_offset));
+            let actual = MODES.map(|mode| classify_verdict(answer, mode, last_acked_offset, 1));
             assert2::assert!(actual == expected, "{name}");
         }
     }
@@ -4223,8 +4467,12 @@ mod harness {
         shutdown(h).await;
     }
 
+    /// Kafka's `Sender.failBatch` fails a batch that has no retry left and
+    /// calls `TransactionManager.handleFailedBatch`, which raises the epoch of
+    /// an idempotent producer and starts every partition at sequence 0. It
+    /// does not fence, so the next record still goes out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exhausted_retry_fences_before_a_sequence_gap_can_be_sent() {
+    async fn exhausted_retry_fails_the_batch_and_bumps_the_epoch() {
         let transport = MockTransport::new(Duration::ZERO);
         transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
         let h = spawn_sender_with_retries(transport.clone(), 1, millis(1), 0);
@@ -4235,20 +4483,65 @@ mod harness {
             .expect("first ack resolves")
             .expect("first sender remains")
             .expect_err("exhausted batch must fail");
-        assert2::assert!(matches!(first_error, ProducerError::FencedProducer));
-        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_FENCED);
+        assert2::assert!(
+            matches!(
+                first_error,
+                ProducerError::Server(test_codes::NOT_LEADER_OR_FOLLOWER)
+            ),
+            "{first_error:?}"
+        );
+        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE);
+        assert2::assert!(h.producer_epoch.load(Ordering::Acquire) == 1);
 
         let second = produce_burst(&h, "t", 0, 1)
             .await
             .pop()
             .expect("second ack");
-        let second_error = tokio::time::timeout(Duration::from_secs(1), second)
+        let metadata = tokio::time::timeout(Duration::from_secs(1), second)
             .await
             .expect("second ack resolves")
             .expect("second sender remains")
-            .expect_err("fenced producer rejects later records");
-        assert2::assert!(matches!(second_error, ProducerError::FencedProducer));
-        assert2::assert!(transport.send_count() == 1);
+            .expect("the producer still sends after the failed batch");
+        assert2::assert!(metadata.partition == 0);
+        // The failed batch at (epoch 0, sequence 0), then the next record at
+        // the new epoch, which starts the partition again at sequence 0.
+        assert2::assert!(transport.sent_batches() == vec![(0, 0), (1, 0)]);
+
+        shutdown(h).await;
+    }
+
+    /// Kafka's `Sender.completeBatch` splits a batch of more than one record
+    /// that gets `MESSAGE_TOO_LARGE` and sends the parts again
+    /// (`RecordAccumulator.splitAndReenqueue`). The parts take the sequences
+    /// of the failed batch, so the partition keeps a gap-free sequence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn message_too_large_splits_the_batch_and_sends_the_parts() {
+        const MESSAGE_TOO_LARGE: i16 = 10;
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.inject_code_once(0, MESSAGE_TOO_LARGE);
+        let h = spawn_sender(transport.clone(), 5);
+
+        let mut offsets = Vec::new();
+        for (index, rx) in produce_single_batch(&h, "t", 0, 2)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            let metadata = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .unwrap_or_else(|_| panic!("record {index} never resolved"))
+                .expect("sender remains")
+                .expect("the split parts are acknowledged");
+            offsets.push(metadata.offset);
+        }
+
+        // The whole batch at sequence 0, then the two parts at sequences 0 and
+        // 1, at the same epoch. The epoch does not change, and the producer
+        // stays active.
+        assert2::assert!(transport.sent_batches() == vec![(0, 0), (0, 0), (0, 1)]);
+        assert2::assert!(h.producer_epoch.load(Ordering::Acquire) == 0);
+        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE);
+        assert2::assert!(offsets.len() == 2);
 
         shutdown(h).await;
     }
@@ -4272,25 +4565,33 @@ mod harness {
             .await
             .expect("failed ack resolves")
             .expect("failed sender remains")
-            .expect_err("exhausted partition must fence");
+            .expect_err("the exhausted partition must fail");
         let accepted_metadata = tokio::time::timeout(Duration::from_secs(1), accepted.remove(0))
             .await
             .expect("accepted ack resolves")
             .expect("accepted sender remains")
             .expect("broker-accepted partition must remain acknowledged");
 
-        assert2::assert!(matches!(failed_error, ProducerError::FencedProducer));
+        // A transport loss carries no broker code, so the records get the
+        // timeout error that Kafka's expiry path raises.
+        assert2::assert!(
+            matches!(failed_error, ProducerError::SendTimeout),
+            "{failed_error:?}"
+        );
         assert2::assert!((accepted_metadata.partition, accepted_metadata.offset) == (1, 0));
-        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_FENCED);
+        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE);
         assert2::assert!(transport.send_count() == 2);
         shutdown(h).await;
     }
 
+    /// Kafka's `Sender.sendProducerData` fails an expired batch with a
+    /// timeout and raises the epoch of an idempotent producer. It does not
+    /// fence.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exhausted_routing_budget_fences_the_producer() {
+    async fn exhausted_routing_budget_fails_the_batch_and_bumps_the_epoch() {
         let transport = MockTransport::new(Duration::ZERO);
         transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
-        let h = spawn_sender_with_policy(transport, 1, millis(1), i32::MAX, millis(1));
+        let h = spawn_sender_with_policy(transport.clone(), 1, millis(1), i32::MAX, millis(1));
 
         let ack = produce_burst(&h, "t", 0, 1).await.pop().expect("ack");
         let error = tokio::time::timeout(Duration::from_secs(1), ack)
@@ -4299,8 +4600,17 @@ mod harness {
             .expect("sender remains")
             .expect_err("expired batch must fail");
 
-        assert2::assert!(matches!(error, ProducerError::FencedProducer));
-        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_FENCED);
+        assert2::assert!(matches!(error, ProducerError::SendTimeout), "{error:?}");
+        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE);
+        assert2::assert!(h.producer_epoch.load(Ordering::Acquire) == 1);
+
+        let next = produce_burst(&h, "t", 0, 1).await.pop().expect("next ack");
+        let metadata = tokio::time::timeout(Duration::from_secs(1), next)
+            .await
+            .expect("next ack resolves")
+            .expect("sender remains")
+            .expect("the producer still sends after the expired batch");
+        assert2::assert!(metadata.partition == 0);
         shutdown(h).await;
     }
 
