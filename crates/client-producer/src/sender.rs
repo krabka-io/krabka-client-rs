@@ -979,6 +979,9 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
     let mut repairs: Vec<((String, i32), SequenceRepair, i32)> = Vec::new();
     let mut restarts: Vec<PreparedBatch> = Vec::new();
     let mut rewrites: Vec<PreparedBatch> = Vec::new();
+    // Failed batches resolve their records after the sequence repair, so a
+    // caller that sees the error already sees the repaired producer.
+    let mut failed: Vec<(PreparedBatch, i16)> = Vec::new();
     while let Some(res) = results.next().await {
         let BatchSendResult {
             mut pb,
@@ -1022,7 +1025,7 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
                         repairs.push(((pb.topic.clone(), pb.partition), repair, pb.base_sequence));
                     }
                 }
-                terminal_fail_batch(cfg, pb, code);
+                failed.push((pb, code));
             }
             // Transport failure, routing error or retriable code: park in the
             // partition's single retry slot, resent next cycle. The batch is
@@ -1063,6 +1066,9 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
     drop(results);
 
     if let Some(mut to_fail) = fenced {
+        for (pb, code) in failed {
+            terminal_fail_batch(cfg, pb, code);
+        }
         to_fail.append(&mut restarts);
         to_fail.append(&mut rewrites);
         fence(cfg, state, to_fail);
@@ -1074,6 +1080,9 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
             // Kafka gets a new producer id with `InitProducerId` when the epoch
             // overflows. This sender cannot send that request, so it fences.
             tracing::error!("idempotent producer epoch overflow; fencing the producer");
+            for (pb, code) in failed {
+                terminal_fail_batch(cfg, pb, code);
+            }
             fence(cfg, state, rewrites);
             return;
         };
@@ -1093,6 +1102,9 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
     for mut pb in restarts {
         restart_sequence(cfg, &mut pb);
         state.retry.insert((pb.topic.clone(), pb.partition), pb);
+    }
+    for (pb, code) in failed {
+        terminal_fail_batch(cfg, pb, code);
     }
 
     if needs_refresh {
