@@ -360,6 +360,15 @@ impl Consumer {
             }
         }
 
+                self.end_offsets.lock().await.insert(
+                    key.clone(),
+                    readable_end_offset(
+                        self.isolation_level,
+                        part.high_watermark,
+                        part.last_stable_offset,
+                    ),
+                );
+
                 self.process_partition_records(&mut offsets, &key, &topic_name, part, &mut out)
                     .await?;
             }
@@ -632,6 +641,17 @@ impl Consumer {
     }
 }
 
+const fn readable_end_offset(
+    isolation: IsolationLevel,
+    high_watermark: i64,
+    last_stable_offset: i64,
+) -> i64 {
+    match isolation {
+        IsolationLevel::ReadCommitted => last_stable_offset,
+        IsolationLevel::ReadUncommitted => high_watermark,
+    }
+}
+
 /// The offset to fetch next after consuming `batches`: one past the highest
 /// `base_offset + last_offset_delta` across all decoded batches.
 ///
@@ -887,6 +907,12 @@ mod offset_advance_tests {
                 "case {name}"
             );
         }
+    }
+
+    #[test]
+    fn readable_end_respects_consumer_isolation() {
+        check!(readable_end_offset(IsolationLevel::ReadUncommitted, 12, 9) == 12);
+        check!(readable_end_offset(IsolationLevel::ReadCommitted, 12, 9) == 9);
     }
 
     #[test]

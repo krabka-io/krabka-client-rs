@@ -78,6 +78,8 @@ pub struct Consumer {
     pub(crate) assignment_changed: Arc<Notify>,
     /// Next offset to fetch per partition.
     pub(crate) next_offsets: Arc<Mutex<HashMap<(String, i32), i64>>>,
+    /// Last broker-reported readable end offset per partition.
+    pub(crate) end_offsets: Arc<Mutex<HashMap<(String, i32), i64>>>,
     /// KIP-320 per-partition leader-epoch metadata, keyed like `next_offsets`.
     pub(crate) positions: Arc<Mutex<HashMap<(String, i32), crate::position::PartitionPosition>>>,
     /// Pending [`seek`](Consumer::seek) targets: `(topic, partition) -> next
@@ -1322,6 +1324,7 @@ async fn spawn_consumer(
     let commit_serialization = Arc::new(Mutex::new(()));
     let commit_async_state = Arc::new(AtomicU8::new(0));
     let next_offsets = Arc::new(Mutex::new(next_offsets));
+    let end_offsets = Arc::new(Mutex::new(HashMap::new()));
     let positions = Arc::new(Mutex::new(positions));
     let pending_seeks = Arc::new(Mutex::new(HashMap::new()));
     let topic_ids = Arc::new(Mutex::new(topic_ids));
@@ -1382,6 +1385,7 @@ async fn spawn_consumer(
         assigned,
         assignment_changed,
         next_offsets,
+        end_offsets,
         positions,
         pending_seeks,
         topic_ids,
@@ -1475,6 +1479,23 @@ impl Consumer {
     /// Snapshot of currently assigned `(topic, partition)` pairs.
     pub async fn assignment(&self) -> Vec<(String, i32)> {
         self.assigned.lock().await.clone()
+    }
+
+    /// Whether every assigned partition has consumed through the last end
+    /// offset reported by a successful fetch.
+    pub async fn at_log_end(&self) -> bool {
+        let assigned = self.assigned.lock().await;
+        if assigned.is_empty() {
+            return false;
+        }
+        let positions = self.next_offsets.lock().await;
+        let ends = self.end_offsets.lock().await;
+        assigned.iter().all(|partition| {
+            positions
+                .get(partition)
+                .zip(ends.get(partition))
+                .is_some_and(|(position, end)| position >= end)
+        })
     }
 
     /// Stop the coordinator task so the broker evicts this member promptly.
@@ -2193,6 +2214,7 @@ mod security_arg_tests {
             assigned: Arc::new(Mutex::new(vec![("orders".into(), 0)])),
             assignment_changed: Arc::new(Notify::new()),
             next_offsets: Arc::new(Mutex::new(HashMap::new())),
+            end_offsets: Arc::new(Mutex::new(HashMap::new())),
             positions: Arc::new(Mutex::new(HashMap::new())),
             pending_seeks: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
@@ -2239,6 +2261,24 @@ mod security_arg_tests {
                     group_instance_id: Some("instance-a".into()),
                 }
         );
+    }
+
+    #[tokio::test]
+    async fn log_end_requires_every_assigned_position_to_reach_a_reported_end() {
+        let consumer = test_consumer().await;
+        assert2::assert!(!consumer.at_log_end().await);
+
+        consumer
+            .next_offsets
+            .lock()
+            .await
+            .insert(("orders".into(), 0), 12);
+        consumer
+            .end_offsets
+            .lock()
+            .await
+            .insert(("orders".into(), 0), 12);
+        assert2::assert!(consumer.at_log_end().await);
     }
 
     /// Regression: the generation that the commit path stamps must track the
