@@ -312,6 +312,12 @@ pub struct ProducerRetryPolicy {
 }
 
 impl ProducerRetryPolicy {
+    /// The first backoff of the policy: `retry_backoff`, and never more than
+    /// `retry_backoff_max`. A coordinator retry starts at it.
+    fn first_backoff(&self) -> Time {
+        self.retry_backoff().min(self.retry_backoff_max()).as_time()
+    }
+
     /// Validate producer retry and transaction timing.
     ///
     /// # Errors
@@ -727,10 +733,10 @@ impl Producer {
     /// `compression_gzip_level`, `compression_lz4_level` and
     /// `compression_zstd_level` take Kafka's defaults (-1, 9 and 3) and ranges
     /// (KIP-390), and `build` fails with [`ProducerError::InvalidConfig`] for a
-    /// level out of range. The producer checks the levels but does not yet
-    /// give them to the codec: batches use the default level of each codec
-    /// until the pinned `krabka-protocol` revision has
-    /// `RecordBatch::encode_with_compression_level`.
+    /// level out of range. Each batch of a gzip, lz4 or zstd producer is
+    /// compressed at the level of its codec. The lz4 codec has no high
+    /// compression mode, so every lz4 level gives the same output
+    /// (krabka-io/krabka-protocol#27).
     ///
     /// When `client_id` is not set, the client id is
     /// `producer-<transactional_id>`, or `producer-<n>` with a process-wide
@@ -860,11 +866,7 @@ impl Producer {
             retry_policy.retry_backoff(),
             retry_policy.retry_backoff_max(),
         );
-        // A coordinator retry starts at the first backoff of the same policy.
-        let first_backoff = retry_policy
-            .retry_backoff()
-            .min(retry_policy.retry_backoff_max())
-            .as_time();
+        let first_backoff = retry_policy.first_backoff();
         let flush_timeout =
             ProducerFlushTimeout::new(flush_timeout).map_err(ProducerError::InvalidConfig)?;
 
@@ -942,6 +944,7 @@ impl Producer {
             producer_epoch: Arc::clone(&producer_epoch),
             acks,
             compression,
+            compression_level: compression_levels.level(compression),
             linger,
             request_timeout_ms: retry_policy.request_timeout_ms(),
             retries,
