@@ -1,0 +1,266 @@
+//! The subscription of a consumer: Kafka's `subscribe(Collection)`,
+//! `subscribe(Pattern)`, `unsubscribe` and `subscription`.
+//!
+//! The consumer and its coordinator task share the subscription. The consumer
+//! changes it when the application calls `subscribe` or `unsubscribe`. The
+//! coordinator task changes the topics of a pattern subscription when the
+//! cluster metadata changes. Each change that the task sees makes the next
+//! `poll` join the group again, as Kafka's
+//! `ConsumerCoordinator.rejoinNeededOrPending` does when the subscription is
+//! not the joined one.
+
+use std::{collections::BTreeSet, fmt, sync::Arc};
+
+use krabka_protocol::owned::metadata_response::MetadataResponse;
+
+use crate::{consumer::Consumer, error::ConsumerError};
+
+/// A topic pattern for [`Consumer::subscribe_pattern`]. Kafka's
+/// `subscribe(java.util.regex.Pattern)`.
+///
+/// The consumer calls the matcher for each topic in the cluster metadata and
+/// subscribes to the topics that match. Pass for example
+/// `move |topic| regex.is_match(topic)`.
+#[derive(Clone)]
+pub struct TopicPattern {
+    matcher: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+impl TopicPattern {
+    /// A pattern that matches the topics for which `matcher` returns `true`.
+    pub fn new(matcher: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            matcher: Arc::new(matcher),
+        }
+    }
+
+    /// Whether `topic` matches.
+    #[must_use]
+    pub fn matches(&self, topic: &str) -> bool {
+        (self.matcher)(topic)
+    }
+}
+
+impl fmt::Debug for TopicPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TopicPattern")
+    }
+}
+
+/// What a consumer subscribes to.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Subscription {
+    /// The subscribed topics, sorted. For a pattern, the topics that matched
+    /// the last metadata.
+    pub topics: Vec<String>,
+    /// The pattern of a pattern subscription.
+    pub pattern: Option<TopicPattern>,
+    /// Kafka's `exclude.internal.topics`: a pattern does not match an
+    /// internal topic.
+    pub exclude_internal_topics: bool,
+    /// The number of `unsubscribe` calls. The coordinator task leaves the
+    /// group for each one that it did not see, also when a new subscription
+    /// came before it saw the change.
+    pub unsubscribes: u64,
+}
+
+impl Subscription {
+    /// A subscription to `topics`.
+    pub(crate) fn topics(topics: impl IntoIterator<Item = String>, exclude_internal: bool) -> Self {
+        Self {
+            topics: sorted(topics),
+            pattern: None,
+            exclude_internal_topics: exclude_internal,
+            unsubscribes: 0,
+        }
+    }
+
+    /// Whether the consumer subscribes to nothing. Kafka's
+    /// `SubscriptionState.subscriptionType == NONE`.
+    pub(crate) fn is_none(&self) -> bool {
+        self.topics.is_empty() && self.pattern.is_none()
+    }
+
+    /// Whether `topic` is subscribed.
+    pub(crate) fn contains(&self, topic: &str) -> bool {
+        self.topics
+            .binary_search_by(|t| t.as_str().cmp(topic))
+            .is_ok()
+    }
+
+    /// The topics of `metadata` that the pattern matches, sorted. Kafka's
+    /// `ConsumerCoordinator.updatePatternSubscription`: an internal topic
+    /// matches only without `exclude.internal.topics`.
+    pub(crate) fn matching_topics(&self, metadata: &MetadataResponse) -> Option<Vec<String>> {
+        let pattern = self.pattern.as_ref()?;
+        Some(sorted(
+            metadata
+                .topics
+                .iter()
+                .filter(|topic| !(self.exclude_internal_topics && topic.is_internal))
+                .filter_map(|topic| topic.name.clone())
+                .filter(|name| pattern.matches(name)),
+        ))
+    }
+}
+
+fn sorted(topics: impl IntoIterator<Item = String>) -> Vec<String> {
+    topics
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The subscription that the consumer and its coordinator task share.
+pub(crate) type SharedSubscription = Arc<tokio::sync::watch::Sender<Subscription>>;
+
+/// The shared subscription of a new consumer.
+pub(crate) fn shared(
+    topics: Vec<String>,
+    pattern: Option<TopicPattern>,
+    exclude_internal_topics: bool,
+) -> SharedSubscription {
+    Arc::new(tokio::sync::watch::Sender::new(Subscription {
+        pattern,
+        ..Subscription::topics(topics, exclude_internal_topics)
+    }))
+}
+
+/// The `JoinGroup` reason after a subscription change. Kafka's
+/// `ConsumerCoordinator.rejoinNeededOrPending`.
+pub(crate) fn subscription_changed_reason(joined: &[String], now: &[String]) -> String {
+    format!(
+        "the subscription has changed from [{}] to [{}] since the last group join",
+        joined.join(", "),
+        now.join(", ")
+    )
+}
+
+impl Consumer {
+    /// Subscribe to `topics`, in place of the current subscription. Kafka's
+    /// `KafkaConsumer.subscribe(Collection)`.
+    ///
+    /// The next `poll` joins the group again with the new topics. An empty
+    /// list is [`unsubscribe`](Self::unsubscribe).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::InvalidArgument`] for an empty topic name, and
+    /// the error of the listener call of `unsubscribe`.
+    pub async fn subscribe<I, S>(&mut self, topics: I) -> Result<(), ConsumerError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let topics: Vec<String> = topics.into_iter().map(Into::into).collect();
+        if topics.iter().any(String::is_empty) {
+            return Err(ConsumerError::InvalidArgument(
+                "Topic collection to subscribe to cannot contain null or empty topic".to_owned(),
+            ));
+        }
+        if topics.is_empty() {
+            return self.unsubscribe().await;
+        }
+        self.client.metadata_topics().set(topics.iter().cloned());
+        self.subscription.send_modify(|subscription| {
+            subscription.topics = sorted(topics);
+            subscription.pattern = None;
+        });
+        Ok(())
+    }
+
+    /// Subscribe to the topics that `pattern` matches, in place of the current
+    /// subscription. Kafka's `KafkaConsumer.subscribe(Pattern)`.
+    ///
+    /// The coordinator task matches the pattern against all topics of the
+    /// cluster at once and each `subscription_metadata_refresh_interval`, and
+    /// the next `poll` joins the group again when the matched topics change.
+    pub fn subscribe_pattern(&self, pattern: TopicPattern) {
+        self.subscription.send_modify(|subscription| {
+            subscription.topics.clear();
+            subscription.pattern = Some(pattern);
+        });
+    }
+
+    /// Give up the subscription and the assigned partitions, and leave the
+    /// group. Kafka's `KafkaConsumer.unsubscribe`.
+    ///
+    /// The rebalance listener gets the owned partitions first, as in `close`.
+    /// Then the coordinator task sends `LeaveGroup` with the reason `the
+    /// consumer unsubscribed from all topics`. A `poll` without a subscription
+    /// returns [`ConsumerError::NotSubscribed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::RebalanceListenerFailed`] when the listener
+    /// callback fails. The consumer unsubscribes also then.
+    pub async fn unsubscribe(&mut self) -> Result<(), ConsumerError> {
+        // Kafka's `unsubscribe` runs `onLeavePrepare` before
+        // `maybeLeaveGroup`.
+        let listener_result = self.leave_prepare().await;
+        self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
+        self.subscription.send_modify(|subscription| {
+            subscription.topics.clear();
+            subscription.pattern = None;
+            subscription.unsubscribes += 1;
+        });
+        listener_result
+    }
+
+    /// The subscribed topics. For a pattern subscription, the topics that
+    /// matched the last metadata. Kafka's `KafkaConsumer.subscription`.
+    #[must_use]
+    pub fn subscription(&self) -> Vec<String> {
+        self.subscription.borrow().topics.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use krabka_protocol::owned::metadata_response::MetadataResponseTopic;
+
+    use super::*;
+
+    #[test]
+    fn a_pattern_matches_the_topics_of_the_metadata() {
+        let metadata = MetadataResponse {
+            topics: [
+                ("orders-eu", false),
+                ("orders-us", false),
+                ("payments", false),
+                ("orders-internal", true),
+            ]
+            .into_iter()
+            .map(|(name, is_internal)| MetadataResponseTopic {
+                name: Some(name.into()),
+                is_internal,
+                ..Default::default()
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let orders = TopicPattern::new(|topic| topic.starts_with("orders"));
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, exclude_internal, expected) in [
+            ("exclude internal", true, vec!["orders-eu", "orders-us"]),
+            (
+                "include internal",
+                false,
+                vec!["orders-eu", "orders-internal", "orders-us"],
+            ),
+        ] {
+            let subscription = Subscription {
+                pattern: Some(orders.clone()),
+                ..Subscription::topics(Vec::new(), exclude_internal)
+            };
+            actual.push((name, subscription.matching_topics(&metadata)));
+            wanted.push((
+                name,
+                Some(expected.into_iter().map(str::to_owned).collect::<Vec<_>>()),
+            ));
+        }
+        assert2::assert!(actual == wanted);
+    }
+}

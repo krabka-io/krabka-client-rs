@@ -620,6 +620,11 @@ impl Consumer {
             + std::time::Duration::from_millis(
                 u64::try_from(timeout.millis_i64_trunc()).unwrap_or(0),
             );
+        // Kafka's `ClassicKafkaConsumer.poll` throws `IllegalStateException`
+        // without a subscription.
+        if self.subscription.borrow().is_none() {
+            return Err(ConsumerError::NotSubscribed);
+        }
         // Kafka's `ConsumerNetworkClient.maybeTriggerWakeup`: a pending
         // wakeup fails the `poll` before it blocks.
         if self.wakeup.take() {
@@ -1311,6 +1316,7 @@ impl Consumer {
     }
 
     async fn group_fetches(&mut self, assigned: &[(String, i32)]) -> FetchByLeader {
+        let subscription = self.subscription.borrow().clone();
         let awaiting_callback = self
             .assigned_callback_pending
             .lock()
@@ -1327,6 +1333,12 @@ impl Consumer {
             let positions = self.positions.lock().await;
             for (t, p) in assigned {
                 if awaiting_callback.contains(&(t.clone(), *p)) {
+                    continue;
+                }
+                // Kafka's `SubscriptionState.isFetchableAndSubscribed`: with a
+                // topic subscription, a partition of a topic that the
+                // consumer no longer subscribes to is not fetched.
+                if subscription.pattern.is_none() && !subscription.contains(t) {
                     continue;
                 }
                 // Skip partitions still awaiting validation — they must not be
@@ -2629,7 +2641,7 @@ pub(crate) mod partition_error_tests {
             commit_async_callbacks: Arc::default(),
             group_instance_id: None,
             current_generation: Arc::new(AtomicI32::new(1)),
-            subscribed_topics: vec!["orders".into()],
+            subscription: crate::subscription::shared(vec!["orders".into()], None, true),
             assigned: Arc::new(Mutex::new(vec![("orders".into(), 0)])),
             assignment_changed: Arc::new(Notify::new()),
             next_offsets: Arc::new(Mutex::new(HashMap::from([(("orders".into(), 0), 5)]))),
