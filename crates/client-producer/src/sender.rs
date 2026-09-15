@@ -54,6 +54,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::BytesMut;
 use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
 use krabka_protocol::{
@@ -62,7 +63,7 @@ use krabka_protocol::{
         produce_response::ProduceResponse,
     },
     primitives::uuid::Uuid,
-    records::{Attributes, Record, RecordBatch, RecordHeader},
+    records::{Attributes, Record, RecordBatch, RecordHeader, RecordsError, RecordsPayload},
 };
 use krabka_units::{
     Time,
@@ -195,6 +196,10 @@ pub(crate) struct SenderConfig {
     pub producer_epoch: Arc<AtomicI16>,
     pub acks: Acks,
     pub compression: Compression,
+    /// The `compression.<codec>.level` of `compression` (KIP-390), or `None`
+    /// for a codec without levels. `KafkaProducer.configureCompression` gives
+    /// the level to the codec of every batch.
+    pub compression_level: Option<i32>,
     pub linger: Time,
     pub request_timeout_ms: i32,
     pub retries: i32,
@@ -1824,7 +1829,26 @@ async fn send_one_batch(
 
     let leader = resolve_leader(cfg, &pb.topic, pb.partition);
     tracing::Span::current().record("leader", leader);
-    let req = build_single_batch_request(cfg, &pb);
+    let req = match build_single_batch_request(cfg, &pb) {
+        Ok(req) => req,
+        Err(error) => {
+            // The same failure as an encode error of the transport: the batch
+            // waits for its resend or its delivery timeout.
+            tracing::warn!(
+                partition = pb.partition,
+                base_sequence = pb.base_sequence,
+                error = %error,
+                "the batch did not encode at the compression level",
+            );
+            back_off(&mut pb, cfg.retry_backoff, Instant::now());
+            pb.last_failure = Some(SendFailure::Transport);
+            return BatchSendResult {
+                pb,
+                verdict: BatchVerdict::Retry,
+                refresh_needed: false,
+            };
+        }
+    };
 
     let route = if leader == BOOTSTRAP_LEADER {
         None
@@ -2015,7 +2039,18 @@ fn interpret_response(
 /// Build a single-partition, single-batch `ProduceRequest`. The transactional
 /// state comes from the batch's own attributes, which are set at build time, so
 /// the request-level `transactional_id` matches the batch exactly.
-fn build_single_batch_request(cfg: &SenderConfig, pb: &PreparedBatch) -> ProduceRequest {
+///
+/// With a compression level, the batch is encoded here at that level, and the
+/// request carries the encoded bytes. Without one, the request carries the
+/// batch, which the codec encodes at its default level.
+///
+/// # Errors
+///
+/// Returns the error of `RecordBatch::encode_with_compression_level`.
+fn build_single_batch_request(
+    cfg: &SenderConfig,
+    pb: &PreparedBatch,
+) -> Result<ProduceRequest, RecordsError> {
     let is_txn = pb.record_batch.attributes.is_transactional();
     let req_txn_id = if is_txn {
         cfg.transactional_id.clone()
@@ -2023,7 +2058,17 @@ fn build_single_batch_request(cfg: &SenderConfig, pb: &PreparedBatch) -> Produce
         None
     };
 
-    ProduceRequest {
+    let records = match cfg.compression_level {
+        Some(level) => {
+            let mut encoded = BytesMut::new();
+            pb.record_batch
+                .encode_with_compression_level(&mut encoded, Some(level))?;
+            RecordsPayload::Raw(encoded.freeze())
+        }
+        None => pb.record_batch.clone().into(),
+    };
+
+    Ok(ProduceRequest {
         transactional_id: req_txn_id,
         acks: cfg.acks.wire(),
         timeout_ms: cfg.request_timeout_ms,
@@ -2032,13 +2077,13 @@ fn build_single_batch_request(cfg: &SenderConfig, pb: &PreparedBatch) -> Produce
             topic_id: pb.topic_id,
             partition_data: vec![PartitionProduceData {
                 index: pb.partition,
-                records: Some(pb.record_batch.clone().into()),
+                records: Some(records),
                 ..Default::default()
             }],
             ..Default::default()
         }],
         ..Default::default()
-    }
+    })
 }
 
 /// Refresh cluster metadata and adopt the fresh partition-to-leader map. The
@@ -3558,6 +3603,7 @@ mod harness {
             producer_epoch: Arc::clone(&producer_epoch),
             acks,
             compression: Compression::None,
+            compression_level: None,
             linger,
             request_timeout_ms: 5_000,
             retries,
@@ -4190,6 +4236,7 @@ mod harness {
             producer_epoch: Arc::new(AtomicI16::new(-1)),
             acks: Acks::All,
             compression: Compression::None,
+            compression_level: None,
             linger: millis(1),
             request_timeout_ms: 5_000,
             retries: i32::MAX,
@@ -5686,6 +5733,99 @@ mod harness {
 
     /// Build a one-record idempotent `PreparedBatch` directly, bypassing the
     /// sender loop, so `expire_batches` can be exercised as a plain function.
+    /// The producer gives its `compression.<codec>.level` to the codec of each
+    /// batch, as Kafka's `KafkaProducer.configureCompression` does (KIP-390).
+    /// With a level the request carries the batch encoded at that level; with
+    /// none it carries the batch for the default level.
+    #[tokio::test]
+    async fn the_request_encodes_the_batch_at_the_compression_level() {
+        /// What the request of one batch carried.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Carried {
+            /// The encoded batch bytes, or `None` for a parsed batch.
+            encoded: Option<bytes::Bytes>,
+            /// The records of the batch after a decode.
+            records: Vec<Record>,
+        }
+        // Words in a pseudo-random order compress at every level, and a higher
+        // level finds more of the repeats.
+        let words = [
+            "broker", "topic", "record", "batch", "level", "codec", "offset",
+        ];
+        let mut state: u32 = 7;
+        let text: Vec<&str> = (0..4_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                words[usize::try_from(state >> 16).unwrap_or(0) % words.len()]
+            })
+            .collect();
+        let value = bytes::Bytes::from(text.join(" "));
+        let batch = |compression: Compression| {
+            let (mut pb, _rx) = idempotent_batch("t", 0, 0, 0);
+            pb.record_batch.attributes =
+                Attributes::default().with_compression(compression.compression_type());
+            pb.record_batch.records = vec![Record {
+                attributes: 0,
+                timestamp_delta: 0,
+                offset_delta: 0,
+                key: None,
+                value: Some(value.clone()),
+                headers: Vec::new(),
+            }];
+            pb
+        };
+        let encoded_at = |pb: &PreparedBatch, level: Option<i32>| {
+            let mut buf = BytesMut::new();
+            pb.record_batch
+                .encode_with_compression_level(&mut buf, level)
+                .expect("encode");
+            buf.freeze()
+        };
+        let cases = [
+            ("gzip level 1", Compression::Gzip, Some(1)),
+            ("gzip level 9", Compression::Gzip, Some(9)),
+            ("zstd level 1", Compression::Zstd, Some(1)),
+            ("zstd level 19", Compression::Zstd, Some(19)),
+            ("no level", Compression::None, None),
+        ];
+        let mut sizes = Vec::new();
+        for (name, compression, level) in cases {
+            let partitioner = Arc::new(BuiltInPartitioner::new(PartitionerConfig::default()));
+            let (mut cfg, _transport) = direct_config(partitioner, 1);
+            cfg.compression = compression;
+            cfg.compression_level = level;
+            let pb = batch(compression);
+            let request = build_single_batch_request(&cfg, &pb).expect("request");
+            let payload = request.topic_data[0].partition_data[0]
+                .records
+                .clone()
+                .expect("records");
+            let actual = match payload {
+                RecordsPayload::Raw(bytes) => {
+                    let mut cursor = bytes.clone();
+                    Carried {
+                        records: RecordBatch::decode(&mut cursor).expect("decode").records,
+                        encoded: Some(bytes),
+                    }
+                }
+                RecordsPayload::V2(batches) => Carried {
+                    records: batches[0].records.clone(),
+                    encoded: None,
+                },
+                other => panic!("{name}: unexpected payload {other:?}"),
+            };
+            sizes.push(actual.encoded.as_ref().map(bytes::Bytes::len));
+            let expected = Carried {
+                encoded: level.map(|level| encoded_at(&pb, Some(level))),
+                records: pb.record_batch.records.clone(),
+            };
+            assert2::assert!(actual == expected, "{name}");
+        }
+        // The level reaches the codec: a higher level gives a smaller batch.
+        assert2::assert!(sizes[1] < sizes[0]);
+        assert2::assert!(sizes[3] < sizes[2]);
+    }
+
     fn idempotent_batch(
         topic: &str,
         partition: i32,
@@ -5755,6 +5895,7 @@ mod harness {
             producer_epoch: Arc::new(AtomicI16::new(3)),
             acks: Acks::All,
             compression: Compression::None,
+            compression_level: None,
             linger: millis(1),
             request_timeout_ms: 5_000,
             retries: i32::MAX,

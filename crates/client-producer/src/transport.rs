@@ -98,6 +98,8 @@ impl<const MAX: i16> ProtocolRequest for CappedProduce<MAX> {
     const API_KEY: i16 = produce_request::API_KEY;
     const MIN_VERSION: i16 = produce_request::MIN_VERSION;
     const MAX_VERSION: i16 = MAX;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = produce_request::FLEXIBLE_MIN;
     type Response = ProduceResponse;
 }

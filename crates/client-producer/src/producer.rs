@@ -47,7 +47,7 @@ use crate::{
     },
     buffer_pool::BufferPool,
     builder::{ProducerFlushTimeout, send_init_producer_id},
-    compression::Compression,
+    compression::{Compression, CompressionLevels},
     error::{ProducerError, RecordSizeLimit},
     metadata_wait::{MetadataRefresh, MetadataWait, metadata_request},
     partitioner::{BuiltInPartitioner, StickyPartition, TopicPartitions},
@@ -91,6 +91,8 @@ impl ProtocolRequest for ClientAddPartitionsToTxn {
     const API_KEY: i16 = add_partitions_to_txn_request::API_KEY;
     const MIN_VERSION: i16 = add_partitions_to_txn_request::MIN_VERSION;
     const MAX_VERSION: i16 = ADD_PARTITIONS_LAST_CLIENT_VERSION;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = add_partitions_to_txn_request::FLEXIBLE_MIN;
     type Response = AddPartitionsToTxnResponse;
 }
@@ -241,6 +243,8 @@ pub struct Producer {
     #[allow(dead_code)]
     pub(crate) acks: Acks,
     pub(crate) compression: Compression,
+    /// The validated `compression.<codec>.level` settings (KIP-390).
+    pub(crate) compression_levels: CompressionLevels,
     pub(crate) batch_size: usize,
     #[allow(dead_code)]
     pub(crate) linger: Time,
@@ -1899,6 +1903,10 @@ impl std::fmt::Debug for Producer {
             .field("producer_epoch", &self.producer_epoch())
             .field("transactional_id", &self.transactional_id)
             .field("compression", &self.compression)
+            .field(
+                "compression_level",
+                &self.compression_levels.level(self.compression),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1975,6 +1983,7 @@ mod tests {
     use crate::{
         ProducerRecord,
         accumulator::{Accumulator, AppendResult},
+        compression::Compression,
         error::ProducerError,
         partitioner::partition_for_key,
     };
@@ -2887,6 +2896,42 @@ mod tests {
             drop(producer);
             assert2::assert!(actual == expected, "{name}");
         }
+    }
+
+    /// The `Debug` form of a producer names the level of its codec, and no
+    /// level for a codec without levels.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn debug_names_the_compression_level_of_the_codec() {
+        let (mock, _) = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+        let mut actual = Vec::new();
+        for compression in [Compression::Gzip, Compression::Zstd, Compression::Snappy] {
+            let producer = Producer::builder()
+                .bootstrap(mock.addr.to_string())
+                .client_id(CLIENT_ID)
+                .enable_idempotence(false)
+                .compression(compression)
+                .compression_gzip_level(5)
+                .compression_zstd_level(19)
+                .build()
+                .await
+                .expect("producer connects to mock broker");
+            let debug = format!("{producer:?}");
+            actual.push(
+                debug
+                    .split(", ")
+                    .find(|field| field.starts_with("compression_level"))
+                    .map(str::to_owned),
+            );
+        }
+        mock.stop();
+        assert2::assert!(
+            actual
+                == vec![
+                    Some("compression_level: Some(5)".to_owned()),
+                    Some("compression_level: Some(19)".to_owned()),
+                    Some("compression_level: None".to_owned()),
+                ]
+        );
     }
 
     /// A record that does not fit the current batch closes that batch before
