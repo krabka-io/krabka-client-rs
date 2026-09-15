@@ -443,7 +443,15 @@ pub(crate) struct CoordinatorState {
     pub assignors: Vec<Assignor>,
     /// The newest rebalance protocol that every assignor supports.
     pub rebalance_protocol: RebalanceProtocol,
-    pub subscribed_topics: Vec<String>,
+    /// The subscription, shared with the `Consumer`.
+    pub subscription: crate::subscription::SharedSubscription,
+    /// Changes of the subscription that the task did not handle yet.
+    pub subscription_changes: tokio::sync::watch::Receiver<crate::subscription::Subscription>,
+    /// The topics of the last `JoinGroup`. Kafka's
+    /// `ConsumerCoordinator.joinedSubscription`.
+    pub joined_topics: Vec<String>,
+    /// The `unsubscribe` calls that the task handled.
+    pub seen_unsubscribes: u64,
     pub assigned: Arc<Mutex<Vec<(String, i32)>>>,
     pub assignment_changed: Arc<Notify>,
     pub next_ownership_id: u64,
@@ -491,13 +499,16 @@ pub(crate) struct CoordinatorState {
     pub rebalance_pending: tokio::sync::watch::Sender<bool>,
     /// What the member does with its group membership when the task stops.
     /// `close_with` writes it before it stops the task.
-    pub close_operation: tokio::sync::watch::Receiver<GroupMembershipOperation>,
+    pub close_operation: tokio::sync::watch::Receiver<crate::control::CloseRequest>,
     /// The reason of the next `JoinGroup` (KIP-800). Kafka's
     /// `AbstractCoordinator.rejoinReason`: empty for the first join, set by
     /// each request to join again, and cleared after a completed sync.
     pub rejoin_reason: String,
     /// The calls of the rebalance listener, or `None` without a listener.
     pub listener_calls: Option<crate::rebalance_listener::ListenerCalls>,
+    /// The reasons of the rebalances that `Consumer::enforce_rebalance` asks
+    /// for.
+    pub enforced_rebalances: tokio::sync::mpsc::UnboundedReceiver<(String, u64)>,
     /// The partitions that the member lost with its generation. The next join
     /// gives them to `on_partitions_lost`, as Kafka's `onJoinPrepare` does.
     pub lost_partitions: Vec<(String, i32)>,
@@ -650,8 +661,8 @@ async fn wait_for_listener_call(
 ///
 /// A member without a generation gives its lost partitions to
 /// `on_partitions_lost`. An eager member gives all owned partitions to
-/// `on_partitions_revoked`. A cooperative member keeps its partitions, and its
-/// subscription does not change, so it revokes nothing here.
+/// `on_partitions_revoked`. A cooperative member gives only the partitions of
+/// topics that it no longer subscribes to.
 async fn join_prepare(state: &mut CoordinatorState) -> Result<(), ConsumerError> {
     if state.join_prepared {
         return Ok(());
@@ -676,6 +687,26 @@ async fn join_prepare(state: &mut CoordinatorState) -> Result<(), ConsumerError>
             owned,
         )
         .await?;
+    } else {
+        // Kafka's cooperative `onJoinPrepare` revokes only the partitions of
+        // topics that the consumer no longer subscribes to.
+        let owned = state.assigned.lock().await.clone();
+        let (kept, revoked): (Vec<_>, Vec<_>) = {
+            let subscription = state.subscription.borrow();
+            owned
+                .into_iter()
+                .partition(|(topic, _)| subscription.contains(topic))
+        };
+        if !revoked.is_empty() {
+            call_listener(
+                state,
+                crate::rebalance_listener::ListenerCallKind::Revoked,
+                revoked,
+            )
+            .await?;
+            let generation = state.generation_id;
+            publish_assignment(state, &kept, true, generation).await;
+        }
     }
     Ok(())
 }
@@ -924,7 +955,7 @@ async fn subscribed_partition_counts(
     let mut counts = HashMap::new();
     for t in &md.topics {
         let Some(name) = &t.name else { continue };
-        if state.subscribed_topics.iter().any(|s| s == name) {
+        if state.subscription.borrow().contains(name) {
             counts.insert(
                 name.clone(),
                 i32::try_from(t.partitions.len()).unwrap_or(i32::MAX),
@@ -1013,6 +1044,18 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     continue;
                 }
             }
+            // Kafka's `enforceRebalance` calls `requestRejoin`: the next `poll`
+            // joins the group again with the reason.
+            Some((reason, polls)) = state.enforced_rebalances.recv() => {
+                state.rejoin_reason = reason;
+                rejoin.request_after_poll(polls, &state.rebalance_pending);
+                continue;
+            }
+            // `subscribe`, `subscribe_pattern` and `unsubscribe`.
+            Ok(()) = state.subscription_changes.changed() => {
+                handle_subscription_change(&mut state, &mut rejoin).await;
+                continue;
+            }
             // Kafka's heartbeat thread checks `pollTimeoutExpired` each retry
             // backoff. The task wakes at the deadline of the poll timer.
             () = tokio::time::sleep_until(state.poll_timer.deadline), if !state.member_id.is_empty() => {
@@ -1051,7 +1094,16 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
             )
         {
             last_meta_check = tokio::time::Instant::now();
-            if let Ok(current) = subscribed_partition_counts(&state).await
+            // Kafka's `ConsumerCoordinator.maybeUpdateSubscriptionMetadata`
+            // matches a pattern against each metadata update.
+            if refresh_pattern_topics(&mut state).await
+                && state.subscription.borrow().topics != state.joined_topics
+            {
+                let topics = state.subscription.borrow().topics.clone();
+                state.rejoin_reason =
+                    crate::subscription::subscription_changed_reason(&state.joined_topics, &topics);
+                rejoin.request_after_next_poll(&state);
+            } else if let Ok(current) = subscribed_partition_counts(&state).await
                 && subscribed_topics_grew(&known_counts, &current)
             {
                 tracing::info!(
@@ -1151,8 +1203,14 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
     // with a stale id is a silent no-op that orphans the real member until
     // its session expires, stalling the rest of the group's rebalance.
     // Best-effort and bounded: a hung broker must not block `close()`.
-    let operation = *state.close_operation.borrow();
-    leave_group(&state, &state.member_id, operation, CLOSE_LEAVE_REASON).await;
+    let close = *state.close_operation.borrow();
+    leave_group(
+        &state,
+        &state.member_id,
+        close.operation,
+        CLOSE_LEAVE_REASON,
+    )
+    .await;
 }
 
 /// What woke the coordinator task.
@@ -1215,10 +1273,20 @@ impl RejoinRequest {
 
     /// Request a rejoin that starts when the application polls again.
     fn request_after_next_poll(&mut self, state: &CoordinatorState) {
+        self.request_after_poll(*state.polls.borrow(), &state.rebalance_pending);
+    }
+
+    /// Request a rejoin that starts with the first `poll` after the `poll`
+    /// count `polls`.
+    fn request_after_poll(
+        &mut self,
+        polls: u64,
+        rebalance_pending: &tokio::sync::watch::Sender<bool>,
+    ) {
         if *self == Self::None {
-            *self = Self::AfterPoll(*state.polls.borrow());
+            *self = Self::AfterPoll(polls);
         }
-        state.rebalance_pending.send_replace(true);
+        rebalance_pending.send_replace(true);
     }
 
     /// Request a rejoin that starts at once, because a `poll` already came.
@@ -1286,6 +1354,97 @@ async fn leave_on_poll_timeout(state: &mut CoordinatorState) {
         )
         .await;
     }
+}
+
+/// Act on a change of the subscription.
+///
+/// An empty subscription is Kafka's `unsubscribe`: the member leaves the group
+/// with the reason `the consumer unsubscribed from all topics`, and its
+/// generation and assignment are reset (`maybeLeaveGroup`,
+/// `resetGenerationOnLeaveGroup`). The `Consumer` already ran the listener.
+/// Any other change makes the next `poll` join the group when the topics are
+/// not the joined ones, as `rejoinNeededOrPending` does.
+async fn handle_subscription_change(state: &mut CoordinatorState, rejoin: &mut RejoinRequest) {
+    let subscription = state.subscription_changes.borrow_and_update().clone();
+    if subscription.unsubscribes != state.seen_unsubscribes {
+        state.seen_unsubscribes = subscription.unsubscribes;
+        let member_id = std::mem::take(&mut state.member_id);
+        state.lost_partitions.clear();
+        install_assignment(state, &[], false, -1, false).await;
+        *rejoin = RejoinRequest::None;
+        state.rebalance_pending.send_replace(false);
+        // Kafka's `resetGenerationOnLeaveGroup` requests the next join with
+        // this reason.
+        state.rejoin_reason = "consumer pro-actively leaving the group".into();
+        leave_group(
+            state,
+            &member_id,
+            GroupMembershipOperation::Default,
+            UNSUBSCRIBE_LEAVE_REASON,
+        )
+        .await;
+    }
+    if subscription.is_none() {
+        return;
+    }
+    refresh_pattern_topics(state).await;
+    let topics = state.subscription.borrow().topics.clone();
+    // The task has its own client. Its metadata requests name the new topics,
+    // so the leader assigns them.
+    state.client.metadata_topics().set(topics.iter().cloned());
+    if topics != state.joined_topics {
+        state.rejoin_reason =
+            crate::subscription::subscription_changed_reason(&state.joined_topics, &topics);
+        rejoin.request_after_next_poll(state);
+    } else if state.member_id.is_empty() {
+        rejoin.request_after_next_poll(state);
+    }
+}
+
+/// The `LeaveGroup` reason of `unsubscribe`. Kafka's
+/// `ClassicKafkaConsumer.unsubscribe`.
+const UNSUBSCRIBE_LEAVE_REASON: &str = "the consumer unsubscribed from all topics";
+
+/// Match the pattern of a pattern subscription against all topics of the
+/// cluster, and store the matched topics. Return whether they changed.
+async fn refresh_pattern_topics(state: &mut CoordinatorState) -> bool {
+    let (pattern, version) = {
+        let subscription = state.subscription.borrow();
+        let Some(pattern) = subscription.pattern.clone() else {
+            return false;
+        };
+        (pattern, subscription.version)
+    };
+    let Ok(metadata) = state
+        .client
+        .refresh_metadata_with(krabka_protocol::owned::metadata_request::MetadataRequest::default())
+        .await
+    else {
+        return false;
+    };
+    let matched = crate::subscription::Subscription {
+        pattern: Some(pattern),
+        ..crate::subscription::Subscription::topics(
+            Vec::new(),
+            state.subscription.borrow().exclude_internal_topics,
+        )
+    }
+    .matching_topics(&metadata)
+    .unwrap_or_default();
+    // Store the topics only for the subscription that the request matched. A
+    // `subscribe`, `subscribe_pattern` or `unsubscribe` of the application
+    // during the request stays a change that the task handles.
+    let stored = state
+        .subscription
+        .send_if_modified(|subscription| subscription.store_pattern_topics(version, &matched));
+    if state.subscription.borrow().version == version {
+        state.client.metadata_topics().set(matched.iter().cloned());
+        if stored {
+            // The task made this change itself.
+            state.subscription_changes.borrow_and_update();
+        }
+    }
+    stored
 }
 
 /// Forget the member id, the generation and the partition ownership after
@@ -2030,6 +2189,10 @@ async fn perform_join(
     state: &mut CoordinatorState,
     owned: &[(String, i32)],
 ) -> Result<JoinGroupResponse, ConsumerError> {
+    // Kafka's `ConsumerCoordinator.metadata` names the subscription at the
+    // join, and `joinedSubscription` keeps it.
+    let topics = state.subscription.borrow().topics.clone();
+    state.joined_topics.clone_from(&topics);
     // Truncating, not rounding: these are `JoinGroupRequest` `int32`
     // milliseconds the coordinator range-checks, and `Duration::as_millis`
     // truncated here before the conversion.
@@ -2043,7 +2206,7 @@ async fn perform_join(
         // still carries the last assignment.
         protocols: join_protocols(
             &state.assignors,
-            &state.subscribed_topics,
+            &topics,
             match state.rebalance_protocol {
                 RebalanceProtocol::Eager => &[],
                 RebalanceProtocol::Cooperative => owned,
@@ -2287,11 +2450,7 @@ async fn compute_leader_assignment(
     let mut resolved_ids = HashMap::new();
     for topic in &metadata.topics {
         let Some(name) = &topic.name else { continue };
-        if state
-            .subscribed_topics
-            .iter()
-            .any(|subscribed| subscribed == name)
-        {
+        if state.subscription.borrow().contains(name) {
             topic_partitions.insert(
                 name.clone(),
                 i32::try_from(topic.partitions.len()).unwrap_or(i32::MAX),
@@ -3063,6 +3222,20 @@ mod retry_tests {
 
     /// A rejoin keeps only the errors that Kafka's consumer raises from
     /// `poll()`, and `poll()` takes each one once.
+    /// Kafka's `enforceRebalance` sets `rejoinNeeded` at the call, so the
+    /// first `poll` after the call joins. The task can see the request after
+    /// that `poll`, so the request keeps the `poll` count of the call.
+    #[test]
+    fn an_enforced_rebalance_is_due_after_a_poll_that_came_before_the_task_saw_it() {
+        let (pending, _pending_rx) = tokio::sync::watch::channel(false);
+        let (polls, polls_rx) = tokio::sync::watch::channel(5_u64);
+        let mut request = RejoinRequest::None;
+        // The application polled after `enforce_rebalance` at count 5.
+        polls.send_replace(6);
+        request.request_after_poll(5, &pending);
+        assert2::assert!((request.due(&polls_rx), *pending.borrow()) == (true, true));
+    }
+
     #[test]
     fn rejoin_errors_reach_poll_only_when_fatal() {
         for (name, error, expected) in [
@@ -3195,7 +3368,10 @@ mod retry_tests {
             current_generation: Arc::new(AtomicI32::new(1)),
             assignors: vec![Assignor::Range],
             rebalance_protocol: RebalanceProtocol::Eager,
-            subscribed_topics: vec!["topic".into()],
+            subscription: crate::subscription::shared(vec!["topic".into()], None, true),
+            subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
+            joined_topics: Vec::new(),
+            seen_unsubscribes: 0,
             assigned: Arc::new(Mutex::new(Vec::new())),
             assignment_changed: Arc::new(Notify::new()),
             next_ownership_id: 1,
@@ -3218,9 +3394,10 @@ mod retry_tests {
             join_prepared: false,
             polls: PollSignal::default().subscribe(),
             rebalance_pending: tokio::sync::watch::Sender::new(false),
-            close_operation: tokio::sync::watch::channel(GroupMembershipOperation::Default).1,
+            close_operation: tokio::sync::watch::channel(crate::control::CloseRequest::default()).1,
             rejoin_reason: String::new(),
             listener_calls: None,
+            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().1,
             lost_partitions: Vec::new(),
             assigned_callback_pending: Arc::default(),
             poll_timer: PollTimer::new(secs(300)),
@@ -3797,7 +3974,10 @@ mod retry_tests {
             current_generation: Arc::new(AtomicI32::new(1)),
             assignors: vec![Assignor::Range],
             rebalance_protocol: RebalanceProtocol::Eager,
-            subscribed_topics: vec![ORDERS.into()],
+            subscription: crate::subscription::shared(vec![ORDERS.into()], None, true),
+            subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
+            joined_topics: Vec::new(),
+            seen_unsubscribes: 0,
             assigned: Arc::new(Mutex::new(vec![orders_0.clone()])),
             assignment_changed: Arc::new(Notify::new()),
             next_ownership_id: 2,
@@ -3824,9 +4004,10 @@ mod retry_tests {
             join_prepared: false,
             polls: poll_signal.subscribe(),
             rebalance_pending: tokio::sync::watch::Sender::new(false),
-            close_operation: tokio::sync::watch::channel(GroupMembershipOperation::Default).1,
+            close_operation: tokio::sync::watch::channel(crate::control::CloseRequest::default()).1,
             rejoin_reason: String::new(),
             listener_calls: None,
+            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().1,
             lost_partitions: Vec::new(),
             assigned_callback_pending: Arc::default(),
             poll_timer: PollTimer::new(secs(300)),

@@ -44,6 +44,11 @@ pub enum ConsumerError {
     #[error("topic '{0}' is invalid")]
     InvalidTopic(String),
 
+    /// [`WakeupHandle::wakeup`](crate::WakeupHandle::wakeup) woke the call.
+    /// Kafka's `WakeupException`.
+    #[error("the consumer was woken up")]
+    Wakeup,
+
     /// A call did not complete before its timeout. Kafka's
     /// `TimeoutException`.
     #[error("timeout: {0}")]
