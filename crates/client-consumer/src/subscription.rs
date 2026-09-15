@@ -190,6 +190,10 @@ impl Consumer {
             ));
         }
         self.client.metadata_topics().set(topics.iter().cloned());
+        // Kafka's `subscribe(topics)` calls
+        // `fetcher.clearBufferedDataForUnassignedTopics(topics)`.
+        self.fetch_buffer
+            .retain_topics(&topics.iter().cloned().collect());
         self.subscription.send_modify(|subscription| {
             subscription.topics = sorted(topics);
             subscription.pattern = None;
@@ -210,13 +214,16 @@ impl Consumer {
     /// Returns [`ConsumerError::InvalidGroupId`] without a group id, and
     /// [`ConsumerError::IllegalState`] for a consumer without group
     /// membership.
-    pub fn subscribe_pattern(&self, pattern: TopicPattern) -> Result<(), ConsumerError> {
+    pub fn subscribe_pattern(&mut self, pattern: TopicPattern) -> Result<(), ConsumerError> {
         self.require_group_membership()?;
         if self.subscription.borrow().manual_assignment {
             return Err(ConsumerError::IllegalState(
                 "Subscription to topics, partitions and pattern are mutually exclusive".to_owned(),
             ));
         }
+        // Kafka's `subscribe(pattern)` calls
+        // `fetcher.clearBufferedDataForUnassignedPartitions(emptySet())`.
+        self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
         self.subscription.send_modify(|subscription| {
             subscription.topics.clear();
             subscription.pattern = Some(pattern);
@@ -238,9 +245,13 @@ impl Consumer {
     /// Returns [`ConsumerError::RebalanceListenerFailed`] when the listener
     /// callback fails. The consumer unsubscribes also then.
     pub async fn unsubscribe(&mut self) -> Result<(), ConsumerError> {
-        // Kafka's `unsubscribe` runs `onLeavePrepare` before
-        // `maybeLeaveGroup`.
-        let listener_result = self.leave_prepare().await;
+        // Kafka's `unsubscribe` runs `onLeavePrepare` and `maybeLeaveGroup`
+        // only with a coordinator, that is with a group.
+        let listener_result = if self.coordinator_handle.is_some() {
+            self.leave_prepare().await
+        } else {
+            Ok(())
+        };
         self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
         // Kafka's `SubscriptionState.unsubscribe` clears the assignment before
         // `unsubscribe` returns. The coordinator task also clears it when it
@@ -251,6 +262,9 @@ impl Consumer {
             assigned.clear();
             identity.ownership_ids.clear();
         }
+        self.next_offsets.lock().await.clear();
+        self.positions.lock().await.clear();
+        self.end_offsets.lock().await.clear();
         self.subscription.send_modify(|subscription| {
             subscription.topics.clear();
             subscription.pattern = None;

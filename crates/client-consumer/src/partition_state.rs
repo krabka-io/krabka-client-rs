@@ -122,7 +122,7 @@ impl Consumer {
                 if let Some(offset) = self.valid_position(&key).await {
                     return Ok(offset);
                 }
-                self.update_fetch_positions(None).await?;
+                self.update_fetch_positions(None, Some(deadline)).await?;
                 if self.valid_position(&key).await.is_none() {
                     tokio::time::sleep(self.retry_policy.initial_backoff).await;
                 }
@@ -167,6 +167,16 @@ impl Consumer {
         &self,
         partitions: &[(String, i32)],
     ) -> Result<HashMap<(String, i32), Option<OffsetAndMetadata>>, ConsumerError> {
+        let deadline = tokio::time::Instant::now() + self.default_api_timeout.to_std();
+        self.committed_until(partitions, deadline).await
+    }
+
+    /// The committed offsets of `partitions`, within `deadline`.
+    pub(crate) async fn committed_until(
+        &self,
+        partitions: &[(String, i32)],
+        deadline: tokio::time::Instant,
+    ) -> Result<HashMap<(String, i32), Option<OffsetAndMetadata>>, ConsumerError> {
         self.require_group_id()?;
         if partitions.is_empty() {
             return Ok(HashMap::new());
@@ -182,13 +192,13 @@ impl Consumer {
             &self.coordinator_id,
             &request,
             CoordinatorRetryPolicy {
-                timeout: self.default_api_timeout.to_std(),
+                timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
                 ..self.retry_policy
             },
         );
-        // The timeout bounds each request too. Kafka's
+        // The deadline bounds each request too. Kafka's
         // `fetchCommittedOffsets` gives up when its timer expires.
-        let response = tokio::time::timeout(self.default_api_timeout.to_std(), fetch)
+        let response = tokio::time::timeout_at(deadline, fetch)
             .await
             .map_err(|_| {
                 ConsumerError::Timeout(
@@ -505,8 +515,17 @@ mod tests {
             .assign(&[key(0), key(1), key(2)])
             .await
             .expect("assign");
+        // The metadata of the poll gave the partition the current leader
+        // epoch before the committed offset came.
         consumer
-            .resolve_committed_sentinels()
+            .positions
+            .lock()
+            .await
+            .entry(key(1))
+            .or_default()
+            .leader_epoch = krabka_ids::LeaderEpoch(5);
+        consumer
+            .resolve_committed_sentinels(None)
             .await
             .expect("resolve");
         let mut offsets: Vec<_> = consumer
@@ -518,6 +537,12 @@ mod tests {
             .collect();
         offsets.sort();
         let identity = consumer.commit_identity.lock().await.clone();
+        let awaiting_validation = consumer
+            .positions
+            .lock()
+            .await
+            .get(&key(1))
+            .is_some_and(|position| position.awaiting_validation);
         let rejected = consumer
             .subscribe(["orders"])
             .await
@@ -526,12 +551,14 @@ mod tests {
         assert2::assert!(
             (
                 offsets,
+                awaiting_validation,
                 identity.generation,
                 identity.member_id,
                 consumer.assignment().await,
                 rejected
             ) == (
                 vec![(key(0), 5), (key(1), 10), (key(2), 0)],
+                true,
                 -1,
                 String::new(),
                 vec![key(0), key(1), key(2)],
