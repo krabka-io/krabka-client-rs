@@ -72,6 +72,7 @@
 
 #![doc(html_root_url = "https://docs.rs/krabka-client-consumer/0.4.0")]
 
+mod assignment;
 mod assignor;
 #[cfg(test)]
 mod authentication_failure_tests;

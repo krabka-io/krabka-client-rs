@@ -167,6 +167,7 @@ impl Consumer {
         &self,
         partitions: &[(String, i32)],
     ) -> Result<HashMap<(String, i32), Option<OffsetAndMetadata>>, ConsumerError> {
+        self.require_group_id()?;
         if partitions.is_empty() {
             return Ok(HashMap::new());
         }
@@ -481,5 +482,61 @@ mod tests {
         let end = consumer.end_offsets.lock().await.get(&key).copied();
         mock.stop();
         assert2::assert!((before, after, end) == (true, false, Some(12)));
+    }
+
+    /// Kafka's `assign` keeps the position of a partition that stays
+    /// assigned, and a new partition starts at the committed offset of the
+    /// group, or by `auto.offset.reset` without one
+    /// (`refreshCommittedOffsetsIfNeeded`, `resetInitializingPositions`).
+    #[tokio::test]
+    async fn assign_starts_new_partitions_at_the_committed_offset_or_the_reset() {
+        let mock = offset_fetch_coordinator(vec![(1, 10, 2, "", 0), (2, -1, -1, "", 0)]).await;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .request_timeout(secs(30))
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = consumer_with_client(client);
+        consumer.subscription = crate::subscription::shared(Vec::new(), None, true);
+        consumer.auto_offset_reset = crate::AutoOffsetReset::Earliest;
+        let key = |partition: i32| ("orders".to_string(), partition);
+        consumer
+            .assign(&[key(0), key(1), key(2)])
+            .await
+            .expect("assign");
+        consumer
+            .resolve_committed_sentinels()
+            .await
+            .expect("resolve");
+        let mut offsets: Vec<_> = consumer
+            .next_offsets
+            .lock()
+            .await
+            .clone()
+            .into_iter()
+            .collect();
+        offsets.sort();
+        let identity = consumer.commit_identity.lock().await.clone();
+        let rejected = consumer
+            .subscribe(["orders"])
+            .await
+            .map_err(|error| error.to_string());
+        mock.stop();
+        assert2::assert!(
+            (
+                offsets,
+                identity.generation,
+                identity.member_id,
+                consumer.assignment().await,
+                rejected
+            ) == (
+                vec![(key(0), 5), (key(1), 10), (key(2), 0)],
+                -1,
+                String::new(),
+                vec![key(0), key(1), key(2)],
+                Err("illegal state: the consumer was built without a subscription, so it has no group membership; build it with subscribe or subscribe_pattern to join a group".to_owned())
+            )
+        );
     }
 }

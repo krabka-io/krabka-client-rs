@@ -24,20 +24,24 @@ Manual single-partition fetches and raw request dispatch stay in
 
 - Classic consumer-group lifecycle with `JoinGroup`, `SyncGroup`, `Heartbeat`,
   `Fetch`, `OffsetCommit`, and `LeaveGroup`.
-- Range and cooperative-sticky partition assignors.
-- `poll`, `commit_sync`, `commit_async`, `seek`, and graceful `close` APIs.
+- Range, round-robin, sticky and cooperative-sticky partition assignors.
+- `subscribe` by topics or by pattern, `unsubscribe`, and manual `assign` with
+  or without a group id.
+- `poll`, `commit_sync`, `commit_async`, `seek`, `pause`, offset queries, and
+  graceful `close` APIs.
 - Leader-epoch position validation to handle truncation.
 - KIP-447 `ConsumerGroupMetadata` for transactional producers.
 - Share-group consumer support with explicit acknowledgement and commit.
 
 ## Kafka Scope
 
-The crate implements subscribe-style consumer flows. These flows cover KIP-429
-cooperative sticky assignment, KIP-320 leader-epoch validation, KIP-516 offset
-wire shapes, KIP-447 consumer group metadata, and KIP-932 share groups.
+The crate implements the classic consumer group protocol and manual
+assignment. These flows cover KIP-429 cooperative sticky assignment, KIP-320
+leader-epoch validation, KIP-516 offset wire shapes, KIP-447 consumer group
+metadata, and KIP-932 share groups.
 
-The public API does not expose a JVM-style manual `assign()` consumer. Use
-`krabka-client-core` for lower-level partition fetches.
+A consumer built without a subscription cannot join a group later. Build it
+with `subscribe` or `subscribe_pattern` to use a group.
 
 ## Install
 
