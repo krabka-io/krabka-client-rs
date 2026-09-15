@@ -58,15 +58,16 @@ fn response_has_error(error_code: i16) -> bool {
     error_code != 0
 }
 
-/// Store the topic id that `metadata` reports for each topic that `topic_ids`
-/// already tracks.
+/// Store the topic id that `metadata` reports for each topic.
 ///
 /// A topic that was deleted and created again keeps its name and gets a new
 /// id. Fetch v13 and later, and `OffsetCommit` and `OffsetFetch` v10, carry
 /// only the id, so a stale id makes the broker answer `UNKNOWN_TOPIC_ID` until
-/// the consumer stores the new one. Kafka's `Metadata.update` replaces the
-/// topic ids on each metadata response in the same way. This function skips a
-/// topic row with an error or with the zero id, and it does not add topics.
+/// the consumer stores the new one. A topic that a subscription change or a
+/// pattern adds needs its id too. Kafka's `Metadata.update` stores the topic
+/// ids of each metadata response in the same way. The metadata requests name
+/// the topics of the consumer, so the response holds no other topics. This
+/// function skips a topic row with an error or with the zero id.
 fn refresh_tracked_topic_ids(
     topic_ids: &mut HashMap<String, WireUuid>,
     metadata: &MetadataResponse,
@@ -76,9 +77,7 @@ fn refresh_tracked_topic_ids(
         if response_has_error(topic.error_code) || topic.topic_id == WireUuid::ZERO {
             continue;
         }
-        if let Some(topic_id) = topic_ids.get_mut(name) {
-            *topic_id = topic.topic_id;
-        }
+        topic_ids.insert(name.clone(), topic.topic_id);
     }
 }
 
@@ -359,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_refresh_replaces_only_tracked_topic_ids() {
+    fn metadata_refresh_stores_the_topic_ids_of_the_response() {
         let old_id = WireUuid([1; 16]);
         let new_id = WireUuid([2; 16]);
         let other_id = WireUuid([3; 16]);
@@ -386,9 +385,12 @@ mod tests {
                 HashMap::from([("orders".to_string(), old_id)]),
             ),
             (
-                "untracked topic is not added",
+                "a new topic is added",
                 topic("payments", 0, other_id),
-                HashMap::from([("orders".to_string(), old_id)]),
+                HashMap::from([
+                    ("orders".to_string(), old_id),
+                    ("payments".to_string(), other_id),
+                ]),
             ),
         ] {
             let mut topic_ids = HashMap::from([("orders".to_string(), old_id)]);

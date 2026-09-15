@@ -62,6 +62,11 @@ pub(crate) struct Subscription {
     /// group for each one that it did not see, also when a new subscription
     /// came before it saw the change.
     pub unsubscribes: u64,
+    /// The number of changes of the application: `subscribe`,
+    /// `subscribe_pattern` and `unsubscribe`. The coordinator task stores the
+    /// topics of a pattern only while this number is the one of its metadata
+    /// request.
+    pub version: u64,
 }
 
 impl Subscription {
@@ -72,6 +77,7 @@ impl Subscription {
             pattern: None,
             exclude_internal_topics: exclude_internal,
             unsubscribes: 0,
+            version: 0,
         }
     }
 
@@ -86,6 +92,17 @@ impl Subscription {
         self.topics
             .binary_search_by(|t| t.as_str().cmp(topic))
             .is_ok()
+    }
+
+    /// Store `matched` as the topics of the pattern of `version`. Return
+    /// whether the topics changed. A newer change of the application keeps
+    /// its subscription.
+    pub(crate) fn store_pattern_topics(&mut self, version: u64, matched: &[String]) -> bool {
+        if self.version != version || self.pattern.is_none() || self.topics == matched {
+            return false;
+        }
+        self.topics = matched.to_vec();
+        true
     }
 
     /// The topics of `metadata` that the pattern matches, sorted. Kafka's
@@ -166,6 +183,7 @@ impl Consumer {
         self.subscription.send_modify(|subscription| {
             subscription.topics = sorted(topics);
             subscription.pattern = None;
+            subscription.version += 1;
         });
         Ok(())
     }
@@ -180,6 +198,7 @@ impl Consumer {
         self.subscription.send_modify(|subscription| {
             subscription.topics.clear();
             subscription.pattern = Some(pattern);
+            subscription.version += 1;
         });
     }
 
@@ -200,10 +219,20 @@ impl Consumer {
         // `maybeLeaveGroup`.
         let listener_result = self.leave_prepare().await;
         self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
+        // Kafka's `SubscriptionState.unsubscribe` clears the assignment before
+        // `unsubscribe` returns. The coordinator task also clears it when it
+        // handles the change.
+        {
+            let mut assigned = self.assigned.lock().await;
+            let mut identity = self.commit_identity.lock().await;
+            assigned.clear();
+            identity.ownership_ids.clear();
+        }
         self.subscription.send_modify(|subscription| {
             subscription.topics.clear();
             subscription.pattern = None;
             subscription.unsubscribes += 1;
+            subscription.version += 1;
         });
         listener_result
     }
@@ -218,6 +247,38 @@ impl Consumer {
 
 #[cfg(test)]
 mod tests {
+    /// The coordinator task stores the topics of a pattern only for the
+    /// subscription that its metadata request matched.
+    #[test]
+    fn pattern_topics_are_stored_only_for_the_matched_version() {
+        let matched = vec!["orders-eu".to_owned()];
+        let pattern = || Subscription {
+            pattern: Some(TopicPattern::new(|topic| topic.starts_with("orders"))),
+            version: 3,
+            ..Subscription::topics(Vec::new(), true)
+        };
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, mut subscription, version, expected) in [
+            ("same version", pattern(), 3, (true, matched.clone())),
+            ("a newer change", pattern(), 2, (false, vec![])),
+            (
+                "a topic subscription now",
+                Subscription {
+                    version: 3,
+                    ..Subscription::topics(vec!["payments".to_owned()], true)
+                },
+                3,
+                (false, vec!["payments".to_owned()]),
+            ),
+        ] {
+            let stored = subscription.store_pattern_topics(version, &matched);
+            actual.push((name, (stored, subscription.topics)));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
     use krabka_protocol::owned::metadata_response::MetadataResponseTopic;
 
     use super::*;
