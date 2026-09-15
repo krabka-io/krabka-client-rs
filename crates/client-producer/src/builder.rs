@@ -32,6 +32,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    buffer_pool::BufferPool,
     compression::Compression,
     error::ProducerError,
     partitioner::UniformStickyPartitioner,
@@ -109,6 +110,10 @@ pub const DEFAULT_PRODUCER_TRANSACTION_TIMEOUT: Duration = Duration::from_mins(1
 ///
 /// Kafka's `max.block.ms` has the same default of 60 s.
 pub const DEFAULT_PRODUCER_MAX_BLOCK: Duration = Duration::from_mins(1);
+/// Default producer buffer memory in bytes.
+///
+/// Kafka's `buffer.memory` default is 33554432 (32 MiB).
+pub const DEFAULT_PRODUCER_BUFFER_MEMORY: usize = 32 * 1024 * 1024;
 
 /// Bounded backlog for coalescing internal sender wakeups.
 const SENDER_WAKE_CHANNEL_CAPACITY: usize = 16;
@@ -532,6 +537,7 @@ impl Producer {
         #[builder(default = DEFAULT_PRODUCER_INIT_MAX_BACKOFF)] init_max_backoff: Duration,
         #[builder(default = DEFAULT_PRODUCER_MAX_IN_FLIGHT)] max_in_flight_per_connection: usize,
         #[builder(default = DEFAULT_PRODUCER_MAX_BLOCK)] max_block: Duration,
+        #[builder(default = DEFAULT_PRODUCER_BUFFER_MEMORY)] buffer_memory: usize,
         #[builder(default)]
         metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
         #[builder(default = krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
@@ -576,6 +582,8 @@ impl Producer {
         let linger = throughput_policy.linger().as_time();
         let batch_size = throughput_policy.batch_bytes();
         let max_in_flight_per_connection = throughput_policy.max_in_flight();
+        let buffer_pool =
+            BufferPool::new(buffer_memory, batch_size).map_err(ProducerError::InvalidConfig)?;
 
         let retry_policy = ProducerRetryPolicy::new(
             request_timeout,
@@ -709,6 +717,7 @@ impl Producer {
             request_timeout,
             flush_timeout,
             max_block,
+            buffer_pool,
             max_in_flight: max_in_flight_per_connection,
             metadata_cache,
             metadata_refresh: crate::metadata_wait::MetadataRefresh::default(),

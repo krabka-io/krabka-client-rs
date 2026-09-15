@@ -42,7 +42,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::{
-    accumulator::{Accumulator, AccumulatorMap, AppendResult},
+    accumulator::{Accumulator, AccumulatorMap, AppendResult, approx_record_size},
+    buffer_pool::BufferPool,
     builder::{ProducerFlushTimeout, send_init_producer_id},
     compression::Compression,
     error::ProducerError,
@@ -247,6 +248,9 @@ pub struct Producer {
     /// The longest time that `send` waits for the metadata of its topic.
     /// Kafka's `max.block.ms` gives the same limit to `waitOnMetadata`.
     pub(crate) max_block: Duration,
+    /// The buffer memory of the batches. `send` waits for it, as Kafka's
+    /// `RecordAccumulator.append` waits for its `BufferPool`.
+    pub(crate) buffer_pool: BufferPool,
     #[allow(dead_code)]
     pub(crate) max_in_flight: usize,
     pub(crate) metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
@@ -1492,20 +1496,39 @@ impl Producer {
             return rx;
         }
 
+        let failed = |error: ProducerError| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Err(error));
+            rx
+        };
+
         // Produce v13 carries only the `topic_id` on the wire, so the cache
         // must hold the topic also when the caller names the partition.
+        let metadata_started = tokio::time::Instant::now();
         let partition = match self.partition_count(&record.topic, record.partition).await {
             Ok(count) => record.partition.unwrap_or_else(|| {
                 self.partitioner
                     .pick(&record.topic, record.key.as_deref(), count)
             }),
-            Err(error) => {
-                let (tx, rx) = oneshot::channel();
-                let _ = tx.send(Err(error));
-                return rx;
-            }
+            Err(error) => return failed(error),
         };
         tracing::Span::current().record("partition", partition);
+        // Kafka's `KafkaProducer.doSend` gives the buffer the part of
+        // `max.block.ms` that the metadata wait left, in whole milliseconds.
+        let waited_on_metadata = Duration::from_millis(
+            u64::try_from(metadata_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        let remaining_block = self.max_block.saturating_sub(waited_on_metadata);
+
+        // Kafka's `KafkaProducer.ensureValidRecordSize`.
+        let record_size = approx_record_size(
+            record.key.as_deref(),
+            record.value.as_deref(),
+            &record.headers,
+        );
+        if record_size > self.buffer_pool.total() {
+            return failed(ProducerError::RecordTooLarge { record_size });
+        }
 
         let key = (record.topic.clone(), partition);
         let acc = Arc::clone(
@@ -1516,61 +1539,90 @@ impl Producer {
         );
 
         let timestamp = record.timestamp_ms.unwrap_or_else(current_millis);
-        // Keep the state lock until the record is registered and appended.
-        // `prepare_transaction` takes the same lock before it flushes, so it
-        // cannot race past a send that has already joined this transaction.
-        let transaction_state = if self.transactional_id.is_some() {
-            Some(self.txn_state.lock().await)
-        } else {
-            None
-        };
-        let transaction_generation = if self.transaction_recovery_required() {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(ProducerError::RecoveryRequired));
-            return rx;
-        } else {
-            match transaction_state.as_deref() {
-                Some(TxnState::InTransaction) => {
-                    Some(self.txn_recovery_generation.load(Ordering::Acquire))
+        let mut memory = None;
+        loop {
+            // A record that starts a new batch needs buffer memory. The wait
+            // holds no lock, so the sender can complete batches and free
+            // memory. Kafka's `RecordAccumulator.append` also allocates
+            // outside the partition lock, and tries the append again after.
+            if memory.is_none()
+                && acc
+                    .lock()
+                    .await
+                    .needs_new_batch(record_size, self.expected_transaction_generation().await)
+            {
+                let size = self.batch_size.max(record_size);
+                match self.buffer_pool.allocate(size, remaining_block).await {
+                    Ok(reservation) => memory = Some(reservation),
+                    Err(error) => return failed(error),
                 }
-                Some(TxnState::Preparing | TxnState::Prepared) => {
-                    let (tx, rx) = oneshot::channel();
-                    let _ = tx.send(Err(ProducerError::InvalidTransactionState(
-                        "send is not allowed after prepare_transaction",
-                    )));
-                    return rx;
-                }
-                _ => None,
             }
-        };
-        if transaction_generation.is_some()
-            && let Err(error) = self
-                .register_transaction_partition(&record.topic, partition)
-                .await
-        {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(error));
+
+            // Keep the state lock until the record is registered and appended.
+            // `prepare_transaction` takes the same lock before it flushes, so
+            // it cannot race past a send that has already joined this
+            // transaction.
+            let transaction_state = if self.transactional_id.is_some() {
+                Some(self.txn_state.lock().await)
+            } else {
+                None
+            };
+            let transaction_generation = if self.transaction_recovery_required() {
+                return failed(ProducerError::RecoveryRequired);
+            } else {
+                match transaction_state.as_deref() {
+                    Some(TxnState::InTransaction) => {
+                        Some(self.txn_recovery_generation.load(Ordering::Acquire))
+                    }
+                    Some(TxnState::Preparing | TxnState::Prepared) => {
+                        return failed(ProducerError::InvalidTransactionState(
+                            "send is not allowed after prepare_transaction",
+                        ));
+                    }
+                    _ => None,
+                }
+            };
+            if transaction_generation.is_some()
+                && let Err(error) = self
+                    .register_transaction_partition(&record.topic, partition)
+                    .await
+            {
+                return failed(error);
+            }
+            let mut a = acc.lock().await;
+            if memory.is_none() && a.needs_new_batch(record_size, transaction_generation) {
+                // Another send filled the batch since the check above. Wait
+                // for memory again, with no lock held. Adding the partition to
+                // the transaction again has no effect.
+                continue;
+            }
+            if let Err(error) = self.is_active() {
+                return failed(error);
+            }
+            let AppendResult {
+                receiver: rx,
+                wakes_sender,
+            } = a.append(
+                record.key,
+                record.value,
+                record.headers,
+                timestamp,
+                transaction_generation,
+                memory,
+            );
+            drop(a);
+            drop(transaction_state);
+            wake_sender_after_append(&self.wake_tx, self.linger, wakes_sender);
             return rx;
         }
-        let mut a = acc.lock().await;
-        if let Err(error) = self.is_active() {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(error));
-            return rx;
-        }
-        let AppendResult {
-            receiver: rx,
-            wakes_sender,
-        } = a.try_append(
-            record.key,
-            record.value,
-            record.headers,
-            timestamp,
-            transaction_generation,
-        );
-        drop(transaction_state);
-        wake_sender_after_append(&self.wake_tx, self.linger, wakes_sender);
-        rx
+    }
+
+    /// The transaction generation that a send takes now: the recovery
+    /// generation inside a transaction, and `None` otherwise.
+    async fn expected_transaction_generation(&self) -> Option<u64> {
+        self.transactional_id.as_ref()?;
+        matches!(*self.txn_state.lock().await, TxnState::InTransaction)
+            .then(|| self.txn_recovery_generation.load(Ordering::Acquire))
     }
 
     /// Return the partition count of `topic`. On a cache miss, or when
@@ -1714,7 +1766,7 @@ mod tests {
     use std::{
         sync::{
             Arc, Mutex,
-            atomic::{AtomicU16, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -2343,6 +2395,217 @@ mod tests {
         for (name, answers, max_block, record, expected) in cases {
             let outcome = send_against_scripted_metadata(answers, max_block, record).await;
             actual.push((name, outcome));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// What a send gave while the buffer memory was full.
+    #[derive(Debug, PartialEq, Eq)]
+    struct BlockedSendOutcome {
+        /// `send` did not return before the broker answered the earlier
+        /// batches, or before `max_block` ended.
+        blocked: bool,
+        /// The outcome of the record: delivered, the error text, or `pending`.
+        delivered: Result<(), String>,
+    }
+
+    /// Start a broker with the topic `orders` of three partitions. It answers
+    /// Produce only while `answer_produce` is set.
+    async fn three_partition_broker(answer_produce: Arc<AtomicBool>) -> MockBroker {
+        let port = Arc::new(AtomicU16::new(0));
+        let handler_port = Arc::clone(&port);
+        let handler_answer = answer_produce;
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(encode_v0(&ApiVersionsResponse {
+                    api_keys: vec![
+                        ApiVersion {
+                            api_key: metadata_request::API_KEY,
+                            min_version: 0,
+                            max_version: 12,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: produce_request::API_KEY,
+                            min_version: PRODUCE_VERSION,
+                            max_version: PRODUCE_VERSION,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }));
+            }
+            if api_key == metadata_request::API_KEY {
+                return metadata_answer(
+                    version,
+                    handler_port.load(Ordering::SeqCst),
+                    MetadataAnswer::Topic {
+                        error_code: 0,
+                        partitions: 3,
+                    },
+                );
+            }
+            if api_key == produce_request::API_KEY && handler_answer.load(Ordering::SeqCst) {
+                let mut request_body = &body[2 + CLIENT_ID.len()..];
+                let request =
+                    ProduceRequest::decode(&mut request_body, version).expect("decode Produce");
+                return Some(produce_answer(&request));
+            }
+            None
+        })
+        .await;
+        port.store(mock.addr.port(), Ordering::SeqCst);
+        mock
+    }
+
+    /// Kafka's `KafkaProducer.ensureValidRecordSize` fails a record that is
+    /// larger than `buffer.memory` before it takes any memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_fails_a_record_larger_than_buffer_memory() {
+        let mock = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+        let producer = Producer::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id(CLIENT_ID)
+            .enable_idempotence(false)
+            .batch_size(64)
+            .buffer_memory(1024)
+            .build()
+            .await
+            .expect("producer connects to mock broker");
+        let record = |bytes: usize| ProducerRecord {
+            topic: METADATA_TOPIC.into(),
+            partition: Some(0),
+            value: Some(Bytes::from(vec![0; bytes])),
+            ..Default::default()
+        };
+
+        let mut outcomes = Vec::new();
+        for bytes in [1_008, 1_009] {
+            let delivered = producer
+                .send(record(bytes))
+                .await
+                .await
+                .expect("the producer answers the send")
+                .map(drop)
+                .map_err(|error| error.to_string());
+            outcomes.push((bytes, delivered));
+        }
+        mock.stop();
+        drop(producer);
+
+        // A record of 1008 value bytes is 1024 bytes in the estimate: 8 bytes
+        // of overhead and 4 bytes each for the key and the value length.
+        assert2::assert!(
+            outcomes
+                == vec![
+                    (1_008, Ok(())),
+                    (
+                        1_009,
+                        Err(
+                            "The message is 1025 bytes when serialized which is larger than \
+                             the total memory buffer you have configured with the \
+                             buffer_memory configuration."
+                                .to_owned()
+                        )
+                    ),
+                ]
+        );
+    }
+
+    /// Fill the buffer memory with two batches of 16 MiB for partitions 0 and
+    /// 1, which the broker does not answer, and send a third record to
+    /// partition 2. When `answer_after` is set, the broker starts to answer
+    /// Produce after that time, so the first batches complete and free their
+    /// memory.
+    async fn send_with_full_buffer_memory(
+        answer_after: Option<Duration>,
+        max_block: Duration,
+    ) -> BlockedSendOutcome {
+        const BATCH_BYTES: usize = 16 * 1024 * 1024;
+        let answer_produce = Arc::new(AtomicBool::new(false));
+        let mock = three_partition_broker(Arc::clone(&answer_produce)).await;
+        let producer = Producer::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id(CLIENT_ID)
+            .enable_idempotence(false)
+            .batch_size(BATCH_BYTES)
+            .request_timeout(Duration::from_millis(300))
+            .retry_backoff(Duration::from_millis(20))
+            .max_block(max_block)
+            .build()
+            .await
+            .expect("producer connects to mock broker");
+        let pinned = |partition: i32| ProducerRecord {
+            topic: METADATA_TOPIC.into(),
+            partition: Some(partition),
+            value: Some(Bytes::from_static(b"v")),
+            ..Default::default()
+        };
+        let _first = producer.send(pinned(0)).await;
+        let _second = producer.send(pinned(1)).await;
+        if let Some(delay) = answer_after {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                answer_produce.store(true, Ordering::SeqCst);
+            });
+        }
+        let started = std::time::Instant::now();
+        let mut third = producer.send(pinned(2)).await;
+        let blocked = started.elapsed() >= Duration::from_millis(80);
+        let delivered = match third.try_recv() {
+            Ok(result) => result.map(drop).map_err(|error| error.to_string()),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err("closed".to_owned()),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                match tokio::time::timeout(Duration::from_secs(3), third).await {
+                    Ok(Ok(result)) => result.map(drop).map_err(|error| error.to_string()),
+                    Ok(Err(_)) => Err("closed".to_owned()),
+                    Err(_) => Err("pending".to_owned()),
+                }
+            }
+        };
+        mock.stop();
+        drop(producer);
+        BlockedSendOutcome { blocked, delivered }
+    }
+
+    /// Kafka's `BufferPool.allocate` blocks a send while `buffer.memory` is in
+    /// use, for at most the rest of `max.block.ms`. It fails the record with
+    /// `BufferExhaustedException` when that time ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_waits_for_buffer_memory_up_to_max_block() {
+        let cases = [
+            (
+                "memory stays full",
+                None,
+                Duration::from_millis(200),
+                BlockedSendOutcome {
+                    blocked: true,
+                    delivered: Err(
+                        "Failed to allocate 16777216 bytes within the configured max \
+                                    blocking time 200 ms. Total memory: 33554432 bytes. Available \
+                                    memory: 0 bytes. Poolable size: 16777216 bytes"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                "earlier batches complete",
+                Some(Duration::from_millis(100)),
+                Duration::from_secs(5),
+                BlockedSendOutcome {
+                    blocked: true,
+                    delivered: Ok(()),
+                },
+            ),
+        ];
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, answer_after, max_block, expected) in cases {
+            actual.push((
+                name,
+                send_with_full_buffer_memory(answer_after, max_block).await,
+            ));
             wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted);
