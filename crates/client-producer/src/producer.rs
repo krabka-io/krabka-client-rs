@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use bytes::BufMut;
@@ -41,10 +42,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::{
-    accumulator::{Accumulator, AccumulatorMap, AppendResult},
+    accumulator::{Accumulator, AccumulatorMap, AppendResult, approx_record_size},
+    buffer_pool::BufferPool,
     builder::{ProducerFlushTimeout, send_init_producer_id},
     compression::Compression,
     error::ProducerError,
+    metadata_wait::{MetadataRefresh, MetadataWait, metadata_request},
     partitioner::UniformStickyPartitioner,
     record::{ProducerRecord, RecordMetadata},
     sender::DrainIntent,
@@ -181,9 +184,8 @@ impl Acks {
 pub(crate) const STATE_ACTIVE: u8 = 0;
 pub(crate) const STATE_FENCED: u8 = 1;
 pub(crate) const STATE_CLOSED: u8 = 2;
-pub(crate) const UNRESOLVED_TOPIC_PARTITION_COUNT: i32 = 1;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TopicMetadata {
     pub num_partitions: i32,
     /// Topic UUID. Produce v13+ needs it, because that version encodes only
@@ -243,13 +245,22 @@ pub struct Producer {
     #[allow(dead_code)]
     pub(crate) request_timeout: Time,
     pub(crate) flush_timeout: ProducerFlushTimeout,
+    /// The longest time that `send` waits for the metadata of its topic.
+    /// Kafka's `max.block.ms` gives the same limit to `waitOnMetadata`.
+    pub(crate) max_block: Duration,
+    /// The buffer memory of the batches. `send` waits for it, as Kafka's
+    /// `RecordAccumulator.append` waits for its `BufferPool`.
+    pub(crate) buffer_pool: BufferPool,
     #[allow(dead_code)]
     pub(crate) max_in_flight: usize,
     pub(crate) metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
+    /// The metadata refreshes that concurrent sends share while they wait for
+    /// a topic. See `MetadataWait`.
+    pub(crate) metadata_refresh: MetadataRefresh,
     /// Per-`(topic, partition)` leader-id cache. The sender uses it to route
     /// each Produce to the broker that actually leads the partition.
     ///
-    /// `Metadata` fills it alongside the partition count; see `partitions_for`.
+    /// `Metadata` fills it alongside the partition count; see `partition_count`.
     /// A missing entry means the leader is unknown, and the sender falls back
     /// to the bootstrap connection. A leader id `< 0` also counts as unknown.
     /// An `Arc` shares the cache with the sender task.
@@ -1477,7 +1488,10 @@ impl Producer {
     /// acks, or when the producer fences or closes.
     ///
     /// This returns a `oneshot::Receiver`. The outer call is `async` because
-    /// partition resolution may need to fetch metadata over the wire.
+    /// it waits for metadata that holds the topic, for at most `max_block`, as
+    /// Kafka's `KafkaProducer.waitOnMetadata` does. When the wait fails, the
+    /// receiver holds the error and the producer sends no Produce for the
+    /// record.
     pub async fn send(
         &self,
         record: ProducerRecord,
@@ -1505,30 +1519,50 @@ impl Producer {
             return rx;
         }
 
-        let resolved = match record.partition {
-            Some(p) => {
-                // Produce v13 omits the topic name on the wire and carries
-                // only `topic_id`, so the metadata cache must hold the topic
-                // even when the caller pins the partition itself. The
-                // partitioner path populates it via `partition_for`; mirror
-                // that here so explicit-partition sends resolve a non-zero
-                // `topic_id` instead of failing with UNKNOWN_TOPIC_OR_PARTITION.
-                self.partitions_for(&record.topic).await.map(|_| p)
-            }
-            None => {
-                self.partition_for(&record.topic, record.key.as_deref())
-                    .await
-            }
+        let failed = |error: ProducerError| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Err(error));
+            rx
         };
-        let partition = match resolved {
-            Ok(partition) => partition,
-            Err(error) => {
-                let (tx, rx) = oneshot::channel();
-                let _ = tx.send(Err(ProducerError::Client(error)));
-                return rx;
+
+        // Kafka's `KafkaProducer.doSend` calls `throwIfInPreparedState` before
+        // `waitOnMetadata`, so a send after `prepare_transaction` does not
+        // wait for metadata. The check before the append covers a
+        // `prepare_transaction` that starts during the wait.
+        if self.transactional_id.is_some() {
+            let state = *self.txn_state.lock().await;
+            if let Err(error) = self.transaction_generation(Some(state)) {
+                return failed(error);
             }
+        }
+
+        // Produce v13 carries only the `topic_id` on the wire, so the cache
+        // must hold the topic also when the caller names the partition.
+        let metadata_started = tokio::time::Instant::now();
+        let partition = match self.partition_count(&record.topic, record.partition).await {
+            Ok(count) => record.partition.unwrap_or_else(|| {
+                self.partitioner
+                    .pick(&record.topic, record.key.as_deref(), count)
+            }),
+            Err(error) => return failed(error),
         };
         tracing::Span::current().record("partition", partition);
+        // Kafka's `KafkaProducer.doSend` gives the buffer the part of
+        // `max.block.ms` that the metadata wait left, in whole milliseconds.
+        let waited_on_metadata = Duration::from_millis(
+            u64::try_from(metadata_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        let remaining_block = self.max_block.saturating_sub(waited_on_metadata);
+
+        // Kafka's `KafkaProducer.ensureValidRecordSize`.
+        let record_size = approx_record_size(
+            record.key.as_deref(),
+            record.value.as_deref(),
+            &record.headers,
+        );
+        if record_size > self.buffer_pool.total() {
+            return failed(ProducerError::RecordTooLarge { record_size });
+        }
 
         let key = (record.topic.clone(), partition);
         let acc = Arc::clone(
@@ -1539,157 +1573,158 @@ impl Producer {
         );
 
         let timestamp = record.timestamp_ms.unwrap_or_else(current_millis);
-        // Keep the state lock until the record is registered and appended.
-        // `prepare_transaction` takes the same lock before it flushes, so it
-        // cannot race past a send that has already joined this transaction.
-        let transaction_state = if self.transactional_id.is_some() {
-            Some(self.txn_state.lock().await)
-        } else {
-            None
-        };
-        let transaction_generation = if self.transaction_recovery_required() {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(ProducerError::RecoveryRequired));
-            return rx;
-        } else {
-            match transaction_state.as_deref() {
-                Some(TxnState::InTransaction) => {
-                    Some(self.txn_recovery_generation.load(Ordering::Acquire))
+        let mut memory = None;
+        loop {
+            // A record that starts a new batch needs buffer memory. The wait
+            // holds no lock, so the sender can complete batches and free
+            // memory. Kafka's `RecordAccumulator.append` also allocates
+            // outside the partition lock, and tries the append again after.
+            //
+            // The state check comes first, so a send that cannot append fails
+            // at once. It releases the state lock before it takes the
+            // accumulator lock: the append below takes the two locks in the
+            // other order.
+            if memory.is_none() {
+                let state = match &self.transactional_id {
+                    Some(_) => Some(*self.txn_state.lock().await),
+                    None => None,
+                };
+                let expected_generation = match self.transaction_generation(state) {
+                    Ok(generation) => generation,
+                    Err(error) => return failed(error),
+                };
+                let needs_memory = {
+                    let mut a = acc.lock().await;
+                    let needs_memory = a.needs_new_batch(record_size, expected_generation);
+                    // Kafka closes a batch that the record does not fit, so
+                    // the sender can send it and free its memory during the
+                    // wait.
+                    if needs_memory && a.current.as_ref().is_some_and(|batch| !batch.is_empty()) {
+                        a.seal_current();
+                        let _ = self.wake_tx.try_send(DrainIntent::Ready);
+                    }
+                    needs_memory
+                };
+                if needs_memory {
+                    let size = self.batch_size.max(record_size);
+                    match self.buffer_pool.allocate(size, remaining_block).await {
+                        Ok(reservation) => memory = Some(reservation),
+                        Err(error) => return failed(error),
+                    }
                 }
-                Some(TxnState::Preparing | TxnState::Prepared) => {
-                    let (tx, rx) = oneshot::channel();
-                    let _ = tx.send(Err(ProducerError::InvalidTransactionState(
-                        "send is not allowed after prepare_transaction",
-                    )));
-                    return rx;
-                }
-                _ => None,
             }
-        };
-        if transaction_generation.is_some()
-            && let Err(error) = self
-                .register_transaction_partition(&record.topic, partition)
-                .await
-        {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(error));
+
+            // Keep the state lock until the record is registered and appended.
+            // `prepare_transaction` takes the same lock before it flushes, so
+            // it cannot race past a send that has already joined this
+            // transaction.
+            let transaction_state = if self.transactional_id.is_some() {
+                Some(self.txn_state.lock().await)
+            } else {
+                None
+            };
+            let transaction_generation =
+                match self.transaction_generation(transaction_state.as_deref().copied()) {
+                    Ok(generation) => generation,
+                    Err(error) => return failed(error),
+                };
+            if transaction_generation.is_some()
+                && let Err(error) = self
+                    .register_transaction_partition(&record.topic, partition)
+                    .await
+            {
+                return failed(error);
+            }
+            let mut a = acc.lock().await;
+            if memory.is_none() && a.needs_new_batch(record_size, transaction_generation) {
+                // Another send filled the batch since the check above. Wait
+                // for memory again, with no lock held. Adding the partition to
+                // the transaction again has no effect.
+                continue;
+            }
+            if let Err(error) = self.is_active() {
+                return failed(error);
+            }
+            let AppendResult {
+                receiver: rx,
+                wakes_sender,
+            } = a.append(
+                record.key,
+                record.value,
+                record.headers,
+                timestamp,
+                transaction_generation,
+                memory,
+            );
+            drop(a);
+            drop(transaction_state);
+            wake_sender_after_append(&self.wake_tx, self.linger, wakes_sender);
             return rx;
         }
-        let mut a = acc.lock().await;
-        if let Err(error) = self.is_active() {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(error));
-            return rx;
-        }
-        let AppendResult {
-            receiver: rx,
-            wakes_sender,
-        } = a.try_append(
-            record.key,
-            record.value,
-            record.headers,
-            timestamp,
-            transaction_generation,
-        );
-        drop(transaction_state);
-        wake_sender_after_append(&self.wake_tx, self.linger, wakes_sender);
-        rx
     }
 
-    /// Resolve the destination partition for a record. It hashes the key when
-    /// the record has one, and otherwise consults the sticky partitioner. It
-    /// fetches and caches topic metadata on the first reference.
-    #[tracing::instrument(
-        level = "debug",
-        skip_all,
-        fields(topic = %topic, keyed = key.is_some()),
-    )]
-    async fn partition_for(&self, topic: &str, key: Option<&[u8]>) -> Result<i32, ClientError> {
-        let num_partitions = self.partitions_for(topic).await?;
-        Ok(self.partitioner.pick(topic, key, num_partitions))
-    }
-
-    /// Return the partition count for `topic`, and fetch metadata on a cache
-    /// miss. It falls back to `1` if the broker reports an error, or if the
-    /// topic is absent. Production code can revisit the retry policy here.
+    /// The transaction generation that a send takes in `state`: the recovery
+    /// generation inside a transaction, and `None` otherwise.
     ///
     /// # Errors
     ///
-    /// Returns the error of a metadata refresh that failed authentication.
-    /// Kafka's `KafkaProducer.waitOnMetadata` raises that
-    /// `AuthenticationException` from `send` (`Metadata.maybeThrowExceptionForTopic`).
+    /// Returns an error when a transaction needs recovery, or when the state
+    /// does not accept a send.
+    fn transaction_generation(
+        &self,
+        state: Option<TxnState>,
+    ) -> Result<Option<u64>, ProducerError> {
+        if self.transaction_recovery_required() {
+            return Err(ProducerError::RecoveryRequired);
+        }
+        match state {
+            Some(TxnState::InTransaction) => {
+                Ok(Some(self.txn_recovery_generation.load(Ordering::Acquire)))
+            }
+            Some(TxnState::Preparing | TxnState::Prepared) => {
+                Err(ProducerError::InvalidTransactionState(
+                    "send is not allowed after prepare_transaction",
+                ))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Return the partition count of `topic`. On a cache miss, or when
+    /// `partition` is not below the cached count, wait for metadata for at
+    /// most `max_block`. See [`MetadataWait::partition_count`].
     ///
-    /// On a cache miss this uses [`Client::refresh_metadata`] rather than a
-    /// bare `send(MetadataRequest)`. `refresh_metadata` also teaches the
+    /// The wait uses [`Client::refresh_metadata_with`] rather than a bare
+    /// `send(MetadataRequest)`. The request names the topics of the producer
+    /// (see [`metadata_request`]). `refresh_metadata_with` also teaches the
     /// client's `BrokerPool` each broker's `(id → addr)` mapping, and that is
     /// what lets the sender route a Produce to the partition *leader* with
-    /// `Client::broker(id)` instead of always hitting the bootstrap connection.
-    /// The producer then records each partition's `leader_id` in
+    /// `Client::broker(id)`. The wait records each partition's `leader_id` in
     /// `partition_leaders` for the sender to consult.
     #[tracing::instrument(
         level = "debug",
         skip_all,
         fields(topic = %topic, num_partitions = tracing::field::Empty),
     )]
-    async fn partitions_for(&self, topic: &str) -> Result<i32, ClientError> {
-        {
-            let m = self.metadata_cache.lock().await;
-            if let Some(meta) = m.get(topic) {
-                tracing::Span::current().record("num_partitions", meta.num_partitions);
-                return Ok(meta.num_partitions);
-            }
+    async fn partition_count(
+        &self,
+        topic: &str,
+        partition: Option<i32>,
+    ) -> Result<i32, ProducerError> {
+        let count = MetadataWait {
+            cache: &self.metadata_cache,
+            partition_leaders: &self.partition_leaders,
+            refresh: &self.metadata_refresh,
+            max_block: self.max_block,
+            retry_backoff: self.init_retry_backoff.to_std(),
+            max_backoff: self.retry_backoff_max.to_std(),
         }
-        // Cache miss: refresh. `refresh_metadata` sends a (full-cluster)
-        // MetadataRequest, returns the response, AND refreshes the pool's
-        // broker address registry so per-leader routing can connect.
-        match self.client.refresh_metadata().await {
-            Ok(resp) => {
-                let topic_meta = resp
-                    .topics
-                    .iter()
-                    .find(|t| t.name.as_deref() == Some(topic));
-                // Non-zero per-topic error_code (e.g. UNKNOWN_TOPIC_OR_PARTITION = 3)
-                // means the broker didn't fill in the partition list — fall back
-                // to a default of 1 so the caller can still attempt the send.
-                let (count, topic_id) = match topic_meta {
-                    Some(t) if t.error_code == 0 => {
-                        let count = i32::try_from(t.partitions.len())
-                            .unwrap_or(UNRESOLVED_TOPIC_PARTITION_COUNT)
-                            .max(UNRESOLVED_TOPIC_PARTITION_COUNT);
-                        // Cache the per-partition leader id so the sender can
-                        // route each Produce to the partition leader.
-                        for part in &t.partitions {
-                            self.partition_leaders
-                                .insert((topic.to_string(), part.partition_index), part.leader_id);
-                        }
-                        (count, t.topic_id)
-                    }
-                    _ => (
-                        UNRESOLVED_TOPIC_PARTITION_COUNT,
-                        krabka_protocol::primitives::uuid::Uuid::ZERO,
-                    ),
-                };
-                // NOTE: an unresolved lookup is cached as `{count: 1, topic_id:
-                // ZERO}` to avoid a metadata-refresh storm (this runs per record
-                // on the produce path). That entry is later corrected in place by
-                // `update_leaders_from_metadata` once the topic exists — which is
-                // essential: a frozen ZERO `topic_id` makes Produce v≥13 (name
-                // dropped on the wire) return an un-correlatable UNKNOWN_TOPIC
-                // response that the sender would retry forever.
-                let mut m = self.metadata_cache.lock().await;
-                m.insert(
-                    topic.to_string(),
-                    TopicMetadata {
-                        num_partitions: count,
-                        topic_id,
-                    },
-                );
-                tracing::Span::current().record("num_partitions", count);
-                Ok(count)
-            }
-            Err(error) if error.is_authentication_failure() => Err(error),
-            Err(_) => Ok(UNRESOLVED_TOPIC_PARTITION_COUNT),
-        }
+        .partition_count(topic, partition, |topics| {
+            self.client.refresh_metadata_with(metadata_request(topics))
+        })
+        .await?;
+        tracing::Span::current().record("num_partitions", count);
+        Ok(count)
     }
 
     #[tracing::instrument(
@@ -1797,7 +1832,11 @@ fn build_topics_payload(offsets: &[((String, i32), i64)]) -> Vec<TxnOffsetCommit
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex, atomic::Ordering},
+        collections::BTreeSet,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -1810,6 +1849,13 @@ mod tests {
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             find_coordinator_request::{self, FindCoordinatorRequest},
             find_coordinator_response::{self, Coordinator, FindCoordinatorResponse},
+            metadata_request::{self, MetadataRequest},
+            metadata_response::{
+                self, MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
+                MetadataResponseTopic,
+            },
+            produce_request::{self, ProduceRequest},
+            produce_response::{PartitionProduceResponse, ProduceResponse, TopicProduceResponse},
         },
     };
 
@@ -1819,8 +1865,10 @@ mod tests {
         wake_sender_after_append,
     };
     use crate::{
+        ProducerRecord,
         accumulator::{Accumulator, AppendResult},
         error::ProducerError,
+        partitioner::partition_for_key,
     };
 
     /// Both halves of the pair must be non-negative. Kafka writes `-1` in
@@ -2157,6 +2205,577 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// One answer of the scripted broker to a `Metadata` request.
+    #[derive(Clone, Copy)]
+    enum MetadataAnswer {
+        /// The topic with this error code and this number of partitions.
+        Topic { error_code: i16, partitions: i32 },
+        /// No answer, so the request times out.
+        Silent,
+    }
+
+    /// What one send gave: the delivered partition or the error text, the
+    /// partitions of every Produce that the broker received, and the distinct
+    /// `Metadata` requests.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SendOutcome {
+        delivered: Result<i32, String>,
+        produced_partitions: Vec<i32>,
+        metadata_requests: BTreeSet<RequestedTopics>,
+    }
+
+    /// The topics that a `Metadata` request names (`None` for all topics),
+    /// and its `allow_auto_topic_creation`.
+    type RequestedTopics = (Option<Vec<String>>, bool);
+
+    fn requested_topics(body: &[u8], version: i16) -> MetadataRequest {
+        let header_len =
+            2 + CLIENT_ID.len() + usize::from(version >= metadata_request::FLEXIBLE_MIN);
+        let mut request_body = &body[header_len..];
+        MetadataRequest::decode(&mut request_body, version).expect("decode Metadata")
+    }
+
+    const METADATA_TOPIC: &str = "orders";
+
+    /// Encode `answer`. A broker lists a topic with an error only when the
+    /// request names it: a request for all topics gives the topics that exist
+    /// and that the client may describe.
+    fn metadata_answer(
+        version: i16,
+        port: u16,
+        answer: MetadataAnswer,
+        named: bool,
+    ) -> Option<Vec<u8>> {
+        let MetadataAnswer::Topic {
+            error_code,
+            partitions,
+        } = answer
+        else {
+            return None;
+        };
+        let listed = named || error_code == 0;
+        let response = MetadataResponse {
+            brokers: vec![MetadataResponseBroker {
+                node_id: 1,
+                host: "127.0.0.1".into(),
+                port: i32::from(port),
+                ..Default::default()
+            }],
+            topics: listed
+                .then(|| MetadataResponseTopic {
+                    error_code,
+                    name: Some(METADATA_TOPIC.into()),
+                    partitions: (0..partitions)
+                        .map(|partition_index| MetadataResponsePartition {
+                            partition_index,
+                            leader_id: 1,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        if version >= metadata_response::FLEXIBLE_MIN {
+            buf.extend_from_slice(&[0]);
+        }
+        response.encode(&mut buf, version).expect("encode Metadata");
+        Some(buf.to_vec())
+    }
+
+    fn produce_answer(request: &ProduceRequest) -> Vec<u8> {
+        let response = ProduceResponse {
+            responses: request
+                .topic_data
+                .iter()
+                .map(|topic| TopicProduceResponse {
+                    name: topic.name.clone(),
+                    partition_responses: topic
+                        .partition_data
+                        .iter()
+                        .map(|partition| PartitionProduceResponse {
+                            index: partition.index,
+                            base_offset: 0,
+                            log_start_offset: -1,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        response
+            .encode(&mut buf, PRODUCE_VERSION)
+            .expect("encode Produce");
+        buf.to_vec()
+    }
+
+    const PRODUCE_VERSION: i16 = 3;
+
+    /// Start a broker that answers `Metadata` from `answers` in order, and
+    /// repeats the last answer. It answers every Produce with success.
+    async fn send_against_scripted_metadata(
+        answers: Vec<MetadataAnswer>,
+        max_block: Duration,
+        record: ProducerRecord,
+    ) -> SendOutcome {
+        let port = Arc::new(AtomicU16::new(0));
+        let handler_port = Arc::clone(&port);
+        let metadata_requests = AtomicUsize::new(0);
+        let metadata_log = Arc::new(Mutex::new(BTreeSet::new()));
+        let handler_metadata_log = Arc::clone(&metadata_log);
+        let produce_log = Arc::new(Mutex::new(Vec::new()));
+        let handler_produce_log = Arc::clone(&produce_log);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(encode_v0(&ApiVersionsResponse {
+                    api_keys: vec![
+                        ApiVersion {
+                            api_key: metadata_request::API_KEY,
+                            min_version: 0,
+                            max_version: 12,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: produce_request::API_KEY,
+                            min_version: PRODUCE_VERSION,
+                            max_version: PRODUCE_VERSION,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }));
+            }
+            if api_key == metadata_request::API_KEY {
+                let index = metadata_requests.fetch_add(1, Ordering::SeqCst);
+                let answer = answers[index.min(answers.len() - 1)];
+                let request = requested_topics(body, version);
+                let topics = request.topics.map(|topics| {
+                    topics
+                        .into_iter()
+                        .map(|topic| topic.name.unwrap_or_default())
+                        .collect::<Vec<_>>()
+                });
+                let named = topics
+                    .as_ref()
+                    .is_some_and(|topics| topics.iter().any(|topic| topic == METADATA_TOPIC));
+                handler_metadata_log
+                    .lock()
+                    .unwrap()
+                    .insert((topics, request.allow_auto_topic_creation));
+                return metadata_answer(
+                    version,
+                    handler_port.load(Ordering::SeqCst),
+                    answer,
+                    named,
+                );
+            }
+            if api_key == produce_request::API_KEY {
+                let mut request_body = &body[2 + CLIENT_ID.len()..];
+                let request =
+                    ProduceRequest::decode(&mut request_body, version).expect("decode Produce");
+                handler_produce_log.lock().unwrap().extend(
+                    request
+                        .topic_data
+                        .iter()
+                        .flat_map(|topic| topic.partition_data.iter().map(|p| p.index)),
+                );
+                return Some(produce_answer(&request));
+            }
+            None
+        })
+        .await;
+        port.store(mock.addr.port(), Ordering::SeqCst);
+        let producer = Producer::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id(CLIENT_ID)
+            .enable_idempotence(false)
+            .request_timeout(Duration::from_millis(300))
+            // Without rebootstrap, a silent `Metadata` fails the refresh, and
+            // the producer's own wait must ask again.
+            .metadata_recovery_strategy(krabka_client_core::MetadataRecoveryStrategy::None)
+            .max_block(max_block)
+            .build()
+            .await
+            .expect("producer connects to mock broker");
+        let delivered = producer
+            .send(record)
+            .await
+            .await
+            .expect("the producer answers the send")
+            .map(|metadata| metadata.partition)
+            .map_err(|error| error.to_string());
+        producer.flush().await.expect("flush");
+        let outcome = SendOutcome {
+            delivered,
+            produced_partitions: produce_log.lock().unwrap().clone(),
+            metadata_requests: metadata_log.lock().unwrap().clone(),
+        };
+        producer.close().await.expect("close producer");
+        mock.stop();
+        outcome
+    }
+
+    /// `send` waits for metadata that holds the topic, as Kafka's
+    /// `KafkaProducer.waitOnMetadata` does. It never picks a partition from a
+    /// guessed partition count. A send that fails sends no Produce.
+    ///
+    /// The broker is a real socket, so the test runs in real time: paused
+    /// Tokio time moves on while socket I/O is pending. The unit tests of
+    /// `metadata_wait` check the backoff and the limit in paused time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_waits_for_topic_metadata_up_to_max_block() {
+        const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+        const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+        let keyed = |key: &'static [u8]| ProducerRecord {
+            topic: METADATA_TOPIC.into(),
+            key: Some(Bytes::from_static(key)),
+            value: Some(Bytes::from_static(b"v")),
+            ..Default::default()
+        };
+        let pinned = |partition: i32| ProducerRecord {
+            topic: METADATA_TOPIC.into(),
+            partition: Some(partition),
+            value: Some(Bytes::from_static(b"v")),
+            ..Default::default()
+        };
+        let topic = |error_code: i16, partitions: i32| MetadataAnswer::Topic {
+            error_code,
+            partitions,
+        };
+        // Kafka's `ProducerMetadata.newMetadataRequestBuilder` names the
+        // producer's topics and allows auto topic creation.
+        let orders_request = || BTreeSet::from([(Some(vec![METADATA_TOPIC.to_owned()]), true)]);
+        let delivered = |partition: i32| SendOutcome {
+            delivered: Ok(partition),
+            produced_partitions: vec![partition],
+            metadata_requests: orders_request(),
+        };
+        let failed = |error: &str| SendOutcome {
+            delivered: Err(error.to_owned()),
+            produced_partitions: vec![],
+            metadata_requests: orders_request(),
+        };
+        let default_block = crate::builder::DEFAULT_PRODUCER_MAX_BLOCK;
+        let short_block = Duration::from_millis(100);
+        let cases = [
+            (
+                "topic appears on the second refresh",
+                vec![topic(UNKNOWN_TOPIC_OR_PARTITION, 0), topic(0, 12)],
+                default_block,
+                keyed(b"kafka"),
+                delivered(partition_for_key(b"kafka", 12)),
+            ),
+            (
+                "topic never appears",
+                vec![topic(UNKNOWN_TOPIC_OR_PARTITION, 0)],
+                short_block,
+                keyed(b"kafka"),
+                failed("Topic orders not present in metadata after 100 ms."),
+            ),
+            (
+                "metadata transport error, then the topic",
+                vec![MetadataAnswer::Silent, topic(0, 12)],
+                default_block,
+                keyed(b"my-key"),
+                delivered(9),
+            ),
+            (
+                "explicit partition beyond the count",
+                vec![topic(0, 4)],
+                short_block,
+                pinned(7),
+                failed(
+                    "Partition 7 of topic orders with partition count 4 is not present in metadata after 100 ms.",
+                ),
+            ),
+            (
+                "explicit partition after the partition count grows",
+                vec![topic(0, 4), topic(0, 12)],
+                default_block,
+                pinned(7),
+                delivered(7),
+            ),
+            (
+                "topic authorization failed fails at once",
+                vec![topic(TOPIC_AUTHORIZATION_FAILED, 0)],
+                default_block,
+                keyed(b"kafka"),
+                failed("broker error_code 29"),
+            ),
+        ];
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, answers, max_block, record, expected) in cases {
+            let outcome = send_against_scripted_metadata(answers, max_block, record).await;
+            actual.push((name, outcome));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// What a send gave while the buffer memory was full.
+    #[derive(Debug, PartialEq, Eq)]
+    struct BlockedSendOutcome {
+        /// `send` did not return before the broker answered the earlier
+        /// batches, or before `max_block` ended.
+        blocked: bool,
+        /// The outcome of the record: delivered, the error text, or `pending`.
+        delivered: Result<(), String>,
+    }
+
+    /// Start a broker with the topic `orders` of three partitions. It answers
+    /// Produce only while `answer_produce` is set.
+    async fn three_partition_broker(answer_produce: Arc<AtomicBool>) -> MockBroker {
+        let port = Arc::new(AtomicU16::new(0));
+        let handler_port = Arc::clone(&port);
+        let handler_answer = answer_produce;
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(encode_v0(&ApiVersionsResponse {
+                    api_keys: vec![
+                        ApiVersion {
+                            api_key: metadata_request::API_KEY,
+                            min_version: 0,
+                            max_version: 12,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: produce_request::API_KEY,
+                            min_version: PRODUCE_VERSION,
+                            max_version: PRODUCE_VERSION,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }));
+            }
+            if api_key == metadata_request::API_KEY {
+                return metadata_answer(
+                    version,
+                    handler_port.load(Ordering::SeqCst),
+                    MetadataAnswer::Topic {
+                        error_code: 0,
+                        partitions: 3,
+                    },
+                    true,
+                );
+            }
+            if api_key == produce_request::API_KEY && handler_answer.load(Ordering::SeqCst) {
+                let mut request_body = &body[2 + CLIENT_ID.len()..];
+                let request =
+                    ProduceRequest::decode(&mut request_body, version).expect("decode Produce");
+                return Some(produce_answer(&request));
+            }
+            None
+        })
+        .await;
+        port.store(mock.addr.port(), Ordering::SeqCst);
+        mock
+    }
+
+    /// A record that does not fit the current batch closes that batch before
+    /// it waits for memory, as Kafka's `RecordAccumulator.append` closes a full
+    /// batch. The sender then sends the closed batch before its linger ends,
+    /// and the memory it frees serves the new batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_record_that_does_not_fit_sends_the_full_batch_to_free_memory() {
+        let mock = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+        let producer = Producer::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id(CLIENT_ID)
+            .enable_idempotence(false)
+            .batch_size(64)
+            .buffer_memory(64)
+            .linger(Duration::from_secs(30))
+            .max_block(Duration::from_secs(2))
+            .build()
+            .await
+            .expect("producer connects to mock broker");
+        let record = || ProducerRecord {
+            topic: METADATA_TOPIC.into(),
+            partition: Some(0),
+            value: Some(Bytes::from_static(&[0; 40])),
+            ..Default::default()
+        };
+
+        let first = producer.send(record()).await;
+        let second = producer.send(record()).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            let first = first.await.expect("first is resolved").map(drop);
+            let second = producer
+                .flush()
+                .await
+                .and(second.await.expect("second is resolved").map(drop));
+            (
+                first.map_err(|e| e.to_string()),
+                second.map_err(|e| e.to_string()),
+            )
+        })
+        .await;
+        mock.stop();
+        drop(producer);
+
+        assert2::assert!(delivered == Ok((Ok(()), Ok(()))));
+    }
+
+    /// Kafka's `KafkaProducer.ensureValidRecordSize` fails a record that is
+    /// larger than `buffer.memory` before it takes any memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_fails_a_record_larger_than_buffer_memory() {
+        let mock = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+        let producer = Producer::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id(CLIENT_ID)
+            .enable_idempotence(false)
+            .batch_size(64)
+            .buffer_memory(1024)
+            .build()
+            .await
+            .expect("producer connects to mock broker");
+        let record = |bytes: usize| ProducerRecord {
+            topic: METADATA_TOPIC.into(),
+            partition: Some(0),
+            value: Some(Bytes::from(vec![0; bytes])),
+            ..Default::default()
+        };
+
+        let mut outcomes = Vec::new();
+        for bytes in [1_008, 1_009] {
+            let delivered = producer
+                .send(record(bytes))
+                .await
+                .await
+                .expect("the producer answers the send")
+                .map(drop)
+                .map_err(|error| error.to_string());
+            outcomes.push((bytes, delivered));
+        }
+        mock.stop();
+        drop(producer);
+
+        // A record of 1008 value bytes is 1024 bytes in the estimate: 8 bytes
+        // of overhead and 4 bytes each for the key and the value length.
+        assert2::assert!(
+            outcomes
+                == vec![
+                    (1_008, Ok(())),
+                    (
+                        1_009,
+                        Err(
+                            "The message is 1025 bytes when serialized which is larger than \
+                             the total memory buffer you have configured with the \
+                             buffer_memory configuration."
+                                .to_owned()
+                        )
+                    ),
+                ]
+        );
+    }
+
+    /// Fill the buffer memory with two batches of 16 MiB for partitions 0 and
+    /// 1, which the broker does not answer, and send a third record to
+    /// partition 2. When `answer_after` is set, the broker starts to answer
+    /// Produce after that time, so the first batches complete and free their
+    /// memory.
+    async fn send_with_full_buffer_memory(
+        answer_after: Option<Duration>,
+        max_block: Duration,
+    ) -> BlockedSendOutcome {
+        const BATCH_BYTES: usize = 16 * 1024 * 1024;
+        let answer_produce = Arc::new(AtomicBool::new(false));
+        let mock = three_partition_broker(Arc::clone(&answer_produce)).await;
+        let producer = Producer::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id(CLIENT_ID)
+            .enable_idempotence(false)
+            .batch_size(BATCH_BYTES)
+            .request_timeout(Duration::from_millis(300))
+            .retry_backoff(Duration::from_millis(20))
+            .max_block(max_block)
+            .build()
+            .await
+            .expect("producer connects to mock broker");
+        let pinned = |partition: i32| ProducerRecord {
+            topic: METADATA_TOPIC.into(),
+            partition: Some(partition),
+            value: Some(Bytes::from_static(b"v")),
+            ..Default::default()
+        };
+        let _first = producer.send(pinned(0)).await;
+        let _second = producer.send(pinned(1)).await;
+        if let Some(delay) = answer_after {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                answer_produce.store(true, Ordering::SeqCst);
+            });
+        }
+        let started = std::time::Instant::now();
+        let mut third = producer.send(pinned(2)).await;
+        let blocked = started.elapsed() >= Duration::from_millis(80);
+        let delivered = match third.try_recv() {
+            Ok(result) => result.map(drop).map_err(|error| error.to_string()),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err("closed".to_owned()),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                match tokio::time::timeout(Duration::from_secs(3), third).await {
+                    Ok(Ok(result)) => result.map(drop).map_err(|error| error.to_string()),
+                    Ok(Err(_)) => Err("closed".to_owned()),
+                    Err(_) => Err("pending".to_owned()),
+                }
+            }
+        };
+        mock.stop();
+        drop(producer);
+        BlockedSendOutcome { blocked, delivered }
+    }
+
+    /// Kafka's `BufferPool.allocate` blocks a send while `buffer.memory` is in
+    /// use, for at most the rest of `max.block.ms`. It fails the record with
+    /// `BufferExhaustedException` when that time ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_waits_for_buffer_memory_up_to_max_block() {
+        let cases = [
+            (
+                "memory stays full",
+                None,
+                Duration::from_millis(200),
+                BlockedSendOutcome {
+                    blocked: true,
+                    delivered: Err(
+                        "Failed to allocate 16777216 bytes within the configured max \
+                                    blocking time 200 ms. Total memory: 33554432 bytes. Available \
+                                    memory: 0 bytes. Poolable size: 16777216 bytes"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                "earlier batches complete",
+                Some(Duration::from_millis(100)),
+                Duration::from_secs(5),
+                BlockedSendOutcome {
+                    blocked: true,
+                    delivered: Ok(()),
+                },
+            ),
+        ];
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, answer_after, max_block, expected) in cases {
+            actual.push((
+                name,
+                send_with_full_buffer_memory(answer_after, max_block).await,
+            ));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
     }
 
     /// The producer sends a coordinator request again only when the request

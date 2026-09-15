@@ -76,11 +76,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     accumulator::{AccumulatorMap, InProgressBatch, PendingRecord},
+    buffer_pool::MemoryReservation,
     compression::Compression,
     error::ProducerError,
     error_class::{self, ErrorClass},
     partitioner::UniformStickyPartitioner,
-    producer::{Acks, STATE_ACTIVE, STATE_FENCED, TopicMetadata, UNRESOLVED_TOPIC_PARTITION_COUNT},
+    producer::{Acks, STATE_ACTIVE, STATE_FENCED, TopicMetadata},
     record::RecordMetadata,
     transactional::{AbortableErrorSlot, TxnState},
     transport::ProduceTransport,
@@ -215,7 +216,7 @@ pub(crate) struct SenderConfig {
     pub max_in_flight: usize,
     pub metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
     /// Per-`(topic, partition)` leader-id cache, shared with the `Producer`.
-    /// `Metadata` fills it; see `Producer::partitions_for`. The sender reads it
+    /// `Metadata` fills it; see `Producer::partition_count`. The sender reads it
     /// to route each Produce to the partition leader, and refreshes it on
     /// `NOT_LEADER_OR_FOLLOWER` and on `UNKNOWN_TOPIC_OR_PARTITION`.
     pub partition_leaders: Arc<DashMap<(String, i32), i32>>,
@@ -555,6 +556,10 @@ struct PreparedBatch {
     /// records when the retries or the delivery timeout ends.
     last_failure: Option<SendFailure>,
     transaction_generation: Option<u64>,
+    /// The buffer memory of the batch. It returns to the pool when the batch
+    /// completes and is dropped, as Kafka's `Sender` deallocates a batch when
+    /// it completes.
+    _memory: Option<MemoryReservation>,
 }
 
 /// Why one send of a batch did not ack it.
@@ -1153,6 +1158,7 @@ async fn prepare_batch(
         backoff_attempts: 0,
         last_failure: None,
         transaction_generation: batch.transaction_generation,
+        _memory: batch.memory,
     }
 }
 
@@ -1618,7 +1624,7 @@ async fn send_one_batch(
     // every request in the same way.
     //
     // Two cases need this. A batch prepared before its topic existed carries a
-    // ZERO `topic_id`, and `partitions_for` backfills the cache once the topic
+    // ZERO `topic_id`, and `update_leaders_from_metadata` backfills the cache once the topic
     // exists. A batch whose topic was deleted and created again carries the old
     // id, and the broker answers UNKNOWN_TOPIC_ID until the resend carries the
     // id that `update_leaders_from_metadata` stored. The batch resends in
@@ -1866,18 +1872,18 @@ async fn update_leaders_from_metadata(cfg: &SenderConfig) {
                 cfg.partition_leaders
                     .insert((name.clone(), p.partition_index), p.leader_id);
             }
-            // Correct a previously-cached unresolved entry now that the topic
-            // exists. `partitions_for` caches `{count: 1, topic_id: ZERO}` when a
-            // produce races ahead of the topic's creation at cold boot; left
-            // frozen, that ZERO `topic_id` makes a v≥13 Produce (name dropped on
-            // the wire) come back as an un-correlatable UNKNOWN_TOPIC response the
-            // sender retries forever. Refreshing the id here lets a parked batch
-            // backfill it on resend (see `send_one_batch`). Only update topics we
-            // already track, so a full-cluster refresh doesn't bloat the cache.
-            if let Some(entry) = cache.get_mut(name) {
-                entry.num_partitions = i32::try_from(t.partitions.len())
-                    .unwrap_or(UNRESOLVED_TOPIC_PARTITION_COUNT)
-                    .max(UNRESOLVED_TOPIC_PARTITION_COUNT);
+            // Take the count and id of a tracked topic from the refresh. A
+            // topic can get a new id when it is deleted and created again, and a
+            // parked batch backfills the id on resend (see `send_one_batch`).
+            // A topic without partitions has no count, as in Kafka's
+            // `Cluster.partitionCountForTopic`, so it keeps the cached entry.
+            // Only update topics we already track, so a full-cluster refresh
+            // doesn't bloat the cache.
+            if let Some(entry) = cache.get_mut(name)
+                && let Ok(num_partitions) = i32::try_from(t.partitions.len())
+                && num_partitions > 0
+            {
+                entry.num_partitions = num_partitions;
                 entry.topic_id = t.topic_id;
             }
         }
@@ -2064,7 +2070,19 @@ fn fail_batch(records: Vec<PendingRecord>, err: ProducerError) {
             ProducerError::Closed => Some(ProducerError::Closed),
             ProducerError::FlushTimeout => Some(ProducerError::FlushTimeout),
             ProducerError::SendTimeout => Some(ProducerError::SendTimeout),
-            ProducerError::BufferFull => Some(ProducerError::BufferFull),
+            ProducerError::BufferExhausted {
+                size,
+                max_block,
+                total,
+                available,
+                poolable,
+            } => Some(ProducerError::BufferExhausted {
+                size: *size,
+                max_block: *max_block,
+                total: *total,
+                available: *available,
+                poolable: *poolable,
+            }),
             ProducerError::BatchTooLarge { batch_size } => Some(ProducerError::BatchTooLarge {
                 batch_size: *batch_size,
             }),
@@ -2145,6 +2163,7 @@ mod tests {
             backoff_attempts: 0,
             last_failure: None,
             transaction_generation: None,
+            _memory: None,
         };
         (pb, rx)
     }
@@ -5033,6 +5052,7 @@ mod harness {
             backoff_attempts: 0,
             last_failure: None,
             transaction_generation: None,
+            _memory: None,
         };
         (pb, rx)
     }

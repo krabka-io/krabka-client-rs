@@ -21,17 +21,47 @@ pub enum ProducerError {
     #[error("batch too large: {batch_size} > max")]
     BatchTooLarge { batch_size: usize },
 
-    #[error("record too large: {record_size} > max_request_size")]
+    /// The record is larger than the whole buffer memory. Kafka's
+    /// `KafkaProducer.ensureValidRecordSize` throws `RecordTooLargeException`
+    /// with the same message.
+    #[error(
+        "The message is {record_size} bytes when serialized which is larger than the total memory buffer you have configured with the buffer_memory configuration."
+    )]
     RecordTooLarge { record_size: usize },
 
-    #[error("send buffer full (max_block exceeded)")]
-    BufferFull,
+    /// `send` waited `max_block` (the part of `max_block` that the metadata
+    /// wait left) for buffer memory, and the memory did not become free.
+    /// Kafka's `BufferPool.allocate` throws `BufferExhaustedException` with the
+    /// same message.
+    #[error(
+        "Failed to allocate {size} bytes within the configured max blocking time {} ms. Total memory: {total} bytes. Available memory: {available} bytes. Poolable size: {poolable} bytes",
+        max_block.as_millis()
+    )]
+    BufferExhausted {
+        size: usize,
+        max_block: std::time::Duration,
+        total: usize,
+        available: usize,
+        poolable: usize,
+    },
 
     #[error("producer closed")]
     Closed,
 
     #[error("flush timed out")]
     FlushTimeout,
+
+    /// `send` waited `waited` (the configured `max_block`) for metadata that
+    /// holds the topic, and the partition of the record when it names one.
+    /// Kafka's `KafkaProducer.waitOnMetadata` throws `TimeoutException` with
+    /// the same message.
+    #[error("{}", metadata_timeout_message(topic, *partition, *partition_count, *waited))]
+    MetadataTimeout {
+        topic: String,
+        partition: Option<i32>,
+        partition_count: Option<i32>,
+        waited: std::time::Duration,
+    },
 
     /// The batch ran out of retries, or its routing budget ended, before the
     /// broker acknowledged it. Kafka raises `TimeoutException` for the same
@@ -58,6 +88,22 @@ pub enum ProducerError {
         "transaction outcome is unknown; call init_transactions before sending or beginning another transaction"
     )]
     RecoveryRequired,
+}
+
+/// Kafka's `KafkaProducer.getErrorMessage`.
+fn metadata_timeout_message(
+    topic: &str,
+    partition: Option<i32>,
+    partition_count: Option<i32>,
+    waited: std::time::Duration,
+) -> String {
+    let waited_ms = waited.as_millis();
+    match (partition, partition_count) {
+        (Some(partition), Some(count)) => format!(
+            "Partition {partition} of topic {topic} with partition count {count} is not present in metadata after {waited_ms} ms."
+        ),
+        _ => format!("Topic {topic} not present in metadata after {waited_ms} ms."),
+    }
 }
 
 #[cfg(test)]

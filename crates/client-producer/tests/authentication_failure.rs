@@ -28,7 +28,7 @@ use krabka_protocol::{
         api_versions_request,
         api_versions_response::{ApiVersion, ApiVersionsResponse},
         metadata_request,
-        metadata_response::MetadataResponse,
+        metadata_response::{MetadataResponse, MetadataResponsePartition, MetadataResponseTopic},
         sasl_handshake_request,
     },
 };
@@ -70,7 +70,8 @@ fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
 
 /// A SASL listener that answers the exchange of connection `n` with
 /// `script[n]`, or with the last entry once the script runs out. After a
-/// successful exchange it answers `ApiVersions` and an empty `Metadata`.
+/// successful exchange it answers `ApiVersions` and a `Metadata` with the
+/// topic `orders`.
 async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) -> MockBroker {
     let mut answer = *script.last().unwrap();
     MockBroker::start_with_replies(move |api_key, version, _corr, _body| {
@@ -105,13 +106,24 @@ async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) 
                 },
                 0,
             )),
-            metadata_request::API_KEY => {
-                MockReply::Respond(encode(&MetadataResponse::default(), version))
-            }
+            metadata_request::API_KEY => MockReply::Respond(encode(&orders_metadata(), version)),
             _ => MockReply::Silent,
         }
     })
     .await
+}
+
+/// Metadata with the topic `orders` and one partition, so `send` finds its
+/// topic and does not wait for `max_block`.
+fn orders_metadata() -> MetadataResponse {
+    MetadataResponse {
+        topics: vec![MetadataResponseTopic {
+            name: Some("orders".into()),
+            partitions: vec![MetadataResponsePartition::default()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
 }
 
 fn plain_security() -> ClientSecurity {

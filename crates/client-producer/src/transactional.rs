@@ -427,7 +427,7 @@ mod tests {
             init_producer_id_response::{self, InitProducerIdResponse},
             metadata_request,
             metadata_response::{
-                MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
+                self, MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
                 MetadataResponseTopic,
             },
             produce_request,
@@ -879,6 +879,8 @@ mod tests {
         txn_offset_commit: Script,
         produce: Script,
         find_coordinator_requests: usize,
+        /// The number of `Metadata` requests.
+        metadata_requests: usize,
         /// The negotiated version of each `AddPartitionsToTxn` request.
         add_partitions_versions: Vec<i16>,
         /// The `AddPartitionsToTxn` version range that the mock advertises.
@@ -966,7 +968,10 @@ mod tests {
             }
             let mut coordinator = handler_shared.lock().expect("scripted coordinator");
             if api_key == metadata_request::API_KEY {
-                return Some(encode_v0(&MetadataResponse {
+                coordinator.metadata_requests += 1;
+                // The producer waits for metadata that holds the topic, so the
+                // answer must decode at the negotiated version.
+                let response = MetadataResponse {
                     brokers: vec![MetadataResponseBroker {
                         node_id: 1,
                         host: "127.0.0.1".into(),
@@ -983,7 +988,13 @@ mod tests {
                         ..Default::default()
                     }],
                     ..Default::default()
-                }));
+                };
+                let mut buf = BytesMut::new();
+                if version >= metadata_response::FLEXIBLE_MIN {
+                    buf.extend_from_slice(&[0]);
+                }
+                response.encode(&mut buf, version).expect("encode Metadata");
+                return Some(buf.to_vec());
             }
             if api_key == produce_request::API_KEY {
                 let Reply::Code(error_code) = coordinator.produce.next() else {
@@ -1686,6 +1697,135 @@ mod tests {
         abort: TxnResult,
         abortable_error_after_abort: Option<i16>,
         next_transaction: TxnResult,
+    }
+
+    /// A send after `prepare_transaction` fails at once with the state error.
+    /// It does not wait for buffer memory first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_in_preparing_state_fails_before_waiting_for_memory() {
+        let (mock, producer, _coordinator) = scripted_producer(Coordinator::default()).await;
+        let _transaction = producer
+            .begin_transaction()
+            .await
+            .expect("begin transaction");
+        *producer.txn_state.lock().await = TxnState::Preparing;
+        let _all_memory = producer
+            .buffer_pool
+            .allocate(producer.buffer_pool.total(), Duration::ZERO)
+            .await
+            .expect("the pool is free");
+
+        let send = producer.send(ProducerRecord {
+            topic: "topic".to_owned(),
+            partition: Some(0),
+            value: Some(bytes::Bytes::from_static(b"v")),
+            ..Default::default()
+        });
+        let outcome = match tokio::time::timeout(Duration::from_secs(2), send).await {
+            Ok(receiver) => receiver
+                .await
+                .expect("the send is resolved")
+                .map(drop)
+                .map_err(|error| error.to_string()),
+            Err(_) => Err("waited".to_owned()),
+        };
+        mock.stop();
+        assert2::assert!(
+            outcome
+                == Err(
+                    "invalid transaction state: send is not allowed after prepare_transaction"
+                        .to_owned()
+                )
+        );
+    }
+
+    /// What a send in a prepared transaction gave, and the `Metadata` requests
+    /// that it sent.
+    #[derive(Debug, PartialEq, Eq)]
+    struct PreparedSend {
+        outcome: Result<(), String>,
+        metadata_requests: usize,
+    }
+
+    /// A send after `prepare_transaction` fails at once with the state error.
+    /// It does not wait for the metadata of a topic that the producer does not
+    /// know, as Kafka's `KafkaProducer.doSend` calls `throwIfInPreparedState`
+    /// before `waitOnMetadata`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_in_a_prepared_transaction_fails_before_the_metadata_wait() {
+        for state in [TxnState::Preparing, TxnState::Prepared] {
+            let (mock, producer, coordinator) = scripted_producer(Coordinator::default()).await;
+            let _transaction = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction");
+            *producer.txn_state.lock().await = state;
+            let before = coordinator
+                .lock()
+                .expect("scripted coordinator")
+                .metadata_requests;
+
+            // The mock broker never lists this topic.
+            let send = producer.send(ProducerRecord {
+                topic: "unknown".to_owned(),
+                value: Some(bytes::Bytes::from_static(b"v")),
+                ..Default::default()
+            });
+            let outcome = match tokio::time::timeout(Duration::from_secs(2), send).await {
+                Ok(receiver) => receiver
+                    .await
+                    .expect("the send is resolved")
+                    .map(drop)
+                    .map_err(|error| error.to_string()),
+                Err(_) => Err("waited".to_owned()),
+            };
+            let actual = PreparedSend {
+                outcome,
+                metadata_requests: coordinator
+                    .lock()
+                    .expect("scripted coordinator")
+                    .metadata_requests
+                    - before,
+            };
+            mock.stop();
+            assert2::assert!(
+                actual
+                    == PreparedSend {
+                        outcome: Err("invalid transaction state: send is not allowed after \
+                                      prepare_transaction"
+                            .to_owned()),
+                        metadata_requests: 0,
+                    },
+                "{state:?}"
+            );
+        }
+    }
+
+    /// Concurrent transactional sends to one partition all complete. A send
+    /// takes the transaction state lock before the accumulator lock, also
+    /// when it checks for buffer memory, so two sends cannot wait for each
+    /// other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_transactional_sends_to_one_partition_complete() {
+        let (mock, producer, _coordinator) = scripted_producer(Coordinator::default()).await;
+        let _transaction = producer
+            .begin_transaction()
+            .await
+            .expect("begin transaction");
+        let sends = (0..200).map(|_| {
+            producer.send(ProducerRecord {
+                topic: "topic".to_owned(),
+                partition: Some(0),
+                value: Some(bytes::Bytes::from_static(b"v")),
+                ..Default::default()
+            })
+        });
+        let enqueued =
+            tokio::time::timeout(Duration::from_secs(10), futures::future::join_all(sends))
+                .await
+                .map(|receivers| receivers.len());
+        mock.stop();
+        assert2::assert!(enqueued == Ok(200));
     }
 
     /// Kafka's `Sender.failBatch` calls

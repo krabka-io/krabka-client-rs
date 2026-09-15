@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use krabka_protocol::owned::metadata_request::MetadataRequest;
 use krabka_units::{Time, convert::TimeExt as _, minutes};
 use refined_type::rule::GreaterEqualI64;
 
@@ -277,12 +278,11 @@ impl Client {
 
     async fn request_metadata_from_current_cluster(
         &self,
+        request: &MetadataRequest,
     ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
-        use krabka_protocol::owned::metadata_request::MetadataRequest;
-
         let broker_ids = self.pool.broker_ids();
         if broker_ids.is_empty() {
-            return self.send(MetadataRequest::default()).await;
+            return self.send(request.clone()).await;
         }
 
         let mut last_error = None;
@@ -304,7 +304,7 @@ impl Client {
                 }
                 Err(error) => return Err(error),
             };
-            match connection.send(MetadataRequest::default()).await {
+            match connection.send(request.clone()).await {
                 Ok(response)
                     if response.error_code == REBOOTSTRAP_REQUIRED
                         || !response.brokers.is_empty() =>
@@ -368,6 +368,31 @@ impl Client {
 
     /// Send a default `MetadataRequest`, parse the broker list from the response,
     /// refresh the pool's address registry, and return the typed response.
+    ///
+    /// The default request asks for all topics. Use
+    /// [`refresh_metadata_with`](Client::refresh_metadata_with) to name the
+    /// topics.
+    ///
+    /// # Errors
+    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
+    pub async fn refresh_metadata(
+        &self,
+    ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
+        self.refresh_metadata_with(MetadataRequest::default()).await
+    }
+
+    /// Send `request`, parse the broker list from the response, refresh the
+    /// pool's address registry, and return the typed response.
+    ///
+    /// Kafka's producer names its topics in the request
+    /// (`ProducerMetadata.newMetadataRequestBuilder`). A request that names a
+    /// topic lets the broker create the topic when
+    /// `allow_auto_topic_creation` is set, and returns a per-topic error such
+    /// as `TOPIC_AUTHORIZATION_FAILED` for it. Every retry and rebootstrap in
+    /// this call sends the same request.
+    ///
+    /// # Errors
+    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     // cargo-mutants: live-broker metadata round-trip; not unit-testable
     #[cfg_attr(test, mutants::skip)]
     #[tracing::instrument(
@@ -376,13 +401,12 @@ impl Client {
         fields(brokers = tracing::field::Empty),
         err,
     )]
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
-    pub async fn refresh_metadata(
+    pub async fn refresh_metadata_with(
         &self,
+        request: MetadataRequest,
     ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
         self.metadata_recovery.begin_attempt();
-        let first = self.request_metadata_from_current_cluster().await;
+        let first = self.request_metadata_from_current_cluster(&request).await;
         let resp = match first {
             Ok(resp)
                 if resp.error_code == REBOOTSTRAP_REQUIRED
@@ -390,7 +414,7 @@ impl Client {
             {
                 self.rebootstrap_metadata().await?;
                 self.metadata_recovery.begin_attempt();
-                self.request_metadata_from_current_cluster().await?
+                self.request_metadata_from_current_cluster(&request).await?
             }
             Ok(resp) if resp.error_code == REBOOTSTRAP_REQUIRED => {
                 return Err(ClientError::Server {
@@ -400,7 +424,7 @@ impl Client {
             Ok(resp) if resp.brokers.is_empty() && self.metadata_recovery.timed_out() => {
                 self.rebootstrap_metadata().await?;
                 self.metadata_recovery.begin_attempt();
-                self.request_metadata_from_current_cluster().await?
+                self.request_metadata_from_current_cluster(&request).await?
             }
             Ok(resp) => resp,
             // `request_metadata_from_current_cluster` has exhausted every
@@ -421,7 +445,7 @@ impl Client {
                 }
                 self.rebootstrap_metadata().await?;
                 self.metadata_recovery.begin_attempt();
-                self.request_metadata_from_current_cluster().await?
+                self.request_metadata_from_current_cluster(&request).await?
             }
             Err(error) => return Err(error),
         };
@@ -725,11 +749,11 @@ mod bootstrap_failover_tests {
 
     use bytes::BytesMut;
     use krabka_protocol::{
-        Encode,
+        Decode, Encode,
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
-            metadata_request,
+            metadata_request::{self, MetadataRequestTopic},
             metadata_response::{
                 FLEXIBLE_MIN as META_FLEXIBLE_MIN, MetadataResponse, MetadataResponseBroker,
             },
@@ -936,6 +960,58 @@ mod bootstrap_failover_tests {
             .await
             .expect("refresh must fail over to live bootstrap B after A dies");
         assert2::assert!(!md.brokers.is_empty());
+    }
+
+    /// `refresh_metadata_with` sends the given request, and the pool learns
+    /// the brokers of the response as it does for `refresh_metadata`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_metadata_with_sends_the_request_and_learns_the_brokers() {
+        let orders = MetadataRequest {
+            topics: Some(vec![MetadataRequestTopic {
+                name: Some("orders".into()),
+                ..Default::default()
+            }]),
+            allow_auto_topic_creation: true,
+            ..Default::default()
+        };
+        for (name, request) in [
+            ("all topics", MetadataRequest::default()),
+            ("the topic orders", orders),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let handler_seen = Arc::clone(&seen);
+            let broker = MockBroker::start(move |api_key, version, _corr, body| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(api_versions_v0());
+                }
+                if api_key == metadata_request::API_KEY {
+                    let header_len =
+                        2 + "krabka".len() + usize::from(version >= metadata_request::FLEXIBLE_MIN);
+                    let mut request_body = &body[header_len..];
+                    let decoded = MetadataRequest::decode(&mut request_body, version)
+                        .expect("decode Metadata");
+                    handler_seen.lock().expect("seen").push(decoded);
+                    return Some(metadata_v(version, 7));
+                }
+                None
+            })
+            .await;
+            let client = Client::builder()
+                .bootstrap(broker.addr.to_string())
+                .request_timeout(millis(500))
+                .build()
+                .await
+                .expect("client connects");
+
+            let refreshed = client.refresh_metadata_with(request.clone()).await.is_ok();
+            let observed = (
+                refreshed,
+                seen.lock().expect("seen").clone(),
+                client.knows_broker(7),
+            );
+            broker.stop();
+            assert2::assert!(observed == (true, vec![request], true), "{name}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
