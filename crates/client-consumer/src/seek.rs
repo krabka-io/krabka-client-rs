@@ -151,10 +151,6 @@ impl Consumer {
         drop(positions);
         drop(offsets);
         drop(assigned);
-        let mut ends = self.end_offsets.lock().await;
-        for key in &targets {
-            ends.remove(key);
-        }
         Ok(())
     }
 

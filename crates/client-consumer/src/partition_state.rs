@@ -114,27 +114,30 @@ impl Consumer {
     ) -> Result<i64, ConsumerError> {
         let key = (topic.into(), partition);
         let deadline = tokio::time::Instant::now() + self.default_api_timeout.to_std();
-        loop {
-            if !self.assigned.lock().await.contains(&key) {
-                return Err(no_current_assignment(&key));
+        let wait = async {
+            loop {
+                if !self.assigned.lock().await.contains(&key) {
+                    return Err(no_current_assignment(&key));
+                }
+                if let Some(offset) = self.valid_position(&key).await {
+                    return Ok(offset);
+                }
+                self.update_fetch_positions().await?;
+                if self.valid_position(&key).await.is_none() {
+                    tokio::time::sleep(self.retry_policy.initial_backoff).await;
+                }
             }
-            if let Some(offset) = self.valid_position(&key).await {
-                return Ok(offset);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(ConsumerError::Timeout(format!(
+        };
+        // The timeout bounds the requests too, as Kafka's `position` passes
+        // its timer to `updateFetchPositions` and `client.poll`.
+        tokio::time::timeout_at(deadline, wait)
+            .await
+            .unwrap_or_else(|_| {
+                Err(ConsumerError::Timeout(format!(
                     "the position for partition {}-{} could not be determined",
                     key.0, key.1
-                )));
-            }
-            self.update_fetch_positions().await?;
-            if self.valid_position(&key).await.is_none() {
-                tokio::time::sleep_until(
-                    (tokio::time::Instant::now() + self.retry_policy.initial_backoff).min(deadline),
-                )
-                .await;
-            }
-        }
+                )))
+            })
     }
 
     /// The position of `key` when it is valid: Kafka's
@@ -171,17 +174,26 @@ impl Consumer {
         for (topic, partition) in partitions {
             by_topic.entry(topic.clone()).or_default().push(*partition);
         }
-        let response = crate::coordinator::send_offset_fetch(
+        let request = crate::offset_wire::build_offset_fetch(&self.group_id, &by_topic);
+        let fetch = crate::coordinator::send_offset_fetch(
             &self.client,
             &self.group_id,
             &self.coordinator_id,
-            &crate::offset_wire::build_offset_fetch(&self.group_id, &by_topic),
+            &request,
             CoordinatorRetryPolicy {
                 timeout: self.default_api_timeout.to_std(),
                 ..self.retry_policy
             },
-        )
-        .await?;
+        );
+        // The timeout bounds each request too. Kafka's
+        // `fetchCommittedOffsets` gives up when its timer expires.
+        let response = tokio::time::timeout(self.default_api_timeout.to_std(), fetch)
+            .await
+            .map_err(|_| {
+                ConsumerError::Timeout(
+                    "the last committed offsets could not be determined".to_owned(),
+                )
+            })??;
         let mut committed = crate::offset_wire::parse_committed_offsets(&response);
         committed.retain(|partition, _| partitions.contains(partition));
         for partition in partitions {
@@ -396,5 +408,78 @@ mod tests {
             ));
         }
         assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `committed(partitions, timeout)` gives up when the timeout
+    /// expires, also while a request waits for its response.
+    #[tokio::test]
+    async fn committed_returns_by_the_api_timeout_when_the_coordinator_is_silent() {
+        let mock = MockBroker::start(|api_key, _version, _corr_id, _body| {
+            (api_key == api_versions_request::API_KEY).then(|| {
+                encode(
+                    &ApiVersionsResponse {
+                        api_keys: [
+                            (api_versions_request::API_KEY, 0, 3),
+                            (offset_fetch_request::API_KEY, 5, 5),
+                        ]
+                        .into_iter()
+                        .map(|(api_key, min_version, max_version)| ApiVersion {
+                            api_key,
+                            min_version,
+                            max_version,
+                            ..Default::default()
+                        })
+                        .collect(),
+                        ..Default::default()
+                    },
+                    0,
+                )
+            })
+        })
+        .await;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .request_timeout(secs(30))
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = consumer_with_client(client);
+        consumer.default_api_timeout = krabka_units::millis(200);
+        let started = tokio::time::Instant::now();
+        let committed = consumer
+            .committed(&[("orders".to_string(), 0)])
+            .await
+            .map_err(|error| error.to_string());
+        let in_time = started.elapsed() < std::time::Duration::from_secs(5);
+        mock.stop();
+        assert2::assert!(
+            (committed, in_time)
+                == (
+                    Err("timeout: the last committed offsets could not be determined".to_owned()),
+                    true
+                )
+        );
+    }
+
+    /// Kafka's `seekToEnd` requests a reset and keeps the high watermark of
+    /// the last fetch. A partition that waits for the reset is not at the end.
+    #[tokio::test]
+    async fn seek_to_end_keeps_the_end_offset_and_leaves_the_log_end() {
+        let mock = offset_fetch_coordinator(vec![]).await;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let consumer = consumer_with_client(client);
+        let key = ("orders".to_string(), 0);
+        consumer.next_offsets.lock().await.insert(key.clone(), 12);
+        consumer.end_offsets.lock().await.insert(key.clone(), 12);
+        let before = consumer.at_log_end().await;
+        consumer.seek_to_end(&[]).await.expect("seek to end");
+        let after = consumer.at_log_end().await;
+        let end = consumer.end_offsets.lock().await.get(&key).copied();
+        mock.stop();
+        assert2::assert!((before, after, end) == (true, false, Some(12)));
     }
 }

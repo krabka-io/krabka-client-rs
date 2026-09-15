@@ -1792,6 +1792,7 @@ impl Consumer {
         assigned.iter().all(|partition| {
             positions
                 .get(partition)
+                .filter(|position| !crate::poll::is_reset_sentinel(**position))
                 .zip(ends.get(partition))
                 .is_some_and(|(position, end)| position >= end)
         })

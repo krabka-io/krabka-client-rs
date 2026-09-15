@@ -633,6 +633,11 @@ impl Consumer {
         tracing::Span::current().record("leaders", by_leader.len());
         let topic_ids = self.topic_ids.lock().await.clone();
         self.send_fetches(by_leader, &topic_ids);
+        self.fetches.collect_ready();
+        if self.fetches.in_flight.is_empty() && self.fetches.ready.is_empty() {
+            self.wait_without_fetches(&assigned, deadline).await;
+            return Ok(Vec::new());
+        }
         self.wait_for_fetches(deadline).await;
         let responses = self.take_completed_fetches(&topic_ids).await?;
 
@@ -748,6 +753,38 @@ impl Consumer {
         drop(assigned_guard);
         records
     }
+    /// Wait when this `poll` sends no Fetch and none is in flight, for example
+    /// when every partition is paused.
+    ///
+    /// Kafka's `ClassicKafkaConsumer.pollForFetches` waits for the poll timeout,
+    /// or for the retry backoff while a partition has no valid position. A
+    /// listener call that waits also ends the wait after the retry backoff, so
+    /// the next `poll` runs it.
+    async fn wait_without_fetches(
+        &self,
+        assigned: &[(String, i32)],
+        deadline: tokio::time::Instant,
+    ) {
+        let all_positions = {
+            let offsets = self.next_offsets.lock().await;
+            let positions = self.positions.lock().await;
+            assigned.iter().all(|key| {
+                offsets
+                    .get(key)
+                    .is_some_and(|offset| !is_reset_sentinel(*offset))
+                    && !positions
+                        .get(key)
+                        .is_some_and(|position| position.awaiting_validation)
+            })
+        };
+        let until = if all_positions && self.listener_calls.is_empty() {
+            deadline
+        } else {
+            deadline.min(tokio::time::Instant::now() + self.retry_policy.initial_backoff)
+        };
+        tokio::time::sleep_until(until).await;
+    }
+
     /// Decode the fetch responses into the fetch buffer, and act on the
     /// partition errors.
     async fn process_fetch_responses(
@@ -4212,6 +4249,33 @@ mod fetch_path_tests {
                     Err("no current assignment for partition orders-9".to_owned())
                 )
         );
+    }
+
+    /// Kafka's `pollForFetches` waits for the poll timeout when no partition
+    /// can be fetched, for example when all are paused.
+    #[tokio::test]
+    async fn poll_waits_for_its_timeout_when_every_partition_is_paused() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(
+            &[vec![FetchAnswer::Respond {
+                error_code: 0,
+                session_id: 0,
+            }]],
+            &sent,
+        )
+        .await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer
+            .pause(&[("orders".to_owned(), 0)])
+            .await
+            .expect("pause");
+        let started = tokio::time::Instant::now();
+        let records = consumer.poll(millis(300)).await.expect("poll").len();
+        let waited = started.elapsed() >= Duration::from_millis(250);
+        let fetches = sent.lock().expect("sent lock").len();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!((records, waited, fetches) == (0, true, 0));
     }
 
     /// One step of a read replica case.
