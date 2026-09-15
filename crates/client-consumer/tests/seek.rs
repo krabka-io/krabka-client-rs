@@ -93,7 +93,7 @@ async fn earliest_consumer(bootstrap: &str, topic: &str, group: &str, client_id:
         .client_id(client_id)
         .group_id(group)
         .session_timeout(secs(30))
-        .rebalance_timeout(secs(10))
+        .max_poll_interval(secs(10))
         .heartbeat_interval(millis(500))
         .subscribe(vec![topic.to_string()])
         .auto_offset_reset(AutoOffsetReset::Earliest)

@@ -728,7 +728,7 @@ impl Consumer {
         skip_all,
         fields(
             group_id = %self.group_id,
-            member_id = %self.member_id,
+            member_id = %self.member_id(),
             generation = self.current_generation.load(Ordering::Relaxed),
             partitions = tracing::field::Empty,
         ),
@@ -994,7 +994,7 @@ impl Consumer {
         skip_all,
         fields(
             group_id = %self.group_id,
-            member_id = %self.member_id,
+            member_id = %self.member_id(),
             generation = self.current_generation.load(Ordering::Relaxed),
         )
     )]
@@ -1337,7 +1337,7 @@ mod tests {
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(0)),
             retry_policy: ConsumerRetryPolicy::default().into(),
-            member_id: "member-a".into(),
+            member_id: tokio::sync::watch::channel("member-a".to_owned()).1,
             commit_identity,
             commit_serialization: Arc::new(Mutex::new(())),
             commit_async_state: Arc::new(std::sync::atomic::AtomicU8::new(ASYNC_COMMIT_IDLE)),
@@ -1364,6 +1364,9 @@ mod tests {
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
             poll_signal: crate::coordinator::PollSignal::default(),
+            rebalance_pending: tokio::sync::watch::channel(false).1,
+            max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
+            fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
         }
     }
 

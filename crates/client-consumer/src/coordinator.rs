@@ -215,6 +215,7 @@ pub(crate) fn build_leave_group_request(
     group_id: String,
     member_id: String,
     group_instance_id: Option<String>,
+    reason: Option<&str>,
 ) -> LeaveGroupRequest {
     LeaveGroupRequest {
         group_id,
@@ -222,6 +223,8 @@ pub(crate) fn build_leave_group_request(
         members: vec![MemberIdentity {
             member_id,
             group_instance_id,
+            // KIP-800. Version 5 and later carry the reason.
+            reason: reason.map(str::to_owned),
             ..Default::default()
         }],
         ..Default::default()
@@ -371,6 +374,9 @@ pub(crate) struct CoordinatorState {
     /// same coordinator and sees re-discovery updates the moment they land.
     pub coordinator_id: Arc<AtomicI32>,
     pub member_id: String,
+    /// The member id that the parent `Consumer` reports. The task publishes
+    /// `member_id` here whenever it publishes a new generation.
+    pub published_member_id: tokio::sync::watch::Sender<String>,
     pub commit_identity: Arc<Mutex<CommitIdentity>>,
     pub group_instance_id: Option<String>,
     pub generation_id: i32,
@@ -391,7 +397,8 @@ pub(crate) struct CoordinatorState {
     pub positions: Arc<Mutex<HashMap<(String, i32), crate::position::PartitionPosition>>>,
     pub topic_ids: Arc<Mutex<HashMap<String, WireUuid>>>,
     pub session_timeout: Time,
-    pub rebalance_timeout: Time,
+    /// Kafka's `max.poll.interval.ms`. It is also the rebalance timeout.
+    pub max_poll_interval: Time,
     pub heartbeat_interval: Time,
     pub subscription_metadata_refresh_interval: Time,
     pub leave_group_timeout: Time,
@@ -424,6 +431,9 @@ pub(crate) struct CoordinatorState {
     /// The `poll` count of the parent `Consumer`. After a fatal error the task
     /// waits for a `poll` that comes after the one that returned the error.
     pub polls: tokio::sync::watch::Receiver<u64>,
+    /// `true` while the member must join the group, from the request of a
+    /// rebalance until the join completes. `poll` reads it.
+    pub rebalance_pending: tokio::sync::watch::Sender<bool>,
 }
 
 /// A fatal coordinator error that waits for the next `poll()`.
@@ -548,6 +558,9 @@ async fn install_assignment(
     identity.member_id.clone_from(&state.member_id);
     identity.rejoin_on_poll = rejoin_on_poll;
     drop(identity);
+    state
+        .published_member_id
+        .send_replace(state.member_id.clone());
     drop(assigned);
     // A high watermark belongs to an ownership snapshot.  Re-learn it from
     // the next successful fetch after any assignment publication.
@@ -698,7 +711,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
 
     let mut ticker = tokio::time::interval(state.heartbeat_interval.to_std());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut needs_rejoin = false;
+    let mut rejoin = RejoinRequest::default();
     // Subscribed-topic partition counts the current assignment was computed
     // against. We rejoin when these GROW (a topic created after we joined, or a
     // topic that gains partitions) so the assignor distributes the new
@@ -712,18 +725,51 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
     // topic existed (empty assignment) recover once the topic is created.
     let mut known_counts = std::mem::take(&mut state.initial_subscribed_counts);
     let mut last_meta_check = tokio::time::Instant::now();
+    // Kafka's `Heartbeat.pollTimer`: `poll` and each completed join reset it.
+    let mut poll_timer = PollTimer::new(state.max_poll_interval);
+    let mut polls_open = true;
 
     loop {
-        tokio::select! {
+        let event = tokio::select! {
+            // A `poll` that came while an RPC was in flight goes before a tick
+            // or the poll deadline, so it resets the timer first.
+            biased;
             () = shutdown.cancelled() => break,
-            _ = ticker.tick() => {}
+            changed = state.polls.changed(), if polls_open => {
+                if changed.is_ok() {
+                    TaskEvent::Poll
+                } else {
+                    polls_open = false;
+                    continue;
+                }
+            }
+            _ = ticker.tick() => TaskEvent::Tick,
+            // Kafka's heartbeat thread checks `pollTimeoutExpired` each retry
+            // backoff. The task wakes at the deadline of the poll timer.
+            () = tokio::time::sleep_until(poll_timer.deadline), if !state.member_id.is_empty() => {
+                TaskEvent::PollTimeout
+            }
+        };
+        if event == TaskEvent::Poll {
+            poll_timer.reset();
+            if !rejoin.due(&state.polls) {
+                continue;
+            }
+        }
+
+        if event != TaskEvent::Poll && !state.member_id.is_empty() && poll_timer.expired() {
+            // Take the `poll` count before the `LeaveGroup` goes out: a `poll`
+            // during the request starts the join.
+            rejoin.request_after_next_poll(&state);
+            leave_on_poll_timeout(&mut state).await;
+            continue;
         }
 
         // Detect a subscribed topic appearing / gaining partitions after we
         // joined (the cold-start race that otherwise strands an empty
         // assignment) and rejoin to distribute it. Throttled, and only when not
         // already rejoining. Best-effort: a failed metadata RPC just retries.
-        if !needs_rejoin
+        if !rejoin.requested()
             && subscription_metadata_refresh_due(
                 last_meta_check,
                 state.subscription_metadata_refresh_interval,
@@ -742,7 +788,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                 // (e.g. a leader whose Metadata lags this read). Advance only
                 // once the rejoin lands, from the snapshot its assignment was
                 // actually computed against (the Ok branch below).
-                needs_rejoin = true;
+                rejoin.request_after_next_poll(&state);
             }
         }
 
@@ -754,12 +800,13 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
         // The RPC futures are cancellation-safe: `Client` multiplexes on
         // correlation ids, so dropping an in-flight send only abandons its
         // pending response — it can't corrupt the connection.
-        if needs_rejoin {
+        if rejoin.due(&state.polls) {
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                result = rejoin(&mut state) => match result {
+                result = rejoin_group(&mut state) => match result {
                     Ok(snapshot) => {
-                        needs_rejoin = false;
+                        rejoin.complete(&state);
+                        poll_timer.reset();
                         // Re-baseline from the metadata the rejoin's assignment
                         // was actually computed against (the leader's snapshot;
                         // empty for a non-leader, which `merge_counts` leaves
@@ -773,6 +820,8 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                         if !wait_for_poll_after_error(&mut state.polls, &state.poll_error, &shutdown).await {
                             break;
                         }
+                        poll_timer.reset();
+                        rejoin.request_now(&state);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "rejoin failed; will retry on next tick");
@@ -780,15 +829,15 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     }
                 },
             }
-        } else {
+        } else if event == TaskEvent::Tick && !state.member_id.is_empty() {
             tokio::select! {
                 () = shutdown.cancelled() => break,
                 outcome = heartbeat_once(&state) => match outcome {
                     HeartbeatOutcome::Ok | HeartbeatOutcome::Transient => {}
-                    HeartbeatOutcome::NeedRejoin => needs_rejoin = true,
+                    HeartbeatOutcome::NeedRejoin => rejoin.request_after_next_poll(&state),
                     HeartbeatOutcome::RejoinFromScratch => {
                         forget_member(&mut state).await;
-                        needs_rejoin = true;
+                        rejoin.request_after_next_poll(&state);
                     }
                     HeartbeatOutcome::Fenced => {
                         let group_instance_id = state.group_instance_id.clone().unwrap_or_default();
@@ -796,7 +845,8 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                         if !wait_for_poll_after_error(&mut state.polls, &state.poll_error, &shutdown).await {
                             break;
                         }
-                        needs_rejoin = true;
+                        poll_timer.reset();
+                        rejoin.request_now(&state);
                     }
                 },
             }
@@ -810,20 +860,153 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
     // with a stale id is a silent no-op that orphans the real member until
     // its session expires, stalling the rest of the group's rebalance.
     // Best-effort and bounded: a hung broker must not block `close()`.
-    leave_group(&state).await;
+    leave_group(&state, &state.member_id, CLOSE_LEAVE_REASON).await;
+}
+
+/// What woke the coordinator task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskEvent {
+    /// The heartbeat interval passed.
+    Tick,
+    /// The application called `poll`.
+    Poll,
+    /// The poll timer reached its deadline.
+    PollTimeout,
+}
+
+/// Kafka's `Heartbeat.pollTimer`: it expires when no `poll` and no completed
+/// join came for `max.poll.interval.ms`.
+struct PollTimer {
+    interval: Duration,
+    deadline: tokio::time::Instant,
+}
+
+impl PollTimer {
+    fn new(interval: Time) -> Self {
+        let interval = interval.to_std();
+        Self {
+            interval,
+            deadline: tokio::time::Instant::now() + interval,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.deadline = tokio::time::Instant::now() + self.interval;
+    }
+
+    /// Kafka's `Timer.isExpired`: the deadline is inclusive.
+    fn expired(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline
+    }
+}
+
+/// A rejoin that the coordinator task starts in the next `poll`.
+///
+/// Kafka's `ConsumerCoordinator.poll` calls `ensureActiveGroup` only when the
+/// application polls. A rebalance that the coordinator asks for therefore does
+/// not start while the application processes the records of the last `poll`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RejoinRequest {
+    /// No rejoin is needed.
+    #[default]
+    None,
+    /// A rejoin is due when a `poll` changed the `poll` count from this value.
+    AfterPoll(u64),
+    /// A rejoin is due at once, because a `poll` already came.
+    Now,
+}
+
+impl RejoinRequest {
+    fn requested(self) -> bool {
+        self != Self::None
+    }
+
+    /// Request a rejoin that starts when the application polls again.
+    fn request_after_next_poll(&mut self, state: &CoordinatorState) {
+        if *self == Self::None {
+            *self = Self::AfterPoll(*state.polls.borrow());
+        }
+        state.rebalance_pending.send_replace(true);
+    }
+
+    /// Request a rejoin that starts at once, because a `poll` already came.
+    fn request_now(&mut self, state: &CoordinatorState) {
+        *self = Self::Now;
+        state.rebalance_pending.send_replace(true);
+    }
+
+    fn due(self, polls: &tokio::sync::watch::Receiver<u64>) -> bool {
+        match self {
+            Self::None => false,
+            Self::Now => true,
+            Self::AfterPoll(count) => *polls.borrow() != count,
+        }
+    }
+
+    fn complete(&mut self, state: &CoordinatorState) {
+        *self = Self::None;
+        state.rebalance_pending.send_replace(false);
+    }
+}
+
+/// The `LeaveGroup` reason of `close`. Kafka's `AbstractCoordinator.close`.
+const CLOSE_LEAVE_REASON: &str = "the consumer is being closed";
+
+/// The `LeaveGroup` reason after `max.poll.interval.ms`. Kafka's
+/// `AbstractCoordinator.handlePollTimeoutExpiry`.
+const POLL_TIMEOUT_LEAVE_REASON: &str = "consumer poll timeout has expired.";
+
+/// Leave the group because the application did not call `poll` within
+/// `max.poll.interval.ms`.
+///
+/// Kafka's `AbstractCoordinator.handlePollTimeoutExpiry` calls
+/// `maybeLeaveGroup`. It sends `LeaveGroup` for a dynamic member only, and it
+/// resets the generation and the member id for every member. The heartbeats
+/// then stop, and the next `poll` joins the group again. This function does the
+/// same, clears the assignment, and marks the commit identity with
+/// `rejoin_on_poll`, so a commit fails with `CommitFailed` until the join.
+///
+/// The function clears the member and the assignment before it sends the
+/// `LeaveGroup`, so a `poll` fetches nothing. It does not wait for the
+/// response, as `maybeLeaveGroup` only sends the request: a `poll` can start
+/// the join while the request is in flight.
+async fn leave_on_poll_timeout(state: &mut CoordinatorState) {
+    tracing::warn!(
+        group = %state.group_id,
+        max_poll_interval = ?state.max_poll_interval,
+        "consumer poll timeout has expired: the time between two poll calls was longer than \
+         max_poll_interval; the member leaves the group and joins again on the next poll"
+    );
+    let member_id = std::mem::take(&mut state.member_id);
+    state.rebalance_pending.send_replace(true);
+    install_assignment(state, &[], false, -1, true).await;
+    if state.group_instance_id.is_none() && !member_id.is_empty() {
+        let request = build_leave_group_request(
+            state.group_id.clone(),
+            member_id,
+            None,
+            Some(POLL_TIMEOUT_LEAVE_REASON),
+        );
+        let client = state.client.clone();
+        let coordinator = state.coordinator_id.load(Ordering::Relaxed);
+        let timeout = state.leave_group_timeout.to_std();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(timeout, client.broker(coordinator).send(request)).await;
+        });
+    }
 }
 
 /// Forget the member id, the generation and the partition ownership after
 /// `UNKNOWN_MEMBER_ID`, so the next join starts from scratch.
+///
+/// Kafka's `ConsumerCoordinator.onJoinPrepare` treats the owned partitions of
+/// a member without a generation as lost, for the eager and the cooperative
+/// protocol. The function therefore clears the assignment too, so no `poll`
+/// fetches a partition that the coordinator can give to another member.
 async fn forget_member(state: &mut CoordinatorState) {
     state.member_id.clear();
-    let mut identity = state.commit_identity.lock().await;
-    identity.member_id.clear();
-    identity.ownership_ids.clear();
-    identity.generation = -1;
-    drop(identity);
-    set_generation(state, -1);
-    state.assignment_changed.notify_waiters();
+    state.rebalance_pending.send_replace(true);
+    install_assignment(state, &[], false, -1, false).await;
 }
 
 /// Remove the member from the group after the coordinator fenced its
@@ -844,6 +1027,7 @@ async fn fence_member(state: &mut CoordinatorState, group_instance_id: String) {
         "another consumer joined with the same group.instance.id; the member joins again on the next poll"
     );
     state.member_id.clear();
+    state.rebalance_pending.send_replace(true);
     install_assignment(state, &[], false, -1, true).await;
     *state
         .poll_error
@@ -879,8 +1063,8 @@ fn group_response_error(error_code: i16, group_instance_id: Option<&str>) -> Con
     skip_all,
     fields(group_id = %state.group_id, member_id = %state.member_id)
 )]
-async fn leave_group(state: &CoordinatorState) {
-    if state.member_id.is_empty() {
+async fn leave_group(state: &CoordinatorState, member_id: &str, reason: &str) {
+    if member_id.is_empty() {
         return;
     }
     // `member_id` is populated for both the v0–v2 (top-level) and v3+
@@ -894,8 +1078,9 @@ async fn leave_group(state: &CoordinatorState) {
         .broker(state.coordinator_id.load(Ordering::Relaxed));
     let send = coordinator.send(build_leave_group_request(
         state.group_id.clone(),
-        state.member_id.clone(),
+        member_id.to_owned(),
         state.group_instance_id.clone(),
+        Some(reason),
     ));
     let _ = tokio::time::timeout(state.leave_group_timeout.to_std(), send).await;
 }
@@ -1019,7 +1204,7 @@ async fn refind_after(state: &CoordinatorState, ctx: &str) {
     ),
     err
 )]
-async fn rejoin(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, ConsumerError> {
+async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, ConsumerError> {
     let owned: Vec<(String, i32)> = state.assigned.lock().await.clone();
     let JoinOutcome {
         assignment: new_assignment,
@@ -1312,7 +1497,7 @@ async fn commit_consumed_before_join(
     state: &CoordinatorState,
     auto_commit: &crate::commit::AutoCommit,
 ) {
-    let deadline = tokio::time::Instant::now() + state.rebalance_timeout.to_std();
+    let deadline = tokio::time::Instant::now() + state.max_poll_interval.to_std();
     let Some(_turn) = commit_turn(&state.commit_serialization, auto_commit, deadline).await else {
         tracing::error!(
             "auto commit before the rebalance timed out waiting for another commit; joining the group"
@@ -1415,7 +1600,7 @@ async fn perform_join(
     // milliseconds the coordinator range-checks, and `Duration::as_millis`
     // truncated here before the conversion.
     let session_timeout_ms = crate::consumer::protocol_millis_i32(state.session_timeout);
-    let rebalance_timeout_ms = crate::consumer::protocol_millis_i32(state.rebalance_timeout);
+    let rebalance_timeout_ms = crate::consumer::protocol_millis_i32(state.max_poll_interval);
 
     let subscription_bytes = encode_subscription(
         &state.subscribed_topics,
@@ -2549,6 +2734,7 @@ mod retry_tests {
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(0)),
             member_id: "member-a".into(),
+            published_member_id: tokio::sync::watch::Sender::new("member-a".to_owned()),
             commit_identity: Arc::new(Mutex::new(CommitIdentity {
                 generation: 1,
                 member_id: "member-a".into(),
@@ -2568,7 +2754,7 @@ mod retry_tests {
             positions: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
             session_timeout: secs(45),
-            rebalance_timeout: minutes(1),
+            max_poll_interval: minutes(1),
             heartbeat_interval: secs(3),
             subscription_metadata_refresh_interval: millis(37),
             leave_group_timeout: millis(37),
@@ -2581,11 +2767,15 @@ mod retry_tests {
             commit_serialization: Arc::new(Mutex::new(())),
             join_prepared: false,
             polls: PollSignal::default().subscribe(),
+            rebalance_pending: tokio::sync::watch::Sender::new(false),
         };
 
-        tokio::time::timeout(Duration::from_secs(1), leave_group(&state))
-            .await
-            .expect("configured leave deadline bounds coordinator shutdown");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            leave_group(&state, &state.member_id, CLOSE_LEAVE_REASON),
+        )
+        .await
+        .expect("configured leave deadline bounds coordinator shutdown");
         mock.stop();
         assert2::assert!(saw_leave.load(Ordering::SeqCst));
     }
@@ -2703,6 +2893,7 @@ mod retry_tests {
             "group-a".into(),
             "member-a".into(),
             Some("instance-a".into()),
+            Some(CLOSE_LEAVE_REASON),
         );
 
         assert2::assert!(
@@ -2712,7 +2903,7 @@ mod retry_tests {
                 members: vec![MemberIdentity {
                     member_id: "member-a".into(),
                     group_instance_id: Some("instance-a".into()),
-                    reason: None,
+                    reason: Some("the consumer is being closed".into()),
                     unknown_tagged_fields: UnknownTaggedFields(vec![]),
                 }],
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
@@ -2910,6 +3101,8 @@ mod retry_tests {
     /// request without a response.
     #[derive(Clone, Copy)]
     struct GroupAnswers {
+        /// Whether the application polls each 10 ms during the case.
+        polls: bool,
         heartbeat: i16,
         join_group: Option<i16>,
         sync_group: Option<i16>,
@@ -3035,6 +3228,7 @@ mod retry_tests {
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(0)),
             member_id: "member-a".into(),
+            published_member_id: tokio::sync::watch::Sender::new("member-a".to_owned()),
             commit_identity: Arc::new(Mutex::new(CommitIdentity {
                 generation: 1,
                 member_id: "member-a".into(),
@@ -3054,7 +3248,7 @@ mod retry_tests {
             positions: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
             session_timeout: secs(45),
-            rebalance_timeout: minutes(1),
+            max_poll_interval: minutes(1),
             heartbeat_interval: millis(20),
             subscription_metadata_refresh_interval: minutes(10),
             leave_group_timeout: millis(200),
@@ -3071,6 +3265,7 @@ mod retry_tests {
             commit_serialization: Arc::new(Mutex::new(())),
             join_prepared: false,
             polls: poll_signal.subscribe(),
+            rebalance_pending: tokio::sync::watch::Sender::new(false),
         };
         let poll_error = Arc::clone(&state.poll_error);
         let assigned = Arc::clone(&state.assigned);
@@ -3078,8 +3273,20 @@ mod retry_tests {
         let commit_identity = Arc::clone(&state.commit_identity);
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(run(state, shutdown.clone()));
+        let poller = answers.polls.then(|| {
+            let poll_signal = poll_signal.clone();
+            tokio::spawn(async move {
+                loop {
+                    note_poll(&poll_signal);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        });
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        // After the observation first equals `expected`, the case watches for
+        // ten more heartbeat intervals, so a late request shows.
+        let mut settle_until = None;
         let observation = loop {
             let poll_error = poll_error
                 .lock()
@@ -3097,12 +3304,21 @@ mod retry_tests {
                 rejoin_on_poll: identity.rejoin_on_poll,
                 group_requests: group_requests.lock().expect("requests lock").clone(),
             };
-            if observation == *expected || tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline || settle_until.is_some_and(|until| now >= until) {
+                break observation;
+            }
+            if observation == *expected {
+                settle_until.get_or_insert(now + Duration::from_millis(200));
+            } else if settle_until.is_some() {
                 break observation;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
 
+        if let Some(poller) = poller {
+            poller.abort();
+        }
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
@@ -3117,7 +3333,8 @@ mod retry_tests {
     /// `FENCED_INSTANCE_ID (82)` clears the assignment and the member, marks
     /// the commit identity with `rejoin_on_poll`, and leaves the fenced error
     /// for the next `poll()`. The task keeps running, sends no `LeaveGroup`,
-    /// and sends no further group request while the application does not poll.
+    /// and sends no further group request before a `poll` takes the error.
+    /// A rebalance starts only when the application polls.
     /// Kafka's `AbstractCoordinator.HeartbeatResponseHandler` resets the member
     /// and raises `FencedInstanceIdException`, which the heartbeat thread keeps
     /// as its failure cause. Other heartbeat answers keep the assignment.
@@ -3130,6 +3347,7 @@ mod retry_tests {
             (
                 "success",
                 GroupAnswers {
+                    polls: false,
                     heartbeat: 0,
                     join_group: None,
                     sync_group: None,
@@ -3148,6 +3366,7 @@ mod retry_tests {
             (
                 "heartbeat fenced instance id",
                 GroupAnswers {
+                    polls: true,
                     heartbeat: 82,
                     join_group: None,
                     sync_group: None,
@@ -3166,6 +3385,26 @@ mod retry_tests {
             (
                 "rebalance in progress",
                 GroupAnswers {
+                    polls: false,
+                    heartbeat: 27,
+                    join_group: None,
+                    sync_group: None,
+                },
+                TaskObservation {
+                    task_exited: false,
+                    shutdown_cancelled: false,
+                    poll_error: None,
+                    assigned: owned.clone(),
+                    generation: 1,
+                    commit_member_id: "member-a".into(),
+                    rejoin_on_poll: false,
+                    group_requests: requests(&["Heartbeat"]),
+                },
+            ),
+            (
+                "rebalance in progress and the application polls",
+                GroupAnswers {
+                    polls: true,
                     heartbeat: 27,
                     join_group: None,
                     sync_group: None,
@@ -3182,8 +3421,28 @@ mod retry_tests {
                 },
             ),
             (
+                "unknown member id",
+                GroupAnswers {
+                    polls: false,
+                    heartbeat: 25,
+                    join_group: None,
+                    sync_group: None,
+                },
+                TaskObservation {
+                    task_exited: false,
+                    shutdown_cancelled: false,
+                    poll_error: None,
+                    assigned: Vec::new(),
+                    generation: -1,
+                    commit_member_id: String::new(),
+                    rejoin_on_poll: false,
+                    group_requests: requests(&["Heartbeat"]),
+                },
+            ),
+            (
                 "coordinator not available",
                 GroupAnswers {
+                    polls: false,
                     heartbeat: 15,
                     join_group: None,
                     sync_group: None,
@@ -3202,6 +3461,7 @@ mod retry_tests {
             (
                 "join group fenced instance id",
                 GroupAnswers {
+                    polls: true,
                     heartbeat: 27,
                     join_group: Some(82),
                     sync_group: None,
@@ -3220,6 +3480,7 @@ mod retry_tests {
             (
                 "sync group fenced instance id",
                 GroupAnswers {
+                    polls: true,
                     heartbeat: 27,
                     join_group: Some(0),
                     sync_group: Some(82),
