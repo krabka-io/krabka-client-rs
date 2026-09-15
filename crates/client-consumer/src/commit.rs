@@ -293,18 +293,76 @@ pub(crate) enum AutoCommitOutcome {
     Failed,
 }
 
+/// `TOPIC_AUTHORIZATION_FAILED`.
+const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+
+/// The error class of one partition in an `OffsetCommitResponse`. A larger
+/// class takes precedence when a response has errors of more than one class.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PartitionCommitError {
+    None,
+    /// Kafka's `OffsetCommitResponseHandler` collects the unauthorized topics
+    /// and raises `TopicAuthorizationException` only when no other partition
+    /// has an error. Any other error takes precedence.
+    TopicAuthorization,
+    Retriable,
+    Fatal,
+}
+
+impl PartitionCommitError {
+    fn of(code: i16) -> Self {
+        match code {
+            0 => Self::None,
+            TOPIC_AUTHORIZATION_FAILED => Self::TopicAuthorization,
+            UNKNOWN_TOPIC_OR_PARTITION | REQUEST_TIMED_OUT => Self::Retriable,
+            code if is_retriable_coordinator_code(code) => Self::Retriable,
+            _ => Self::Fatal,
+        }
+    }
+}
+
+/// Whether a partition of `response` says that the coordinator is loading or
+/// moved. The consumer then finds the coordinator again.
+pub(crate) fn names_moved_coordinator(response: &OffsetCommitResponse) -> bool {
+    response.topics.iter().any(|topic| {
+        topic
+            .partitions
+            .iter()
+            .any(|partition| is_retriable_coordinator_code(partition.error_code))
+    })
+}
+
 /// Classify the result of one automatic `OffsetCommit`, as Kafka's
 /// `ConsumerCoordinator.OffsetCommitResponseHandler` does.
+///
+/// The function reads the error of every partition. Kafka's handler stops at
+/// the first partition error other than `TOPIC_AUTHORIZATION_FAILED`, so its
+/// result for a response with a retriable and a fatal partition error depends
+/// on the partition order. That order comes from hash maps, here and in Kafka
+/// (`ConsumerCoordinator.sendOffsetCommitRequest`). This function gives the
+/// fatal error precedence, so the result does not depend on that order. The
+/// commit before a `JoinGroup` then does not retry until the rebalance timeout
+/// when a partition can never commit.
 pub(crate) fn auto_commit_outcome(
     result: &Result<OffsetCommitResponse, ConsumerError>,
 ) -> AutoCommitOutcome {
     match result {
-        Ok(response) => match first_commit_error(response) {
-            0 => AutoCommitOutcome::Committed,
-            UNKNOWN_TOPIC_OR_PARTITION | REQUEST_TIMED_OUT => AutoCommitOutcome::Retriable,
-            code if is_retriable_coordinator_code(code) => AutoCommitOutcome::Retriable,
-            _ => AutoCommitOutcome::Failed,
-        },
+        Ok(response) => {
+            let error = response
+                .topics
+                .iter()
+                .flat_map(|topic| topic.partitions.iter())
+                .map(|partition| PartitionCommitError::of(partition.error_code))
+                .max()
+                .unwrap_or(PartitionCommitError::None);
+            match error {
+                PartitionCommitError::None => AutoCommitOutcome::Committed,
+                PartitionCommitError::Retriable => AutoCommitOutcome::Retriable,
+                PartitionCommitError::TopicAuthorization | PartitionCommitError::Fatal => {
+                    AutoCommitOutcome::Failed
+                }
+            }
+        }
         Err(ConsumerError::Client(error))
             if is_retriable_transport_error(error)
                 || matches!(error, krabka_client_core::ClientError::Timeout(_)) =>
@@ -400,7 +458,7 @@ impl CommitRoute {
             .send(request(topics.clone()))
             .await;
         let moved = match &result {
-            Ok(response) => is_retriable_coordinator_code(first_commit_error(response)),
+            Ok(response) => names_moved_coordinator(response),
             Err(error) => is_retriable_transport_error(error),
         };
         if !moved {
@@ -1291,6 +1349,8 @@ mod tests {
     /// 14, 15 and 16, and for a failed connection. Every other error is final.
     #[test]
     fn auto_commit_outcome_follows_kafka_commit_error_classes() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
         for (name, result, expected) in [
             (
                 "success",
@@ -1361,9 +1421,41 @@ mod tests {
                 Err(ConsumerError::Server(30)),
                 AutoCommitOutcome::Failed,
             ),
+            (
+                "topic authorization failed",
+                Ok(response(&[0, 29])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "retriable partition, then a fatal partition",
+                Ok(response(&[3, 30])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "fatal partition, then a retriable partition",
+                Ok(response(&[30, 3])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "retriable coordinator partition, then a fatal partition",
+                Ok(response(&[16, 22])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "topic authorization failure, then a retriable partition",
+                Ok(response(&[29, 3])),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "retriable partition, then a topic authorization failure",
+                Ok(response(&[3, 29])),
+                AutoCommitOutcome::Retriable,
+            ),
         ] {
-            assert2::check!(auto_commit_outcome(&result) == expected, "case {name}");
+            actual.push((name, auto_commit_outcome(&result)));
+            wanted.push((name, expected));
         }
+        assert2::assert!(actual == wanted);
     }
 
     /// `poll` does not wait for a commit that holds the commit lock. The

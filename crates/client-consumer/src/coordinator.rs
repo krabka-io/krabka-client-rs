@@ -54,7 +54,9 @@ use crate::{
         AutoOffsetReset, decode_assignment, decode_subscription, encode_assignment,
         encode_subscription,
     },
-    commit::{AutoCommitOutcome, auto_commit_outcome, build_commit_request},
+    commit::{
+        AutoCommitOutcome, auto_commit_outcome, build_commit_request, names_moved_coordinator,
+    },
     consumer::{CommitIdentity, ConsumerRetryPolicy, reset_starting_offset, starting_offset},
     error::ConsumerError,
     offset_wire::{
@@ -1140,12 +1142,7 @@ async fn commit_before_join(state: &mut CoordinatorState) {
             }
             AutoCommitOutcome::Retriable => {
                 let moved = match &result {
-                    Ok(response) => response.topics.iter().any(|topic| {
-                        topic
-                            .partitions
-                            .iter()
-                            .any(|partition| is_retriable_coordinator_code(partition.error_code))
-                    }),
+                    Ok(response) => names_moved_coordinator(response),
                     Err(_) => true,
                 };
                 if moved {
