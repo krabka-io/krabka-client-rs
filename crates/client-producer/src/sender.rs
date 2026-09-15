@@ -84,7 +84,7 @@ use crate::{
     partitioner::{BuiltInPartitioner, QueueSizes},
     producer::{Acks, STATE_ACTIVE, STATE_FENCED, TopicMetadata},
     record::RecordMetadata,
-    transactional::{AbortableErrorSlot, TxnState},
+    transactional::{AbortableError, FatalError, TxnErrorSlot, TxnState},
     transport::ProduceTransport,
 };
 
@@ -250,11 +250,12 @@ pub(crate) struct SenderConfig {
     pub txn_pid_epoch: Arc<Mutex<(i64, i16)>>,
     pub txn_recovery_required: Arc<AtomicBool>,
     pub txn_recovery_generation: Arc<AtomicU64>,
-    /// Shared with `Producer`. The sender sets it when a batch of the
-    /// transaction fails, so a later commit fails and the application must
-    /// abort. Kafka's `TransactionManager.handleFailedBatch` moves to
-    /// `ABORTABLE_ERROR` in the same place.
-    pub txn_abortable_error: Arc<AbortableErrorSlot>,
+    /// Shared with `Producer`. The sender sets the abortable error when a
+    /// batch of the transaction fails, so a later commit fails and the
+    /// application must abort. Kafka's `TransactionManager.handleFailedBatch`
+    /// moves to `ABORTABLE_ERROR` in the same place. The sender reads it to
+    /// fail the batches that the transaction can no longer send.
+    pub txn_error: Arc<TxnErrorSlot>,
 }
 
 /// Mutable per-partition pipeline state, owned by [`run`] and threaded into
@@ -496,7 +497,7 @@ async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Sch
 
     for batch in state.retry.values() {
         schedule.settled = false;
-        if batch_crosses_recovery_barrier(cfg, batch.transaction_generation) {
+        if drained_barrier(cfg, batch.transaction_generation).is_some() {
             schedule.immediate = true;
             continue;
         }
@@ -545,11 +546,11 @@ async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Sch
         }
         let has_recovery_invalid =
             accumulator.current.as_ref().is_some_and(|batch| {
-                batch_crosses_recovery_barrier(cfg, batch.transaction_generation)
+                undrained_barrier(cfg, batch.transaction_generation).is_some()
             }) || accumulator
                 .ready
                 .iter()
-                .any(|batch| batch_crosses_recovery_barrier(cfg, batch.transaction_generation));
+                .any(|batch| undrained_barrier(cfg, batch.transaction_generation).is_some());
         if has_recovery_invalid {
             schedule.immediate = true;
             continue;
@@ -565,7 +566,7 @@ async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Sch
             .as_ref()
             .filter(|batch| !batch.is_empty())
         {
-            if force || batch_crosses_recovery_barrier(cfg, batch.transaction_generation) {
+            if force || undrained_barrier(cfg, batch.transaction_generation).is_some() {
                 schedule.immediate = true;
             } else {
                 include_deadline(
@@ -820,7 +821,7 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
             let should_seal = a.current.as_ref().is_some_and(|batch| {
                 !batch.is_empty()
                     && (matches!(intent, DrainIntent::Force)
-                        || batch_crosses_recovery_barrier(cfg, batch.transaction_generation)
+                        || undrained_barrier(cfg, batch.transaction_generation).is_some()
                         || (matches!(intent, DrainIntent::Expired)
                             && now
                                 .saturating_duration_since(batch.first_append_at)
@@ -841,8 +842,8 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
         };
         let Some(batch) = batch else { continue };
         note_node_latency(cfg, state, &key, now, true);
-        if batch_crosses_recovery_barrier(cfg, batch.transaction_generation) {
-            fail_batch(batch.records, ProducerError::RecoveryRequired);
+        if let Some(barrier) = undrained_barrier(cfg, batch.transaction_generation) {
+            fail_batch(batch.records, barrier.error());
             finish_in_flight(cfg);
             continue;
         }
@@ -965,7 +966,7 @@ async fn fail_expired_accumulator_batches(cfg: &SenderConfig, now: Instant) {
             "a batch reached the delivery timeout before its first send; failing its records",
         );
         if batch.transaction_generation.is_some() {
-            cfg.txn_abortable_error.set_timeout();
+            cfg.txn_error.set_abortable_timeout();
         }
         fail_batch(batch.records, ProducerError::SendTimeout);
     }
@@ -1052,10 +1053,7 @@ enum BatchVerdict {
     RestartSequenceAndRetry,
     /// Fail the records with `Server(code)`, then repair the partition
     /// sequence.
-    Terminal {
-        code: i16,
-        repair: SequenceRepair,
-    },
+    Terminal { code: i16, repair: SequenceRepair },
     /// Split the batch in two, put both parts back at the front of the
     /// accumulator, and send them again. Kafka's `Sender.completeBatch` splits
     /// a batch of more than one record that gets `MESSAGE_TOO_LARGE`
@@ -1066,7 +1064,35 @@ enum BatchVerdict {
     /// `TransactionManager.maybeTransitionToErrorState` makes these codes
     /// fatal.
     Fatal(i16),
+    /// Fail the records with the error of the barrier, and send nothing.
+    Barred(Barrier),
+}
+
+/// Why the sender must not send a batch of a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Barrier {
+    /// The batch was accepted before a transaction recovery.
     RecoveryRequired,
+    /// The transaction is in the fatal error state. Kafka's `Sender.runOnce`
+    /// aborts every incomplete batch with `lastError` (`maybeAbortBatches`).
+    Fatal(FatalError),
+    /// The transaction is in the abortable error state, and the batch is not
+    /// drained yet. Kafka's `Sender.maybeSendAndPollTransactionalRequest`
+    /// aborts the undrained batches with `lastError`
+    /// (`RecordAccumulator.abortUndrainedBatches`).
+    Abortable(AbortableError),
+}
+
+impl Barrier {
+    /// The error that the records of a barred batch get.
+    const fn error(self) -> ProducerError {
+        match self {
+            Self::RecoveryRequired => ProducerError::RecoveryRequired,
+            Self::Fatal(error) => error.error(),
+            Self::Abortable(AbortableError::Server(code)) => ProducerError::Server(code),
+            Self::Abortable(AbortableError::Timeout) => ProducerError::SendTimeout,
+        }
+    }
 }
 
 /// How the producer stamped a batch. Kafka's `Sender` handles a failed batch
@@ -1374,11 +1400,12 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
                     terminal_fail_batch(cfg, pb, ProducerError::Server(code));
                 }
                 BatchVerdict::Fatal(code) => {
+                    record_transaction_fatal_error(cfg, &pb, code);
                     fail_batch(pb.records, fatal_error(code));
                     finish_in_flight(cfg);
                 }
-                BatchVerdict::RecoveryRequired => {
-                    fail_batch(pb.records, ProducerError::RecoveryRequired);
+                BatchVerdict::Barred(barrier) => {
+                    fail_batch(pb.records, barrier.error());
                     finish_in_flight(cfg);
                 }
                 BatchVerdict::Retry
@@ -1449,12 +1476,13 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
             // processed (their in-flight slots are counted, so they must be
             // released), then fence the producer and stop sending.
             BatchVerdict::Fatal(code) => {
+                record_transaction_fatal_error(cfg, &pb, code);
                 fail_batch(pb.records, fatal_error(code));
                 finish_in_flight(cfg);
                 fenced = Some(Vec::new());
             }
-            BatchVerdict::RecoveryRequired => {
-                fail_batch(pb.records, ProducerError::RecoveryRequired);
+            BatchVerdict::Barred(barrier) => {
+                fail_batch(pb.records, barrier.error());
                 finish_in_flight(cfg);
             }
         }
@@ -1528,6 +1556,25 @@ impl PipelineState {
             .and_modify(|offset| *offset = (*offset).max(last_offset))
             .or_insert(last_offset);
     }
+}
+
+/// Move the transaction to the fatal error state when a batch of it failed with
+/// the fatal `code`.
+///
+/// Kafka's `Sender.failBatch` calls `TransactionManager.handleFailedBatch`,
+/// and `maybeTransitionToErrorState` makes `CLUSTER_AUTHORIZATION_FAILED`,
+/// `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, `PRODUCER_FENCED`,
+/// `UNSUPPORTED_VERSION` and `INVALID_PRODUCER_ID_MAPPING` fatal
+/// (`transitionToFatalError`). Every later transactional operation then fails.
+fn record_transaction_fatal_error(cfg: &SenderConfig, pb: &PreparedBatch, code: i16) {
+    if BatchMode::of(&pb.record_batch) != BatchMode::Transactional {
+        return;
+    }
+    cfg.txn_error.set_fatal(if code == codes::PRODUCER_FENCED {
+        FatalError::Fenced
+    } else {
+        FatalError::Server(code)
+    });
 }
 
 /// The error for the records of a batch that failed with a fatal code.
@@ -1643,8 +1690,8 @@ fn terminal_fail_batch(cfg: &SenderConfig, pb: PreparedBatch, error: ProducerErr
         // its code, and a batch that timed out with no answer stores that it
         // timed out, as Kafka stores the raised `TimeoutException` there.
         match error {
-            ProducerError::Server(code) => cfg.txn_abortable_error.set(code),
-            _ => cfg.txn_abortable_error.set_timeout(),
+            ProducerError::Server(code) => cfg.txn_error.set_abortable(code),
+            _ => cfg.txn_error.set_abortable_timeout(),
         }
     }
     fail_batch(pb.records, error);
@@ -1797,10 +1844,10 @@ async fn send_one_batch(
     mut pb: PreparedBatch,
     last_acked_offset: Option<i64>,
 ) -> BatchSendResult {
-    if batch_crosses_recovery_barrier(cfg, pb.transaction_generation) {
+    if let Some(barrier) = drained_barrier(cfg, pb.transaction_generation) {
         return BatchSendResult {
             pb,
-            verdict: BatchVerdict::RecoveryRequired,
+            verdict: BatchVerdict::Barred(barrier),
             refresh_needed: false,
         };
     }
@@ -2122,18 +2169,32 @@ async fn update_leaders_from_metadata(cfg: &SenderConfig) {
     }
 }
 
-fn batch_crosses_recovery_barrier(cfg: &SenderConfig, generation: Option<u64>) -> bool {
-    generation.is_some_and(|batch_generation| {
-        cfg.txn_recovery_required.load(Ordering::Acquire)
-            || batch_generation != cfg.txn_recovery_generation.load(Ordering::Acquire)
+/// The barrier that stops a drained batch of transaction `generation`, or
+/// `None` for a batch that the sender can send.
+fn drained_barrier(cfg: &SenderConfig, generation: Option<u64>) -> Option<Barrier> {
+    let batch_generation = generation?;
+    if let Some(error) = cfg.txn_error.fatal() {
+        return Some(Barrier::Fatal(error));
+    }
+    (cfg.txn_recovery_required.load(Ordering::Acquire)
+        || batch_generation != cfg.txn_recovery_generation.load(Ordering::Acquire))
+    .then_some(Barrier::RecoveryRequired)
+}
+
+/// The barrier that stops a batch of transaction `generation` that is still
+/// in an accumulator. It is [`drained_barrier`], and also the abortable error.
+fn undrained_barrier(cfg: &SenderConfig, generation: Option<u64>) -> Option<Barrier> {
+    drained_barrier(cfg, generation).or_else(|| {
+        generation?;
+        cfg.txn_error.abortable().map(Barrier::Abortable)
     })
 }
 
 fn fail_recovered_batches(cfg: &SenderConfig, batches: &mut Vec<PreparedBatch>) {
     let mut retained = Vec::with_capacity(batches.len());
     for batch in batches.drain(..) {
-        if batch_crosses_recovery_barrier(cfg, batch.transaction_generation) {
-            fail_batch(batch.records, ProducerError::RecoveryRequired);
+        if let Some(barrier) = drained_barrier(cfg, batch.transaction_generation) {
+            fail_batch(batch.records, barrier.error());
             finish_in_flight(cfg);
         } else {
             retained.push(batch);
@@ -2148,14 +2209,15 @@ fn fail_recovered_retry_slots(
 ) {
     let recovered_keys = retry
         .iter()
-        .filter(|(_, batch)| batch_crosses_recovery_barrier(cfg, batch.transaction_generation))
-        .map(|(key, _)| key.clone())
+        .filter_map(|(key, batch)| {
+            drained_barrier(cfg, batch.transaction_generation).map(|barrier| (key.clone(), barrier))
+        })
         .collect::<Vec<_>>();
-    for key in recovered_keys {
+    for (key, barrier) in recovered_keys {
         let batch = retry
             .remove(&key)
             .expect("recovered retry key remains present");
-        fail_batch(batch.records, ProducerError::RecoveryRequired);
+        fail_batch(batch.records, barrier.error());
         finish_in_flight(cfg);
     }
 }
@@ -2169,20 +2231,20 @@ async fn fail_recovered_accumulator_batches(cfg: &SenderConfig) {
     let mut failed_any = false;
     for accumulator in accumulators {
         let mut accumulator = accumulator.lock().await;
-        if accumulator
+        if let Some(barrier) = accumulator
             .current
             .as_ref()
-            .is_some_and(|batch| batch_crosses_recovery_barrier(cfg, batch.transaction_generation))
+            .and_then(|batch| undrained_barrier(cfg, batch.transaction_generation))
             && let Some(batch) = accumulator.current.take()
         {
-            fail_batch(batch.records, ProducerError::RecoveryRequired);
+            fail_batch(batch.records, barrier.error());
             failed_any = true;
         }
 
         let mut retained = VecDeque::with_capacity(accumulator.ready.len());
         while let Some(batch) = accumulator.ready.pop_front() {
-            if batch_crosses_recovery_barrier(cfg, batch.transaction_generation) {
-                fail_batch(batch.records, ProducerError::RecoveryRequired);
+            if let Some(barrier) = undrained_barrier(cfg, batch.transaction_generation) {
+                fail_batch(batch.records, barrier.error());
                 failed_any = true;
             } else {
                 retained.push_back(batch);
@@ -2325,6 +2387,9 @@ fn fail_batch(records: Vec<PendingRecord>, err: ProducerError) {
                 })
             }
             ProducerError::InvalidConfig(s) => Some(ProducerError::InvalidConfig(s.clone())),
+            ProducerError::FatalTransactionError(code) => {
+                Some(ProducerError::FatalTransactionError(*code))
+            }
             _ => None, // Client, Protocol, Compression — not Clone.
         }
     }
@@ -3414,7 +3479,7 @@ mod harness {
         recovery_required: Arc<AtomicBool>,
         recovery_generation: Arc<AtomicU64>,
         producer_epoch: Arc<AtomicI16>,
-        txn_abortable_error: Arc<AbortableErrorSlot>,
+        txn_error: Arc<TxnErrorSlot>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -3593,7 +3658,7 @@ mod harness {
         let state = Arc::new(AtomicU8::new(STATE_ACTIVE));
         let recovery_required = Arc::new(AtomicBool::new(false));
         let recovery_generation = Arc::new(AtomicU64::new(0));
-        let abortable_error = Arc::new(AbortableErrorSlot::default());
+        let abortable_error = Arc::new(TxnErrorSlot::default());
 
         // Box the same Arc<MockTransport> for the sender; keep a clone for the
         // test to inspect.
@@ -3629,7 +3694,7 @@ mod harness {
             })),
             txn_recovery_required: Arc::clone(&recovery_required),
             txn_recovery_generation: Arc::clone(&recovery_generation),
-            txn_abortable_error: Arc::clone(&abortable_error),
+            txn_error: Arc::clone(&abortable_error),
         };
 
         let handle = tokio::spawn(run(cfg));
@@ -3648,7 +3713,7 @@ mod harness {
             recovery_required,
             recovery_generation,
             producer_epoch,
-            txn_abortable_error: abortable_error,
+            txn_error: abortable_error,
             handle,
         }
     }
@@ -4258,7 +4323,7 @@ mod harness {
             txn_pid_epoch: Arc::new(Mutex::new((-1, -1))),
             txn_recovery_required: Arc::new(AtomicBool::new(false)),
             txn_recovery_generation: Arc::new(AtomicU64::new(0)),
-            txn_abortable_error: Arc::new(AbortableErrorSlot::default()),
+            txn_error: Arc::new(TxnErrorSlot::default()),
         };
         (cfg, transport)
     }
@@ -5512,7 +5577,7 @@ mod harness {
         // records get it, not a synthesized error.
         assert2::assert!(matches!(error, ProducerError::Server(6)), "{error:?}");
         assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE);
-        assert2::assert!(h.txn_abortable_error.get() == Some(AbortableError::Server(6)));
+        assert2::assert!(h.txn_error.abortable() == Some(AbortableError::Server(6)));
 
         // The producer itself is not fenced: a later send from a fresh
         // partition still goes through the sender and gets acknowledged.
@@ -5524,6 +5589,81 @@ mod harness {
             .expect("the sender keeps accepting sends after the abortable error");
         assert2::assert!(metadata.partition == 1);
         shutdown(h).await;
+    }
+
+    /// A transactional batch that fails with a fatal code moves the
+    /// transaction to the fatal error state, as Kafka's
+    /// `TransactionManager.maybeTransitionToErrorState` does. An idempotent
+    /// batch leaves the transaction error slot alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fatal_transactional_batch_sets_the_fatal_error() {
+        /// What the failed record gave, and the stored transaction errors.
+        #[derive(Debug, PartialEq, Eq)]
+        struct FatalBatch {
+            record: String,
+            fatal: Option<FatalError>,
+            abortable: Option<AbortableError>,
+        }
+        let cases = [
+            (
+                "transactional id authorization",
+                BatchMode::Transactional,
+                53,
+                FatalBatch {
+                    record: "broker error_code 53".to_owned(),
+                    fatal: Some(FatalError::Server(53)),
+                    abortable: None,
+                },
+            ),
+            (
+                "producer fenced",
+                BatchMode::Transactional,
+                90,
+                FatalBatch {
+                    record: "fenced by newer producer instance".to_owned(),
+                    fatal: Some(FatalError::Fenced),
+                    abortable: None,
+                },
+            ),
+            (
+                "unsupported version",
+                BatchMode::Transactional,
+                35,
+                FatalBatch {
+                    record: "broker error_code 35".to_owned(),
+                    fatal: Some(FatalError::Server(35)),
+                    abortable: None,
+                },
+            ),
+            (
+                "idempotent batch",
+                BatchMode::Idempotent,
+                53,
+                FatalBatch {
+                    record: "broker error_code 53".to_owned(),
+                    fatal: None,
+                    abortable: None,
+                },
+            ),
+        ];
+        for (name, mode, code, expected) in cases {
+            let transport = MockTransport::new(Duration::ZERO);
+            transport.inject_code_once(0, code);
+            let h = spawn_sender_full(transport, 1, millis(1), 0, secs(30), Acks::All, mode);
+            let ack = produce_burst(&h, "t", 0, 1).await.pop().expect("ack");
+            let record = tokio::time::timeout(Duration::from_secs(1), ack)
+                .await
+                .expect("ack resolves")
+                .expect("sender remains")
+                .map_or_else(|error| error.to_string(), |_| "acked".to_owned());
+            let actual = FatalBatch {
+                record,
+                fatal: h.txn_error.fatal(),
+                abortable: h.txn_error.abortable(),
+            };
+            shutdown(h).await;
+            assert2::assert!(actual == expected, "{name}");
+        }
     }
 
     /// The same rule for a batch that reached the delivery timeout with no
@@ -5549,7 +5689,7 @@ mod harness {
 
         assert2::assert!(matches!(error, ProducerError::SendTimeout), "{error:?}");
         assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE);
-        assert2::assert!(h.txn_abortable_error.get() == Some(AbortableError::Timeout));
+        assert2::assert!(h.txn_error.abortable() == Some(AbortableError::Timeout));
         shutdown(h).await;
     }
 
@@ -5917,7 +6057,7 @@ mod harness {
             txn_pid_epoch: Arc::new(Mutex::new((1, 0))),
             txn_recovery_required: Arc::new(AtomicBool::new(false)),
             txn_recovery_generation: Arc::new(AtomicU64::new(0)),
-            txn_abortable_error: Arc::new(AbortableErrorSlot::default()),
+            txn_error: Arc::new(TxnErrorSlot::default()),
         };
         let mut state = PipelineState::default();
 
@@ -6302,6 +6442,113 @@ mod harness {
         assert_eq!(transport.applied.load(Ordering::Acquire), 0);
 
         shutdown(h).await;
+    }
+
+    /// Kafka's `Sender.runOnce` aborts every incomplete batch in
+    /// `FATAL_ERROR` (`maybeAbortBatches`), and
+    /// `Sender.maybeSendAndPollTransactionalRequest` aborts the undrained
+    /// batches in `ABORTABLE_ERROR` (`abortUndrainedBatches`), each with
+    /// `lastError`. A batch outside a transaction is not affected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_transactional_batch_fails_with_the_transaction_error() {
+        #[derive(Debug, Clone, Copy)]
+        enum Stored {
+            Fatal(FatalError),
+            Abortable(i16),
+            AbortableTimeout,
+        }
+        /// What one queued record gave, and the Produce requests applied.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Queued {
+            acknowledgement: Result<(), String>,
+            applied: usize,
+        }
+        let cases = [
+            (
+                "fatal code",
+                Stored::Fatal(FatalError::Server(49)),
+                Some(0),
+                Queued {
+                    acknowledgement: Err("the transactional producer is in a fatal error state \
+                                          after broker error_code 49; close the producer"
+                        .to_owned()),
+                    applied: 0,
+                },
+            ),
+            (
+                "fenced",
+                Stored::Fatal(FatalError::Fenced),
+                Some(0),
+                Queued {
+                    acknowledgement: Err("fenced by newer producer instance".to_owned()),
+                    applied: 0,
+                },
+            ),
+            (
+                "abortable code",
+                Stored::Abortable(42),
+                Some(0),
+                Queued {
+                    acknowledgement: Err("broker error_code 42".to_owned()),
+                    applied: 0,
+                },
+            ),
+            (
+                "abortable timeout",
+                Stored::AbortableTimeout,
+                Some(0),
+                Queued {
+                    acknowledgement: Err(
+                        "the batch was not acknowledged before its retries ran out".to_owned(),
+                    ),
+                    applied: 0,
+                },
+            ),
+            (
+                "outside a transaction",
+                Stored::Fatal(FatalError::Server(49)),
+                None,
+                Queued {
+                    acknowledgement: Ok(()),
+                    applied: 1,
+                },
+            ),
+        ];
+        for (name, stored, generation, expected) in cases {
+            let transport = MockTransport::new(Duration::ZERO);
+            let h = spawn_sender_with(transport.clone(), 1, secs(30));
+            let accumulator = Arc::new(Mutex::new(Accumulator::new(1024)));
+            h.accumulators
+                .insert(("t".to_string(), 0), Arc::clone(&accumulator));
+            let crate::accumulator::AppendResult { receiver: rx, .. } =
+                accumulator.lock().await.try_append(
+                    None,
+                    Some(bytes::Bytes::from_static(b"queued")),
+                    vec![],
+                    0,
+                    generation,
+                );
+            match stored {
+                Stored::Fatal(error) => h.txn_error.set_fatal(error),
+                Stored::Abortable(code) => h.txn_error.set_abortable(code),
+                Stored::AbortableTimeout => h.txn_error.set_abortable_timeout(),
+            }
+            h.wake_tx
+                .send(DrainIntent::Force)
+                .await
+                .expect("sender is running");
+
+            let acknowledgement = tokio::time::timeout(Duration::from_secs(3), rx)
+                .await
+                .expect("the queued acknowledgement is resolved")
+                .expect("acknowledgement channel remains connected");
+            let actual = Queued {
+                acknowledgement: acknowledgement.map(drop).map_err(|error| error.to_string()),
+                applied: transport.applied.load(Ordering::Acquire),
+            };
+            shutdown(h).await;
+            assert2::assert!(actual == expected, "{name}");
+        }
     }
 
     /// A transport-failed transactional batch occupies the retry slot. Once

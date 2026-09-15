@@ -41,7 +41,7 @@ use crate::{
     partitioner::{BuiltInPartitioner, PartitionerConfig},
     producer::{Acks, Producer, ProducerIdentity},
     sender,
-    transactional::{AbortableErrorSlot, TxnState},
+    transactional::{TxnErrorSlot, TxnState},
     transport::ClientTransport,
     txn_retry::{self, CoordinatorAttempt, TxnRequestDecision},
 };
@@ -936,7 +936,7 @@ impl Producer {
         let txn_guard_generation = Arc::new(AtomicU64::new(0));
         let txn_pid_epoch = Arc::new(Mutex::new(initial_txn_pid_epoch()));
         let prepared_transaction_state = Arc::new(Mutex::new(None));
-        let txn_abortable_error = Arc::new(AbortableErrorSlot::default());
+        let txn_error = Arc::new(TxnErrorSlot::default());
 
         let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
             transport: Box::new(ClientTransport::new(client.clone())),
@@ -966,7 +966,7 @@ impl Producer {
             txn_pid_epoch: Arc::clone(&txn_pid_epoch),
             txn_recovery_required: Arc::clone(&txn_recovery_required),
             txn_recovery_generation: Arc::clone(&txn_recovery_generation),
-            txn_abortable_error: Arc::clone(&txn_abortable_error),
+            txn_error: Arc::clone(&txn_error),
         }));
 
         Ok(Producer {
@@ -1014,7 +1014,7 @@ impl Producer {
             txn_guard_generation,
             txn_coord_client: Mutex::new(None),
             txn_pid_epoch,
-            txn_abortable_error,
+            txn_error,
             prepared_transaction_state,
         })
     }
