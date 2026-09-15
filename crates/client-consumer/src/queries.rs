@@ -90,6 +90,43 @@ fn classify_query_row(error_code: i16, offset: i64, timestamp: i64, leader_epoch
     }
 }
 
+/// Fail for a requested topic that `metadata` does not authorize or names as
+/// invalid. Kafka's `Metadata.update` records these errors, and the next
+/// `client.poll` of `OffsetFetcher.fetchOffsetsByTimes` throws
+/// `TopicAuthorizationException` or `InvalidTopicException`. Other topic
+/// errors wait for the next round.
+fn requested_topic_errors(
+    metadata: &MetadataResponse,
+    topics: &BTreeSet<String>,
+) -> Result<(), ConsumerError> {
+    let requested = |topic: &&krabka_protocol::owned::metadata_response::MetadataResponseTopic| {
+        topic
+            .name
+            .as_ref()
+            .is_some_and(|name| topics.contains(name))
+    };
+    let unauthorized: BTreeSet<String> = metadata
+        .topics
+        .iter()
+        .filter(requested)
+        .filter(|topic| topic.error_code == TOPIC_AUTHORIZATION_FAILED)
+        .filter_map(|topic| topic.name.clone())
+        .collect();
+    if !unauthorized.is_empty() {
+        return Err(ConsumerError::TopicAuthorizationFailed(unauthorized));
+    }
+    if let Some(name) = metadata
+        .topics
+        .iter()
+        .filter(requested)
+        .find(|topic| topic.error_code == INVALID_TOPIC_EXCEPTION)
+        .and_then(|topic| topic.name.clone())
+    {
+        return Err(ConsumerError::InvalidTopic(name));
+    }
+    Ok(())
+}
+
 /// The leader id and epoch of each partition in `metadata` that has a leader.
 fn partition_leaders(metadata: &MetadataResponse) -> HashMap<(String, i32), (i32, i32)> {
     metadata
@@ -353,19 +390,44 @@ impl Consumer {
     /// higher.
     async fn search_offsets(
         &self,
-        mut search: HashMap<(String, i32), i64>,
+        search: HashMap<(String, i32), i64>,
         require_timestamps: bool,
     ) -> Result<HashMap<(String, i32), OffsetAndTimestamp>, ConsumerError> {
         let started = tokio::time::Instant::now();
         let deadline = started + self.default_api_timeout.to_std();
+        // The deadline bounds each request too, as Kafka's timer bounds each
+        // `client.poll`.
+        tokio::time::timeout_at(
+            deadline,
+            self.search_offsets_until(search, require_timestamps, started, deadline),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ConsumerError::Timeout(format!(
+                "Failed to get offsets by times in {}ms",
+                started.elapsed().as_millis()
+            )))
+        })
+    }
+
+    async fn search_offsets_until(
+        &self,
+        mut search: HashMap<(String, i32), i64>,
+        require_timestamps: bool,
+        started: tokio::time::Instant,
+        deadline: tokio::time::Instant,
+    ) -> Result<HashMap<(String, i32), OffsetAndTimestamp>, ConsumerError> {
         let mut backoff = self.retry_policy.initial_backoff;
         let mut found = HashMap::new();
         while !search.is_empty() {
             let topics: BTreeSet<String> = search.keys().map(|(topic, _)| topic.clone()).collect();
-            let request =
-                krabka_client_core::topics_request(topics, self.allows_auto_topic_creation());
+            let request = krabka_client_core::topics_request(
+                topics.iter().cloned(),
+                self.allows_auto_topic_creation(),
+            );
             match self.client.refresh_metadata_with(request).await {
                 Ok(metadata) => {
+                    requested_topic_errors(&metadata, &topics)?;
                     let leaders = partition_leaders(&metadata);
                     let mut by_leader: BTreeMap<i32, Vec<QueryPartition>> = BTreeMap::new();
                     for (partition, timestamp) in &search {
@@ -480,6 +542,20 @@ impl Consumer {
         request: MetadataRequest,
     ) -> Result<HashMap<String, Vec<PartitionInfo>>, ConsumerError> {
         let deadline = tokio::time::Instant::now() + self.default_api_timeout.to_std();
+        tokio::time::timeout_at(deadline, self.topic_metadata_until(request, deadline))
+            .await
+            .unwrap_or_else(|_| {
+                Err(ConsumerError::Timeout(
+                    "Timeout expired while fetching topic metadata".to_owned(),
+                ))
+            })
+    }
+
+    async fn topic_metadata_until(
+        &self,
+        request: MetadataRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<HashMap<String, Vec<PartitionInfo>>, ConsumerError> {
         let mut backoff = self.retry_policy.initial_backoff;
         loop {
             match self.client.refresh_metadata_with(request.clone()).await {
@@ -607,9 +683,14 @@ mod tests {
         }
     }
 
-    /// A broker that leads `orders-0` and `orders-1`, and answers each
-    /// `ListOffsets` partition with `rows`.
-    async fn query_broker(rows: Rows, sent: SentRequests) -> MockBroker {
+    /// A broker that leads `orders-0` and `orders-1`, answers `Metadata` with
+    /// `metadata_error` for the topic, and answers each `ListOffsets`
+    /// partition with `rows`, or not at all for `None`.
+    async fn query_broker(
+        rows: Option<Rows>,
+        metadata_error: i16,
+        sent: SentRequests,
+    ) -> MockBroker {
         use bytes::Buf as _;
         let port = Arc::new(AtomicU16::new(0));
         let port_in_mock = Arc::clone(&port);
@@ -635,12 +716,14 @@ mod tests {
             }
             if api_key == metadata_request::API_KEY {
                 let port = i32::from(port_in_mock.load(Ordering::SeqCst));
-                return Some(encode(&metadata(port, 0), version));
+                return Some(encode(&metadata(port, metadata_error), version));
             }
             if api_key == list_offsets_request::API_KEY {
                 let client_id_len = usize::try_from(body.get_i16()).expect("client id");
                 body.advance(client_id_len);
                 let request = ListOffsetsRequest::decode(&mut body, version).expect("decode");
+                sent.lock().expect("sent lock").push(request.clone());
+                let rows = rows?;
                 let answer = ListOffsetsResponse {
                     topics: request
                         .topics
@@ -668,7 +751,6 @@ mod tests {
                         .collect(),
                     ..Default::default()
                 };
-                sent.lock().expect("sent lock").push(request);
                 return Some(encode(&answer, version));
             }
             None
@@ -734,12 +816,12 @@ mod tests {
         let unauthorized: Rows = |_, _| (29, -1, -1, -1);
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
-        for (name, isolation, query, rows, expected, expected_requests) in [
+        for (name, isolation, query, (rows, metadata_error), expected, expected_requests) in [
             (
                 "beginning offsets",
                 IsolationLevel::ReadUncommitted,
                 Query::Beginning,
-                found,
+                (Some(found), 0),
                 Answer::Offsets(HashMap::from([(key(0), 3), (key(1), 4)])),
                 vec![request(0, [-2, -2])],
             ),
@@ -747,7 +829,7 @@ mod tests {
                 "end offsets with read committed",
                 IsolationLevel::ReadCommitted,
                 Query::End,
-                found,
+                (Some(found), 0),
                 Answer::Offsets(HashMap::from([(key(0), 3), (key(1), 4)])),
                 vec![request(1, [-1, -1])],
             ),
@@ -755,7 +837,7 @@ mod tests {
                 "offsets for times",
                 IsolationLevel::ReadUncommitted,
                 Query::Times([1000, 2000]),
-                found,
+                (Some(found), 0),
                 Answer::Times(HashMap::from([
                     (
                         key(0),
@@ -773,7 +855,7 @@ mod tests {
                 "negative timestamp",
                 IsolationLevel::ReadUncommitted,
                 Query::Times([-1, 2000]),
-                found,
+                (Some(found), 0),
                 Answer::Error(
                     "invalid argument: The target time for partition orders-0 is -1. The target time cannot be negative."
                         .into(),
@@ -784,13 +866,37 @@ mod tests {
                 "unauthorized topic",
                 IsolationLevel::ReadUncommitted,
                 Query::Beginning,
-                unauthorized,
+                (Some(unauthorized), 0),
                 Answer::Error("not authorized to access topics: [orders]".into()),
                 vec![request(0, [-2, -2])],
             ),
+            (
+                "metadata does not authorize the topic",
+                IsolationLevel::ReadUncommitted,
+                Query::Beginning,
+                (Some(found), 29),
+                Answer::Error("not authorized to access topics: [orders]".into()),
+                vec![],
+            ),
+            (
+                "metadata names the topic invalid",
+                IsolationLevel::ReadUncommitted,
+                Query::End,
+                (Some(found), 17),
+                Answer::Error("topic 'orders' is invalid".into()),
+                vec![],
+            ),
+            (
+                "a silent leader ends by the API timeout",
+                IsolationLevel::ReadUncommitted,
+                Query::Times([1000, 2000]),
+                (None, 0),
+                Answer::Error("timeout".into()),
+                vec![request(0, [1000, 2000])],
+            ),
         ] {
             let sent = SentRequests::default();
-            let broker = query_broker(rows, Arc::clone(&sent)).await;
+            let broker = query_broker(rows, metadata_error, Arc::clone(&sent)).await;
             let client = Client::builder()
                 .bootstrap(broker.addr.to_string())
                 .request_timeout(secs(30))
@@ -809,7 +915,11 @@ mod tests {
                     .await
                     .map(Answer::Times),
             }
-            .unwrap_or_else(|error| Answer::Error(error.to_string()));
+            .unwrap_or_else(|error| match error {
+                // The message names the elapsed time.
+                ConsumerError::Timeout(_) => Answer::Error("timeout".into()),
+                error => Answer::Error(error.to_string()),
+            });
             broker.stop();
             let mut requests = sent.lock().expect("sent lock").clone();
             for request in &mut requests {
@@ -888,7 +998,7 @@ mod tests {
     /// unassigned partition (`SubscriptionState.partitionLag`).
     #[tokio::test]
     async fn current_lag_follows_kafkas_partition_lag() {
-        let broker = query_broker(|_, _| (0, 0, 0, 0), SentRequests::default()).await;
+        let broker = query_broker(Some(|_, _| (0, 0, 0, 0)), 0, SentRequests::default()).await;
         let client = Client::builder()
             .bootstrap(broker.addr.to_string())
             .build()
@@ -898,14 +1008,16 @@ mod tests {
         let key = ("orders".to_string(), 0);
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
-        for (name, partition, position, end, expected) in [
-            ("known", 0, 5, Some(12), Ok(Some(7))),
-            ("no end offset", 0, 5, None, Ok(None)),
+        for (name, partition, position, end, seek, expected) in [
+            ("known", 0, 5, Some(12), None, Ok(Some(7))),
+            ("after a seek", 0, 5, Some(12), Some(8), Ok(Some(4))),
+            ("no end offset", 0, 5, None, None, Ok(None)),
             (
                 "awaiting reset",
                 0,
                 crate::poll::END_SENTINEL,
                 Some(12),
+                None,
                 Ok(None),
             ),
             (
@@ -913,6 +1025,7 @@ mod tests {
                 9,
                 5,
                 Some(12),
+                None,
                 Err("no current assignment for partition orders-9".to_string()),
             ),
         ] {
@@ -927,6 +1040,9 @@ mod tests {
                 ends.insert(key.clone(), end);
             }
             drop(ends);
+            if let Some(offset) = seek {
+                consumer.seek("orders", 0, offset).await.expect("seek");
+            }
             let lag = consumer
                 .current_lag("orders", partition)
                 .await
