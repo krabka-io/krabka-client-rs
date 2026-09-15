@@ -204,6 +204,19 @@ fn async_commit_result(
                 ConsumerError::Client(error),
             )));
         }
+        // `CommitRoute::send` finds the coordinator again after 15 or 16.
+        // Kafka gives a failed lookup to the callback as
+        // `RetriableCommitFailedException` (`commitOffsetsAsync`).
+        Err(ConsumerError::CoordinatorUnavailable) => {
+            return Err(ConsumerError::RetriableCommitFailed(Box::new(
+                ConsumerError::CoordinatorUnavailable,
+            )));
+        }
+        Err(ConsumerError::Server(code)) if is_retriable_coordinator_code(code) => {
+            return Err(ConsumerError::RetriableCommitFailed(Box::new(
+                ConsumerError::Server(code),
+            )));
+        }
         Err(error) => return Err(error),
     };
     let partitions = || {
@@ -3363,6 +3376,39 @@ mod tests {
             ));
         }
         assert2::assert!(actual == wanted);
+    }
+
+    /// A failed coordinator lookup of an asynchronous commit comes to the
+    /// callback as `RetriableCommitFailedException` (Kafka's
+    /// `ConsumerCoordinator.commitOffsetsAsync`). Other errors stay as they
+    /// are.
+    #[test]
+    fn asynchronous_commit_wraps_a_failed_coordinator_lookup() {
+        let actual = [
+            ConsumerError::Server(15),
+            ConsumerError::Server(14),
+            ConsumerError::CoordinatorUnavailable,
+            ConsumerError::Server(30),
+            ConsumerError::CommitFailed,
+        ]
+        .map(|error| {
+            async_commit_result(Err(error), "group-a", None).map_err(|error| error.to_string())
+        });
+        let retriable = |cause: &str| {
+            Err(format!(
+                "offset commit failed with a retriable exception: {cause}"
+            ))
+        };
+        assert2::assert!(
+            actual
+                == [
+                    retriable("broker error_code 15"),
+                    retriable("broker error_code 14"),
+                    retriable("coordinator unavailable"),
+                    Err("broker error_code 30".to_owned()),
+                    Err("offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group".to_owned()),
+                ]
+        );
     }
 
     /// Kafka's `commitAsync(callback)` calls the callback with the offsets and
