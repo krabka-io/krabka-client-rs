@@ -1,8 +1,15 @@
 //! Consumer-group admin APIs: [`AdminClient::list_groups`] and
 //! [`AdminClient::list_consumer_group_offsets`].
 //!
-//! These are thin wrappers over the `ListGroups` (`api_key`=16),
-//! `OffsetCommit` (`api_key`=8) and `OffsetFetch` (`api_key`=9) RPCs.
+//! These wrap the `ListGroups` (`api_key`=16), `OffsetCommit` (`api_key`=8)
+//! and `OffsetFetch` (`api_key`=9) RPCs.
+//!
+//! ## `ListGroups` fan-out
+//!
+//! A broker lists only the groups that it coordinates.
+//! [`AdminClient::list_groups`] sends `ListGroups` to every broker in the
+//! metadata and merges the answers, as Apache Kafka's
+//! `KafkaAdminClient.listGroups` does.
 //!
 //! ## `OffsetCommit` version note
 //!
@@ -24,16 +31,23 @@
 //! codes as Apache Kafka's `ListConsumerGroupOffsetsHandler.handleGroupError`
 //! does, until Kafka's default `default.api.timeout.ms` (60 s) elapses.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use bytes::BufMut;
 use krabka_client_core::{
-    ClientError, CoordinatorKeyType, build_find_coordinator, coordinator_endpoint,
+    ClientError, Connection, ConnectionOptions, CoordinatorKeyType, build_find_coordinator,
+    coordinator_endpoint,
 };
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
     owned::{
-        list_groups_request::ListGroupsRequest,
+        list_groups_request::{self, ListGroupsRequest},
+        list_groups_response::ListedGroup,
+        metadata_request::MetadataRequest,
+        metadata_response::MetadataResponseBroker,
         offset_commit_request::{
             self, OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
         },
@@ -45,6 +59,7 @@ use krabka_protocol::{
 
 use crate::{
     AdminClient, AdminError, KafkaError, format_host_port, kafka_error_if, kafka_error_name,
+    send_connection_at_least,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +67,239 @@ pub struct ConsumerGroupOffsetOutcome {
     pub topic: String,
     pub partition: i32,
     pub error: Option<KafkaError>,
+}
+
+/// The state of a group, as Apache Kafka's `GroupState` names it.
+///
+/// `ListGroups` v4 (KIP-518) filters groups by these names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GroupState {
+    /// A state name that the client does not know.
+    Unknown,
+    PreparingRebalance,
+    CompletingRebalance,
+    Stable,
+    Dead,
+    Empty,
+    Assigning,
+    Reconciling,
+    NotReady,
+}
+
+impl GroupState {
+    const ALL: [Self; 9] = [
+        Self::Unknown,
+        Self::PreparingRebalance,
+        Self::CompletingRebalance,
+        Self::Stable,
+        Self::Dead,
+        Self::Empty,
+        Self::Assigning,
+        Self::Reconciling,
+        Self::NotReady,
+    ];
+
+    /// The wire name of the state, for example `"Stable"`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::PreparingRebalance => "PreparingRebalance",
+            Self::CompletingRebalance => "CompletingRebalance",
+            Self::Stable => "Stable",
+            Self::Dead => "Dead",
+            Self::Empty => "Empty",
+            Self::Assigning => "Assigning",
+            Self::Reconciling => "Reconciling",
+            Self::NotReady => "NotReady",
+        }
+    }
+
+    /// Reads a state name without regard to case. A name that the client
+    /// does not know gives [`GroupState::Unknown`], as Kafka's
+    /// `GroupState.parse` does.
+    #[must_use]
+    pub fn parse(name: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|state| state.as_str().eq_ignore_ascii_case(name))
+            .unwrap_or(Self::Unknown)
+    }
+}
+
+impl std::fmt::Display for GroupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The type of a group, as Apache Kafka's `GroupType` names it.
+///
+/// `ListGroups` v5 (KIP-848) filters groups by these names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GroupType {
+    /// A type name that the client does not know.
+    Unknown,
+    Consumer,
+    Classic,
+    Share,
+    Streams,
+}
+
+impl GroupType {
+    const ALL: [Self; 5] = [
+        Self::Unknown,
+        Self::Consumer,
+        Self::Classic,
+        Self::Share,
+        Self::Streams,
+    ];
+
+    /// The wire name of the type, for example `"Classic"`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Consumer => "Consumer",
+            Self::Classic => "Classic",
+            Self::Share => "Share",
+            Self::Streams => "Streams",
+        }
+    }
+
+    /// Reads a type name without regard to case. A name that the client does
+    /// not know gives [`GroupType::Unknown`], as Kafka's `GroupType.parse`
+    /// does.
+    #[must_use]
+    pub fn parse(name: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|group_type| group_type.as_str().eq_ignore_ascii_case(name))
+            .unwrap_or(Self::Unknown)
+    }
+}
+
+impl std::fmt::Display for GroupType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The options of [`AdminClient::list_groups`], as Apache Kafka's
+/// `ListGroupsOptions` holds them. An empty set does not filter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListGroupsOptions {
+    /// The broker lists only groups in these states (`states_filter`).
+    pub group_states: BTreeSet<GroupState>,
+    /// The broker lists only groups of these types (`types_filter`).
+    pub types: BTreeSet<GroupType>,
+    /// The client keeps only groups with these protocol types.
+    pub protocol_types: BTreeSet<String>,
+}
+
+impl ListGroupsOptions {
+    /// Classic and consumer groups with the `consumer` protocol type or no
+    /// protocol type, as Kafka's `ListGroupsOptions.forConsumerGroups` selects.
+    #[must_use]
+    pub fn for_consumer_groups() -> Self {
+        Self {
+            group_states: BTreeSet::new(),
+            types: BTreeSet::from([GroupType::Classic, GroupType::Consumer]),
+            protocol_types: BTreeSet::from([String::new(), "consumer".to_owned()]),
+        }
+    }
+
+    /// Share groups, as Kafka's `ListGroupsOptions.forShareGroups` selects.
+    #[must_use]
+    pub fn for_share_groups() -> Self {
+        Self {
+            types: BTreeSet::from([GroupType::Share]),
+            ..Self::default()
+        }
+    }
+
+    /// Streams groups, as Kafka's `ListGroupsOptions.forStreamsGroups`
+    /// selects.
+    #[must_use]
+    pub fn for_streams_groups() -> Self {
+        Self {
+            types: BTreeSet::from([GroupType::Streams]),
+            ..Self::default()
+        }
+    }
+}
+
+/// One group of [`AdminClient::list_groups`], as Apache Kafka's
+/// `GroupListing` holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupListing {
+    pub group_id: String,
+    /// `None` when the broker sends no type (`ListGroups` v4 or lower).
+    pub group_type: Option<GroupType>,
+    /// The protocol type, for example `"consumer"`. Empty for a simple
+    /// consumer group.
+    pub protocol_type: String,
+    /// `None` when the broker sends no state (`ListGroups` v3 or lower).
+    pub group_state: Option<GroupState>,
+}
+
+impl GroupListing {
+    /// Whether the group is a classic group with no protocol type, as Kafka's
+    /// `GroupListing.isSimpleConsumerGroup` decides.
+    #[must_use]
+    pub fn is_simple_consumer_group(&self) -> bool {
+        self.group_type == Some(GroupType::Classic) && self.protocol_type.is_empty()
+    }
+}
+
+impl From<ListedGroup> for GroupListing {
+    fn from(group: ListedGroup) -> Self {
+        Self {
+            group_type: (!group.group_type.is_empty()).then(|| GroupType::parse(&group.group_type)),
+            group_state: (!group.group_state.is_empty())
+                .then(|| GroupState::parse(&group.group_state)),
+            group_id: group.group_id,
+            protocol_type: group.protocol_type,
+        }
+    }
+}
+
+/// The failure of `ListGroups` on one broker.
+///
+/// Kafka's `listGroups` puts one exception for each failed broker in
+/// `ListGroupsResult.errors`. `error` holds the Kafka error code of that
+/// exception, as Kafka's `ApiError.fromThrowable` gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListGroupsError {
+    pub node_id: i32,
+    pub host: String,
+    pub port: i32,
+    pub error: KafkaError,
+}
+
+/// The result of [`AdminClient::list_groups`], as Apache Kafka's
+/// `ListGroupsResult` holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListGroupsResult {
+    /// The groups of every broker that answered, one entry for each group
+    /// id, in group id order.
+    pub valid: Vec<GroupListing>,
+    /// One entry for each broker that failed, in metadata order.
+    pub errors: Vec<ListGroupsError>,
+}
+
+impl ListGroupsResult {
+    /// The groups when no broker failed, as Kafka's `ListGroupsResult.all`
+    /// gives them.
+    ///
+    /// # Errors
+    /// Returns the first broker failure.
+    pub fn all(self) -> Result<Vec<GroupListing>, ListGroupsError> {
+        match self.errors.into_iter().next() {
+            Some(error) => Err(error),
+            None => Ok(self.valid),
+        }
+    }
 }
 
 impl AdminClient {
@@ -93,23 +341,136 @@ impl AdminClient {
             .collect())
     }
 
-    /// Returns the group-id of every consumer group known to the broker.
+    /// Lists the groups of the whole cluster, as Apache Kafka's
+    /// `KafkaAdminClient.listGroups` does.
+    ///
+    /// A broker lists only the groups that it coordinates. The call first
+    /// sends `Metadata` to find every broker. It then sends `ListGroups` to
+    /// each broker at the same time, on a new connection, and merges the
+    /// answers:
+    ///
+    /// - The result has one [`GroupListing`] for each group id. A group that
+    ///   two brokers list appears once.
+    /// - A broker that fails gives one [`ListGroupsError`]. The groups of the
+    ///   other brokers stay in [`ListGroupsResult::valid`].
+    /// - `COORDINATOR_LOAD_IN_PROGRESS` (14) and `COORDINATOR_NOT_AVAILABLE`
+    ///   (15) make the call send `ListGroups` to that broker again. A failed
+    ///   connection or a lost connection also makes the call try again. The
+    ///   call stops when Kafka's default `default.api.timeout.ms` (60 s)
+    ///   elapses, and then reports the last error for the broker.
+    /// - A filter that the broker version does not support gives
+    ///   `UNSUPPORTED_VERSION` (35) for that broker. `states_filter` needs
+    ///   `ListGroups` v4 (KIP-518) and `types_filter` needs v5 (KIP-848).
+    ///   Below v5, the call omits a type filter that holds `Classic`, and
+    ///   `Consumer` at most, as Kafka's `ListGroupsRequest.Builder.build`
+    ///   does.
+    /// - [`ListGroupsOptions::protocol_types`] filters on the client.
     ///
     /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
-    pub async fn list_groups(&mut self) -> Result<Vec<String>, AdminError> {
-        // Default request lists every group (empty state/type filters).
-        let req = ListGroupsRequest::default();
-        let resp = self.conn.send(req).await?;
-        if resp.error_code != 0 {
-            return Err(AdminError::Broker {
-                api: "ListGroups",
-                code: resp.error_code,
-                name: kafka_error_name(resp.error_code),
-                message: None,
-            });
+    /// Returns an error when the `Metadata` request fails, or when the
+    /// metadata names no broker after the timeout. A failure on one broker is
+    /// an entry in [`ListGroupsResult::errors`], not an error of the call.
+    pub async fn list_groups(
+        &self,
+        options: &ListGroupsOptions,
+    ) -> Result<ListGroupsResult, AdminError> {
+        self.list_groups_with_retry(options, KAFKA_ADMIN_RETRY)
+            .await
+    }
+
+    async fn list_groups_with_retry(
+        &self,
+        options: &ListGroupsOptions,
+        retry: CoordinatorRetry,
+    ) -> Result<ListGroupsResult, AdminError> {
+        let start = tokio::time::Instant::now();
+        let brokers = self.list_groups_brokers(start, retry).await?;
+        let request = ListGroupsRequest {
+            states_filter: options
+                .group_states
+                .iter()
+                .map(|state| state.as_str().to_owned())
+                .collect(),
+            types_filter: options
+                .types
+                .iter()
+                .map(|group_type| group_type.as_str().to_owned())
+                .collect(),
+            ..Default::default()
+        };
+        let min_version = list_groups_min_version(options);
+        let answers = futures_util::future::join_all(brokers.iter().map(|broker| {
+            list_groups_on_broker(
+                broker,
+                self.options.clone(),
+                request.clone(),
+                min_version,
+                start,
+                retry,
+            )
+        }))
+        .await;
+
+        let mut listings = BTreeMap::new();
+        let mut errors = Vec::new();
+        for (broker, answer) in brokers.into_iter().zip(answers) {
+            match answer {
+                Ok(groups) => {
+                    for group in groups {
+                        if options.protocol_types.is_empty()
+                            || options.protocol_types.contains(&group.protocol_type)
+                        {
+                            let listing = GroupListing::from(group);
+                            listings.insert(listing.group_id.clone(), listing);
+                        }
+                    }
+                }
+                Err(error) => errors.push(ListGroupsError {
+                    node_id: broker.node_id,
+                    host: broker.host,
+                    port: broker.port,
+                    error: list_groups_kafka_error(&error),
+                }),
+            }
         }
-        Ok(resp.groups.into_iter().map(|g| g.group_id).collect())
+        Ok(ListGroupsResult {
+            valid: listings.into_values().collect(),
+            errors,
+        })
+    }
+
+    /// Sends `Metadata` for no topics and returns each broker once. Kafka's
+    /// `listGroups` retries a broker list that is empty
+    /// (`StaleMetadataException`) until the timeout.
+    async fn list_groups_brokers(
+        &self,
+        start: tokio::time::Instant,
+        retry: CoordinatorRetry,
+    ) -> Result<Vec<MetadataResponseBroker>, AdminError> {
+        let mut backoff = retry.initial_backoff;
+        loop {
+            let response = self
+                .conn
+                .send(MetadataRequest {
+                    topics: Some(Vec::new()),
+                    allow_auto_topic_creation: true,
+                    ..Default::default()
+                })
+                .await?;
+            let mut brokers = response.brokers;
+            let mut seen = BTreeSet::new();
+            brokers.retain(|broker| seen.insert(broker.node_id));
+            if !brokers.is_empty() {
+                return Ok(brokers);
+            }
+            if start.elapsed() >= retry.timeout {
+                return Err(AdminError::Protocol(
+                    "failed to find brokers to send ListGroups: metadata has no brokers".to_owned(),
+                ));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+        }
     }
 
     /// Returns `(topic, partition) → committed_offset` for the named group.
@@ -284,6 +645,140 @@ fn offset_fetch_retry_action<T>(result: Result<T, AdminError>) -> RetryAction<T>
             ..
         }) => RetryAction::FindCoordinator(result),
         result => RetryAction::Done(result),
+    }
+}
+
+/// The lowest `ListGroups` version that carries the filters of `options`, as
+/// Kafka's `ListGroupsRequest.Builder.build` requires it.
+///
+/// `states_filter` needs v4. `types_filter` needs v5, except when it holds
+/// `Classic` and `Consumer` at most, with `Classic`. A broker below v5 lists
+/// only classic groups, so the filter can be omitted. The request encoder
+/// omits `types_filter` below v5.
+fn list_groups_min_version(options: &ListGroupsOptions) -> i16 {
+    let types_need_v5 = !options.types.is_empty()
+        && (!options.types.contains(&GroupType::Classic)
+            || options
+                .types
+                .iter()
+                .any(|group_type| !matches!(group_type, GroupType::Classic | GroupType::Consumer)));
+    if types_need_v5 {
+        5
+    } else if options.group_states.is_empty() {
+        list_groups_request::MIN_VERSION
+    } else {
+        4
+    }
+}
+
+/// Sends `ListGroups` to one broker until it answers, as one Kafka
+/// `listGroups` node call does. `COORDINATOR_LOAD_IN_PROGRESS`,
+/// `COORDINATOR_NOT_AVAILABLE`, a failed connection and a lost connection
+/// retry until `retry.timeout` has elapsed since `start`.
+async fn list_groups_on_broker(
+    broker: &MetadataResponseBroker,
+    options: ConnectionOptions,
+    request: ListGroupsRequest,
+    min_version: i16,
+    start: tokio::time::Instant,
+    retry: CoordinatorRetry,
+) -> Result<Vec<ListedGroup>, AdminError> {
+    let host_port = format_host_port(&broker.host, broker.port);
+    let mut backoff = retry.initial_backoff;
+    let mut connection = None;
+    loop {
+        let last = match list_groups_attempt(
+            &mut connection,
+            &host_port,
+            &options,
+            request.clone(),
+            min_version,
+        )
+        .await
+        {
+            RetryAction::Done(result) => return result,
+            RetryAction::SameCoordinator(last) | RetryAction::FindCoordinator(last) => last,
+        };
+        if start.elapsed() >= retry.timeout {
+            return last;
+        }
+        tracing::debug!(
+            node_id = broker.node_id,
+            "ListGroups got a retriable error; retrying"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+    }
+}
+
+/// One `ListGroups` attempt on one broker. The attempt connects first when
+/// `connection` is empty, and empties it after a connection error.
+async fn list_groups_attempt(
+    connection: &mut Option<Connection>,
+    host_port: &str,
+    options: &ConnectionOptions,
+    request: ListGroupsRequest,
+    min_version: i16,
+) -> RetryAction<Vec<ListedGroup>> {
+    let current = match connection {
+        Some(current) => current,
+        None => match AdminClient::connect_one(host_port, options.clone()).await {
+            Ok(new) => connection.insert(new),
+            Err(error) => return RetryAction::SameCoordinator(Err(error)),
+        },
+    };
+    match send_connection_at_least(current, request, min_version).await {
+        Ok(response) => match response.error_code {
+            0 => RetryAction::Done(Ok(response.groups)),
+            code => {
+                let error = Err(AdminError::Broker {
+                    api: "ListGroups",
+                    code,
+                    name: kafka_error_name(code),
+                    message: None,
+                });
+                if matches!(
+                    code,
+                    COORDINATOR_LOAD_IN_PROGRESS | COORDINATOR_NOT_AVAILABLE
+                ) {
+                    RetryAction::SameCoordinator(error)
+                } else {
+                    RetryAction::Done(error)
+                }
+            }
+        },
+        Err(error) if AdminClient::is_retriable_transport_error(&error) => {
+            *connection = None;
+            RetryAction::SameCoordinator(Err(error.into()))
+        }
+        Err(error) => RetryAction::Done(Err(error.into())),
+    }
+}
+
+/// The Kafka error code of a `ListGroups` failure on one broker, as Kafka's
+/// `Errors.forException` maps the exception class.
+fn list_groups_kafka_error(error: &AdminError) -> KafkaError {
+    const UNKNOWN_SERVER_ERROR: i16 = -1;
+    const REQUEST_TIMED_OUT: i16 = 7;
+    const NETWORK_EXCEPTION: i16 = 13;
+    const UNSUPPORTED_VERSION: i16 = 35;
+    let (code, message) = match error {
+        AdminError::Broker { code, message, .. } => (*code, message.clone()),
+        AdminError::Transport(ClientError::IncompatibleVersion { .. }) => {
+            (UNSUPPORTED_VERSION, Some(error.to_string()))
+        }
+        AdminError::Transport(ClientError::Timeout(_)) => {
+            (REQUEST_TIMED_OUT, Some(error.to_string()))
+        }
+        AdminError::Transport(
+            ClientError::Connect { .. } | ClientError::Disconnected | ClientError::Io(_),
+        ) => (NETWORK_EXCEPTION, Some(error.to_string())),
+        _ => (UNKNOWN_SERVER_ERROR, Some(error.to_string())),
+    };
+    KafkaError {
+        code,
+        name: kafka_error_name(code),
+        message,
     }
 }
 
@@ -499,6 +994,7 @@ mod tests {
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             find_coordinator_request,
             find_coordinator_response::FindCoordinatorResponse,
+            list_groups_response::ListGroupsResponse,
             metadata_request,
             metadata_response::MetadataResponse,
             offset_commit_response::{OffsetCommitResponsePartition, OffsetCommitResponseTopic},
@@ -1311,5 +1807,550 @@ mod tests {
         assert!(fetched == BTreeMap::from([(("orders".into(), 2), 41)]));
         bootstrap.stop();
         coordinator.stop();
+    }
+
+    /// The answer of a mock broker to one `ListGroups` request.
+    #[derive(Clone)]
+    enum ListGroupsAnswer {
+        /// The groups that the broker coordinates. The broker applies the
+        /// state and type filters of the request.
+        Groups(Vec<ListedGroup>),
+        /// A top-level error code.
+        Error(i16),
+    }
+
+    /// One mock broker of a `ListGroups` case: its highest `ListGroups`
+    /// version, and its answers, one per request. The last answer repeats.
+    #[derive(Clone)]
+    struct ListGroupsBroker {
+        max_version: i16,
+        answers: Vec<ListGroupsAnswer>,
+    }
+
+    fn listed(group_id: &str, protocol_type: &str, state: &str, group_type: &str) -> ListedGroup {
+        ListedGroup {
+            group_id: group_id.into(),
+            protocol_type: protocol_type.into(),
+            group_state: state.into(),
+            group_type: group_type.into(),
+            ..Default::default()
+        }
+    }
+
+    fn consumer_group(group_id: &str) -> ListedGroup {
+        listed(group_id, "consumer", "Stable", "Classic")
+    }
+
+    fn stable_listing(group_id: &str) -> GroupListing {
+        GroupListing {
+            group_id: group_id.into(),
+            group_type: Some(GroupType::Classic),
+            protocol_type: "consumer".into(),
+            group_state: Some(GroupState::Stable),
+        }
+    }
+
+    fn groups(ids: &[&str]) -> ListGroupsBroker {
+        ListGroupsBroker {
+            max_version: 5,
+            answers: vec![ListGroupsAnswer::Groups(
+                ids.iter().map(|id| consumer_group(id)).collect(),
+            )],
+        }
+    }
+
+    /// A mock broker that answers `Metadata` with every address in `cluster`
+    /// (node ids from 1) and `ListGroups` from `script`. It records each
+    /// `ListGroups` request with its version.
+    async fn list_groups_broker(
+        script: ListGroupsBroker,
+        cluster: Arc<Mutex<Vec<std::net::SocketAddr>>>,
+        requests: Arc<Mutex<Vec<(i16, ListGroupsRequest)>>>,
+    ) -> MockBroker {
+        MockBroker::start(move |api_key, version, _, body| match api_key {
+            api_versions_request::API_KEY => Some(encode(
+                &ApiVersionsResponse {
+                    api_keys: vec![
+                        ApiVersion {
+                            api_key: api_versions_request::API_KEY,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: metadata_request::API_KEY,
+                            min_version: 12,
+                            max_version: 12,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: list_groups_request::API_KEY,
+                            max_version: script.max_version,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                0,
+                false,
+            )),
+            metadata_request::API_KEY => Some(encode(
+                &MetadataResponse {
+                    brokers: cluster
+                        .lock()
+                        .expect("cluster lock")
+                        .iter()
+                        .zip(1..)
+                        .map(|(addr, node_id)| MetadataResponseBroker {
+                            node_id,
+                            host: addr.ip().to_string(),
+                            port: i32::from(addr.port()),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                version,
+                true,
+            )),
+            list_groups_request::API_KEY => {
+                let request: ListGroupsRequest = decode_request(body, version);
+                let mut requests = requests.lock().expect("requests lock");
+                let answer = &script.answers[requests.len().min(script.answers.len() - 1)];
+                let response = match answer {
+                    ListGroupsAnswer::Groups(groups) => ListGroupsResponse {
+                        groups: groups
+                            .iter()
+                            .filter(|group| {
+                                (request.states_filter.is_empty()
+                                    || request.states_filter.contains(&group.group_state))
+                                    && (request.types_filter.is_empty()
+                                        || request.types_filter.contains(&group.group_type))
+                            })
+                            .cloned()
+                            .collect(),
+                        ..Default::default()
+                    },
+                    ListGroupsAnswer::Error(error_code) => ListGroupsResponse {
+                        error_code: *error_code,
+                        ..Default::default()
+                    },
+                };
+                requests.push((version, request));
+                Some(encode(
+                    &response,
+                    version,
+                    version >= list_groups_request::FLEXIBLE_MIN,
+                ))
+            }
+            _ => None,
+        })
+        .await
+    }
+
+    /// An expected broker failure: node id, error code and message.
+    type ExpectedError = (i32, i16, Option<String>);
+
+    /// One `ListGroups` fan-out case on a cluster of three mock brokers.
+    struct ListGroupsCase {
+        name: &'static str,
+        brokers: [ListGroupsBroker; 3],
+        options: ListGroupsOptions,
+        timeout: Duration,
+        valid: Vec<GroupListing>,
+        errors: Vec<ExpectedError>,
+        /// The `ListGroups` requests that each broker receives.
+        requests: [Vec<(i16, ListGroupsRequest)>; 3],
+    }
+
+    const LONG: Duration = Duration::from_secs(5);
+    const NOW: Duration = Duration::ZERO;
+
+    fn plain(version: i16) -> (i16, ListGroupsRequest) {
+        (version, ListGroupsRequest::default())
+    }
+
+    fn stable(version: i16) -> (i16, ListGroupsRequest) {
+        (
+            version,
+            ListGroupsRequest {
+                states_filter: vec!["Stable".into()],
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The request for the type filter `Classic` and `Consumer`. The encoder
+    /// omits `types_filter` below v5.
+    fn classic_and_consumer(version: i16) -> (i16, ListGroupsRequest) {
+        (
+            version,
+            ListGroupsRequest {
+                types_filter: if version >= 5 {
+                    vec!["Consumer".into(), "Classic".into()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    fn consumer_type(version: i16) -> (i16, ListGroupsRequest) {
+        (
+            version,
+            ListGroupsRequest {
+                types_filter: vec!["Consumer".into()],
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The message of a `ListGroups` version error on a broker with
+    /// `ListGroups` v0 to `broker_max`.
+    fn unsupported(broker_max: i16, client_min: i16) -> String {
+        AdminError::Transport(ClientError::IncompatibleVersion {
+            api_key: list_groups_request::API_KEY,
+            broker_min: 0,
+            broker_max,
+            client_min,
+            client_max: 5,
+        })
+        .to_string()
+    }
+
+    fn states(states: &[GroupState]) -> ListGroupsOptions {
+        ListGroupsOptions {
+            group_states: states.iter().copied().collect(),
+            ..ListGroupsOptions::default()
+        }
+    }
+
+    fn types(types: &[GroupType]) -> ListGroupsOptions {
+        ListGroupsOptions {
+            types: types.iter().copied().collect(),
+            ..ListGroupsOptions::default()
+        }
+    }
+
+    fn broker_error(code: i16) -> ListGroupsBroker {
+        ListGroupsBroker {
+            max_version: 5,
+            answers: vec![ListGroupsAnswer::Error(code)],
+        }
+    }
+
+    fn below(max_version: i16, ids: &[&str]) -> ListGroupsBroker {
+        ListGroupsBroker {
+            max_version,
+            ..groups(ids)
+        }
+    }
+
+    /// Runs `case` on a new cluster of three mock brokers. Broker 1 is the
+    /// bootstrap broker.
+    async fn run_list_groups_case(case: ListGroupsCase) {
+        let cluster = Arc::new(Mutex::new(Vec::new()));
+        let mut brokers = Vec::new();
+        let mut requests = Vec::new();
+        for script in case.brokers {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            brokers.push(list_groups_broker(script, Arc::clone(&cluster), Arc::clone(&sent)).await);
+            requests.push(sent);
+        }
+        *cluster.lock().expect("cluster lock") = brokers.iter().map(|broker| broker.addr).collect();
+        let admin = AdminClient::connect(&[brokers[0].addr.to_string()])
+            .await
+            .expect("admin connects");
+
+        let result = admin
+            .list_groups_with_retry(
+                &case.options,
+                CoordinatorRetry {
+                    timeout: case.timeout,
+                    initial_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(1),
+                },
+            )
+            .await
+            .expect("list_groups succeeds");
+
+        let expected = ListGroupsResult {
+            valid: case.valid,
+            errors: case
+                .errors
+                .into_iter()
+                .map(|(node_id, code, message)| {
+                    let addr = brokers[usize::try_from(node_id - 1).expect("node id")].addr;
+                    ListGroupsError {
+                        node_id,
+                        host: addr.ip().to_string(),
+                        port: i32::from(addr.port()),
+                        error: KafkaError {
+                            code,
+                            name: kafka_error_name(code),
+                            message,
+                        },
+                    }
+                })
+                .collect(),
+        };
+        for broker in brokers {
+            broker.stop();
+        }
+        let requests = requests
+            .iter()
+            .map(|sent| sent.lock().expect("requests lock").clone())
+            .collect::<Vec<_>>();
+        let name = case.name;
+        assert!(
+            (result, requests) == (expected, case.requests.to_vec()),
+            "case {name}"
+        );
+    }
+
+    /// Apache Kafka's `KafkaAdminClient.listGroups` sends `Metadata`, then
+    /// `ListGroups` to every broker, and merges the answers: one listing per
+    /// group id, and one error per failed broker. It retries 14 and 15 on the
+    /// broker until the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_groups_asks_every_broker_and_merges() {
+        for case in [
+            ListGroupsCase {
+                name: "one group on each broker",
+                brokers: [groups(&["a"]), groups(&["b"]), groups(&["c"])],
+                options: ListGroupsOptions::default(),
+                timeout: LONG,
+                valid: vec![
+                    stable_listing("a"),
+                    stable_listing("b"),
+                    stable_listing("c"),
+                ],
+                errors: Vec::new(),
+                requests: [vec![plain(5)], vec![plain(5)], vec![plain(5)]],
+            },
+            ListGroupsCase {
+                name: "broker 2 has no groups",
+                brokers: [groups(&["a"]), groups(&[]), groups(&["c"])],
+                options: ListGroupsOptions::default(),
+                timeout: LONG,
+                valid: vec![stable_listing("a"), stable_listing("c")],
+                errors: Vec::new(),
+                requests: [vec![plain(5)], vec![plain(5)], vec![plain(5)]],
+            },
+            ListGroupsCase {
+                name: "a group on two brokers is listed once",
+                brokers: [groups(&["a"]), groups(&["a", "b"]), groups(&["c"])],
+                options: ListGroupsOptions::default(),
+                timeout: LONG,
+                valid: vec![
+                    stable_listing("a"),
+                    stable_listing("b"),
+                    stable_listing("c"),
+                ],
+                errors: Vec::new(),
+                requests: [vec![plain(5)], vec![plain(5)], vec![plain(5)]],
+            },
+            ListGroupsCase {
+                name: "broker 2 answers coordinator not available until the timeout",
+                brokers: [groups(&["a"]), broker_error(15), groups(&["c"])],
+                options: ListGroupsOptions::default(),
+                timeout: NOW,
+                valid: vec![stable_listing("a"), stable_listing("c")],
+                errors: vec![(2, 15, None)],
+                requests: [vec![plain(5)], vec![plain(5)], vec![plain(5)]],
+            },
+            ListGroupsCase {
+                name: "broker 2 answers coordinator load in progress, then its groups",
+                brokers: [
+                    groups(&["a"]),
+                    ListGroupsBroker {
+                        max_version: 5,
+                        answers: vec![
+                            ListGroupsAnswer::Error(14),
+                            ListGroupsAnswer::Error(15),
+                            ListGroupsAnswer::Groups(vec![consumer_group("b")]),
+                        ],
+                    },
+                    groups(&["c"]),
+                ],
+                options: ListGroupsOptions::default(),
+                timeout: LONG,
+                valid: vec![
+                    stable_listing("a"),
+                    stable_listing("b"),
+                    stable_listing("c"),
+                ],
+                errors: Vec::new(),
+                requests: [
+                    vec![plain(5)],
+                    vec![plain(5), plain(5), plain(5)],
+                    vec![plain(5)],
+                ],
+            },
+            ListGroupsCase {
+                name: "broker 2 answers cluster authorization failed",
+                brokers: [groups(&["a"]), broker_error(31), groups(&["c"])],
+                options: ListGroupsOptions::default(),
+                timeout: LONG,
+                valid: vec![stable_listing("a"), stable_listing("c")],
+                errors: vec![(2, 31, None)],
+                requests: [vec![plain(5)], vec![plain(5)], vec![plain(5)]],
+            },
+        ] {
+            run_list_groups_case(case).await;
+        }
+    }
+
+    /// Kafka's `listGroups` sends the state and type filters to every broker,
+    /// and filters protocol types on the client. `ListGroupsRequest.Builder.build`
+    /// rejects a state filter below v4 and a type filter below v5, except a
+    /// type filter of `Classic` and `Consumer` at most, with `Classic`, which
+    /// it omits. The rejection is an error for that broker only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_groups_sends_filters_as_kafka_does() {
+        for case in [
+            ListGroupsCase {
+                name: "state filter Stable is sent to every broker",
+                brokers: [
+                    ListGroupsBroker {
+                        max_version: 5,
+                        answers: vec![ListGroupsAnswer::Groups(vec![
+                            listed("a", "consumer", "Empty", "Classic"),
+                            consumer_group("b"),
+                        ])],
+                    },
+                    groups(&["c"]),
+                    groups(&[]),
+                ],
+                options: states(&[GroupState::Stable]),
+                timeout: LONG,
+                valid: vec![stable_listing("b"), stable_listing("c")],
+                errors: Vec::new(),
+                requests: [vec![stable(5)], vec![stable(5)], vec![stable(5)]],
+            },
+            ListGroupsCase {
+                name: "state filter on a broker below v4 is unsupported on that broker",
+                brokers: [groups(&["a"]), below(3, &["b"]), groups(&["c"])],
+                options: states(&[GroupState::Stable]),
+                timeout: LONG,
+                valid: vec![stable_listing("a"), stable_listing("c")],
+                errors: vec![(2, 35, Some(unsupported(3, 4)))],
+                requests: [vec![stable(5)], Vec::new(), vec![stable(5)]],
+            },
+            ListGroupsCase {
+                name: "type filter Consumer on a broker below v5 is unsupported on that broker",
+                brokers: [groups(&["a"]), below(4, &["b"]), groups(&["c"])],
+                options: types(&[GroupType::Consumer]),
+                timeout: LONG,
+                valid: Vec::new(),
+                errors: vec![(2, 35, Some(unsupported(4, 5)))],
+                requests: [vec![consumer_type(5)], Vec::new(), vec![consumer_type(5)]],
+            },
+            ListGroupsCase {
+                name: "type filter Classic and Consumer on a broker below v5 is omitted",
+                brokers: [groups(&["a"]), below(4, &["b"]), groups(&["c"])],
+                options: types(&[GroupType::Classic, GroupType::Consumer]),
+                timeout: LONG,
+                valid: vec![
+                    stable_listing("a"),
+                    GroupListing {
+                        group_type: None,
+                        ..stable_listing("b")
+                    },
+                    stable_listing("c"),
+                ],
+                errors: Vec::new(),
+                requests: [
+                    vec![classic_and_consumer(5)],
+                    vec![classic_and_consumer(4)],
+                    vec![classic_and_consumer(5)],
+                ],
+            },
+            ListGroupsCase {
+                name: "protocol type filter is applied by the client",
+                brokers: [
+                    ListGroupsBroker {
+                        max_version: 5,
+                        answers: vec![ListGroupsAnswer::Groups(vec![
+                            consumer_group("a"),
+                            listed("connect-a", "connect", "Stable", "Classic"),
+                            listed("simple", "", "Empty", "Classic"),
+                        ])],
+                    },
+                    groups(&[]),
+                    ListGroupsBroker {
+                        max_version: 5,
+                        answers: vec![ListGroupsAnswer::Groups(vec![listed(
+                            "share", "share", "Stable", "Share",
+                        )])],
+                    },
+                ],
+                options: ListGroupsOptions::for_consumer_groups(),
+                timeout: LONG,
+                valid: vec![
+                    stable_listing("a"),
+                    GroupListing {
+                        group_id: "simple".into(),
+                        group_type: Some(GroupType::Classic),
+                        protocol_type: String::new(),
+                        group_state: Some(GroupState::Empty),
+                    },
+                ],
+                errors: Vec::new(),
+                requests: [
+                    vec![classic_and_consumer(5)],
+                    vec![classic_and_consumer(5)],
+                    vec![classic_and_consumer(5)],
+                ],
+            },
+        ] {
+            run_list_groups_case(case).await;
+        }
+    }
+
+    /// Kafka's `GroupListing` has no type or state when the broker sends an
+    /// empty name, and `GroupState.parse` and `GroupType.parse` ignore case
+    /// and map an unknown name to `Unknown`.
+    #[test]
+    fn group_listing_reads_listed_group() {
+        for (group, expected) in [
+            (
+                listed("g", "consumer", "Stable", "Consumer"),
+                GroupListing {
+                    group_id: "g".into(),
+                    group_type: Some(GroupType::Consumer),
+                    protocol_type: "consumer".into(),
+                    group_state: Some(GroupState::Stable),
+                },
+            ),
+            (
+                listed("g", "", "", ""),
+                GroupListing {
+                    group_id: "g".into(),
+                    group_type: None,
+                    protocol_type: String::new(),
+                    group_state: None,
+                },
+            ),
+            (
+                listed("g", "consumer", "preparingrebalance", "STREAMS"),
+                GroupListing {
+                    group_id: "g".into(),
+                    group_type: Some(GroupType::Streams),
+                    protocol_type: "consumer".into(),
+                    group_state: Some(GroupState::PreparingRebalance),
+                },
+            ),
+            (
+                listed("g", "consumer", "Rebalancing", "Future"),
+                GroupListing {
+                    group_id: "g".into(),
+                    group_type: Some(GroupType::Unknown),
+                    protocol_type: "consumer".into(),
+                    group_state: Some(GroupState::Unknown),
+                },
+            ),
+        ] {
+            assert!(GroupListing::from(group) == expected);
+        }
     }
 }

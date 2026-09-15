@@ -1358,9 +1358,11 @@ pub(crate) const NOT_CONTROLLER: i16 = 41;
 /// surfaces today. Unknown codes serialize as `"UNKNOWN"`.
 pub(crate) fn kafka_error_name(code: i16) -> &'static str {
     match code {
+        -1 => "UNKNOWN_SERVER_ERROR",
         0 => "NONE",
         3 => "UNKNOWN_TOPIC_OR_PARTITION",
         7 => "REQUEST_TIMED_OUT",
+        13 => "NETWORK_EXCEPTION",
         14 => "COORDINATOR_LOAD_IN_PROGRESS",
         15 => "COORDINATOR_NOT_AVAILABLE",
         16 => "NOT_COORDINATOR",
@@ -1809,10 +1811,12 @@ mod tests {
         // list is exhaustive on purpose: a sampled table lets a deleted arm
         // pass unnoticed, and a wrong name sends an operator to the wrong
         // cause.
-        let cases: [(i16, &str); 38] = [
+        let cases: [(i16, &str); 40] = [
+            (-1, "UNKNOWN_SERVER_ERROR"),
             (0, "NONE"),
             (3, "UNKNOWN_TOPIC_OR_PARTITION"),
             (7, "REQUEST_TIMED_OUT"),
+            (13, "NETWORK_EXCEPTION"),
             (14, "COORDINATOR_LOAD_IN_PROGRESS"),
             (15, "COORDINATOR_NOT_AVAILABLE"),
             (16, "NOT_COORDINATOR"),
@@ -1854,7 +1858,7 @@ mod tests {
             assert2::assert!(kafka_error_name(code) == name, "code {code}");
         }
         assert2::assert!(kafka_error_name(i16::MAX) == "UNKNOWN");
-        assert2::assert!(kafka_error_name(-1) == "UNKNOWN");
+        assert2::assert!(kafka_error_name(-2) == "UNKNOWN");
     }
 
     #[test]
