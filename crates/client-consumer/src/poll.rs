@@ -77,7 +77,7 @@ fn is_read_committed(isolation_level: IsolationLevel) -> bool {
     isolation_level == IsolationLevel::ReadCommitted
 }
 
-fn is_transient_transport_error(e: &krabka_client_core::ClientError) -> bool {
+pub(crate) fn is_transient_transport_error(e: &krabka_client_core::ClientError) -> bool {
     matches!(
         e,
         krabka_client_core::ClientError::Connect { .. }
@@ -332,9 +332,9 @@ impl Drop for Fetches {
 const FETCH_SESSION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `ListOffsets` timestamp that asks for the log end offset.
-const LATEST_TIMESTAMP: i64 = -1;
+pub(crate) const LATEST_TIMESTAMP: i64 = -1;
 /// `ListOffsets` timestamp that asks for the log start offset.
-const EARLIEST_TIMESTAMP: i64 = -2;
+pub(crate) const EARLIEST_TIMESTAMP: i64 = -2;
 
 /// Placeholder for "reset with `ListOffsets`", resolved before the next Fetch:
 /// the log end, or the offset for the timestamp of `by_duration`.
@@ -434,7 +434,7 @@ fn build_offsets_request(
 /// with `ClientError::IncompatibleVersion` before the request goes out.
 /// Kafka fails with `UnsupportedVersionException` in that case.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ReadCommittedListOffsets(ListOffsetsRequest);
+pub(crate) struct ReadCommittedListOffsets(pub(crate) ListOffsetsRequest);
 
 impl Encode for ReadCommittedListOffsets {
     fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {

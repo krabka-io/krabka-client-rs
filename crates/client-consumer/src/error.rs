@@ -35,6 +35,15 @@ pub enum ConsumerError {
     #[error("illegal state: {0}")]
     IllegalState(String),
 
+    /// An argument of a call is not valid. Kafka's `IllegalArgumentException`.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// The broker answered `INVALID_TOPIC_EXCEPTION` for the topic. Kafka's
+    /// `InvalidTopicException`.
+    #[error("topic '{0}' is invalid")]
+    InvalidTopic(String),
+
     /// A call did not complete before its timeout. Kafka's
     /// `TimeoutException`.
     #[error("timeout: {0}")]

@@ -89,6 +89,7 @@ mod offset_wire;
 mod partition_state;
 mod poll;
 mod position;
+mod queries;
 mod rebalance_listener;
 mod seek;
 mod share;
@@ -108,6 +109,7 @@ pub use consumer::{
 };
 pub use error::ConsumerError;
 pub use group_metadata::ConsumerGroupMetadata;
+pub use queries::{Node, OffsetAndTimestamp, PartitionInfo};
 pub use rebalance_listener::{ConsumerRebalanceListener, RebalanceListenerError};
 pub use share::{
     DEFAULT_SHARE_CONSUMER_FETCH_MAX, DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS,

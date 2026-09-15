@@ -309,7 +309,7 @@ fn classify_group_error(code: i16) -> OffsetFetchAction {
 
 /// Whether Apache Kafka's `common/protocol/Errors` maps `code` to an exception
 /// that extends `RetriableException`.
-fn is_retriable_error(code: i16) -> bool {
+pub(crate) fn is_retriable_error(code: i16) -> bool {
     matches!(
         code,
         2 | 3
