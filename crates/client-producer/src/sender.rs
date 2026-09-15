@@ -3498,6 +3498,18 @@ mod harness {
         }
     }
 
+    /// A policy where a batch that failed its first send expires in its retry
+    /// slot: the delivery timeout (300 ms) ends during the retry backoff (1 s).
+    fn expiry_policy(mode: BatchMode) -> HarnessPolicy {
+        HarnessPolicy {
+            delivery_timeout: millis(300),
+            retry_backoff: secs(1),
+            retry_backoff_max: secs(1),
+            mode,
+            ..HarnessPolicy::default()
+        }
+    }
+
     fn spawn_sender_policy(transport: Arc<MockTransport>, policy: HarnessPolicy) -> Harness {
         let HarnessPolicy {
             max_in_flight,
@@ -5467,22 +5479,19 @@ mod harness {
     /// The same rule for a batch that reached the delivery timeout with no
     /// broker code at all: the abortable slot stores that the transaction
     /// timed out, since there is no code to report.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    ///
+    /// The clock is paused, so the first send happens before the delivery
+    /// timeout, and the batch expires in its retry slot during the backoff.
+    /// With a running clock and a 1 ms timeout, a loaded machine let the batch
+    /// expire in the accumulator before its first send (#95).
+    #[tokio::test(start_paused = true)]
     async fn a_transactional_batch_that_times_out_sets_the_abortable_timeout() {
         let transport = MockTransport::new(Duration::ZERO);
         transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
-        let h = spawn_sender_full(
-            transport.clone(),
-            1,
-            millis(1),
-            i32::MAX,
-            millis(1),
-            Acks::All,
-            BatchMode::Transactional,
-        );
+        let h = spawn_sender_policy(transport.clone(), expiry_policy(BatchMode::Transactional));
 
         let ack = produce_burst(&h, "t", 0, 1).await.pop().expect("ack");
-        let error = tokio::time::timeout(Duration::from_secs(1), ack)
+        let error = tokio::time::timeout(Duration::from_secs(5), ack)
             .await
             .expect("ack resolves")
             .expect("sender remains")
@@ -5571,14 +5580,17 @@ mod harness {
     /// Kafka's `Sender.sendProducerData` fails an expired batch with a
     /// timeout and raises the epoch of an idempotent producer. It does not
     /// fence.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    ///
+    /// The clock is paused, so the batch expires after its first send, during
+    /// the retry backoff (#95).
+    #[tokio::test(start_paused = true)]
     async fn reached_delivery_timeout_fails_the_batch_and_bumps_the_epoch() {
         let transport = MockTransport::new(Duration::ZERO);
         transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
-        let h = spawn_sender_with_policy(transport.clone(), 1, millis(1), i32::MAX, millis(1));
+        let h = spawn_sender_policy(transport.clone(), expiry_policy(BatchMode::Idempotent));
 
         let ack = produce_burst(&h, "t", 0, 1).await.pop().expect("ack");
-        let error = tokio::time::timeout(Duration::from_secs(1), ack)
+        let error = tokio::time::timeout(Duration::from_secs(5), ack)
             .await
             .expect("ack resolves")
             .expect("sender remains")
@@ -6155,7 +6167,17 @@ mod harness {
     async fn retry_slot_transactional_batch_is_failed_after_recovery_without_resend() {
         let transport = MockTransport::new(Duration::ZERO);
         transport.fail_once_on(0);
-        let h = spawn_sender_with(transport.clone(), 1, secs(30));
+        // The retry backoff is longer than the test, so the failed batch stays
+        // in its retry slot until the recovery below. With a 1 ms backoff the
+        // sender could resend it first on a loaded machine.
+        let h = spawn_sender_policy(
+            transport.clone(),
+            HarnessPolicy {
+                retry_backoff: secs(30),
+                retry_backoff_max: secs(30),
+                ..HarnessPolicy::default()
+            },
+        );
         let accumulator = Arc::new(Mutex::new(Accumulator::new(1024)));
         h.accumulators
             .insert(("t".to_string(), 0), Arc::clone(&accumulator));
@@ -6176,11 +6198,7 @@ mod harness {
         tokio::time::timeout(Duration::from_secs(3), initial_send)
             .await
             .expect("transactional batch should reach the controlled transport failure");
-        assert_eq!(
-            transport.send_count(),
-            1,
-            "initial send must fail exactly once"
-        );
+        let sends_before_recovery = transport.send_count();
 
         // Mirror successful reinitialization: the epoch generation advances and
         // the recovery barrier is lifted before the sender examines its retry slot.
@@ -6195,15 +6213,16 @@ mod harness {
         let acknowledgement = tokio::time::timeout(Duration::from_secs(3), rx)
             .await
             .expect("recovery must resolve retry-slot acknowledgement")
-            .expect("acknowledgement channel remains connected");
-        assert!(matches!(
-            acknowledgement,
-            Err(ProducerError::RecoveryRequired)
-        ));
-        assert_eq!(
-            transport.send_count(),
-            1,
-            "a retry-slot batch from the old generation must not resend"
+            .expect("acknowledgement channel remains connected")
+            .map(drop)
+            .map_err(|error| error.to_string());
+        // One failed send, and no resend of the batch from the old generation.
+        assert2::assert!(
+            (
+                sends_before_recovery,
+                acknowledgement,
+                transport.send_count()
+            ) == (1, Err(ProducerError::RecoveryRequired.to_string()), 1)
         );
 
         shutdown(h).await;
