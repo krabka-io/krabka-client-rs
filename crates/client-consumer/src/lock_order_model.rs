@@ -51,9 +51,10 @@
 //! - `apply_pending_seeks` (seek.rs): PS fast-path probe (released) → A
 //!   `assigned.clone()` (released) → **PS → N → P** held together, all released
 //!   at scope end. Region edges: PS→N, N→P.
-//! - `resolve_latest_sentinels` (poll.rs): **N alone**, held across a
-//!   `ListOffsets` `.await`. The region takes no second lock, so it cannot be
-//!   half of a cycle. Modeled as N-alone.
+//! - `resolve_latest_sentinels` (poll.rs): **N alone** for the sentinel
+//!   snapshot, released; then **P alone** in `list_offsets` for the leader
+//!   routes, released before the `ListOffsets` `.await`; then **N alone** to
+//!   apply the offsets. No region takes a second lock.
 //! - `refresh_leader_epochs` (validate.rs): **P alone** (after the metadata
 //!   `.await`), released; then **T alone** (the tracked `topic_ids` update).
 //! - `validate_positions` (validate.rs): **N→P** snapshot held together,
@@ -66,6 +67,8 @@
 //!   is already locked, positions acquired second"). VERIFIED: there is **no
 //!   P→N inversion** on the post-fetch path. N released before the metadata
 //!   refresh `.await`. Updating the fetched high watermark adds **N→E**.
+//!   After N is released, `recover_out_of_range` takes **P alone** for the
+//!   leader routes, and then **N alone** to apply the log starts.
 //! - `at_log_end` (consumer.rs): **A→N→E**.
 //!
 //! ### coordinator task (`coordinator.rs`)
@@ -203,8 +206,12 @@ fn poll_program() -> Vec<Op> {
         Release(P),
         Release(N),
         Release(PS),
-        // --- resolve_latest_sentinels (poll.rs): N alone, across a
-        //     ListOffsets await; no second lock taken in the region. ---
+        // --- resolve_latest_sentinels (poll.rs): N alone (sentinel
+        //     snapshot), P alone (`list_offsets` routes), N alone (apply). ---
+        Acquire(N),
+        Release(N),
+        Acquire(P),
+        Release(P),
         Acquire(N),
         Release(N),
         // --- refresh_leader_epochs (validate.rs): P alone, then T alone
@@ -239,6 +246,12 @@ fn poll_program() -> Vec<Op> {
         Release(P),
         Acquire(E),
         Release(E),
+        Release(N),
+        // recover_out_of_range (poll.rs), after N is released: P alone
+        // (`list_offsets` routes), then N alone (apply the log starts).
+        Acquire(P),
+        Release(P),
+        Acquire(N),
         Release(N),
     ]
 }

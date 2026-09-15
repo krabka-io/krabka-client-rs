@@ -1,7 +1,7 @@
 //! `Consumer::poll` issues one `Fetch` that covers every assigned partition,
 //! advances next-offsets, and returns the decoded records.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use krabka_ids::LeaderEpoch;
 use krabka_protocol::owned::{
@@ -19,6 +19,7 @@ use crate::{
     builder::{AutoOffsetReset, IsolationLevel},
     consumer::{Consumer, ConsumerRecord, Header},
     error::ConsumerError,
+    position::PartitionPosition,
 };
 
 /// Synthetic leader id that means "leader unknown → use the bootstrap
@@ -192,9 +193,24 @@ const EARLIEST_TIMESTAMP: i64 = -2;
 /// Placeholder for "fetch from the log end", resolved before the next Fetch.
 const LATEST_SENTINEL: i64 = i64::MAX;
 
+/// `ListOffsets` partitions for one broker, by topic:
+/// `(partition, current_leader_epoch)`.
+type ListOffsetsSpecs = BTreeMap<String, Vec<(i32, LeaderEpoch)>>;
+
+/// Build the consumer's `ListOffsets` request for one broker.
+///
+/// Kafka's `ListOffsetsRequest.Builder.forConsumer` sends the consumer's own
+/// isolation level, so a `read_committed` consumer that asks for the latest
+/// offset gets the last stable offset and not the high watermark. The broker
+/// reads `isolation_level` from version 2. The client negotiates the highest
+/// version that both sides support (up to 11), and every broker since Kafka
+/// 0.11 supports version 2. `current_leader_epoch` (KIP-320, version 4) comes
+/// from metadata and is `-1` when the epoch is unknown, as in
+/// `OffsetFetcher.groupListOffsetRequests`.
 fn build_offsets_request(
-    by_topic: HashMap<String, Vec<i32>>,
+    by_topic: ListOffsetsSpecs,
     timestamp: i64,
+    isolation_level: IsolationLevel,
 ) -> ListOffsetsRequest {
     let topics: Vec<ListOffsetsTopic> = by_topic
         .into_iter()
@@ -202,8 +218,10 @@ fn build_offsets_request(
             name,
             partitions: partitions
                 .into_iter()
-                .map(|p| ListOffsetsPartition {
-                    partition_index: p,
+                .map(|(partition_index, leader_epoch)| ListOffsetsPartition {
+                    partition_index,
+                    // Unwrap the leader epoch to the raw wire `int32`.
+                    current_leader_epoch: leader_epoch.get(),
                     timestamp,
                     ..Default::default()
                 })
@@ -213,8 +231,123 @@ fn build_offsets_request(
         .collect();
     ListOffsetsRequest {
         replica_id: -1,
+        isolation_level: isolation_level.wire(),
         topics,
         ..Default::default()
+    }
+}
+
+/// Group `ListOffsets` partitions by the broker that gets the request.
+///
+/// A partition goes to its leader when the leader id is known and the pool
+/// can dial it, and to the bootstrap connection otherwise. That is the rule
+/// that `Consumer::group_fetches` uses for Fetch. Each partition carries the
+/// leader epoch from its position, which is `-1` when metadata has not
+/// reported one.
+fn group_list_offsets(
+    keys: &[(String, i32)],
+    positions: &HashMap<(String, i32), PartitionPosition>,
+    knows_broker: impl Fn(i32) -> bool,
+) -> BTreeMap<i32, ListOffsetsSpecs> {
+    let mut grouped: BTreeMap<i32, ListOffsetsSpecs> = BTreeMap::new();
+    for key in keys {
+        let position = positions.get(key).copied().unwrap_or_default();
+        let leader = fetch_leader_id(position.leader_id, knows_broker(position.leader_id));
+        grouped
+            .entry(leader)
+            .or_default()
+            .entry(key.0.clone())
+            .or_default()
+            .push((key.1, position.leader_epoch));
+    }
+    grouped
+}
+
+/// What the consumer does with one partition row of a `ListOffsets` answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListOffsetsRowAction {
+    /// `NONE` with a known offset: set the position to the offset.
+    Position(i64),
+    /// `TOPIC_AUTHORIZATION_FAILED`: fail the poll.
+    Unauthorized,
+    /// Any other row: keep the position and try again after a metadata
+    /// refresh.
+    Retry,
+}
+
+/// Map a `ListOffsets` partition row to its [`ListOffsetsRowAction`].
+///
+/// Kafka's `OffsetFetcherUtils.handleListOffsetResponse` sets a position only
+/// for `NONE` with an offset other than `-1`. It throws
+/// `TopicAuthorizationException` for `TOPIC_AUTHORIZATION_FAILED`. It retries
+/// every other code, which includes codes that it does not name.
+fn classify_list_offsets_row(error_code: i16, offset: i64) -> ListOffsetsRowAction {
+    match error_code {
+        0 if offset != UNKNOWN_OFFSET => ListOffsetsRowAction::Position(offset),
+        29 /* TOPIC_AUTHORIZATION_FAILED */ => ListOffsetsRowAction::Unauthorized,
+        _ => ListOffsetsRowAction::Retry,
+    }
+}
+
+/// What the consumer takes from the `ListOffsets` answers for a set of
+/// partitions.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ListOffsetsResult {
+    /// The offset for each requested partition that got one.
+    offsets: HashMap<(String, i32), i64>,
+    /// `true` when a requested partition got no offset and must be tried
+    /// again after a metadata refresh.
+    retry: bool,
+    /// The topics that answered `TOPIC_AUTHORIZATION_FAILED`.
+    unauthorized: BTreeSet<String>,
+}
+
+impl ListOffsetsResult {
+    /// Collect the answers for `requested`.
+    ///
+    /// A requested partition that no answer names is retried. An answer with
+    /// an unauthorized row gives no offsets, because Kafka's
+    /// `handleListOffsetResponse` throws for the whole response.
+    fn collect(requested: &[(String, i32)], answers: &[ListOffsetsResponse]) -> Self {
+        let mut result = Self::default();
+        for answer in answers {
+            let mut offsets = HashMap::new();
+            let mut unauthorized = BTreeSet::new();
+            for topic in &answer.topics {
+                for row in &topic.partitions {
+                    match classify_list_offsets_row(row.error_code, row.offset) {
+                        ListOffsetsRowAction::Position(offset) => {
+                            offsets.insert((topic.name.clone(), row.partition_index), offset);
+                        }
+                        ListOffsetsRowAction::Unauthorized => {
+                            unauthorized.insert(topic.name.clone());
+                        }
+                        ListOffsetsRowAction::Retry => {}
+                    }
+                }
+            }
+            if unauthorized.is_empty() {
+                result.offsets.extend(offsets);
+            } else {
+                result.unauthorized.extend(unauthorized);
+            }
+        }
+        result.offsets.retain(|key, _| requested.contains(key));
+        result.retry = requested
+            .iter()
+            .any(|key| !result.offsets.contains_key(key));
+        result
+    }
+
+    /// `Err(TopicAuthorizationFailed)` when a topic was not authorized.
+    fn authorization(&self) -> Result<(), ConsumerError> {
+        if self.unauthorized.is_empty() {
+            Ok(())
+        } else {
+            Err(ConsumerError::TopicAuthorizationFailed(
+                self.unauthorized.clone(),
+            ))
+        }
     }
 }
 
@@ -431,8 +564,8 @@ impl Consumer {
         // RPC, and we must never hold a Mutex guard across an await point.
         drop(offsets);
         tracing::Span::current().record("records", out.len());
-        if !out_of_range.is_empty() {
-            self.recover_out_of_range(&out_of_range).await?;
+        if !out_of_range.is_empty() && self.recover_out_of_range(&out_of_range).await? {
+            refresh_after_processing = true;
         }
         if refresh_after_processing {
             // Best-effort: a NOT_LEADER_OR_FOLLOWER without a current_leader
@@ -521,6 +654,12 @@ impl Consumer {
                     continue;
                 }
                 let next = offsets.get(&(t.clone(), *p)).copied().unwrap_or(0);
+                // A `LATEST_SENTINEL` is a reset that `ListOffsets` did not
+                // resolve yet. Kafka does not fetch a partition that awaits a
+                // reset, and the sentinel is no offset to fetch from.
+                if next == LATEST_SENTINEL {
+                    continue;
+                }
                 let pos = positions.get(&(t.clone(), *p)).copied().unwrap_or_default();
                 // Route to the leader when its id is known AND the pool has a
                 // dialable address for it; otherwise fall back to the bootstrap
@@ -744,7 +883,14 @@ impl Consumer {
     ///
     /// `auto_offset_reset = Latest` plants those sentinels at build time, and
     /// the `OFFSET_OUT_OF_RANGE` arm of the poll loop plants them again. This
-    /// runs in `prepare_poll`, so a sentinel never reaches a Fetch.
+    /// runs in `prepare_poll`. A partition whose row has an error keeps its
+    /// sentinel. `group_fetches` skips it, and the metadata refresh that
+    /// `prepare_poll` does next lets the next poll try again.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TopicAuthorizationFailed` when the broker does not authorize
+    /// a topic, and a transport error that is not transient.
     #[tracing::instrument(
         name = "consumer.resolve_latest_sentinels",
         level = "debug",
@@ -753,26 +899,69 @@ impl Consumer {
         err
     )]
     async fn resolve_latest_sentinels(&self) -> Result<(), ConsumerError> {
-        let mut offsets = self.next_offsets.lock().await;
-        let sentinels = keys_at(&offsets, LATEST_SENTINEL);
+        let sentinels = keys_at(&*self.next_offsets.lock().await, LATEST_SENTINEL);
         if sentinels.is_empty() {
             return Ok(());
         }
         tracing::Span::current().record("sentinels", sentinels.len());
-        let mut by_topic: HashMap<String, Vec<i32>> = HashMap::new();
-        for (t, p) in &sentinels {
-            by_topic.entry(t.clone()).or_default().push(*p);
-        }
-        let lo = self
-            .client
-            .send(build_offsets_request(by_topic, LATEST_TIMESTAMP))
-            .await?;
-        for t in &lo.topics {
-            for p in &t.partitions {
-                offsets.insert((t.name.clone(), p.partition_index), p.offset);
+        let result = self.list_offsets(&sentinels, LATEST_TIMESTAMP).await?;
+        {
+            // A seek or a rebalance can change a position while the request
+            // is in flight. Replace only a sentinel that is still there.
+            let mut offsets = self.next_offsets.lock().await;
+            for (key, offset) in &result.offsets {
+                if let Some(next) = offsets.get_mut(key)
+                    && *next == LATEST_SENTINEL
+                {
+                    *next = *offset;
+                }
             }
         }
-        Ok(())
+        result.authorization()
+    }
+
+    /// Send `ListOffsets(timestamp)` for `keys` to each partition leader.
+    ///
+    /// This is Kafka's `OffsetFetcher.groupListOffsetRequests` and
+    /// `sendListOffsetRequest`: one request per leader, with the consumer's
+    /// isolation level and the leader epoch from metadata. No lock is held
+    /// across a request. A transient transport error drops that connection,
+    /// and its partitions are retried, as Kafka retries a
+    /// `RetriableException`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error that is not transient.
+    #[cfg_attr(test, mutants::skip)] // cargo-mutants: ListOffsets RPC orchestration, exercised by the mock-broker test
+    async fn list_offsets(
+        &self,
+        keys: &[(String, i32)],
+        timestamp: i64,
+    ) -> Result<ListOffsetsResult, ConsumerError> {
+        let by_leader = group_list_offsets(keys, &*self.positions.lock().await, |id| {
+            self.client.knows_broker(id)
+        });
+        let mut answers = Vec::with_capacity(by_leader.len());
+        for (leader, by_topic) in by_leader {
+            let request = build_offsets_request(by_topic, timestamp, self.isolation_level);
+            let answer = if should_use_bootstrap_leader(leader) {
+                self.client.send(request).await
+            } else {
+                self.client.broker(leader).send(request).await
+            };
+            match answer {
+                Ok(answer) => answers.push(answer),
+                Err(e) if is_transient_transport_error(&e) => {
+                    if should_use_bootstrap_leader(leader) {
+                        self.client.reconnect_bootstrap().await;
+                    } else {
+                        self.client.evict_broker(leader);
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(ListOffsetsResult::collect(keys, &answers))
     }
 
     /// Recover the partitions that answered `OFFSET_OUT_OF_RANGE`.
@@ -784,7 +973,15 @@ impl Consumer {
     /// to.
     ///
     /// The caller has already released the `next_offsets` guard, so the RPC
-    /// here holds no lock.
+    /// here holds no lock. A partition whose row has an error keeps its
+    /// position, so the next Fetch gets `OFFSET_OUT_OF_RANGE` again and this
+    /// path runs again. The return value is `true` when the caller must
+    /// refresh metadata before that.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TopicAuthorizationFailed` when the broker does not authorize
+    /// a topic, and `LogTruncation` under `auto.offset.reset=none`.
     #[tracing::instrument(
         name = "consumer.recover_out_of_range",
         level = "debug",
@@ -795,44 +992,24 @@ impl Consumer {
     async fn recover_out_of_range(
         &self,
         out_of_range: &[((String, i32), i64)],
-    ) -> Result<(), ConsumerError> {
-        let mut by_topic: HashMap<String, Vec<i32>> = HashMap::new();
-        for ((topic, partition), _) in out_of_range {
-            by_topic.entry(topic.clone()).or_default().push(*partition);
-        }
-        let answer = self
-            .client
-            .send(build_offsets_request(by_topic, EARLIEST_TIMESTAMP))
-            .await?;
-        let log_starts = log_starts_in(&answer);
+    ) -> Result<bool, ConsumerError> {
+        let keys: Vec<(String, i32)> = out_of_range.iter().map(|(key, _)| key.clone()).collect();
+        let result = self.list_offsets(&keys, EARLIEST_TIMESTAMP).await?;
+        result.authorization()?;
 
         if let AutoOffsetReset::None = self.auto_offset_reset {
-            if let Some(truncation) = out_of_range_truncation(out_of_range, &log_starts) {
+            if let Some(truncation) = out_of_range_truncation(out_of_range, &result.offsets) {
                 return Err(truncation);
             }
-            return Ok(());
+            return Ok(false);
         }
 
         let mut offsets = self.next_offsets.lock().await;
-        for (key, log_start) in out_of_range_positions(out_of_range, &log_starts) {
+        for (key, log_start) in out_of_range_positions(out_of_range, &result.offsets) {
             offsets.insert(key, log_start);
         }
-        Ok(())
+        Ok(result.retry)
     }
-}
-
-/// The log start each partition of a `ListOffsets` answer reports.
-fn log_starts_in(answer: &ListOffsetsResponse) -> HashMap<(String, i32), i64> {
-    let mut log_starts = HashMap::new();
-    for topic in &answer.topics {
-        for partition in &topic.partitions {
-            log_starts.insert(
-                (topic.name.clone(), partition.partition_index),
-                partition.offset,
-            );
-        }
-    }
-    log_starts
 }
 
 /// The fetch position to write for each out-of-range partition.
@@ -1196,28 +1373,34 @@ mod offset_advance_tests {
         );
     }
 
-    /// The request carries the caller's timestamp verbatim and asks as a
-    /// consumer, which is `replica_id = -1`.
+    /// The request carries the caller's timestamp verbatim, the consumer's
+    /// isolation level and the leader epoch, and asks as a consumer, which
+    /// is `replica_id = -1`.
     ///
     /// `-1` asks for the log end and `-2` for the log start. The
     /// `OFFSET_OUT_OF_RANGE` recovery path depends on the second one, because
     /// an errored Fetch partition reports no usable `log_start_offset`.
     #[test]
-    fn offsets_request_carries_the_timestamp_and_the_consumer_replica_id() {
-        for timestamp in [LATEST_TIMESTAMP, EARLIEST_TIMESTAMP] {
-            let mut by_topic = HashMap::new();
-            by_topic.insert("topic-a".to_string(), vec![3]);
-            let req = build_offsets_request(by_topic, timestamp);
+    fn offsets_request_carries_the_timestamp_isolation_and_leader_epoch() {
+        for (timestamp, isolation, isolation_level, leader_epoch) in [
+            (LATEST_TIMESTAMP, IsolationLevel::ReadCommitted, 1, 4),
+            (LATEST_TIMESTAMP, IsolationLevel::ReadUncommitted, 0, -1),
+            (EARLIEST_TIMESTAMP, IsolationLevel::ReadCommitted, 1, -1),
+            (EARLIEST_TIMESTAMP, IsolationLevel::ReadUncommitted, 0, 9),
+        ] {
+            let by_topic =
+                BTreeMap::from([("topic-a".to_string(), vec![(3, LeaderEpoch(leader_epoch))])]);
+            let req = build_offsets_request(by_topic, timestamp, isolation);
 
-            assert2::assert!(
+            check!(
                 req == ListOffsetsRequest {
                     replica_id: -1,
-                    isolation_level: 0,
+                    isolation_level,
                     topics: vec![ListOffsetsTopic {
                         name: "topic-a".into(),
                         partitions: vec![ListOffsetsPartition {
                             partition_index: 3,
-                            current_leader_epoch: -1,
+                            current_leader_epoch: leader_epoch,
                             timestamp,
                             unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
                         }],
@@ -1225,19 +1408,185 @@ mod offset_advance_tests {
                     }],
                     timeout_ms: 0,
                     unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
-                }
+                },
+                "timestamp {timestamp}, isolation {isolation:?}"
             );
         }
     }
 
-    /// A `ListOffsets(-2)` answer becomes a log start per partition.
+    /// A partition goes to its known leader with the metadata epoch. A
+    /// partition without a known, dialable leader goes to the bootstrap
+    /// connection with the epoch that its position has.
     #[test]
-    fn log_starts_in_reads_every_partition_of_the_answer() {
-        let answer = list_offsets_answer(&[("topic-a", 0, 5), ("topic-a", 1, 9)]);
-        let mut expected: HashMap<(String, i32), i64> = HashMap::new();
-        expected.insert(("topic-a".to_string(), 0), 5);
-        expected.insert(("topic-a".to_string(), 1), 9);
-        assert2::assert!(log_starts_in(&answer) == expected);
+    fn list_offsets_partitions_group_by_leader_with_the_leader_epoch() {
+        let position = |leader_id, leader_epoch| PartitionPosition {
+            leader_id,
+            leader_epoch: LeaderEpoch(leader_epoch),
+            ..Default::default()
+        };
+        let positions = HashMap::from([
+            (("topic-a".to_string(), 0), position(1, 5)),
+            (("topic-a".to_string(), 1), position(2, 6)),
+            (("topic-b".to_string(), 0), position(1, 3)),
+            (("topic-b".to_string(), 1), position(3, 8)),
+        ]);
+        let keys = [
+            ("topic-a".to_string(), 0),
+            ("topic-a".to_string(), 1),
+            ("topic-b".to_string(), 0),
+            ("topic-b".to_string(), 1),
+            ("topic-c".to_string(), 0),
+        ];
+        let grouped = group_list_offsets(&keys, &positions, |id| id != 3);
+        assert2::assert!(
+            grouped
+                == BTreeMap::from([
+                    (
+                        BOOTSTRAP_LEADER,
+                        BTreeMap::from([
+                            ("topic-b".to_string(), vec![(1, LeaderEpoch(8))]),
+                            ("topic-c".to_string(), vec![(0, LeaderEpoch(-1))]),
+                        ]),
+                    ),
+                    (
+                        1,
+                        BTreeMap::from([
+                            ("topic-a".to_string(), vec![(0, LeaderEpoch(5))]),
+                            ("topic-b".to_string(), vec![(0, LeaderEpoch(3))]),
+                        ]),
+                    ),
+                    (
+                        2,
+                        BTreeMap::from([("topic-a".to_string(), vec![(1, LeaderEpoch(6))])]),
+                    ),
+                ])
+        );
+    }
+
+    /// `OffsetFetcherUtils.handleListOffsetResponse` sets a position only for
+    /// `NONE` with a known offset, fails for `TOPIC_AUTHORIZATION_FAILED`, and
+    /// retries every other code.
+    #[test]
+    fn list_offsets_rows_map_to_kafka_consumer_actions() {
+        for (name, error_code, offset, expected) in [
+            ("none", 0, 40, ListOffsetsRowAction::Position(40)),
+            ("none at zero", 0, 0, ListOffsetsRowAction::Position(0)),
+            ("none without an offset", 0, -1, ListOffsetsRowAction::Retry),
+            ("not leader or follower", 6, -1, ListOffsetsRowAction::Retry),
+            (
+                "unknown topic or partition",
+                3,
+                -1,
+                ListOffsetsRowAction::Retry,
+            ),
+            ("leader not available", 5, -1, ListOffsetsRowAction::Retry),
+            ("replica not available", 9, -1, ListOffsetsRowAction::Retry),
+            ("offset not available", 78, -1, ListOffsetsRowAction::Retry),
+            ("fenced leader epoch", 74, -1, ListOffsetsRowAction::Retry),
+            ("unknown leader epoch", 75, -1, ListOffsetsRowAction::Retry),
+            ("kafka storage error", 56, -1, ListOffsetsRowAction::Retry),
+            (
+                "unsupported for message format",
+                43,
+                -1,
+                ListOffsetsRowAction::Retry,
+            ),
+            ("unexpected code", 2, -1, ListOffsetsRowAction::Retry),
+            (
+                "topic authorization failed",
+                29,
+                -1,
+                ListOffsetsRowAction::Unauthorized,
+            ),
+        ] {
+            check!(
+                classify_list_offsets_row(error_code, offset) == expected,
+                "case {name}"
+            );
+        }
+    }
+
+    /// The answers become offsets for the requested partitions. A partition
+    /// with an error row or without a row is retried. An answer with an
+    /// unauthorized row gives no offsets.
+    #[test]
+    fn list_offsets_result_collects_offsets_retries_and_unauthorized_topics() {
+        let row = |partition_index, error_code, offset| ListOffsetsPartitionResponse {
+            partition_index,
+            error_code,
+            offset,
+            ..Default::default()
+        };
+        let answer = |name: &str, rows| ListOffsetsResponse {
+            topics: vec![ListOffsetsTopicResponse {
+                name: name.into(),
+                partitions: rows,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let requested = [("topic-a".to_string(), 0), ("topic-a".to_string(), 1)];
+        for (name, answers, expected) in [
+            (
+                "every partition answered",
+                vec![answer("topic-a", vec![row(0, 0, 5), row(1, 0, 9)])],
+                ListOffsetsResult {
+                    offsets: HashMap::from([
+                        (("topic-a".to_string(), 0), 5),
+                        (("topic-a".to_string(), 1), 9),
+                    ]),
+                    retry: false,
+                    unauthorized: BTreeSet::new(),
+                },
+            ),
+            (
+                "an error row is retried",
+                vec![answer("topic-a", vec![row(0, 0, 5), row(1, 6, -1)])],
+                ListOffsetsResult {
+                    offsets: HashMap::from([(("topic-a".to_string(), 0), 5)]),
+                    retry: true,
+                    unauthorized: BTreeSet::new(),
+                },
+            ),
+            (
+                "a missing row is retried and an unrequested row is ignored",
+                vec![answer("topic-a", vec![row(0, 0, 5), row(2, 0, 3)])],
+                ListOffsetsResult {
+                    offsets: HashMap::from([(("topic-a".to_string(), 0), 5)]),
+                    retry: true,
+                    unauthorized: BTreeSet::new(),
+                },
+            ),
+            (
+                "an unauthorized answer gives no offsets",
+                vec![answer("topic-a", vec![row(0, 0, 5), row(1, 29, -1)])],
+                ListOffsetsResult {
+                    offsets: HashMap::new(),
+                    retry: true,
+                    unauthorized: BTreeSet::from(["topic-a".to_string()]),
+                },
+            ),
+        ] {
+            check!(
+                ListOffsetsResult::collect(&requested, &answers) == expected,
+                "case {name}"
+            );
+        }
+    }
+
+    /// Only an unauthorized topic fails the reset.
+    #[test]
+    fn list_offsets_result_authorization_names_the_unauthorized_topics() {
+        let mut result = ListOffsetsResult::default();
+        check!(result.authorization().map_err(|e| e.to_string()) == Ok(()));
+        result.unauthorized.insert("topic-a".to_string());
+        check!(
+            result.authorization().map_err(|e| e.to_string())
+                == Err(ConsumerError::TopicAuthorizationFailed(BTreeSet::from([
+                    "topic-a".to_string()
+                ]))
+                .to_string())
+        );
     }
 
     /// The recovery writes the broker's log start, and leaves a partition the
@@ -1252,7 +1601,7 @@ mod offset_advance_tests {
             (("topic-a".to_string(), 0), 0),
             (("topic-a".to_string(), 1), 3),
         ];
-        let log_starts = log_starts_in(&list_offsets_answer(&[("topic-a", 0, 5)]));
+        let log_starts = HashMap::from([(("topic-a".to_string(), 0), 5)]);
         assert2::assert!(
             out_of_range_positions(&out_of_range, &log_starts)
                 == vec![(("topic-a".to_string(), 0), 5)]
@@ -1267,8 +1616,11 @@ mod offset_advance_tests {
     #[test]
     fn out_of_range_truncation_names_the_first_partition_and_its_log_start() {
         for (answered, expected_safe) in [(true, 5), (false, UNKNOWN_OFFSET)] {
-            let entries: &[(&str, i32, i64)] = if answered { &[("topic-a", 0, 5)] } else { &[] };
-            let log_starts = log_starts_in(&list_offsets_answer(entries));
+            let log_starts = if answered {
+                HashMap::from([(("topic-a".to_string(), 0), 5)])
+            } else {
+                HashMap::new()
+            };
             let out_of_range = vec![
                 (("topic-a".to_string(), 0), 2),
                 (("topic-a".to_string(), 1), 3),
@@ -1292,30 +1644,6 @@ mod offset_advance_tests {
     #[test]
     fn out_of_range_truncation_is_none_for_an_empty_set() {
         assert2::assert!(out_of_range_truncation(&[], &HashMap::new()).is_none());
-    }
-
-    /// Build a `ListOffsets` answer from `(topic, partition, offset)` entries.
-    fn list_offsets_answer(entries: &[(&str, i32, i64)]) -> ListOffsetsResponse {
-        let mut topics: Vec<ListOffsetsTopicResponse> = Vec::new();
-        for (name, partition_index, offset) in entries {
-            let partition = ListOffsetsPartitionResponse {
-                partition_index: *partition_index,
-                offset: *offset,
-                ..Default::default()
-            };
-            match topics.iter_mut().find(|t| t.name == *name) {
-                Some(topic) => topic.partitions.push(partition),
-                None => topics.push(ListOffsetsTopicResponse {
-                    name: (*name).to_string(),
-                    partitions: vec![partition],
-                    ..Default::default()
-                }),
-            }
-        }
-        ListOffsetsResponse {
-            topics,
-            ..Default::default()
-        }
     }
 
     /// `keys_at` picks exactly the partitions parked on a sentinel.
@@ -1353,7 +1681,7 @@ mod offset_advance_tests {
 mod partition_error_tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicUsize, Ordering},
     };
 
     use assert2::check;
@@ -1603,6 +1931,327 @@ mod partition_error_tests {
             };
 
             broker.stop();
+            check!(outcome == expected, "case {name}");
+        }
+    }
+
+    /// The broker id that the metadata names as the leader of `orders-0`.
+    const LEADER_ID: i32 = 1;
+    /// The leader epoch that the metadata reports for `orders-0`.
+    const LEADER_EPOCH: i32 = 7;
+
+    /// The `ListOffsets` requests that the mock brokers decoded, with the
+    /// name of the broker that received each one.
+    type SentListOffsets = Arc<std::sync::Mutex<Vec<(&'static str, ListOffsetsRequest)>>>;
+
+    /// The response bytes for a `ListOffsets` request at `version` with one
+    /// `orders-0` row.
+    fn list_offsets_answer_bytes(version: i16, error_code: i16, offset: i64) -> Vec<u8> {
+        use krabka_protocol::owned::{
+            list_offsets_request::FLEXIBLE_MIN,
+            list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
+        };
+        let answer = ListOffsetsResponse {
+            topics: vec![ListOffsetsTopicResponse {
+                name: "orders".into(),
+                partitions: vec![ListOffsetsPartitionResponse {
+                    partition_index: 0,
+                    error_code,
+                    offset,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        if version >= FLEXIBLE_MIN {
+            // The flexible response header has an empty tagged-field section.
+            bytes.push(0);
+        }
+        bytes.extend(encode(&answer, version));
+        bytes
+    }
+
+    /// A mock broker that answers `ApiVersions`, `Metadata` and `ListOffsets`.
+    ///
+    /// It records each decoded `ListOffsets` request under `name` and answers
+    /// it with one `orders-0` row. The `Metadata` answer names broker
+    /// `LEADER_ID` at `leader_port` as the leader of `orders-0`, with epoch
+    /// `LEADER_EPOCH`.
+    async fn list_offsets_broker(
+        name: &'static str,
+        leader_port: Arc<AtomicU16>,
+        row: (i16, i64),
+        sent: SentListOffsets,
+        metadata_requests: Arc<AtomicUsize>,
+    ) -> MockBroker {
+        use bytes::Buf as _;
+        use krabka_protocol::{
+            Decode as _,
+            owned::{
+                list_offsets_request::{self, FLEXIBLE_MIN},
+                metadata_response::{
+                    MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+                },
+            },
+        };
+        MockBroker::start(move |api_key, version, _corr_id, mut body| {
+            if api_key == api_versions_request::API_KEY {
+                let versions = ApiVersionsResponse {
+                    api_keys: [
+                        (api_versions_request::API_KEY, 3),
+                        (metadata_request::API_KEY, 8),
+                        (
+                            list_offsets_request::API_KEY,
+                            list_offsets_request::MAX_VERSION,
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(api_key, max_version)| ApiVersion {
+                        api_key,
+                        min_version: 0,
+                        max_version,
+                        ..Default::default()
+                    })
+                    .collect(),
+                    ..Default::default()
+                };
+                return Some(encode(&versions, 0));
+            }
+            if api_key == metadata_request::API_KEY {
+                metadata_requests.fetch_add(1, Ordering::SeqCst);
+                let metadata = MetadataResponse {
+                    brokers: vec![MetadataResponseBroker {
+                        node_id: LEADER_ID,
+                        host: "127.0.0.1".into(),
+                        port: i32::from(leader_port.load(Ordering::SeqCst)),
+                        ..Default::default()
+                    }],
+                    topics: vec![MetadataResponseTopic {
+                        name: Some("orders".into()),
+                        topic_id: TOPIC_ID,
+                        partitions: vec![MetadataResponsePartition {
+                            partition_index: 0,
+                            leader_id: LEADER_ID,
+                            leader_epoch: LEADER_EPOCH,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                return Some(encode(&metadata, version));
+            }
+            if api_key == list_offsets_request::API_KEY {
+                let client_id_len = usize::try_from(body.get_i16()).expect("client id length");
+                body.advance(client_id_len);
+                if version >= FLEXIBLE_MIN {
+                    body.advance(1);
+                }
+                let request =
+                    ListOffsetsRequest::decode(&mut body, version).expect("ListOffsets decodes");
+                sent.lock().expect("sent lock").push((name, request));
+                return Some(list_offsets_answer_bytes(version, row.0, row.1));
+            }
+            None
+        })
+        .await
+    }
+
+    /// The `ListOffsets` request that the consumer sends for `orders-0`.
+    fn expected_list_offsets(isolation_level: i8, timestamp: i64) -> ListOffsetsRequest {
+        ListOffsetsRequest {
+            replica_id: -1,
+            isolation_level,
+            topics: vec![ListOffsetsTopic {
+                name: "orders".into(),
+                partitions: vec![ListOffsetsPartition {
+                    partition_index: 0,
+                    current_leader_epoch: LEADER_EPOCH,
+                    timestamp,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// How the consumer handled one `ListOffsets` exchange.
+    #[derive(Debug, PartialEq)]
+    struct ListOffsetsOutcome {
+        /// Each decoded request, with the name of the broker that received it.
+        requests: Vec<(&'static str, ListOffsetsRequest)>,
+        /// `Ok(())`, `Err(Some(topics))` for `TopicAuthorizationFailed`, or
+        /// `Err(None)` for any other error.
+        result: Result<(), Option<std::collections::BTreeSet<String>>>,
+        /// The `Metadata` requests after the setup refresh.
+        metadata_requests: usize,
+        next_offset: Option<i64>,
+    }
+
+    /// How the test reaches the `ListOffsets` path.
+    #[derive(Clone, Copy, Debug)]
+    enum Reset {
+        /// `auto.offset.reset=latest`: a sentinel that `prepare_poll` resolves.
+        Latest,
+        /// `auto.offset.reset=earliest`: a Fetch row with
+        /// `OFFSET_OUT_OF_RANGE`.
+        EarliestOutOfRange,
+    }
+
+    /// Kafka's consumer sends `ListOffsets` to the partition leader with its
+    /// own isolation level and the leader epoch from metadata
+    /// (`OffsetFetcher.groupListOffsetRequests` and
+    /// `ListOffsetsRequest.Builder.forConsumer`). A row with an error never
+    /// sets a position. `TOPIC_AUTHORIZATION_FAILED` fails the poll, and any
+    /// other code retries after a metadata refresh
+    /// (`OffsetFetcherUtils.handleListOffsetResponse`).
+    #[tokio::test]
+    async fn list_offsets_goes_to_the_leader_with_the_isolation_level_and_honours_row_errors() {
+        use std::collections::BTreeSet;
+
+        let latest_request = |isolation| vec![("leader", expected_list_offsets(isolation, -1))];
+        for (name, isolation, reset, row, expected) in [
+            (
+                "read committed latest reads the last stable offset",
+                IsolationLevel::ReadCommitted,
+                Reset::Latest,
+                (0, 40),
+                ListOffsetsOutcome {
+                    requests: latest_request(1),
+                    result: Ok(()),
+                    metadata_requests: 1,
+                    next_offset: Some(40),
+                },
+            ),
+            (
+                "read uncommitted latest reads the high watermark",
+                IsolationLevel::ReadUncommitted,
+                Reset::Latest,
+                (0, 50),
+                ListOffsetsOutcome {
+                    requests: latest_request(0),
+                    result: Ok(()),
+                    metadata_requests: 1,
+                    next_offset: Some(50),
+                },
+            ),
+            (
+                "not leader or follower keeps the sentinel and refreshes metadata",
+                IsolationLevel::ReadCommitted,
+                Reset::Latest,
+                (6, -1),
+                ListOffsetsOutcome {
+                    requests: latest_request(1),
+                    result: Ok(()),
+                    metadata_requests: 1,
+                    next_offset: Some(LATEST_SENTINEL),
+                },
+            ),
+            (
+                "topic authorization failed fails the poll",
+                IsolationLevel::ReadCommitted,
+                Reset::Latest,
+                (29, -1),
+                ListOffsetsOutcome {
+                    requests: latest_request(1),
+                    result: Err(Some(BTreeSet::from(["orders".to_string()]))),
+                    metadata_requests: 0,
+                    next_offset: Some(LATEST_SENTINEL),
+                },
+            ),
+            (
+                "earliest after out of range reads the log start",
+                IsolationLevel::ReadUncommitted,
+                Reset::EarliestOutOfRange,
+                (0, 7),
+                ListOffsetsOutcome {
+                    requests: vec![("leader", expected_list_offsets(0, -2))],
+                    result: Ok(()),
+                    metadata_requests: 0,
+                    next_offset: Some(7),
+                },
+            ),
+            (
+                "earliest with a retriable row keeps the position and refreshes metadata",
+                IsolationLevel::ReadCommitted,
+                Reset::EarliestOutOfRange,
+                (74, -1),
+                ListOffsetsOutcome {
+                    requests: vec![("leader", expected_list_offsets(1, -2))],
+                    result: Ok(()),
+                    metadata_requests: 1,
+                    next_offset: Some(5),
+                },
+            ),
+        ] {
+            let sent: SentListOffsets = Arc::default();
+            let metadata_requests = Arc::new(AtomicUsize::new(0));
+            let leader_port = Arc::new(AtomicU16::new(0));
+            let leader = list_offsets_broker(
+                "leader",
+                Arc::clone(&leader_port),
+                row,
+                Arc::clone(&sent),
+                Arc::clone(&metadata_requests),
+            )
+            .await;
+            leader_port.store(leader.addr.port(), Ordering::SeqCst);
+            let bootstrap = list_offsets_broker(
+                "bootstrap",
+                Arc::clone(&leader_port),
+                (6, -1),
+                Arc::clone(&sent),
+                Arc::clone(&metadata_requests),
+            )
+            .await;
+            let mut consumer = consumer_on(&bootstrap).await;
+            consumer.isolation_level = isolation;
+            consumer
+                .refresh_leader_epochs()
+                .await
+                .expect("setup metadata");
+            metadata_requests.store(0, Ordering::SeqCst);
+
+            let result = match reset {
+                Reset::Latest => {
+                    consumer.auto_offset_reset = AutoOffsetReset::Latest;
+                    consumer
+                        .next_offsets
+                        .lock()
+                        .await
+                        .insert(("orders".into(), 0), LATEST_SENTINEL);
+                    consumer.prepare_poll().await.map(|_| ())
+                }
+                Reset::EarliestOutOfRange => {
+                    consumer.auto_offset_reset = AutoOffsetReset::Earliest;
+                    let topic_ids = consumer.topic_ids.lock().await.clone();
+                    consumer
+                        .process_fetch_responses(vec![fetch_response(1)], &topic_ids)
+                        .await
+                        .map(|_| ())
+                }
+            };
+            let requests = sent.lock().expect("sent lock").clone();
+            let outcome = ListOffsetsOutcome {
+                requests,
+                result: result.map_err(|error| match error {
+                    ConsumerError::TopicAuthorizationFailed(topics) => Some(topics),
+                    _ => None,
+                }),
+                metadata_requests: metadata_requests.load(Ordering::SeqCst),
+                next_offset: consumer
+                    .next_offsets
+                    .lock()
+                    .await
+                    .get(&("orders".to_string(), 0))
+                    .copied(),
+            };
+
+            bootstrap.stop();
+            leader.stop();
             check!(outcome == expected, "case {name}");
         }
     }
