@@ -1753,7 +1753,8 @@ async fn spawn_consumer(
     let (listener_sender, listener_calls) = tokio::sync::mpsc::unbounded_channel();
     let (enforced_rebalances, enforced_rebalance_reasons) = tokio::sync::mpsc::unbounded_channel();
     let assigned_callback_pending = crate::rebalance_listener::AssignedCallbackPending::default();
-    if has_rebalance_listener {
+    // A consumer that joined no group runs no rebalance callback.
+    if has_rebalance_listener && !standalone {
         queue_initial_assign_call(&listener_sender, initial_assignment);
     }
     let auto_commit = auto_commit_interval.map(crate::commit::AutoCommit::new);
@@ -5279,6 +5280,45 @@ mod group_membership_tests {
         drop(consumer);
         mock.stop();
         assert2::assert!((before, after, owned) == (vec![partition(0)], vec![], 0));
+    }
+
+    /// Kafka's `assign` after `unsubscribe` keeps its partitions, and
+    /// `enforceRebalance` then fails because the consumer has no group
+    /// subscription.
+    #[tokio::test]
+    async fn a_manual_assignment_after_unsubscribe_survives_and_blocks_enforce_rebalance() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut consumer = started_consumer(&mock, None).await;
+        consumer.unsubscribe().await.expect("unsubscribe");
+        consumer
+            .assign(&[(TOPIC.to_owned(), 1)])
+            .await
+            .expect("assign");
+        // Let the coordinator task handle the changes.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let assignment = consumer.assignment().await;
+        let enforced = consumer
+            .enforce_rebalance(None)
+            .map_err(|error| error.to_string());
+        let rejected = consumer
+            .assign(&[(TOPIC.to_owned(), -1)])
+            .await
+            .map_err(|error| error.to_string());
+        drop(consumer);
+        mock.stop();
+        assert2::assert!(
+            (assignment, enforced, rejected)
+                == (
+                    vec![(TOPIC.to_owned(), 1)],
+                    Err("illegal state: Tried to force a rebalance but the consumer has a manual assignment.".to_owned()),
+                    Err("invalid argument: Partition index of orders--1 is negative".to_owned())
+                )
+        );
     }
 
     /// Kafka's `enforceRebalance(reason)` makes the next `poll` join the group

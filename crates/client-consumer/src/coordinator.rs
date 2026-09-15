@@ -1056,7 +1056,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
             }
             // `subscribe`, `subscribe_pattern` and `unsubscribe`.
             Ok(()) = state.subscription_changes.changed() => {
-                handle_subscription_change(&mut state, &mut rejoin).await;
+                handle_subscription_change(&mut state, &mut rejoin, &mut known_counts).await;
                 continue;
             }
             // Kafka's heartbeat thread checks `pollTimeoutExpired` each retry
@@ -1367,13 +1367,21 @@ async fn leave_on_poll_timeout(state: &mut CoordinatorState) {
 /// `resetGenerationOnLeaveGroup`). The `Consumer` already ran the listener.
 /// Any other change makes the next `poll` join the group when the topics are
 /// not the joined ones, as `rejoinNeededOrPending` does.
-async fn handle_subscription_change(state: &mut CoordinatorState, rejoin: &mut RejoinRequest) {
+async fn handle_subscription_change(
+    state: &mut CoordinatorState,
+    rejoin: &mut RejoinRequest,
+    known_counts: &mut HashMap<String, i32>,
+) {
     let subscription = state.subscription_changes.borrow_and_update().clone();
     if subscription.unsubscribes != state.seen_unsubscribes {
         state.seen_unsubscribes = subscription.unsubscribes;
         let member_id = std::mem::take(&mut state.member_id);
         state.lost_partitions.clear();
-        install_assignment(state, &[], false, -1, false).await;
+        // An `assign` after the `unsubscribe` already installed its own
+        // assignment. The task must not clear it.
+        if !subscription.manual_assignment {
+            install_assignment(state, &[], false, -1, false).await;
+        }
         *rejoin = RejoinRequest::None;
         state.rebalance_pending.send_replace(false);
         // Kafka's `resetGenerationOnLeaveGroup` requests the next join with
@@ -1399,6 +1407,12 @@ async fn handle_subscription_change(state: &mut CoordinatorState, rejoin: &mut R
         state.rejoin_reason =
             crate::subscription::subscription_changed_reason(&state.joined_topics, &topics);
         rejoin.request_after_next_poll(state);
+        // The partition counts of the new topics are the baseline of the next
+        // growth check. Without this, each check sees them as growth and asks
+        // for another rebalance.
+        if let Ok(counts) = subscribed_partition_counts(state).await {
+            *known_counts = counts;
+        }
     } else if state.member_id.is_empty() {
         rejoin.request_after_next_poll(state);
     }
@@ -3415,6 +3429,65 @@ mod retry_tests {
             poll_timer: PollTimer::new(secs(300)),
             poll_timeout_in_callback: false,
         }
+    }
+
+    /// A subscription change makes the partition counts of the new topics the
+    /// baseline of the growth check, so the task does not ask for a rebalance
+    /// again at each metadata refresh.
+    #[tokio::test]
+    async fn a_subscription_change_rebaselines_the_partition_counts() {
+        use krabka_protocol::owned::metadata_response::{
+            MetadataResponsePartition, MetadataResponseTopic,
+        };
+
+        let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions_for_leave_group());
+            }
+            if api_key != metadata_request::API_KEY {
+                return None;
+            }
+            let response = MetadataResponse {
+                topics: vec![MetadataResponseTopic {
+                    name: Some(PAYMENTS.into()),
+                    partitions: (0..2)
+                        .map(|partition_index| MetadataResponsePartition {
+                            partition_index,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut buffer = bytes::BytesMut::new();
+            response.encode(&mut buffer, version).expect("encode");
+            Some(buffer.to_vec())
+        })
+        .await;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .metadata_scope(krabka_client_core::MetadataScope::Topics {
+                allow_auto_topic_creation: false,
+            })
+            .build()
+            .await
+            .expect("client");
+        let mut state = test_state(client);
+        state.member_id = "member-a".into();
+        state.joined_topics = vec![ORDERS.to_owned()];
+        state.subscription = crate::subscription::shared(vec![PAYMENTS.to_owned()], None, true);
+        state.subscription_changes = state.subscription.subscribe();
+        state
+            .subscription
+            .send_modify(|subscription| subscription.version += 1);
+        let mut rejoin = RejoinRequest::None;
+        let mut known_counts = HashMap::new();
+        handle_subscription_change(&mut state, &mut rejoin, &mut known_counts).await;
+        mock.stop();
+        assert2::assert!(
+            (known_counts, rejoin.requested()) == (HashMap::from([(PAYMENTS.to_owned(), 2)]), true)
+        );
     }
 
     /// Kafka's `ConsumerCoordinator.onLeaderElected` fetches metadata for the

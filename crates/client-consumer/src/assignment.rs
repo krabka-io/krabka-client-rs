@@ -40,6 +40,11 @@ impl Consumer {
                 "Topic partitions to assign to cannot have null or empty topic".to_owned(),
             ));
         }
+        if let Some((topic, partition)) = partitions.iter().find(|(_, partition)| *partition < 0) {
+            return Err(ConsumerError::InvalidArgument(format!(
+                "Partition index of {topic}-{partition} is negative"
+            )));
+        }
         if !self.subscription.borrow().is_none() {
             return Err(ConsumerError::IllegalState(
                 "Subscription to topics, partitions and pattern are mutually exclusive".to_owned(),

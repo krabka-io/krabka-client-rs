@@ -111,6 +111,13 @@ impl FetchBuffer {
         out
     }
 
+    /// Drop the data of the partitions whose topic is not in `topics`.
+    /// Kafka's `FetchBuffer.retainAll` after a subscription change.
+    pub(crate) fn retain_topics(&mut self, topics: &HashSet<String>) {
+        self.partitions
+            .retain(|partition| topics.contains(&partition.key.0));
+    }
+
     /// The partitions that have buffered data.
     pub(crate) fn buffered_partitions(&self) -> HashSet<(String, i32)> {
         self.partitions
@@ -280,5 +287,21 @@ mod tests {
             left.sort();
             assert2::check!((actual, left) == (expected, remaining), "case {name}");
         }
+    }
+
+    /// Kafka's `subscribe(topics)` clears the buffered data of the topics that
+    /// the consumer no longer subscribes to.
+    #[test]
+    fn retain_topics_drops_the_data_of_other_topics() {
+        let mut buffer = FetchBuffer::default();
+        buffer.push(buffered(0, 10..12, 12));
+        buffer.push(BufferedPartition {
+            key: ("payments".into(), 0),
+            ..buffered(0, 20..22, 22)
+        });
+        buffer.retain_topics(&HashSet::from(["payments".to_string()]));
+        let mut left: Vec<_> = buffer.buffered_partitions().into_iter().collect();
+        left.sort();
+        assert2::assert!(left == vec![("payments".to_string(), 0)]);
     }
 }

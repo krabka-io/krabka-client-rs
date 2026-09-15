@@ -140,6 +140,11 @@ impl Consumer {
     /// have a group.`).
     pub fn enforce_rebalance(&self, reason: Option<&str>) -> Result<(), ConsumerError> {
         self.require_group_membership()?;
+        if self.subscription.borrow().manual_assignment {
+            return Err(ConsumerError::IllegalState(
+                "Tried to force a rebalance but the consumer has a manual assignment.".to_owned(),
+            ));
+        }
         let reason = reason
             .filter(|reason| !reason.is_empty())
             .unwrap_or(ENFORCED_REBALANCE_REASON);

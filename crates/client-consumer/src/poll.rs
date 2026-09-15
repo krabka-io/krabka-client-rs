@@ -636,7 +636,7 @@ impl Consumer {
         if self.wakeup.take() {
             return Err(ConsumerError::Wakeup);
         }
-        if !self.prepare_poll().await? {
+        if !self.prepare_poll(deadline).await? {
             return Ok(Vec::new());
         }
         if !self.wait_for_rebalance(deadline).await? {
@@ -1417,7 +1417,10 @@ impl Consumer {
         grouped
     }
 
-    async fn prepare_poll(&mut self) -> Result<bool, ConsumerError> {
+    async fn prepare_poll(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ConsumerError> {
         // Kafka's consumer raises a fatal `OffsetFetch` error from `poll()`.
         // A rejoin in the coordinator task leaves such an error here.
         if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
@@ -1437,7 +1440,8 @@ impl Consumer {
         // routes with `metadata.currentLeader(tp)` in the same way.
         self.sync_metadata_topics();
         let wakeup = self.wakeup.clone();
-        self.update_fetch_positions(Some(&wakeup)).await
+        self.update_fetch_positions(Some(&wakeup), Some(deadline))
+            .await
     }
 
     /// Name the subscribed topics in the metadata requests of this consumer.
@@ -1469,6 +1473,7 @@ impl Consumer {
     pub(crate) async fn update_fetch_positions(
         &self,
         wakeup: Option<&crate::control::WakeupHandle>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<bool, ConsumerError> {
         if let Err(error) = until_woken(wakeup, self.refresh_leader_epochs()).await? {
             if is_transient_poll_error(&error) {
@@ -1477,7 +1482,7 @@ impl Consumer {
             }
             return Err(error);
         }
-        if let Err(error) = until_woken(wakeup, self.resolve_committed_sentinels()).await? {
+        if let Err(error) = until_woken(wakeup, self.resolve_committed_sentinels(deadline)).await? {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
                 return Ok(false);
@@ -1747,15 +1752,22 @@ impl Consumer {
     /// # Errors
     ///
     /// Returns the error of the `OffsetFetch` request.
-    pub(crate) async fn resolve_committed_sentinels(&self) -> Result<(), ConsumerError> {
+    pub(crate) async fn resolve_committed_sentinels(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), ConsumerError> {
         let keys = keys_at(&*self.next_offsets.lock().await, COMMITTED_SENTINEL);
         if keys.is_empty() {
             return Ok(());
         }
+        // Kafka's `updateFetchPositions` gives the committed offsets the timer
+        // of the `poll`.
+        let deadline = deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + self.default_api_timeout.to_std());
         let committed = if self.group_id.is_empty() {
             HashMap::new()
         } else {
-            self.committed(&keys).await?
+            self.committed_until(&keys, deadline).await?
         };
         let reset = crate::consumer::reset_starting_offset(self.auto_offset_reset);
         let mut offsets = self.next_offsets.lock().await;
@@ -1770,8 +1782,15 @@ impl Consumer {
             match committed.get(&key).cloned().flatten() {
                 Some(offset) => {
                     *next = offset.offset;
-                    positions.entry(key).or_default().offset_epoch =
-                        LeaderEpoch(offset.leader_epoch.unwrap_or(-1));
+                    let position = positions.entry(key).or_default();
+                    position.offset_epoch = LeaderEpoch(offset.leader_epoch.unwrap_or(-1));
+                    // Kafka's `TopicPartitionState.seekUnvalidated` waits for
+                    // `OffsetForLeaderEpoch` when the committed epoch is older
+                    // than the leader epoch of the metadata.
+                    position.awaiting_validation = crate::validate::should_await_validation(
+                        position.leader_epoch,
+                        position.offset_epoch,
+                    );
                 }
                 None => *next = reset,
             }
@@ -2809,12 +2828,15 @@ pub(crate) mod partition_error_tests {
             ConsumerError::TopicAuthorizationFailed(topics.clone()),
         );
 
-        let first = consumer.prepare_poll().await.map_err(|error| match error {
-            ConsumerError::TopicAuthorizationFailed(topics) => Some(topics),
-            _ => None,
-        });
+        let first = consumer
+            .prepare_poll(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+            .map_err(|error| match error {
+                ConsumerError::TopicAuthorizationFailed(topics) => Some(topics),
+                _ => None,
+            });
         let second = consumer
-            .prepare_poll()
+            .prepare_poll(tokio::time::Instant::now() + Duration::from_secs(5))
             .await
             .map_err(|_| None::<std::collections::BTreeSet<String>>);
 
@@ -3530,7 +3552,10 @@ pub(crate) mod partition_error_tests {
                     .lock()
                     .await
                     .insert(("orders".into(), 0), LATEST_SENTINEL);
-                consumer.prepare_poll().await.map(|_| ())
+                consumer
+                    .prepare_poll(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .await
+                    .map(|_| ())
             }
             Reset::ByOneHour => {
                 consumer.auto_offset_reset =
@@ -3540,7 +3565,10 @@ pub(crate) mod partition_error_tests {
                     .lock()
                     .await
                     .insert(("orders".into(), 0), LATEST_SENTINEL);
-                consumer.prepare_poll().await.map(|_| ())
+                consumer
+                    .prepare_poll(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .await
+                    .map(|_| ())
             }
             Reset::EarliestOutOfRange => {
                 consumer.auto_offset_reset = AutoOffsetReset::Earliest;
@@ -4577,6 +4605,63 @@ mod fetch_path_tests {
         assert2::assert!(names == vec!["orders".to_owned(), "payments".to_owned()]);
     }
 
+    /// A listener that records its calls. A consumer without a group runs no
+    /// callback.
+    struct CallRecorder {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ConsumerRebalanceListener for CallRecorder {
+        async fn on_partitions_revoked(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), crate::RebalanceListenerError> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(format!("revoked {partitions:?}"));
+            Ok(())
+        }
+
+        async fn on_partitions_assigned(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), crate::RebalanceListenerError> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(format!("assigned {partitions:?}"));
+            Ok(())
+        }
+    }
+
+    /// Kafka's `updateFetchPositions` gives the committed offsets the timer of
+    /// the `poll`, so an unresponsive coordinator does not hold a short poll
+    /// for the whole `default.api.timeout.ms`.
+    #[tokio::test]
+    async fn a_short_poll_does_not_wait_for_the_committed_offsets() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(&[vec![FetchAnswer::Silent]], &sent).await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer
+            .next_offsets
+            .lock()
+            .await
+            .insert(("orders".to_owned(), 0), COMMITTED_SENTINEL);
+        let started = tokio::time::Instant::now();
+        let result = consumer
+            .poll(millis(200))
+            .await
+            .map(|records| records.len());
+        let elapsed = started.elapsed();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!((result.is_err(), elapsed < Duration::from_secs(5)) == (true, true));
+    }
+
     /// Kafka's consumer without `group.id` fetches the partitions of
     /// `assign` from the reset position, and throws `InvalidGroupIdException`
     /// for the group calls.
@@ -4591,9 +4676,13 @@ mod fetch_path_tests {
             &sent,
         )
         .await;
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut consumer = Consumer::builder()
             .bootstrap(brokers[0].addr.to_string())
             .auto_offset_reset(AutoOffsetReset::Earliest)
+            .rebalance_listener(Box::new(CallRecorder {
+                calls: std::sync::Arc::clone(&calls),
+            }))
             .build()
             .await
             .expect("build");
@@ -4637,16 +4726,29 @@ mod fetch_path_tests {
                 .enforce_rebalance(None)
                 .map_err(|error| error.to_string()),
         );
+        consumer.unsubscribe().await.expect("unsubscribe");
+        let after_unsubscribe = (
+            consumer.assignment().await,
+            consumer.next_offsets.lock().await.len(),
+        );
+        let listener_calls = calls.lock().expect("calls lock").clone();
         consumer.close().await.expect("close");
         stop(brokers);
         let invalid_group = Err(ConsumerError::InvalidGroupId.to_string());
         assert2::assert!(
-            (before_assign, fetched.first().cloned(), group_calls)
-                == (
-                    Err("not subscribed to any topic".to_owned()),
-                    Some((1, "orders".to_owned(), 0, 0)),
-                    (invalid_group.clone(), invalid_group.clone(), invalid_group)
-                )
+            (
+                before_assign,
+                fetched.first().cloned(),
+                group_calls,
+                after_unsubscribe,
+                listener_calls
+            ) == (
+                Err("not subscribed to any topic".to_owned()),
+                Some((1, "orders".to_owned(), 0, 0)),
+                (invalid_group.clone(), invalid_group.clone(), invalid_group),
+                (Vec::new(), 0),
+                Vec::<String>::new()
+            )
         );
     }
 
