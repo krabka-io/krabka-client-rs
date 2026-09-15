@@ -1,7 +1,7 @@
 //! `Consumer::commit_sync` and `commit_async`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -15,8 +15,9 @@ use tokio::sync::Mutex;
 use crate::{
     consumer::{CommitIdentity, Consumer},
     coordinator::{
-        find_coordinator, is_retriable_coordinator_code, is_retriable_transport_error,
-        next_backoff, retry_deadline_elapsed, with_coordinator_refind,
+        COORDINATOR_LOAD_IN_PROGRESS, COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR, find_coordinator,
+        is_retriable_coordinator_code, is_retriable_transport_error, next_backoff,
+        retry_deadline_elapsed,
     },
     error::ConsumerError,
     offset_wire::{TopicNameOffsetCommit, build_commit_topics},
@@ -29,25 +30,20 @@ const ASYNC_COMMIT_DIRTY: u8 = 2;
 
 /// `UNKNOWN_TOPIC_OR_PARTITION`: the coordinator does not know the topic.
 const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
-/// `UNKNOWN_TOPIC_ID`: a topic id that the coordinator does not hold. Kafka's
-/// `CommitRequestManager` retries it as an `InvalidMetadataException`.
-const UNKNOWN_TOPIC_ID: i16 = 100;
-
-/// First non-zero per-partition `error_code` in an `OffsetCommitResponse`, or
-/// `0` if every partition committed cleanly.
-///
-/// `with_coordinator_refind` reads this to decide whether to re-discover the
-/// coordinator and retry.
-fn first_commit_error(resp: &OffsetCommitResponse) -> i16 {
-    for t in &resp.topics {
-        for p in &t.partitions {
-            if p.error_code != 0 {
-                return p.error_code;
-            }
-        }
-    }
-    0
-}
+/// `REQUEST_TIMED_OUT`.
+const REQUEST_TIMED_OUT: i16 = 7;
+/// `ILLEGAL_GENERATION`.
+const ILLEGAL_GENERATION: i16 = 22;
+/// `UNKNOWN_MEMBER_ID`.
+const UNKNOWN_MEMBER_ID: i16 = 25;
+/// `REBALANCE_IN_PROGRESS`.
+const REBALANCE_IN_PROGRESS: i16 = 27;
+/// `TOPIC_AUTHORIZATION_FAILED`.
+const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+/// `GROUP_AUTHORIZATION_FAILED`.
+const GROUP_AUTHORIZATION_FAILED: i16 = 30;
+/// `FENCED_INSTANCE_ID`.
+const FENCED_INSTANCE_ID: i16 = 82;
 
 fn commit_offsets(
     raw_offsets: HashMap<(String, i32), i64>,
@@ -142,77 +138,134 @@ pub(crate) fn build_commit_request(
     })
 }
 
-/// Map an `OffsetCommit` response to a result, from the response and from
-/// whether the coordinator task is still alive.
-///
-/// `0` is success. This function DEFERS the rebalance codes
-/// `ILLEGAL_GENERATION (22)` and `REBALANCE_IN_PROGRESS (27)`, that is it
-/// classifies them as deferred ONLY while the coordinator task is alive to
-/// rejoin. The synchronous commit loop then retries continuously-owned
-/// partitions under the newly-published identity. A long-running block-builder
-/// or compactor commit loop therefore survives a routine rebalance without
-/// reporting an unacknowledged commit as successful.
-///
-/// If the coordinator task has EXITED it can never republish a fresh
-/// generation, so deferral would silently never advance. This function then
-/// surfaces those codes as fatal, so the process restarts and rejoins from
-/// scratch.
-///
-/// `UNKNOWN_TOPIC_OR_PARTITION (3)` and `UNKNOWN_TOPIC_ID (100)` are retriable.
-/// The synchronous commit loop sends them again until the coordinator retry
-/// timeout elapses. Any other non-zero code is always fatal.
-#[cfg(test)]
-fn commit_response_result(
-    resp: &OffsetCommitResponse,
-    coordinator_alive: bool,
-) -> Result<(), ConsumerError> {
-    commit_response_outcome(resp, coordinator_alive).map(|_| ())
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CommitOutcome {
     Acked(HashSet<(String, i32)>),
+    /// A rebalance moved the group away from the identity of the request. The
+    /// commit waits for the coordinator task to join the group again.
     Deferred {
         code: i16,
         acknowledged: HashSet<(String, i32)>,
     },
-    /// The coordinator does not know the topic or the topic id of a partition.
-    /// Kafka's `CommitRequestManager` retries these codes until the commit
-    /// deadline.
+    /// Kafka's `OffsetCommitResponseHandler` raises a retriable error, and
+    /// `commitOffsetsSync` sends the commit again until the timeout.
     Retriable {
         code: i16,
         acknowledged: HashSet<(String, i32)>,
+        /// Kafka calls `markCoordinatorUnknown` before the retry, so the next
+        /// attempt finds the coordinator again.
+        find_coordinator: bool,
     },
 }
 
+/// The consumer state that decides what an `OffsetCommit` partition error
+/// means for a synchronous commit.
+#[derive(Clone, Copy, Debug)]
+struct CommitResponseContext<'a> {
+    group_id: &'a str,
+    group_instance_id: Option<&'a str>,
+    /// The coordinator task runs, so it can join the group again.
+    coordinator_alive: bool,
+    /// The generation and the member id are still the ones of the request.
+    /// Kafka's `CoordinatorResponseHandler.generationUnchanged`.
+    generation_unchanged: bool,
+}
+
+/// Map an `OffsetCommit` response of a synchronous commit to a result, as
+/// Kafka's `ConsumerCoordinator.OffsetCommitResponseHandler.handle` and
+/// `commitOffsetsSync` do.
+///
+/// - `0`: the partition is acknowledged.
+/// - `GROUP_AUTHORIZATION_FAILED (30)`: [`ConsumerError::GroupAuthorizationFailed`].
+/// - `TOPIC_AUTHORIZATION_FAILED (29)`: the function collects the topics and
+///   returns [`ConsumerError::TopicAuthorizationFailed`] when no other partition
+///   has an error.
+/// - `UNKNOWN_TOPIC_OR_PARTITION (3)`, `COORDINATOR_LOAD_IN_PROGRESS (14)`:
+///   retriable.
+/// - `REQUEST_TIMED_OUT (7)`, `COORDINATOR_NOT_AVAILABLE (15)`,
+///   `NOT_COORDINATOR (16)`: retriable after the consumer finds the coordinator
+///   again.
+/// - `FENCED_INSTANCE_ID (82)` with the generation of the request:
+///   [`ConsumerError::FencedInstanceId`].
+/// - `ILLEGAL_GENERATION (22)`, `UNKNOWN_MEMBER_ID (25)`,
+///   `REBALANCE_IN_PROGRESS (27)`, and `82` after the generation changed:
+///   deferred while the coordinator task runs. Otherwise
+///   [`ConsumerError::CommitFailed`].
+/// - Any other code, for example `OFFSET_METADATA_TOO_LARGE (12)` and
+///   `INVALID_COMMIT_OFFSET_SIZE (28)`: [`ConsumerError::Server`].
+///
+/// Kafka's classic consumer raises `CommitFailedException` or
+/// `RebalanceInProgressException` for the rebalance codes. It can only join
+/// the group again inside `poll`. The krabka coordinator task joins the group
+/// in the background, so the commit waits for the new generation and sends the
+/// offsets of the partitions that the consumer still owns again. A long-running
+/// commit loop thus continues through a routine rebalance, and the commit
+/// does not report an offset that the coordinator did not acknowledge as
+/// committed. When the task has stopped, no new generation comes, and the
+/// commit fails as Kafka's does.
+///
+/// Kafka stops at the first partition error other than `29`, so its result
+/// for a response with errors of more than one class depends on the partition
+/// order. This function gives a final error precedence over a deferral, a
+/// deferral over a retriable error, and a retriable error over `29`.
 fn commit_response_outcome(
     resp: &OffsetCommitResponse,
-    coordinator_alive: bool,
+    context: CommitResponseContext<'_>,
 ) -> Result<CommitOutcome, ConsumerError> {
     let mut deferred = None;
     let mut retriable = None;
+    let mut find_coordinator = false;
+    let mut unauthorized_topics = BTreeSet::new();
     let mut acknowledged = HashSet::new();
     for topic in &resp.topics {
         for partition in &topic.partitions {
-            match partition.error_code {
-                0 => {
+            let code = partition.error_code;
+            match PartitionCommitError::of(code) {
+                PartitionCommitError::None => {
                     acknowledged.insert((topic.name.clone(), partition.partition_index));
                 }
-                code @ (22 | 25 | 27) if coordinator_alive => {
-                    deferred.get_or_insert(code);
+                PartitionCommitError::TopicAuthorization => {
+                    unauthorized_topics.insert(topic.name.clone());
                 }
-                code @ (UNKNOWN_TOPIC_OR_PARTITION | UNKNOWN_TOPIC_ID) => {
+                PartitionCommitError::Retriable => {
                     retriable.get_or_insert(code);
                 }
-                code => return Err(ConsumerError::Server(code)),
+                PartitionCommitError::CoordinatorUnknown => {
+                    retriable.get_or_insert(code);
+                    find_coordinator = true;
+                }
+                PartitionCommitError::FencedInstanceId if context.generation_unchanged => {
+                    return Err(ConsumerError::FencedInstanceId(
+                        context.group_instance_id.unwrap_or_default().to_owned(),
+                    ));
+                }
+                PartitionCommitError::Rebalance | PartitionCommitError::FencedInstanceId => {
+                    if !context.coordinator_alive {
+                        return Err(ConsumerError::CommitFailed);
+                    }
+                    deferred.get_or_insert(code);
+                }
+                PartitionCommitError::GroupAuthorization => {
+                    return Err(ConsumerError::GroupAuthorizationFailed(
+                        context.group_id.to_owned(),
+                    ));
+                }
+                PartitionCommitError::Fatal => return Err(ConsumerError::Server(code)),
             }
         }
     }
-    Ok(match (deferred, retriable) {
-        (Some(code), _) => CommitOutcome::Deferred { code, acknowledged },
-        (None, Some(code)) => CommitOutcome::Retriable { code, acknowledged },
-        (None, None) => CommitOutcome::Acked(acknowledged),
-    })
+    match (deferred, retriable) {
+        (Some(code), _) => Ok(CommitOutcome::Deferred { code, acknowledged }),
+        (None, Some(code)) => Ok(CommitOutcome::Retriable {
+            code,
+            acknowledged,
+            find_coordinator,
+        }),
+        (None, None) if !unauthorized_topics.is_empty() => {
+            Err(ConsumerError::TopicAuthorizationFailed(unauthorized_topics))
+        }
+        (None, None) => Ok(CommitOutcome::Acked(acknowledged)),
+    }
 }
 
 fn retain_continuously_owned(
@@ -225,9 +278,6 @@ fn retain_continuously_owned(
 /// Kafka's `ConsumerUtils.DEFAULT_CLOSE_TIMEOUT_MS`. It bounds the synchronous
 /// auto commit in [`Consumer::close`].
 const AUTO_COMMIT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// `REQUEST_TIMED_OUT`. Kafka's `OffsetCommitResponseHandler` retries it.
-const REQUEST_TIMED_OUT: i16 = 7;
 
 /// The committable position of one owned partition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,19 +376,34 @@ pub(crate) enum AutoCommitOutcome {
     Failed,
 }
 
-/// `TOPIC_AUTHORIZATION_FAILED`.
-const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
-
-/// The error class of one partition in an `OffsetCommitResponse`. A larger
-/// class takes precedence when a response has errors of more than one class.
+/// What Kafka's `ConsumerCoordinator.OffsetCommitResponseHandler.handle` does
+/// with the error code of one partition. A larger class takes precedence in
+/// [`auto_commit_outcome`] when a response has errors of more than one class.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PartitionCommitError {
     None,
-    /// Kafka's `OffsetCommitResponseHandler` collects the unauthorized topics
+    /// `TOPIC_AUTHORIZATION_FAILED`. Kafka collects the unauthorized topics
     /// and raises `TopicAuthorizationException` only when no other partition
     /// has an error. Any other error takes precedence.
     TopicAuthorization,
+    /// `UNKNOWN_TOPIC_OR_PARTITION` and `COORDINATOR_LOAD_IN_PROGRESS`. Kafka
+    /// retries.
     Retriable,
+    /// `REQUEST_TIMED_OUT`, `COORDINATOR_NOT_AVAILABLE` and `NOT_COORDINATOR`.
+    /// Kafka calls `markCoordinatorUnknown` and retries.
+    CoordinatorUnknown,
+    /// `ILLEGAL_GENERATION`, `UNKNOWN_MEMBER_ID` and `REBALANCE_IN_PROGRESS`.
+    /// Kafka raises `CommitFailedException` or `RebalanceInProgressException`.
+    Rebalance,
+    /// `FENCED_INSTANCE_ID`. Kafka raises `FencedInstanceIdException` while the
+    /// generation is unchanged, and a rebalance error after it changed.
+    FencedInstanceId,
+    /// `GROUP_AUTHORIZATION_FAILED`. Kafka raises
+    /// `GroupAuthorizationException`.
+    GroupAuthorization,
+    /// Any other code. Kafka raises the error to the application:
+    /// `OFFSET_METADATA_TOO_LARGE` and `INVALID_COMMIT_OFFSET_SIZE` as
+    /// themselves, other codes as "Unexpected error in commit".
     Fatal,
 }
 
@@ -347,21 +412,27 @@ impl PartitionCommitError {
         match code {
             0 => Self::None,
             TOPIC_AUTHORIZATION_FAILED => Self::TopicAuthorization,
-            UNKNOWN_TOPIC_OR_PARTITION | REQUEST_TIMED_OUT => Self::Retriable,
-            code if is_retriable_coordinator_code(code) => Self::Retriable,
+            UNKNOWN_TOPIC_OR_PARTITION | COORDINATOR_LOAD_IN_PROGRESS => Self::Retriable,
+            REQUEST_TIMED_OUT | COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => {
+                Self::CoordinatorUnknown
+            }
+            ILLEGAL_GENERATION | UNKNOWN_MEMBER_ID | REBALANCE_IN_PROGRESS => Self::Rebalance,
+            FENCED_INSTANCE_ID => Self::FencedInstanceId,
+            GROUP_AUTHORIZATION_FAILED => Self::GroupAuthorization,
             _ => Self::Fatal,
         }
     }
 }
 
-/// Whether a partition of `response` says that the coordinator is loading or
-/// moved. The consumer then finds the coordinator again.
+/// Whether a partition of `response` makes Kafka's
+/// `OffsetCommitResponseHandler` call `markCoordinatorUnknown`. The consumer
+/// then finds the coordinator again.
 pub(crate) fn names_moved_coordinator(response: &OffsetCommitResponse) -> bool {
     response.topics.iter().any(|topic| {
-        topic
-            .partitions
-            .iter()
-            .any(|partition| is_retriable_coordinator_code(partition.error_code))
+        topic.partitions.iter().any(|partition| {
+            PartitionCommitError::of(partition.error_code)
+                == PartitionCommitError::CoordinatorUnknown
+        })
     })
 }
 
@@ -390,10 +461,14 @@ pub(crate) fn auto_commit_outcome(
                 .unwrap_or(PartitionCommitError::None);
             match error {
                 PartitionCommitError::None => AutoCommitOutcome::Committed,
-                PartitionCommitError::Retriable => AutoCommitOutcome::Retriable,
-                PartitionCommitError::TopicAuthorization | PartitionCommitError::Fatal => {
-                    AutoCommitOutcome::Failed
+                PartitionCommitError::Retriable | PartitionCommitError::CoordinatorUnknown => {
+                    AutoCommitOutcome::Retriable
                 }
+                PartitionCommitError::TopicAuthorization
+                | PartitionCommitError::Rebalance
+                | PartitionCommitError::FencedInstanceId
+                | PartitionCommitError::GroupAuthorization
+                | PartitionCommitError::Fatal => AutoCommitOutcome::Failed,
             }
         }
         Err(ConsumerError::Client(error))
@@ -859,10 +934,37 @@ impl Consumer {
                     .await;
             }
             let topics = build_commit_topics(offsets);
-            match self
+            let outcome = match self
                 .commit_topics_once(topics, (identity.generation, identity.member_id.clone()))
-                .await?
+                .await
             {
+                Ok(outcome) => outcome,
+                // Kafka's `CoordinatorResponseHandler.onFailure` marks the
+                // coordinator unknown after a disconnect, and
+                // `commitOffsetsSync` retries until the timeout. A request
+                // timeout is a disconnect in Kafka's `NetworkClient`.
+                Err(ConsumerError::Client(error))
+                    if is_retriable_transport_error(&error)
+                        || matches!(error, krabka_client_core::ClientError::Timeout(_)) =>
+                {
+                    if retry_deadline_elapsed(retry_start, self.retry_policy.timeout) {
+                        return Err(ConsumerError::CoordinatorUnavailable);
+                    }
+                    tracing::warn!(
+                        group = %self.group_id,
+                        %error,
+                        "offset commit request failed; finding the coordinator again and retrying",
+                    );
+                    self.client
+                        .evict_broker(self.coordinator_id.load(Ordering::Relaxed));
+                    self.find_coordinator_again(retry_start).await;
+                    tokio::time::sleep(retry_backoff).await;
+                    retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match outcome {
                 CommitOutcome::Acked(acknowledged) => {
                     pending.retain(|partition, _| !acknowledged.contains(partition));
                     if pending.is_empty() {
@@ -891,15 +993,19 @@ impl Consumer {
                         tokio::select! {
                             () = &mut assignment_changed => {}
                             () = self.coordinator_shutdown.cancelled() => {
-                                return Err(ConsumerError::Server(code));
+                                return Err(ConsumerError::CommitFailed);
                             }
                         }
                     }
                 }
-                CommitOutcome::Retriable { code, acknowledged } => {
-                    // Kafka's `CommitRequestManager.commitSyncWithRetries` sends
-                    // the commit again while it fails with a retriable error and
-                    // the deadline has not passed.
+                CommitOutcome::Retriable {
+                    code,
+                    acknowledged,
+                    find_coordinator,
+                } => {
+                    // Kafka's `ConsumerCoordinator.commitOffsetsSync` sends the
+                    // commit again while it fails with a retriable error and
+                    // the timeout has not passed.
                     pending.retain(|partition, _| !acknowledged.contains(partition));
                     if pending.is_empty() {
                         return Ok(());
@@ -910,8 +1016,11 @@ impl Consumer {
                     tracing::warn!(
                         group = %self.group_id,
                         error_code = code,
-                        "offset commit names a topic the coordinator does not know; retrying",
+                        "offset commit failed with a retriable error; retrying",
                     );
+                    if find_coordinator {
+                        self.find_coordinator_again(retry_start).await;
+                    }
                     tokio::time::sleep(retry_backoff).await;
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
                 }
@@ -919,58 +1028,68 @@ impl Consumer {
         }
     }
 
+    /// Find the group coordinator again, within the time that is left of a
+    /// synchronous commit that started at `retry_start`. Kafka's
+    /// `commitOffsetsSync` does this in `coordinatorUnknownAndUnreadySync` after
+    /// `markCoordinatorUnknown`. If the lookup fails, the next attempt uses the
+    /// last known coordinator.
+    async fn find_coordinator_again(&self, retry_start: tokio::time::Instant) {
+        let retry_policy = crate::coordinator::CoordinatorRetryPolicy {
+            timeout: self
+                .retry_policy
+                .timeout
+                .saturating_sub(retry_start.elapsed()),
+            ..self.retry_policy
+        };
+        match find_coordinator(&self.client, &self.group_id, retry_policy).await {
+            Ok(id) => self.coordinator_id.store(id, Ordering::Relaxed),
+            Err(error) => {
+                tracing::warn!(
+                    group = %self.group_id,
+                    %error,
+                    "coordinator lookup for an offset commit failed; retrying with the last known coordinator",
+                );
+            }
+        }
+    }
+
+    /// Send one `OffsetCommit` to the coordinator and map the response.
+    ///
+    /// [`Consumer::commit_pending_offsets`] retries a retriable result.
     async fn commit_topics_once(
         &self,
         topics: Vec<OffsetCommitRequestTopic>,
         identity: (i32, String),
     ) -> Result<CommitOutcome, ConsumerError> {
-        // OffsetCommit is a coordinator RPC: route it to the coordinator broker
-        // (discovered at build time, kept current by the coordinator task), and
-        // re-discover on a cold/relocating-coordinator code so a coordinator
-        // move is chased rather than looping NOT_COORDINATOR on the stale id.
-        let resp = with_coordinator_refind(
-            &self.client,
-            &self.group_id,
-            &self.coordinator_id,
-            self.retry_policy,
-            first_commit_error,
-            || {
-                let group_id = self.group_id.clone();
-                let group_instance_id = self.group_instance_id.clone();
-                let topics = topics.clone();
-                let client = &self.client;
-                let target = self.coordinator_id.load(Ordering::Relaxed);
-                let identity = identity.clone();
-                async move {
-                    let (generation, member_id) = identity;
-                    client
-                        .broker(target)
-                        .send(build_commit_request(
-                            group_id,
-                            generation,
-                            member_id,
-                            group_instance_id,
-                            topics,
-                        ))
-                        .await
-                        .map_err(ConsumerError::from)
-                }
-            },
-        )
-        .await?;
+        let (generation, member_id) = identity;
+        let target = self.coordinator_id.load(Ordering::Relaxed);
+        let resp = self
+            .client
+            .broker(target)
+            .send(build_commit_request(
+                self.group_id.clone(),
+                generation,
+                member_id.clone(),
+                self.group_instance_id.clone(),
+                topics,
+            ))
+            .await?;
 
-        // A rebalance can move the group out from under this commit (22
-        // ILLEGAL_GENERATION / 27 REBALANCE_IN_PROGRESS). While the coordinator
-        // task is alive it rejoins, republishes the generation, and the offsets
-        // recommit next round, so `commit_response_result` defers (Ok) and the
-        // commit loop survives the rebalance. If the coordinator task has exited
-        // it returns fatal instead — a dead coordinator can never recover the
-        // generation, so a loud restart beats a silent never-advance.
+        let current = self.commit_identity.lock().await.clone();
         let coordinator_alive = self
             .coordinator_handle
             .as_ref()
             .is_none_or(|h| !h.is_finished());
-        let outcome = commit_response_outcome(&resp, coordinator_alive)?;
+        let outcome = commit_response_outcome(
+            &resp,
+            CommitResponseContext {
+                group_id: &self.group_id,
+                group_instance_id: self.group_instance_id.as_deref(),
+                coordinator_alive,
+                generation_unchanged: current.generation == generation
+                    && current.member_id == member_id,
+            },
+        )?;
         if let CommitOutcome::Deferred { code, .. } = outcome {
             tracing::warn!(
                 group = %self.group_id,
@@ -1099,13 +1218,13 @@ mod tests {
     };
 
     use assert2::check;
-    use krabka_client_core::{Client, MockBroker};
+    use krabka_client_core::{Client, MockBroker, MockReply};
     use krabka_protocol::{
         Encode, UnknownTaggedFields,
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
-            offset_commit_request,
+            find_coordinator_request, metadata_request, offset_commit_request,
             offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
             offset_commit_response::{OffsetCommitResponsePartition, OffsetCommitResponseTopic},
         },
@@ -1150,7 +1269,8 @@ mod tests {
     }
 
     /// An `ApiVersions` response that advertises `OffsetCommit` in
-    /// `offset_commit_range`.
+    /// `offset_commit_range`, and the `FindCoordinator` and `Metadata` requests
+    /// of a coordinator lookup.
     fn api_versions_for_offset_commit(offset_commit_range: (i16, i16)) -> Vec<u8> {
         let response = ApiVersionsResponse {
             error_code: 0,
@@ -1165,6 +1285,18 @@ mod tests {
                     api_key: offset_commit_request::API_KEY,
                     min_version: offset_commit_range.0,
                     max_version: offset_commit_range.1,
+                    ..Default::default()
+                },
+                ApiVersion {
+                    api_key: find_coordinator_request::API_KEY,
+                    min_version: 0,
+                    max_version: 0,
+                    ..Default::default()
+                },
+                ApiVersion {
+                    api_key: metadata_request::API_KEY,
+                    min_version: 0,
+                    max_version: 8,
                     ..Default::default()
                 },
             ],
@@ -1362,17 +1494,6 @@ mod tests {
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
-        }
-    }
-
-    #[test]
-    fn first_commit_error_returns_first_non_zero_partition_error() {
-        for (_name, errors, want) in [
-            ("all successful", &[0, 0][..], 0),
-            ("later first error", &[0, 27, 42][..], 27),
-            ("first partition errors", &[16, 27][..], 16),
-        ] {
-            assert2::assert!(first_commit_error(&response(errors)) == want);
         }
     }
 
@@ -1794,82 +1915,143 @@ mod tests {
         );
     }
 
+    /// `commit_response_outcome` gives a final error precedence over a
+    /// deferral, a deferral over a retriable error, and a retriable error over
+    /// `TOPIC_AUTHORIZATION_FAILED`, where Kafka's result depends on the
+    /// partition order. The rebalance codes and `FENCED_INSTANCE_ID` depend on
+    /// the generation and on the coordinator task.
     #[test]
-    fn commit_response_result_defers_rebalance_codes_only_while_coordinator_alive() {
-        for (name, errors, coordinator_alive, expected_error) in [
-            ("success while alive", &[0, 0][..], true, None),
-            ("success after coordinator exit", &[0, 0][..], false, None),
-            ("non-rebalance error", &[0, 42][..], true, Some(42)),
-            ("illegal generation deferred", &[22][..], true, None),
-            ("unknown member deferred", &[25][..], true, None),
-            ("rebalance deferred", &[27][..], true, None),
+    fn commit_response_outcome_orders_errors_and_reads_the_consumer_state() {
+        let running = CommitResponseContext {
+            group_id: "group-a",
+            group_instance_id: Some("instance-a"),
+            coordinator_alive: true,
+            generation_unchanged: true,
+        };
+        let stopped = CommitResponseContext {
+            coordinator_alive: false,
+            ..running
+        };
+        let rejoined = CommitResponseContext {
+            generation_unchanged: false,
+            ..running
+        };
+        let rejoined_and_stopped = CommitResponseContext {
+            coordinator_alive: false,
+            ..rejoined
+        };
+        let commit_failed = ConsumerError::CommitFailed.to_string();
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, errors, context, expected) in [
             (
-                "later illegal generation deferred",
-                &[0, 22][..],
-                true,
-                None,
+                "success",
+                &[0, 0][..],
+                running,
+                Ok(CommitOutcome::Acked(HashSet::from([
+                    ("topic".into(), 0),
+                    ("topic".into(), 1),
+                ]))),
             ),
-            ("illegal generation after exit", &[22][..], false, Some(22)),
-            ("unknown member after exit", &[25][..], false, Some(25)),
-            ("rebalance after exit", &[27][..], false, Some(27)),
             (
-                "fatal error takes precedence",
-                &[27, 42][..],
-                true,
-                Some(42),
-            ),
-        ] {
-            let actual = commit_response_result(&response(errors), coordinator_alive);
-            let actual_error = match actual {
-                Ok(()) => None,
-                Err(ConsumerError::Server(code)) => Some(code),
-                Err(other) => panic!("case {name}: unexpected error {other:?}"),
-            };
-            check!(actual_error == expected_error, "case {name}");
-        }
-    }
-
-    #[test]
-    fn commit_partition_error_codes_map_to_kafka_commit_actions() {
-        for (name, errors, expected) in [
-            (
-                "unknown topic or partition is retriable",
+                "retriable code keeps the acknowledged partitions",
                 &[0, 3][..],
+                running,
                 Ok(CommitOutcome::Retriable {
                     code: 3,
                     acknowledged: HashSet::from([("topic".into(), 0)]),
+                    find_coordinator: false,
                 }),
             ),
-            ("not leader or follower is fatal", &[6][..], Err(6)),
             (
-                "unknown topic id is retriable",
-                &[100][..],
+                "a later coordinator code finds the coordinator",
+                &[14, 7][..],
+                running,
                 Ok(CommitOutcome::Retriable {
-                    code: 100,
+                    code: 14,
                     acknowledged: HashSet::new(),
+                    find_coordinator: true,
                 }),
             ),
             (
-                "rebalance deferral takes precedence over a retriable code",
-                &[100, 27][..],
+                "deferral takes precedence over a retriable code",
+                &[3, 27][..],
+                running,
                 Ok(CommitOutcome::Deferred {
                     code: 27,
                     acknowledged: HashSet::new(),
                 }),
             ),
             (
-                "fatal error takes precedence over a retriable code",
-                &[100, 42][..],
-                Err(42),
+                "final code takes precedence over a deferral",
+                &[27, 42][..],
+                running,
+                Err(ConsumerError::Server(42).to_string()),
+            ),
+            (
+                "group authorization takes precedence over a deferral",
+                &[22, 30][..],
+                running,
+                Err("not authorized to access group: group-a".into()),
+            ),
+            (
+                "retriable code takes precedence over topic authorization",
+                &[29, 16][..],
+                running,
+                Ok(CommitOutcome::Retriable {
+                    code: 16,
+                    acknowledged: HashSet::new(),
+                    find_coordinator: true,
+                }),
+            ),
+            (
+                "topic authorization after a success",
+                &[0, 29][..],
+                running,
+                Err("not authorized to access topics: [topic]".into()),
+            ),
+            (
+                "unknown member id after the task stopped",
+                &[25][..],
+                stopped,
+                Err(commit_failed.clone()),
+            ),
+            (
+                "rebalance in progress after the task stopped",
+                &[27][..],
+                stopped,
+                Err(commit_failed.clone()),
+            ),
+            (
+                "fenced instance id with the same generation",
+                &[82][..],
+                running,
+                Err(ConsumerError::FencedInstanceId("instance-a".into()).to_string()),
+            ),
+            (
+                "fenced instance id after a rejoin",
+                &[82][..],
+                rejoined,
+                Ok(CommitOutcome::Deferred {
+                    code: 82,
+                    acknowledged: HashSet::new(),
+                }),
+            ),
+            (
+                "fenced instance id after a rejoin and a task stop",
+                &[82][..],
+                rejoined_and_stopped,
+                Err(commit_failed.clone()),
             ),
         ] {
-            let actual =
-                commit_response_outcome(&response(errors), true).map_err(|error| match error {
-                    ConsumerError::Server(code) => code,
-                    other => panic!("case {name}: unexpected error {other:?}"),
-                });
-            check!(actual == expected, "case {name}");
+            actual.push((
+                name,
+                commit_response_outcome(&response(errors), context)
+                    .map_err(|error| error.to_string()),
+            ));
+            wanted.push((name, expected));
         }
+        assert2::assert!(actual == wanted);
     }
 
     /// The negotiated `OffsetCommit` version and the request that the
@@ -1987,82 +2169,320 @@ mod tests {
         }
     }
 
-    /// `commit_offsets_sync` sends the commit again after a retriable topic
-    /// error and succeeds when the coordinator acks, as Kafka's
-    /// `CommitRequestManager.commitSyncWithRetries` does. A fatal code fails at
-    /// once, and a retriable code fails when the retry timeout has elapsed.
+    /// One scripted answer of the mock coordinator to an `OffsetCommit`.
+    #[derive(Clone, Copy, Debug)]
+    enum CommitAnswer {
+        /// Answer each partition of a topic with the error code of that topic,
+        /// and `0` for a topic that is not in the list.
+        Codes(&'static [(&'static str, i16)]),
+        /// Close the connection without a response.
+        Close,
+        /// Send no response, so the request times out.
+        Silent,
+    }
+
+    /// The result of a synchronous commit, the `OffsetCommit` requests and the
+    /// `FindCoordinator` requests that the coordinator received.
+    type CommitCodeResult = (Result<(), String>, usize, usize);
+
+    /// `commit_sync` handles each `OffsetCommit` error code as Kafka's
+    /// `ConsumerCoordinator.OffsetCommitResponseHandler.handle` and
+    /// `commitOffsetsSync` do. Retriable codes and failed requests retry until
+    /// the timeout. `7`, `15`, `16` and a failed request find the coordinator
+    /// again first. The rebalance codes wait for the coordinator task to join
+    /// the group again.
     #[tokio::test]
-    async fn commit_sync_retries_unknown_topic_errors_until_the_deadline() {
-        for (name, responses, timeout, expected) in [
+    async fn commit_sync_handles_each_offset_commit_error_code_as_kafka_does() {
+        use CommitAnswer::{Close, Codes, Silent};
+
+        const RETRY: Duration = Duration::from_secs(2);
+        let fenced = ConsumerError::FencedInstanceId("instance-a".into()).to_string();
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, answers, rejoin, timeout, expected) in [
+            ("success", vec![Codes(&[])], false, RETRY, (Ok(()), 1, 0)),
             (
-                "unknown topic id then success",
-                vec![vec![100], vec![0]],
-                Duration::from_secs(5),
-                (Ok(()), 2),
+                "unknown topic or partition retries",
+                vec![Codes(&[("orders", 3)]), Codes(&[])],
+                false,
+                RETRY,
+                (Ok(()), 2, 0),
             ),
             (
-                "unknown topic or partition then success",
-                vec![vec![3], vec![0]],
-                Duration::from_secs(5),
-                (Ok(()), 2),
+                "coordinator load in progress retries",
+                vec![Codes(&[("orders", 14)]), Codes(&[])],
+                false,
+                RETRY,
+                (Ok(()), 2, 0),
             ),
             (
-                "not leader or follower fails at once",
-                vec![vec![6]],
-                Duration::from_secs(5),
-                (Err(Some(6)), 1),
+                "request timed out finds the coordinator and retries",
+                vec![Codes(&[("orders", 7)]), Codes(&[])],
+                false,
+                RETRY,
+                (Ok(()), 2, 1),
             ),
             (
-                "unknown topic id past the deadline",
-                vec![vec![100]],
+                "coordinator not available finds the coordinator and retries",
+                vec![Codes(&[("orders", 15)]), Codes(&[])],
+                false,
+                RETRY,
+                (Ok(()), 2, 1),
+            ),
+            (
+                "not coordinator finds the coordinator and retries",
+                vec![Codes(&[("orders", 16)]), Codes(&[])],
+                false,
+                RETRY,
+                (Ok(()), 2, 1),
+            ),
+            (
+                "unknown topic or partition past the timeout",
+                vec![Codes(&[("orders", 3)])],
+                false,
                 Duration::ZERO,
-                (Err(Some(100)), 1),
+                (Err(ConsumerError::Server(3).to_string()), 1, 0),
+            ),
+            (
+                "disconnect finds the coordinator and retries",
+                vec![Close, Codes(&[])],
+                false,
+                RETRY,
+                (Ok(()), 2, 1),
+            ),
+            (
+                "request timeout finds the coordinator and retries",
+                vec![Silent, Codes(&[])],
+                false,
+                RETRY,
+                (Ok(()), 2, 1),
+            ),
+            (
+                "disconnect past the timeout",
+                vec![Close],
+                false,
+                Duration::ZERO,
+                (Err(ConsumerError::CoordinatorUnavailable.to_string()), 1, 0),
+            ),
+            (
+                "group authorization failed",
+                vec![Codes(&[("orders", 30)])],
+                false,
+                RETRY,
+                (Err("not authorized to access group: group-a".into()), 1, 0),
+            ),
+            (
+                "topic authorization failed collects every topic",
+                vec![Codes(&[("orders", 29), ("payments", 29)])],
+                false,
+                RETRY,
+                (
+                    Err("not authorized to access topics: [orders, payments]".into()),
+                    1,
+                    0,
+                ),
+            ),
+            (
+                "topic authorization failed with a retriable code retries",
+                vec![Codes(&[("orders", 29), ("payments", 3)]), Codes(&[])],
+                false,
+                RETRY,
+                (Ok(()), 2, 0),
+            ),
+            (
+                "offset metadata too large",
+                vec![Codes(&[("orders", 12)])],
+                false,
+                RETRY,
+                (Err(ConsumerError::Server(12).to_string()), 1, 0),
+            ),
+            (
+                "invalid commit offset size",
+                vec![Codes(&[("orders", 28)])],
+                false,
+                RETRY,
+                (Err(ConsumerError::Server(28).to_string()), 1, 0),
+            ),
+            (
+                "unknown topic id is unexpected for a request by topic name",
+                vec![Codes(&[("orders", 100)])],
+                false,
+                RETRY,
+                (Err(ConsumerError::Server(100).to_string()), 1, 0),
+            ),
+            (
+                "not leader or follower is unexpected",
+                vec![Codes(&[("orders", 6)])],
+                false,
+                RETRY,
+                (Err(ConsumerError::Server(6).to_string()), 1, 0),
+            ),
+            (
+                "fenced instance id with the same generation",
+                vec![Codes(&[("orders", 82)])],
+                false,
+                RETRY,
+                (Err(fenced.clone()), 1, 0),
+            ),
+            (
+                "fenced instance id after a rejoin commits again",
+                vec![Codes(&[("orders", 82)]), Codes(&[])],
+                true,
+                RETRY,
+                (Ok(()), 2, 0),
+            ),
+            (
+                "illegal generation commits again after the rejoin",
+                vec![Codes(&[("orders", 22)]), Codes(&[])],
+                true,
+                RETRY,
+                (Ok(()), 2, 0),
+            ),
+            (
+                "unknown member id commits again after the rejoin",
+                vec![Codes(&[("orders", 25)]), Codes(&[])],
+                true,
+                RETRY,
+                (Ok(()), 2, 0),
+            ),
+            (
+                "rebalance in progress commits again after the rejoin",
+                vec![Codes(&[("orders", 27)]), Codes(&[])],
+                true,
+                RETRY,
+                (Ok(()), 2, 0),
             ),
         ] {
-            let requests = Arc::new(AtomicUsize::new(0));
-            let requests_in_mock = Arc::clone(&requests);
-            let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
-                if api_key == api_versions_request::API_KEY {
-                    return Some(api_versions_for_offset_commit((2, 2)));
-                }
-                if api_key != offset_commit_request::API_KEY {
-                    return None;
-                }
-                let attempt = requests_in_mock.fetch_add(1, Ordering::SeqCst);
-                let errors = &responses[attempt.min(responses.len() - 1)];
-                Some(encode_response(&response(errors), version))
-            })
-            .await;
-            let mut consumer = commit_consumer(
-                &mock,
-                commit_identity(7, "member-a"),
-                Arc::new(tokio::sync::Notify::new()),
-                Arc::new(AtomicI32::new(7)),
-            )
-            .await;
-            consumer.retry_policy = CoordinatorRetryPolicy {
-                timeout,
-                initial_backoff: Duration::from_millis(1),
-                max_backoff: Duration::from_millis(1),
-            };
-
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                consumer.commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)])),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("case {name}: commit never finished"))
-            .map_err(|error| match error {
-                ConsumerError::Server(code) => Some(code),
-                _ => None,
-            });
-
-            mock.stop();
-            check!(
-                (result, requests.load(Ordering::SeqCst)) == expected,
-                "case {name}"
-            );
+            actual.push((name, scripted_commit_sync(answers, rejoin, timeout).await));
+            wanted.push((name, expected));
         }
+        let wanted: Vec<(&str, CommitCodeResult)> = wanted;
+        assert2::assert!(actual == wanted);
+    }
+
+    /// Run `commit_sync` against a mock coordinator that gives `answers` to
+    /// the `OffsetCommit` requests in order and repeats the last answer. With
+    /// `rejoin`, the coordinator task joins the group again with generation 8
+    /// before the first answer.
+    async fn scripted_commit_sync(
+        answers: Vec<CommitAnswer>,
+        rejoin: bool,
+        timeout: Duration,
+    ) -> CommitCodeResult {
+        use CommitAnswer::{Close, Codes, Silent};
+        use krabka_protocol::owned::{
+            find_coordinator_response::FindCoordinatorResponse, metadata_response::MetadataResponse,
+        };
+
+        let identity = Arc::new(Mutex::new(CommitIdentity {
+            generation: 7,
+            member_id: "member-a".into(),
+            ownership_ids: HashMap::from([(("orders".into(), 0), 1), (("payments".into(), 0), 2)]),
+        }));
+        let assignment_changed = Arc::new(tokio::sync::Notify::new());
+        let offset_commits = Arc::new(AtomicUsize::new(0));
+        let find_coordinators = Arc::new(AtomicUsize::new(0));
+        let identity_in_mock = Arc::clone(&identity);
+        let changed_in_mock = Arc::clone(&assignment_changed);
+        let offset_commits_in_mock = Arc::clone(&offset_commits);
+        let find_coordinators_in_mock = Arc::clone(&find_coordinators);
+        let mock = MockBroker::start_with_replies(move |api_key, version, _corr_id, mut body| {
+            let mut buffer = bytes::BytesMut::new();
+            match api_key {
+                api_versions_request::API_KEY => {
+                    MockReply::Respond(api_versions_for_offset_commit((7, 7)))
+                }
+                find_coordinator_request::API_KEY => {
+                    find_coordinators_in_mock.fetch_add(1, Ordering::SeqCst);
+                    FindCoordinatorResponse::default()
+                        .encode(&mut buffer, version)
+                        .unwrap();
+                    MockReply::Respond(buffer.to_vec())
+                }
+                metadata_request::API_KEY => {
+                    MetadataResponse::default()
+                        .encode(&mut buffer, version)
+                        .unwrap();
+                    MockReply::Respond(buffer.to_vec())
+                }
+                offset_commit_request::API_KEY => {
+                    let attempt = offset_commits_in_mock.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 && rejoin {
+                        identity_in_mock.try_lock().unwrap().generation = 8;
+                        changed_in_mock.notify_waiters();
+                    }
+                    let client_id_len = bytes::Buf::get_i16(&mut body);
+                    bytes::Buf::advance(&mut body, usize::try_from(client_id_len).unwrap());
+                    let request: OffsetCommitRequest =
+                        krabka_protocol::Decode::decode(&mut body, version).unwrap();
+                    let codes = match answers[attempt.min(answers.len() - 1)] {
+                        Codes(codes) => codes,
+                        Close => return MockReply::Close,
+                        Silent => return MockReply::Silent,
+                    };
+                    let code_of = |topic: &str| {
+                        codes
+                            .iter()
+                            .find(|(name, _)| *name == topic)
+                            .map_or(0, |(_, code)| *code)
+                    };
+                    let response = OffsetCommitResponse {
+                        topics: request
+                            .topics
+                            .iter()
+                            .map(|topic| OffsetCommitResponseTopic {
+                                name: topic.name.clone(),
+                                partitions: topic
+                                    .partitions
+                                    .iter()
+                                    .map(|partition| OffsetCommitResponsePartition {
+                                        partition_index: partition.partition_index,
+                                        error_code: code_of(&topic.name),
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    };
+                    MockReply::Respond(encode_response(&response, version))
+                }
+                _ => MockReply::Silent,
+            }
+        })
+        .await;
+        let mut consumer = commit_consumer(
+            &mock,
+            Arc::clone(&identity),
+            assignment_changed,
+            Arc::new(AtomicI32::new(7)),
+        )
+        .await;
+        consumer.client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .request_timeout(krabka_units::millis(300))
+            .build()
+            .await
+            .unwrap();
+        consumer.group_instance_id = Some("instance-a".into());
+        consumer.retry_policy = CoordinatorRetryPolicy {
+            timeout,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(10), consumer.commit_sync())
+            .await
+            .map_err(|_| "commit never finished".to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+
+        mock.stop();
+        (
+            result,
+            offset_commits.load(Ordering::SeqCst),
+            find_coordinators.load(Ordering::SeqCst),
+        )
     }
 
     /// A commit fails without a request after the coordinator task stopped,
