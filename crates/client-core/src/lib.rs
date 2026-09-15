@@ -61,6 +61,7 @@ mod fetch;
 mod metadata_topics;
 mod offset_for_leader_epoch;
 mod pool;
+mod reauth;
 mod request;
 pub mod sasl;
 pub mod security;
@@ -100,7 +101,9 @@ pub use mock::{MockBroker, MockReply, MockSaslAnswer};
 pub use offset_for_leader_epoch::{EpochEndOffset, offset_for_leader_epoch};
 pub use pool::{BrokerInfo, BrokerPool};
 pub use request::ProtocolRequest;
-pub use sasl::{OutboundSaslError, SaslAuthenticationError, SaslCredentials, outbound_sasl};
+pub use sasl::{
+    OutboundSaslError, SaslAuthenticationError, SaslCredentials, SaslSession, outbound_sasl,
+};
 pub use security::{
     ClientSecurity, KeyStore, Password, TlsConfigError, TlsConnectorConfig, TlsVersion, TrustStore,
     connection_target_host,

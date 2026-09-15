@@ -13,7 +13,11 @@
 //! and the public clients both call. The only difference is the
 //! credentials value and the reporter `client_id`.
 
-use std::path::PathBuf;
+use std::{
+    future::Future,
+    path::PathBuf,
+    sync::atomic::{AtomicI64, Ordering},
+};
 
 use bytes::{Buf, BufMut, BytesMut};
 use krabka_ids::{ApiKey, ApiVersion};
@@ -57,13 +61,84 @@ fn next_correlation_id(corr_id: &mut i32) -> i32 {
 }
 
 #[derive(Clone, Copy)]
-struct SaslPolicy<'a> {
+pub(crate) struct SaslPolicy<'a> {
     client_id: &'a str,
     frame_max: ClientFrameMax,
     /// The `SaslAuthenticate` version, or `None` when the broker does not list
     /// `SaslAuthenticate` and the tokens go without a Kafka header
     /// (`DISABLE_KAFKA_SASL_AUTHENTICATE_HEADER`).
     authenticate_version: Option<i16>,
+    /// The last positive `session_lifetime_ms` of a `SaslAuthenticate`
+    /// response, as Kafka's `ReauthInfo.positiveSessionLifetimeMs` holds it.
+    session_lifetime_ms: &'a AtomicI64,
+}
+
+/// The request path of one SASL exchange: a stream before the connection
+/// carries other requests, or a live connection for re-authentication
+/// (KIP-368).
+pub(crate) trait SaslChannel: Send {
+    /// Send one framed Kafka request and return the response body after the
+    /// response header.
+    fn request(
+        &mut self,
+        header: (ApiKey, ApiVersion, i32),
+        flexible: bool,
+        body: &[u8],
+        policy: SaslPolicy<'_>,
+    ) -> impl Future<Output = Result<Vec<u8>, OutboundSaslError>> + Send;
+
+    /// Send a size-prefixed token with no Kafka header and return the answer.
+    fn token(
+        &mut self,
+        token: &[u8],
+        frame_max: ClientFrameMax,
+    ) -> impl Future<Output = Result<SaslAuthenticateResponse, OutboundSaslError>> + Send;
+}
+
+impl<S> SaslChannel for S
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+{
+    async fn request(
+        &mut self,
+        (api_key, api_version, corr_id): (ApiKey, ApiVersion, i32),
+        flexible: bool,
+        body: &[u8],
+        policy: SaslPolicy<'_>,
+    ) -> Result<Vec<u8>, OutboundSaslError> {
+        round_trip(self, api_key, api_version, corr_id, flexible, body, policy).await
+    }
+
+    async fn token(
+        &mut self,
+        token: &[u8],
+        frame_max: ClientFrameMax,
+    ) -> Result<SaslAuthenticateResponse, OutboundSaslError> {
+        send_raw_token(self, token, frame_max).await
+    }
+}
+
+/// What a completed SASL exchange leaves for re-authentication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SaslSession {
+    /// The `SaslHandshake` version of the exchange.
+    pub handshake_version: i16,
+    /// The `SaslAuthenticate` version, or `None` for tokens with no Kafka
+    /// header.
+    pub authenticate_version: Option<i16>,
+    /// The positive session lifetime that the broker sent, or `None` when the
+    /// broker does not require re-authentication.
+    pub session_lifetime_ms: Option<i64>,
+}
+
+impl SaslSession {
+    /// Whether the connection must re-authenticate before the session ends.
+    /// Kafka's `SaslClientAuthenticator` re-authenticates only with a positive
+    /// session lifetime, which `SaslAuthenticate` v1 and later carry.
+    #[must_use]
+    pub fn needs_reauthentication(&self) -> bool {
+        self.session_lifetime_ms.is_some() && self.authenticate_version.is_some_and(|v| v >= 1)
+    }
 }
 
 /// The `SaslHandshake` and `SaslAuthenticate` versions for a broker's
@@ -244,7 +319,7 @@ pub async fn outbound_sasl<S>(
     server_name: &str,
     client_id: &str,
     frame_max: ClientFrameMax,
-) -> Result<(), OutboundSaslError>
+) -> Result<SaslSession, OutboundSaslError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
 {
@@ -254,32 +329,64 @@ where
     //         GSSAPI token, so the client uses version 0.
     let api_versions = send_api_versions(stream, &mut corr_id, client_id, frame_max).await?;
     let (handshake_version, authenticate_version) = sasl_versions(&api_versions);
+    // Steps 2 and 3: SaslHandshake and SaslAuthenticate.
+    authenticate(
+        stream,
+        creds,
+        server_name,
+        SaslSession {
+            handshake_version,
+            authenticate_version,
+            session_lifetime_ms: None,
+        },
+        (&mut corr_id, client_id, frame_max),
+    )
+    .await
+}
+
+/// Run `SaslHandshake` and the `SaslAuthenticate` rounds of `creds` over
+/// `channel` at the versions of `versions`, and return the new session.
+///
+/// A re-authentication (KIP-368) calls this with the versions of the first
+/// exchange, as Kafka's `SaslClientAuthenticator.reauthenticate` uses the
+/// original `ApiVersions` response.
+pub(crate) async fn authenticate<C>(
+    channel: &mut C,
+    creds: &SaslCredentials,
+    server_name: &str,
+    versions: SaslSession,
+    (corr_id, client_id, frame_max): (&mut i32, &str, ClientFrameMax),
+) -> Result<SaslSession, OutboundSaslError>
+where
+    C: SaslChannel + ?Sized,
+{
+    let session_lifetime_ms = AtomicI64::new(0);
     let policy = SaslPolicy {
         client_id,
         frame_max,
-        authenticate_version,
+        authenticate_version: versions.authenticate_version,
+        session_lifetime_ms: &session_lifetime_ms,
     };
-    // Step 2: SaslHandshake with the chosen mechanism, at the version that
-    //         ApiVersions allows.
+    // SaslHandshake with the chosen mechanism, at the version that
+    // ApiVersions allows.
     send_sasl_handshake(
-        stream,
+        channel,
         creds.mechanism(),
-        handshake_version,
-        &mut corr_id,
+        versions.handshake_version,
+        corr_id,
         policy,
     )
     .await?;
-    // Step 3: SaslAuthenticate (one round for PLAIN, two for SCRAM, three
-    //         for GSSAPI).
+    // SaslAuthenticate (one round for PLAIN, two for SCRAM, three for GSSAPI).
     match creds {
         SaslCredentials::Plain { username, password } => {
-            send_plain_authenticate(stream, username, password, &mut corr_id, policy).await
+            send_plain_authenticate(channel, username, password, corr_id, policy).await
         }
         SaslCredentials::Scram {
             mechanism,
             username,
             password,
-        } => run_scram_client(stream, username, password, *mechanism, &mut corr_id, policy).await,
+        } => run_scram_client(channel, username, password, *mechanism, corr_id, policy).await,
         SaslCredentials::Gssapi {
             keytab_path,
             client_principal,
@@ -287,26 +394,33 @@ where
             kdc_url,
         } => {
             run_gssapi_client(
-                stream,
+                channel,
                 keytab_path,
                 client_principal,
                 (service_name, server_name),
                 kdc_url,
-                &mut corr_id,
+                corr_id,
                 policy,
             )
             .await
         }
         SaslCredentials::OAuthBearer { token_path } => {
+            // Each exchange reads the token file again, so a re-authentication
+            // sends a refreshed token.
             let token = tokio::fs::read(token_path).await.map_err(|error| {
                 mechanism_failure(format!(
                     "cannot read OAUTHBEARER token {}: {error}",
                     token_path.display()
                 ))
             })?;
-            run_oauthbearer_client(stream, token.trim_ascii(), &mut corr_id, policy).await
+            run_oauthbearer_client(channel, token.trim_ascii(), corr_id, policy).await
         }
-    }
+    }?;
+    let lifetime = session_lifetime_ms.load(Ordering::Relaxed);
+    Ok(SaslSession {
+        session_lifetime_ms: (lifetime > 0).then_some(lifetime),
+        ..versions
+    })
 }
 
 /// Run the RFC 7628 OAUTHBEARER client exchange.
@@ -322,7 +436,7 @@ async fn run_oauthbearer_client<S>(
     policy: SaslPolicy<'_>,
 ) -> Result<(), OutboundSaslError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+    S: SaslChannel + ?Sized,
 {
     if token.is_empty() || token.contains(&b'\x01') {
         return Err(mechanism_failure(
@@ -378,6 +492,7 @@ where
             client_id,
             frame_max,
             authenticate_version: None,
+            session_lifetime_ms: &AtomicI64::new(0),
         },
     )
     .await?;
@@ -400,7 +515,7 @@ async fn send_sasl_handshake<S>(
     policy: SaslPolicy<'_>,
 ) -> Result<(), OutboundSaslError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+    S: SaslChannel + ?Sized,
 {
     let req = SaslHandshakeRequest {
         mechanism: mechanism.wire_name().to_string(),
@@ -409,16 +524,18 @@ where
     let mut body = BytesMut::new();
     req.encode(&mut body, version)
         .map_err(|e| OutboundSaslError::Codec(format!("SaslHandshake encode: {e}")))?;
-    let resp_bytes = round_trip(
-        stream,
-        ApiKey(API_KEY_SASL_HANDSHAKE),
-        ApiVersion(version),
-        next_correlation_id(corr_id),
-        false,
-        &body,
-        policy,
-    )
-    .await?;
+    let resp_bytes = stream
+        .request(
+            (
+                ApiKey(API_KEY_SASL_HANDSHAKE),
+                ApiVersion(version),
+                next_correlation_id(corr_id),
+            ),
+            false,
+            &body,
+            policy,
+        )
+        .await?;
     let mut cur: &[u8] = &resp_bytes;
     let resp = SaslHandshakeResponse::decode(&mut cur, version)
         .map_err(|e| unparsable_response(format!("SaslHandshake decode: {e}")))?;
@@ -461,7 +578,7 @@ async fn send_plain_authenticate<S>(
     policy: SaslPolicy<'_>,
 ) -> Result<(), OutboundSaslError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+    S: SaslChannel + ?Sized,
 {
     let mut payload = Vec::with_capacity(2 + user.len() + pass.len());
     payload.push(0); // authzid (empty)
@@ -490,7 +607,7 @@ async fn run_scram_client<S>(
     policy: SaslPolicy<'_>,
 ) -> Result<(), OutboundSaslError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+    S: SaslChannel + ?Sized,
 {
     let exch = ScramClientExchange::new(user.to_string(), pass.as_bytes().to_vec(), mechanism);
 
@@ -547,7 +664,7 @@ async fn run_gssapi_client<S>(
     policy: SaslPolicy<'_>,
 ) -> Result<(), OutboundSaslError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+    S: SaslChannel + ?Sized,
 {
     use krabka_security::gssapi::{
         client::{ClientStep, GssapiClientExchange},
@@ -608,10 +725,10 @@ async fn send_sasl_authenticate<S>(
     policy: SaslPolicy<'_>,
 ) -> Result<SaslAuthenticateResponse, OutboundSaslError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+    S: SaslChannel + ?Sized,
 {
     let Some(version) = policy.authenticate_version else {
-        return send_raw_token(stream, &auth_bytes, policy.frame_max).await;
+        return stream.token(&auth_bytes, policy.frame_max).await;
     };
     let req = SaslAuthenticateRequest {
         auth_bytes: bytes::Bytes::from(auth_bytes),
@@ -620,19 +737,28 @@ where
     let mut body = BytesMut::new();
     req.encode(&mut body, version)
         .map_err(|e| OutboundSaslError::Codec(format!("SaslAuthenticate encode: {e}")))?;
-    let resp_bytes = round_trip(
-        stream,
-        ApiKey(API_KEY_SASL_AUTHENTICATE),
-        ApiVersion(version),
-        next_correlation_id(corr_id),
-        version >= krabka_protocol::owned::sasl_authenticate_request::FLEXIBLE_MIN,
-        &body,
-        policy,
-    )
-    .await?;
+    let resp_bytes = stream
+        .request(
+            (
+                ApiKey(API_KEY_SASL_AUTHENTICATE),
+                ApiVersion(version),
+                next_correlation_id(corr_id),
+            ),
+            version >= krabka_protocol::owned::sasl_authenticate_request::FLEXIBLE_MIN,
+            &body,
+            policy,
+        )
+        .await?;
     let mut cur: &[u8] = &resp_bytes;
     let resp = SaslAuthenticateResponse::decode(&mut cur, version)
         .map_err(|e| unparsable_response(format!("SaslAuthenticate decode: {e}")))?;
+    // Kafka's `SaslClientAuthenticator.receiveToken` keeps a positive
+    // lifetime of a response without an error.
+    if resp.error_code == 0 && resp.session_lifetime_ms > 0 {
+        policy
+            .session_lifetime_ms
+            .store(resp.session_lifetime_ms, Ordering::Relaxed);
+    }
     Ok(resp)
 }
 
@@ -1223,6 +1349,7 @@ mod tests {
                 client_id: TEST_CLIENT_ID,
                 frame_max: ClientFrameMax::default(),
                 authenticate_version: Some(2),
+                session_lifetime_ms: &AtomicI64::new(0),
             },
         )
         .await
@@ -1236,6 +1363,7 @@ mod tests {
                 client_id: TEST_CLIENT_ID,
                 frame_max: ClientFrameMax::default(),
                 authenticate_version: Some(2),
+                session_lifetime_ms: &AtomicI64::new(0),
             },
         )
         .await
@@ -1416,6 +1544,7 @@ mod tests {
                 client_id: TEST_CLIENT_ID,
                 frame_max: ClientFrameMax::default(),
                 authenticate_version: Some(2),
+                session_lifetime_ms: &AtomicI64::new(0),
             },
         )
         .await
@@ -1451,6 +1580,7 @@ mod tests {
                 client_id: TEST_CLIENT_ID,
                 frame_max: ClientFrameMax::default(),
                 authenticate_version: Some(2),
+                session_lifetime_ms: &AtomicI64::new(0),
             },
         )
         .await
@@ -1483,6 +1613,7 @@ mod tests {
                 client_id: TEST_CLIENT_ID,
                 frame_max: crate::ClientFrameMax::default(),
                 authenticate_version: Some(2),
+                session_lifetime_ms: &AtomicI64::new(0),
             },
         )
         .await
@@ -1504,6 +1635,7 @@ mod tests {
                 client_id: "",
                 frame_max: crate::ClientFrameMax::try_from(krabka_units::bytes(10)).unwrap(),
                 authenticate_version: Some(2),
+                session_lifetime_ms: &AtomicI64::new(0),
             },
         )
         .await
@@ -1535,6 +1667,7 @@ mod tests {
                 client_id: "",
                 frame_max: crate::ClientFrameMax::try_from(krabka_units::bytes(16)).unwrap(),
                 authenticate_version: Some(2),
+                session_lifetime_ms: &AtomicI64::new(0),
             },
         )
         .await
