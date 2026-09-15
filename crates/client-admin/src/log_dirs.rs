@@ -25,13 +25,10 @@ use krabka_protocol::{
 use krabka_units::{ByteSize, convert::ByteSizeExt as _};
 
 use crate::{
-    AdminClient, AdminError, KafkaError, format_host_port,
+    AdminClient, AdminError, KafkaError, RecoveringConnection, format_host_port,
     groups::list_groups_kafka_error,
     kafka_error_if, kafka_error_name,
-    retry::{
-        CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryDeadline, RetryPolicy,
-        is_connection_failure,
-    },
+    retry::{CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, is_connection_failure},
 };
 
 /// `UNKNOWN_SERVER_ERROR`.
@@ -91,22 +88,23 @@ impl AdminClient {
     ///
     /// `assignments` maps each replica to the absolute path of its target log
     /// dir. The call groups the replicas by broker id and sends one request to
-    /// each broker. The result has one entry for each replica:
+    /// each broker, all at the same time. The result has one entry for each
+    /// replica:
     ///
     /// - The error code of the broker for that partition, `Ok(())` for 0.
     /// - `UNKNOWN_SERVER_ERROR` (-1) when the response of the broker has no
     ///   result for the replica (`completeUnrealizedFutures`).
     /// - The error of the broker call for every replica of a broker that
-    ///   fails. A failed or lost connection is sent again with Kafka's backoff
-    ///   until `default.api.timeout.ms` (60 s). A broker that is not in the
-    ///   metadata at the deadline gives `REQUEST_TIMED_OUT` (7).
-    ///
-    /// # Errors
-    /// Returns an error when the `Metadata` request fails.
+    ///   fails. The call finds each broker by id in fresh metadata for each
+    ///   connection attempt, so a broker that is missing from the metadata or
+    ///   that moved to a new address is found again. A missing broker and a
+    ///   failed or lost connection are tried again with Kafka's backoff until
+    ///   `default.api.timeout.ms` (60 s), and then give `REQUEST_TIMED_OUT`
+    ///   (7). A slow or missing broker does not delay the other brokers.
     pub async fn alter_replica_log_dirs(
         &mut self,
         assignments: &BTreeMap<TopicPartitionReplica, String>,
-    ) -> Result<BTreeMap<TopicPartitionReplica, BrokerResult<()>>, AdminError> {
+    ) -> BTreeMap<TopicPartitionReplica, BrokerResult<()>> {
         self.alter_replica_log_dirs_with_retry(assignments, KAFKA_ADMIN_RETRY)
             .await
     }
@@ -115,7 +113,7 @@ impl AdminClient {
         &mut self,
         assignments: &BTreeMap<TopicPartitionReplica, String>,
         retry: RetryPolicy,
-    ) -> Result<BTreeMap<TopicPartitionReplica, BrokerResult<()>>, AdminError> {
+    ) -> BTreeMap<TopicPartitionReplica, BrokerResult<()>> {
         let start = retry.start();
         let mut by_broker = BTreeMap::<i32, BTreeMap<TopicPartitionReplica, String>>::new();
         for (replica, path) in assignments {
@@ -124,21 +122,15 @@ impl AdminClient {
                 .or_default()
                 .insert(replica.clone(), path.clone());
         }
-        let broker_ids = by_broker.keys().copied().collect::<BTreeSet<_>>();
-        let endpoints = self.broker_endpoints(&broker_ids, start).await?;
+        let (conn, options) = (&self.conn, &self.options);
         let answers = futures_util::future::join_all(by_broker.iter().map(|(broker_id, moves)| {
-            let endpoint = endpoints.get(broker_id).cloned();
-            let options = self.options.clone();
-            async move {
-                let endpoint = endpoint.ok_or_else(|| unknown_broker(*broker_id))?;
-                call_broker(
-                    &endpoint,
-                    &options,
-                    alter_request(moves),
-                    CoordinatorRetry::from_deadline(start),
-                )
-                .await
-            }
+            call_broker(
+                conn,
+                *broker_id,
+                options,
+                alter_request(moves),
+                CoordinatorRetry::from_deadline(start),
+            )
         }))
         .await;
 
@@ -155,7 +147,7 @@ impl AdminClient {
                 }
             }
         }
-        Ok(out)
+        out
     }
 
     /// `DescribeLogDirs` (KIP-113): lists every configured `log.dir` of each
@@ -166,20 +158,18 @@ impl AdminClient {
     /// topic to partitions filter to narrow the result. An empty inner vec
     /// means all partitions of that topic.
     ///
-    /// The result has one entry for each broker id. A broker that answers
-    /// with no log dir gives its top-level error code, or
-    /// `CLUSTER_AUTHORIZATION_FAILED` (31) when it has none, as Kafka does.
-    /// A failed or lost connection is sent again with Kafka's backoff until
-    /// `default.api.timeout.ms` (60 s). A broker that is not in the metadata
-    /// at the deadline gives `REQUEST_TIMED_OUT` (7).
-    ///
-    /// # Errors
-    /// Returns an error when the `Metadata` request fails.
+    /// The result has one entry for each broker id, and the brokers are asked
+    /// at the same time. A broker that answers with no log dir gives its
+    /// top-level error code, or `CLUSTER_AUTHORIZATION_FAILED` (31) when it
+    /// has none, as Kafka does. The call finds each broker by id in fresh
+    /// metadata for each connection attempt. A missing broker and a failed or
+    /// lost connection are tried again with Kafka's backoff until
+    /// `default.api.timeout.ms` (60 s), and then give `REQUEST_TIMED_OUT` (7).
     pub async fn describe_log_dirs(
         &mut self,
         brokers: &[i32],
         filter: Option<&BTreeMap<String, Vec<i32>>>,
-    ) -> Result<BTreeMap<i32, BrokerResult<Vec<LogDirInfo>>>, AdminError> {
+    ) -> BTreeMap<i32, BrokerResult<Vec<LogDirInfo>>> {
         self.describe_log_dirs_with_retry(brokers, filter, KAFKA_ADMIN_RETRY)
             .await
     }
@@ -189,20 +179,18 @@ impl AdminClient {
         brokers: &[i32],
         filter: Option<&BTreeMap<String, Vec<i32>>>,
         retry: RetryPolicy,
-    ) -> Result<BTreeMap<i32, BrokerResult<Vec<LogDirInfo>>>, AdminError> {
+    ) -> BTreeMap<i32, BrokerResult<Vec<LogDirInfo>>> {
         let start = retry.start();
         let broker_ids = brokers.iter().copied().collect::<BTreeSet<_>>();
-        let endpoints = self.broker_endpoints(&broker_ids, start).await?;
         let request = describe_request(filter);
+        let (conn, options) = (&self.conn, &self.options);
         let answers = futures_util::future::join_all(broker_ids.iter().map(|broker_id| {
-            let endpoint = endpoints.get(broker_id).cloned();
-            let options = self.options.clone();
             let request = request.clone();
             async move {
-                let endpoint = endpoint.ok_or_else(|| unknown_broker(*broker_id))?;
                 let response = call_broker(
-                    &endpoint,
-                    &options,
+                    conn,
+                    *broker_id,
+                    options,
                     request,
                     CoordinatorRetry::from_deadline(start),
                 )
@@ -211,62 +199,21 @@ impl AdminClient {
             }
         }))
         .await;
-        Ok(broker_ids.into_iter().zip(answers).collect())
-    }
-
-    /// The `host:port` of each broker id in `wanted` that the metadata names.
-    /// While a wanted broker is missing, the call sends `Metadata` again with
-    /// the retry backoff until the deadline, as Kafka's
-    /// `ConstantNodeIdProvider` asks for a metadata update and waits.
-    async fn broker_endpoints(
-        &mut self,
-        wanted: &BTreeSet<i32>,
-        mut deadline: RetryDeadline,
-    ) -> Result<BTreeMap<i32, String>, AdminError> {
-        loop {
-            let response = self
-                .conn
-                .send(MetadataRequest {
-                    topics: Some(Vec::new()),
-                    allow_auto_topic_creation: true,
-                    ..Default::default()
-                })
-                .await?;
-            let endpoints = response
-                .brokers
-                .into_iter()
-                .filter(|broker| wanted.contains(&broker.node_id))
-                .map(|broker| (broker.node_id, format_host_port(&broker.host, broker.port)))
-                .collect::<BTreeMap<_, _>>();
-            if endpoints.len() == wanted.len() || deadline.expired() {
-                return Ok(endpoints);
-            }
-            deadline.backoff().await;
-            if deadline.expired() {
-                return Ok(endpoints);
-            }
-        }
+        broker_ids.into_iter().zip(answers).collect()
     }
 }
 
-/// The error of a broker id that the metadata does not name at the deadline.
-fn unknown_broker(broker_id: i32) -> KafkaError {
-    KafkaError {
-        code: REQUEST_TIMED_OUT,
-        name: kafka_error_name(REQUEST_TIMED_OUT),
-        message: Some(format!(
-            "timed out waiting for broker {broker_id} to appear in the metadata"
-        )),
-    }
-}
-
-/// Send `request` to one broker until it answers, the error is final, or the
-/// call deadline passes. A failed or lost connection, including a TLS or SASL
-/// handshake with no verdict, connects again after the backoff, as Kafka's
-/// `Call.fail` retries a `RetriableException`. The result of the last attempt
-/// is the result at the deadline.
+/// Send `request` to broker `broker_id` until it answers, the error is
+/// final, or the call deadline passes, as one Kafka `Call` with a
+/// `ConstantNodeIdProvider` does.
+///
+/// Each connection attempt looks the broker up in fresh metadata. A broker
+/// that the metadata does not name, and a failed or lost connection
+/// (including a TLS or SASL handshake with no verdict), are tried again after
+/// the backoff, as Kafka's `Call.fail` retries a `RetriableException`.
 async fn call_broker<R>(
-    host_port: &str,
+    conn: &RecoveringConnection,
+    broker_id: i32,
     options: &ConnectionOptions,
     request: R,
     mut retry: CoordinatorRetry,
@@ -279,53 +226,74 @@ where
         let action = retry
             .run(broker_attempt(
                 &mut connection,
-                host_port,
+                conn,
+                broker_id,
                 options,
                 request.clone(),
             ))
             .await;
         if let Some(result) = retry.next(action).await {
-            return result.map_err(|error| broker_error(host_port, &error));
+            return result.map_err(|error| broker_error(broker_id, &error));
         }
     }
 }
 
-/// The Kafka error of a failed broker call. A connection failure is the last
-/// error of a call past its deadline, so it gives `REQUEST_TIMED_OUT` (7), as
-/// Kafka's `Call.handleTimeoutFailure` gives a `TimeoutException`.
-fn broker_error(host_port: &str, error: &AdminError) -> KafkaError {
+/// The Kafka error of a failed broker call. A timeout is the error of a call
+/// past its deadline, so it gives `REQUEST_TIMED_OUT` (7), as Kafka's
+/// `Call.handleTimeoutFailure` gives a `TimeoutException`.
+fn broker_error(broker_id: i32, error: &AdminError) -> KafkaError {
     if is_connection_failure(error) {
         return KafkaError {
             code: REQUEST_TIMED_OUT,
             name: kafka_error_name(REQUEST_TIMED_OUT),
-            message: Some(format!(
-                "the call to broker {host_port} timed out; last error: {error}"
-            )),
+            message: Some(format!("the call to broker {broker_id} timed out: {error}")),
         };
     }
     list_groups_kafka_error(error)
 }
 
-/// One attempt of [`call_broker`]. A connection failure empties
-/// `connection` and asks for another attempt.
+/// One attempt of [`call_broker`]. Without a connection, the attempt finds
+/// the broker in the metadata and connects to it. A missing broker or a
+/// connection failure empties `connection` and asks for another attempt.
 async fn broker_attempt<R>(
     connection: &mut Option<Connection>,
-    host_port: &str,
+    conn: &RecoveringConnection,
+    broker_id: i32,
     options: &ConnectionOptions,
     request: R,
 ) -> RetryAction<R::Response>
 where
     R: ProtocolRequest,
 {
-    let current = match connection {
-        Some(current) => current,
-        None => match AdminClient::connect_one(host_port, options.clone()).await {
-            Ok(new) => connection.insert(new),
+    if connection.is_none() {
+        let endpoint = match broker_endpoint(conn, broker_id).await {
+            Ok(Some(endpoint)) => endpoint,
+            Ok(None) => {
+                tracing::debug!(broker_id, "the broker is not in the metadata; retrying");
+                return RetryAction::SameCoordinator(Err(AdminError::Broker {
+                    api: "Metadata",
+                    code: REQUEST_TIMED_OUT,
+                    name: kafka_error_name(REQUEST_TIMED_OUT),
+                    message: Some(format!("broker {broker_id} is not in the metadata")),
+                }));
+            }
             Err(error) if is_connection_failure(&error) => {
                 return RetryAction::SameCoordinator(Err(error));
             }
             Err(error) => return RetryAction::Done(Err(error)),
-        },
+        };
+        match AdminClient::connect_one(&endpoint, options.clone()).await {
+            Ok(new) => *connection = Some(new),
+            Err(error) if is_connection_failure(&error) => {
+                return RetryAction::SameCoordinator(Err(error));
+            }
+            Err(error) => return RetryAction::Done(Err(error)),
+        }
+    }
+    let Some(current) = connection.as_ref() else {
+        return RetryAction::SameCoordinator(Err(AdminError::Transport(
+            krabka_client_core::ClientError::Disconnected,
+        )));
     };
     match current.send(request).await {
         Ok(response) => RetryAction::Done(Ok(response)),
@@ -339,6 +307,26 @@ where
             }
         }
     }
+}
+
+/// The `host:port` of `broker_id` in fresh metadata, or `None` when the
+/// metadata does not name it.
+async fn broker_endpoint(
+    conn: &RecoveringConnection,
+    broker_id: i32,
+) -> Result<Option<String>, AdminError> {
+    let response = conn
+        .send(MetadataRequest {
+            topics: Some(Vec::new()),
+            allow_auto_topic_creation: true,
+            ..Default::default()
+        })
+        .await?;
+    Ok(response
+        .brokers
+        .into_iter()
+        .find(|broker| broker.node_id == broker_id)
+        .map(|broker| format_host_port(&broker.host, broker.port)))
 }
 
 /// The `AlterReplicaLogDirs` request of one broker. It lists each log dir
@@ -536,6 +524,10 @@ mod tests {
         NoLogDirs,
         /// The metadata names it at an address that refuses connections.
         Down,
+        /// The first metadata response names it at an address that refuses
+        /// connections, and later responses name its real address, as after
+        /// a restart with a new advertised address.
+        Moved,
     }
 
     fn encode(response: &impl Encode, version: i16, flexible: bool) -> Vec<u8> {
@@ -609,7 +601,7 @@ mod tests {
     async fn cluster_broker(
         broker_id: i32,
         behavior: Behavior,
-        addresses: Arc<Mutex<Vec<(i32, SocketAddr)>>>,
+        addresses: Arc<Mutex<Addresses>>,
         received: Arc<Mutex<Vec<Received>>>,
     ) -> MockBroker {
         MockBroker::start(move |api_key, version, _, body| match api_key {
@@ -619,6 +611,7 @@ mod tests {
                     brokers: addresses
                         .lock()
                         .expect("addresses lock")
+                        .next()
                         .iter()
                         .map(|(node_id, addr)| MetadataResponseBroker {
                             node_id: *node_id,
@@ -710,6 +703,20 @@ mod tests {
         .await
     }
 
+    /// The broker addresses that the metadata names. `first` is used for the
+    /// first metadata response only.
+    #[derive(Default)]
+    struct Addresses {
+        first: Option<Vec<(i32, SocketAddr)>>,
+        later: Vec<(i32, SocketAddr)>,
+    }
+
+    impl Addresses {
+        fn next(&mut self) -> Vec<(i32, SocketAddr)> {
+            self.first.take().unwrap_or_else(|| self.later.clone())
+        }
+    }
+
     /// A running two-broker cluster.
     struct Cluster {
         brokers: Vec<MockBroker>,
@@ -720,7 +727,7 @@ mod tests {
     impl Cluster {
         /// Start brokers 1 and 2. Broker 1 is the bootstrap broker.
         async fn start(broker_2: Behavior) -> Self {
-            let addresses = Arc::new(Mutex::new(Vec::new()));
+            let addresses = Arc::new(Mutex::new(Addresses::default()));
             let received = Arc::new(Mutex::new(Vec::new()));
             let one = cluster_broker(
                 1,
@@ -731,15 +738,26 @@ mod tests {
             .await;
             let two =
                 cluster_broker(2, broker_2, Arc::clone(&addresses), Arc::clone(&received)).await;
-            let two_addr = if broker_2 == Behavior::Down {
+            let refused = {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                     .await
                     .expect("bind a port");
                 listener.local_addr().expect("local address")
-            } else {
-                two.addr
             };
-            *addresses.lock().expect("addresses lock") = vec![(1, one.addr), (2, two_addr)];
+            *addresses.lock().expect("addresses lock") = match broker_2 {
+                Behavior::Down => Addresses {
+                    first: None,
+                    later: vec![(1, one.addr), (2, refused)],
+                },
+                Behavior::Moved => Addresses {
+                    first: Some(vec![(1, one.addr), (2, refused)]),
+                    later: vec![(1, one.addr), (2, two.addr)],
+                },
+                Behavior::Normal | Behavior::NoLogDirs => Addresses {
+                    first: None,
+                    later: vec![(1, one.addr), (2, two.addr)],
+                },
+            };
             let admin = AdminClient::connect(&[one.addr.to_string()])
                 .await
                 .expect("admin connects");
@@ -821,6 +839,22 @@ mod tests {
                 BTreeMap::from([(3, Err(REQUEST_TIMED_OUT))]),
             ),
             (
+                "a known broker is asked while an unknown broker waits",
+                Behavior::Normal,
+                vec![1, 3],
+                SHORT,
+                vec![Received::Describe(1, all.clone())],
+                BTreeMap::from([(1, Ok(described(1))), (3, Err(REQUEST_TIMED_OUT))]),
+            ),
+            (
+                "a broker at a new address is found again",
+                Behavior::Moved,
+                vec![2],
+                LONG,
+                vec![Received::Describe(2, all.clone())],
+                BTreeMap::from([(2, Ok(described(2)))]),
+            ),
+            (
                 "a broker with no log dir",
                 Behavior::NoLogDirs,
                 vec![1, 2],
@@ -847,8 +881,7 @@ mod tests {
             let result = cluster
                 .admin
                 .describe_log_dirs_with_retry(&brokers, None, policy(timeout))
-                .await
-                .expect("metadata succeeds");
+                .await;
             let received = cluster.stop();
             assert!(
                 (codes(result), received) == (expected, expected_requests),
@@ -861,11 +894,7 @@ mod tests {
     async fn describe_log_dirs_sends_the_topic_filter() {
         let mut cluster = Cluster::start(Behavior::Normal).await;
         let filter = BTreeMap::from([("orders".to_string(), vec![0])]);
-        cluster
-            .admin
-            .describe_log_dirs(&[1], Some(&filter))
-            .await
-            .expect("metadata succeeds");
+        cluster.admin.describe_log_dirs(&[1], Some(&filter)).await;
         let received = cluster.stop();
         assert!(
             received
@@ -973,7 +1002,6 @@ mod tests {
                 .admin
                 .alter_replica_log_dirs_with_retry(&assignments, policy(timeout))
                 .await
-                .expect("metadata succeeds")
                 .into_iter()
                 .map(|(replica, result)| (replica, result.map_err(|error| error.code)))
                 .collect::<BTreeMap<_, _>>();

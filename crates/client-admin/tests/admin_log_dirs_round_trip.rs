@@ -88,10 +88,7 @@ async fn describe(
     filter: Option<&BTreeMap<String, Vec<i32>>>,
 ) -> Vec<LogDirInfo> {
     let broker = broker_id(admin).await;
-    let mut report = admin
-        .describe_log_dirs(&[broker], filter)
-        .await
-        .expect("describe_log_dirs");
+    let mut report = admin.describe_log_dirs(&[broker], filter).await;
     report
         .remove(&broker)
         .expect("a result for the broker")
@@ -135,10 +132,7 @@ async fn move_partitions_to_target(admin: &mut AdminClient, topic: &str) {
         (replica(0), TARGET_LOG_DIR.to_owned()),
         (replica(1), TARGET_LOG_DIR.to_owned()),
     ]);
-    let outcomes = admin
-        .alter_replica_log_dirs(&assignments)
-        .await
-        .expect("alter_replica_log_dirs");
+    let outcomes = admin.alter_replica_log_dirs(&assignments).await;
     assert!(outcomes == BTreeMap::from([(replica(0), Ok(())), (replica(1), Ok(()))]));
 }
 
