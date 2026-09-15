@@ -33,6 +33,18 @@ pub enum ProducerError {
     #[error("flush timed out")]
     FlushTimeout,
 
+    /// `send` waited `waited` (the configured `max_block`) for metadata that
+    /// holds the topic, and the partition of the record when it names one.
+    /// Kafka's `KafkaProducer.waitOnMetadata` throws `TimeoutException` with
+    /// the same message.
+    #[error("{}", metadata_timeout_message(topic, *partition, *partition_count, *waited))]
+    MetadataTimeout {
+        topic: String,
+        partition: Option<i32>,
+        partition_count: Option<i32>,
+        waited: std::time::Duration,
+    },
+
     /// The batch ran out of retries, or its routing budget ended, before the
     /// broker acknowledged it. Kafka raises `TimeoutException` for the same
     /// case (`Sender.sendProducerData` and `RecordAccumulator.expiredBatches`).
@@ -58,6 +70,22 @@ pub enum ProducerError {
         "transaction outcome is unknown; call init_transactions before sending or beginning another transaction"
     )]
     RecoveryRequired,
+}
+
+/// Kafka's `KafkaProducer.getErrorMessage`.
+fn metadata_timeout_message(
+    topic: &str,
+    partition: Option<i32>,
+    partition_count: Option<i32>,
+    waited: std::time::Duration,
+) -> String {
+    let waited_ms = waited.as_millis();
+    match (partition, partition_count) {
+        (Some(partition), Some(count)) => format!(
+            "Partition {partition} of topic {topic} with partition count {count} is not present in metadata after {waited_ms} ms."
+        ),
+        _ => format!("Topic {topic} not present in metadata after {waited_ms} ms."),
+    }
 }
 
 #[cfg(test)]
