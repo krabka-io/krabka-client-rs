@@ -634,6 +634,31 @@ pub(crate) async fn init_producer_id_with_retry(
     }
 }
 
+/// The transaction timeout, or its default. Two-phase commit (KIP-939) does
+/// not allow `transaction.timeout.ms`, and it needs a transactional id.
+fn resolve_transaction_timeout(
+    enabled: bool,
+    transaction_timeout: Option<Duration>,
+    transactional_id: Option<&str>,
+) -> Result<Duration, ProducerError> {
+    if enabled && transaction_timeout.is_some() {
+        return Err(ProducerError::InvalidConfig(
+            "transaction_timeout cannot be set when transaction_two_phase_commit_enable=true"
+                .to_owned(),
+        ));
+    }
+    if enabled && transactional_id.is_none() {
+        return Err(ProducerError::InvalidConfig(
+            "transaction_two_phase_commit_enable=true requires transactional_id".to_owned(),
+        ));
+    }
+    Ok(transaction_timeout.unwrap_or(DEFAULT_PRODUCER_TRANSACTION_TIMEOUT))
+}
+
+/// Kafka's producer `receive.buffer.bytes` default, half the consumer and
+/// admin default.
+const PRODUCER_RECEIVE_BUFFER: krabka_units::ByteSize = krabka_units::kibibytes(32);
+
 /// Kafka's `ProducerMetadata` names the topics that the producer sends to,
 /// and lets the broker create a missing one.
 const PRODUCER_METADATA_SCOPE: krabka_client_core::MetadataScope =
@@ -728,19 +753,11 @@ impl Producer {
             transactional_id.as_deref(),
         )?;
         let client_id = resolve_client_id(client_id, transactional_id.as_deref());
-        if transaction_two_phase_commit_enable && transaction_timeout.is_some() {
-            return Err(ProducerError::InvalidConfig(
-                "transaction_timeout cannot be set when transaction_two_phase_commit_enable=true"
-                    .to_owned(),
-            ));
-        }
-        if transaction_two_phase_commit_enable && transactional_id.is_none() {
-            return Err(ProducerError::InvalidConfig(
-                "transaction_two_phase_commit_enable=true requires transactional_id".to_owned(),
-            ));
-        }
-        let transaction_timeout =
-            transaction_timeout.unwrap_or(DEFAULT_PRODUCER_TRANSACTION_TIMEOUT);
+        let transaction_timeout = resolve_transaction_timeout(
+            transaction_two_phase_commit_enable,
+            transaction_timeout,
+            transactional_id.as_deref(),
+        )?;
         let dns_timeout =
             ClientDnsTimeout::new(dns_timeout).map_err(ProducerError::InvalidConfig)?;
         let dispatch_queue_capacity = ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
@@ -808,9 +825,7 @@ impl Producer {
             .dispatch_queue_capacity(dispatch_queue_capacity.get())
             .frame_max(frame_max.size())
             .request_timeout(request_timeout)
-            // Kafka's producer `receive.buffer.bytes` default is 32 KiB, half
-            // the consumer and admin default.
-            .receive_buffer(Some(krabka_units::kibibytes(32)))
+            .receive_buffer(Some(PRODUCER_RECEIVE_BUFFER))
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
             .maybe_security(security.clone())
