@@ -66,6 +66,23 @@ pub enum ConsumerError {
     /// does not retry.
     #[error("unexpected error in offset fetch response: error_code {0}")]
     OffsetFetchFailed(i16),
+
+    /// The coordinator answered `FENCED_INSTANCE_ID` (82) for this
+    /// `group.instance.id`, because another consumer joined with the same
+    /// id. The consumer stops. Kafka's consumer raises
+    /// `FencedInstanceIdException`.
+    #[error(
+        "fenced group.instance.id {0}: another consumer with the same group.instance.id joined the group"
+    )]
+    FencedInstanceId(String),
+
+    /// A commit found that the consumer is not part of an active group,
+    /// because its coordinator task stopped. Kafka's consumer raises
+    /// `CommitFailedException`.
+    #[error(
+        "offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group"
+    )]
+    CommitFailed,
 }
 
 impl ConsumerError {
@@ -112,6 +129,16 @@ mod tests {
                 "offset fetch failed",
                 ConsumerError::OffsetFetchFailed(6),
                 "unexpected error in offset fetch response: error_code 6",
+            ),
+            (
+                "fenced instance id",
+                ConsumerError::FencedInstanceId("instance-a".into()),
+                "fenced group.instance.id instance-a: another consumer with the same group.instance.id joined the group",
+            ),
+            (
+                "commit failed",
+                ConsumerError::CommitFailed,
+                "offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group",
             ),
             (
                 "log truncation",

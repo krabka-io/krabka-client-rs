@@ -229,6 +229,7 @@ impl Consumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn commit_sync(&self) -> Result<(), ConsumerError> {
+        self.ensure_active_group()?;
         let _commit_guard = self.commit_serialization.lock().await;
         let pending = {
             let identity = self.commit_identity.lock().await;
@@ -268,6 +269,7 @@ impl Consumer {
         &self,
         offsets: HashMap<(String, i32), i64>,
     ) -> Result<(), ConsumerError> {
+        self.ensure_active_group()?;
         let _commit_guard = self.commit_serialization.lock().await;
         if offsets.is_empty() {
             return Ok(());
@@ -287,6 +289,24 @@ impl Consumer {
         };
 
         self.commit_pending_offsets(pending).await
+    }
+
+    /// Fail a synchronous commit when the coordinator task has stopped.
+    ///
+    /// The task stops when the coordinator fences the static member. The
+    /// consumer is then not part of an active group, and no later generation
+    /// can make a commit valid. Kafka's
+    /// `ConsumerCoordinator.sendOffsetCommitRequest` raises
+    /// `CommitFailedException` in this state and sends no request.
+    fn ensure_active_group(&self) -> Result<(), ConsumerError> {
+        if self
+            .coordinator_handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(ConsumerError::CommitFailed);
+        }
+        Ok(())
     }
 
     async fn commit_pending_offsets(
@@ -1279,6 +1299,109 @@ mod tests {
                 _ => None,
             });
 
+            mock.stop();
+            check!(
+                (result, requests.load(Ordering::SeqCst)) == expected,
+                "case {name}"
+            );
+        }
+    }
+
+    /// A commit fails without a request after the coordinator task stopped,
+    /// for example after the coordinator fenced the static member. Kafka's
+    /// `ConsumerCoordinator.sendOffsetCommitRequest` raises
+    /// `CommitFailedException` when the member is not part of an active group.
+    #[tokio::test]
+    async fn commit_fails_without_a_request_after_the_coordinator_task_stops() {
+        #[derive(Clone, Copy)]
+        enum Commit {
+            All,
+            Selected,
+        }
+        let commit_failed = "offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group";
+        for (name, commit, task_stopped, owned, expected) in [
+            (
+                "commit sync while the task runs",
+                Commit::All,
+                false,
+                true,
+                (Ok(()), 1),
+            ),
+            (
+                "commit sync after the task stops",
+                Commit::All,
+                true,
+                true,
+                (Err(commit_failed.to_string()), 0),
+            ),
+            (
+                "commit sync after a fence cleared the assignment",
+                Commit::All,
+                true,
+                false,
+                (Err(commit_failed.to_string()), 0),
+            ),
+            (
+                "selected commit after the task stops",
+                Commit::Selected,
+                true,
+                true,
+                (Err(commit_failed.to_string()), 0),
+            ),
+        ] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let requests_in_mock = Arc::clone(&requests);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(api_versions_for_offset_commit((2, 2)));
+                }
+                if api_key != offset_commit_request::API_KEY {
+                    return None;
+                }
+                requests_in_mock.fetch_add(1, Ordering::SeqCst);
+                Some(encode_response(&response(&[0]), version))
+            })
+            .await;
+            let identity = commit_identity(7, "member-a");
+            if !owned {
+                identity.lock().await.ownership_ids.clear();
+            }
+            let mut consumer = commit_consumer(
+                &mock,
+                identity,
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(AtomicI32::new(7)),
+            )
+            .await;
+            let task = if task_stopped {
+                let task = tokio::spawn(async {});
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                task
+            } else {
+                tokio::spawn(std::future::pending::<()>())
+            };
+            consumer.coordinator_handle = Some(task);
+
+            let commit_future = async {
+                match commit {
+                    Commit::All => consumer.commit_sync().await,
+                    Commit::Selected => {
+                        consumer
+                            .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+                            .await
+                    }
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(5), commit_future)
+                .await
+                .unwrap_or_else(|_| panic!("case {name}: commit never finished"))
+                .map_err(|error| error.to_string());
+
+            if let Some(task) = consumer.coordinator_handle.take() {
+                task.abort();
+            }
             mock.stop();
             check!(
                 (result, requests.load(Ordering::SeqCst)) == expected,
