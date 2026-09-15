@@ -1419,6 +1419,7 @@ async fn spawn_consumer(
         retry_policy: retry_policy.into(),
         poll_error: Arc::clone(&poll_error),
         auto_commit: auto_commit.clone(),
+        commit_serialization: Arc::clone(&commit_serialization),
         join_prepared: false,
     };
     // IMPORTANT: `tokio::spawn` is the very last operation — no `.await`
@@ -2496,7 +2497,7 @@ mod auto_commit_tests {
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
-            heartbeat_request,
+            find_coordinator_request, heartbeat_request,
             heartbeat_response::HeartbeatResponse,
             join_group_request, leave_group_request,
             leave_group_response::LeaveGroupResponse,
@@ -2520,22 +2521,43 @@ mod auto_commit_tests {
     /// `REBALANCE_IN_PROGRESS`.
     const REBALANCE_IN_PROGRESS: i16 = 27;
     const AUTO_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
+    /// How long a rebalance step waits for the `SyncGroup` requests. The first
+    /// heartbeat comes after 3 s.
+    const REBALANCE_WAIT: Duration = Duration::from_secs(30);
 
-    /// A group request that the mock coordinator received, in arrival order.
+    /// A group request that the mock coordinator received, or an event of the
+    /// application, in arrival order.
     #[derive(Clone, Debug, PartialEq)]
     enum GroupRequest {
         OffsetCommit(OffsetCommitRequest),
         JoinGroup,
         SyncGroup,
         LeaveGroup,
+        /// `commit_sync` returned to the application.
+        CommitSyncReturned,
+        /// The coordinator did not receive the expected `SyncGroup` requests in
+        /// the time of the step.
+        SyncGroupLate,
+        /// `close` did not return in the time of the step.
+        CloseTimedOut,
+    }
+
+    /// How the mock coordinator answers one `OffsetCommit`.
+    #[derive(Clone, Copy, Debug)]
+    enum CommitReply {
+        /// Send no response.
+        Drop,
+        /// Answer each partition with this error code.
+        Error(i16),
     }
 
     /// The API versions that the mock advertises: `(api_key, min, max)`. Each
     /// maximum is below the flexible version of its API, so no response needs a
     /// tagged response header.
-    const API_VERSIONS: [(i16, i16, i16); 7] = [
+    const API_VERSIONS: [(i16, i16, i16); 8] = [
         (api_versions_request::API_KEY, 0, 3),
         (metadata_request::API_KEY, 0, 8),
+        (find_coordinator_request::API_KEY, 0, 2),
         (join_group_request::API_KEY, 0, 5),
         (sync_group_request::API_KEY, 0, 3),
         (heartbeat_request::API_KEY, 0, 3),
@@ -2543,8 +2565,9 @@ mod auto_commit_tests {
         (offset_commit_request::API_KEY, 2, 7),
     ];
 
-    /// A group coordinator that records every group request and answers each
-    /// one with success.
+    /// A group coordinator that records every group request. It answers each
+    /// one with success, except the `OffsetCommit` requests in
+    /// `commit_replies`. It does not answer `FindCoordinator`.
     struct MockCoordinator {
         protocol: &'static str,
         requests: std::sync::Mutex<Vec<GroupRequest>>,
@@ -2555,6 +2578,12 @@ mod auto_commit_tests {
         /// last one.
         assignments: std::sync::Mutex<VecDeque<Vec<(String, i32)>>>,
         generation: AtomicI32,
+        /// The answers to the next `OffsetCommit` requests. An empty queue
+        /// answers with success.
+        commit_replies: std::sync::Mutex<VecDeque<CommitReply>>,
+        /// When `true`, the next `OffsetCommit` makes the next `Heartbeat`
+        /// answer `REBALANCE_IN_PROGRESS`.
+        rebalance_on_commit: std::sync::atomic::AtomicBool,
     }
 
     fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
@@ -2647,6 +2676,23 @@ mod auto_commit_tests {
                     for topic in &mut request.topics {
                         topic.partitions.sort_by_key(|p| p.partition_index);
                     }
+                    if self.rebalance_on_commit.swap(false, Ordering::SeqCst) {
+                        self.heartbeat_error
+                            .store(REBALANCE_IN_PROGRESS, Ordering::SeqCst);
+                    }
+                    let error_code = match self
+                        .commit_replies
+                        .lock()
+                        .expect("commit replies lock")
+                        .pop_front()
+                    {
+                        None => 0,
+                        Some(CommitReply::Error(code)) => code,
+                        Some(CommitReply::Drop) => {
+                            self.record(GroupRequest::OffsetCommit(request));
+                            return None;
+                        }
+                    };
                     let response = OffsetCommitResponse {
                         topics: request
                             .topics
@@ -2658,6 +2704,7 @@ mod auto_commit_tests {
                                     .iter()
                                     .map(|p| OffsetCommitResponsePartition {
                                         partition_index: p.partition_index,
+                                        error_code,
                                         ..Default::default()
                                     })
                                     .collect(),
@@ -2709,13 +2756,18 @@ mod auto_commit_tests {
         })
     }
 
-    fn start_config(bootstrap: String, assignor: Assignor, auto_commit: bool) -> StartConfig {
+    fn start_config(
+        bootstrap: String,
+        assignor: Assignor,
+        auto_commit: bool,
+        rebalance_timeout: Time,
+    ) -> StartConfig {
         StartConfig {
             bootstrap,
             client_id: "auto-commit-test".into(),
             group_id: GROUP.into(),
             session_timeout: secs(45),
-            rebalance_timeout: minutes(1),
+            rebalance_timeout,
             heartbeat_interval: secs(3),
             subscription_metadata_refresh_interval: minutes(60),
             subscribe: vec![TOPIC.into()],
@@ -2757,11 +2809,41 @@ mod auto_commit_tests {
         /// application has not processed them until it polls again.
         ReceiveRecords,
         /// The next heartbeat answers `REBALANCE_IN_PROGRESS`. Wait until the
-        /// coordinator received `syncs` `SyncGroup` requests in total.
-        Rebalance {
+        /// coordinator received `syncs` `SyncGroup` requests in total, or
+        /// record `SyncGroupLate` after `within`.
+        Rebalance { syncs: usize, within: Duration },
+        /// Run `commit_sync`.
+        CommitSync,
+        /// The mock answers the next `OffsetCommit` with this reply, and the
+        /// next heartbeat after that commit answers `REBALANCE_IN_PROGRESS`.
+        /// Run `commit_sync`, and wait as `Rebalance` does.
+        CommitSyncDuringRebalance {
+            reply: CommitReply,
             syncs: usize,
+            within: Duration,
         },
+        /// The mock answers the next `OffsetCommit` with this reply.
+        ReplyToNextCommit(CommitReply),
+        /// Take the commit lock and keep it until the scenario ends.
+        HoldCommitLock,
+        /// Run `close`, or record `CloseTimedOut` after two minutes.
         Close,
+    }
+
+    /// Wait until the coordinator received `syncs` `SyncGroup` requests in
+    /// total, or record `SyncGroupLate` after `within`.
+    async fn wait_for_sync_groups(coordinator: &MockCoordinator, syncs: usize, within: Duration) {
+        let waited = tokio::time::timeout(within, async {
+            while coordinator.sync_groups() < syncs {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        if waited.is_err() {
+            coordinator.record(GroupRequest::SyncGroupLate);
+        }
+        // Let a commit that comes after the last SyncGroup arrive.
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     /// Start a consumer that owns partitions 0 (next offset 12, leader epoch 3)
@@ -2773,19 +2855,37 @@ mod auto_commit_tests {
         assignments: Vec<Vec<(String, i32)>>,
         steps: &[Step],
     ) -> Vec<GroupRequest> {
+        run_with_rebalance_timeout(auto_commit, assignor, assignments, minutes(1), steps).await
+    }
+
+    /// [`run`] with a rebalance timeout.
+    async fn run_with_rebalance_timeout(
+        auto_commit: bool,
+        assignor: Assignor,
+        assignments: Vec<Vec<(String, i32)>>,
+        rebalance_timeout: Time,
+        steps: &[Step],
+    ) -> Vec<GroupRequest> {
         let coordinator = Arc::new(MockCoordinator {
             protocol: assignor.protocol_name(),
             requests: std::sync::Mutex::new(Vec::new()),
             heartbeat_error: AtomicI16::new(0),
             assignments: std::sync::Mutex::new(assignments.into()),
             generation: AtomicI32::new(1),
+            commit_replies: std::sync::Mutex::new(VecDeque::new()),
+            rebalance_on_commit: std::sync::atomic::AtomicBool::new(false),
         });
         let in_mock = Arc::clone(&coordinator);
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
             in_mock.respond(api_key, version, body)
         })
         .await;
-        let config = start_config(mock.addr.to_string(), assignor, auto_commit);
+        let config = start_config(
+            mock.addr.to_string(),
+            assignor,
+            auto_commit,
+            rebalance_timeout,
+        );
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
             .build()
@@ -2809,6 +2909,7 @@ mod auto_commit_tests {
             .await
             .expect("spawn consumer"),
         );
+        let mut held_commit_lock = None;
 
         for step in steps {
             match step {
@@ -2822,31 +2923,66 @@ mod auto_commit_tests {
                     let consumer = consumer.as_ref().expect("open consumer");
                     consumer.next_offsets.lock().await.insert(partition(0), 20);
                 }
-                Step::Rebalance { syncs } => {
+                Step::Rebalance { syncs, within } => {
                     coordinator
                         .heartbeat_error
                         .store(REBALANCE_IN_PROGRESS, Ordering::SeqCst);
-                    for _ in 0..600 {
-                        if coordinator.sync_groups() >= *syncs {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    // Let a commit that comes after the last SyncGroup arrive.
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    wait_for_sync_groups(&coordinator, *syncs, *within).await;
+                }
+                Step::CommitSync => {
+                    let consumer = consumer.as_ref().expect("open consumer");
+                    consumer.commit_sync().await.expect("commit_sync");
+                    coordinator.record(GroupRequest::CommitSyncReturned);
+                }
+                Step::CommitSyncDuringRebalance {
+                    reply,
+                    syncs,
+                    within,
+                } => {
+                    let consumer = consumer.as_ref().expect("open consumer");
+                    coordinator
+                        .commit_replies
+                        .lock()
+                        .expect("commit replies lock")
+                        .push_back(*reply);
+                    coordinator
+                        .rebalance_on_commit
+                        .store(true, Ordering::SeqCst);
+                    let commit = async {
+                        // The result does not matter here: the scenario checks
+                        // the order of the requests.
+                        let _ = consumer.commit_sync().await;
+                        coordinator.record(GroupRequest::CommitSyncReturned);
+                    };
+                    tokio::join!(commit, wait_for_sync_groups(&coordinator, *syncs, *within));
+                }
+                Step::ReplyToNextCommit(reply) => {
+                    coordinator
+                        .commit_replies
+                        .lock()
+                        .expect("commit replies lock")
+                        .push_back(*reply);
+                }
+                Step::HoldCommitLock => {
+                    let consumer = consumer.as_ref().expect("open consumer");
+                    held_commit_lock = Some(
+                        Arc::clone(&consumer.commit_serialization)
+                            .lock_owned()
+                            .await,
+                    );
                 }
                 Step::Close => {
-                    consumer
-                        .take()
-                        .expect("open consumer")
-                        .close()
-                        .await
-                        .expect("close");
+                    let close = consumer.take().expect("open consumer").close();
+                    match tokio::time::timeout(Duration::from_mins(2), close).await {
+                        Ok(result) => result.expect("close"),
+                        Err(_) => coordinator.record(GroupRequest::CloseTimedOut),
+                    }
                 }
             }
         }
 
         let requests = coordinator.requests();
+        drop(held_commit_lock);
         drop(consumer);
         mock.stop();
         requests
@@ -2903,7 +3039,14 @@ mod auto_commit_tests {
                 true,
                 Assignor::Range,
                 vec![vec![partition(0), partition(1)]],
-                vec![Poll, ReceiveRecords, Rebalance { syncs: 1 }],
+                vec![
+                    Poll,
+                    ReceiveRecords,
+                    Rebalance {
+                        syncs: 1,
+                        within: REBALANCE_WAIT,
+                    },
+                ],
                 vec![commit(1, &both), JoinGroup, SyncGroup],
             ),
             (
@@ -2911,7 +3054,14 @@ mod auto_commit_tests {
                 false,
                 Assignor::Range,
                 vec![vec![partition(0), partition(1)]],
-                vec![Poll, ReceiveRecords, Rebalance { syncs: 1 }],
+                vec![
+                    Poll,
+                    ReceiveRecords,
+                    Rebalance {
+                        syncs: 1,
+                        within: REBALANCE_WAIT,
+                    },
+                ],
                 vec![JoinGroup, SyncGroup],
             ),
             (
@@ -2919,7 +3069,14 @@ mod auto_commit_tests {
                 true,
                 Assignor::CooperativeSticky,
                 vec![vec![partition(0)]],
-                vec![Poll, ReceiveRecords, Rebalance { syncs: 2 }],
+                vec![
+                    Poll,
+                    ReceiveRecords,
+                    Rebalance {
+                        syncs: 2,
+                        within: REBALANCE_WAIT,
+                    },
+                ],
                 vec![
                     commit(1, &both),
                     JoinGroup,
@@ -2934,7 +3091,14 @@ mod auto_commit_tests {
                 false,
                 Assignor::CooperativeSticky,
                 vec![vec![partition(0)]],
-                vec![Poll, ReceiveRecords, Rebalance { syncs: 2 }],
+                vec![
+                    Poll,
+                    ReceiveRecords,
+                    Rebalance {
+                        syncs: 2,
+                        within: REBALANCE_WAIT,
+                    },
+                ],
                 vec![JoinGroup, SyncGroup, JoinGroup, SyncGroup],
             ),
             (
@@ -2958,6 +3122,141 @@ mod auto_commit_tests {
         let mut wanted = Vec::new();
         for (name, auto_commit, assignor, assignments, steps, expected) in cases {
             actual.push((name, run(auto_commit, assignor, assignments, &steps).await));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// The commit before a `JoinGroup` and the commit of `close` wait for the
+    /// other commits of the consumer, so the committed offset does not move
+    /// back. The rebalance timeout bounds the commit before a `JoinGroup`, and
+    /// the close timeout bounds the commit of `close`. A commit that waits for
+    /// the rebalance does not block the rebalance.
+    #[tokio::test(start_paused = true)]
+    async fn auto_commit_keeps_the_commit_order_within_the_group_timeouts() {
+        use CommitReply::{Drop, Error};
+        use GroupRequest::{CommitSyncReturned, JoinGroup, LeaveGroup, SyncGroup};
+        use Step::{
+            Close, CommitSync, CommitSyncDuringRebalance, HoldCommitLock, Poll, Rebalance,
+            ReceiveRecords, ReplyToNextCommit,
+        };
+
+        let polled = [(0, 12, 3), (1, 7, -1)];
+        let received = [(0, 20, 3), (1, 7, -1)];
+        let both_partitions = vec![vec![partition(0), partition(1)]];
+        let cases: Vec<(&str, Time, Vec<Step>, Vec<GroupRequest>)> = vec![
+            (
+                "commit_sync, then a rebalance: the commit before JoinGroup does not go back",
+                minutes(1),
+                vec![
+                    Poll,
+                    ReceiveRecords,
+                    CommitSync,
+                    Rebalance {
+                        syncs: 1,
+                        within: REBALANCE_WAIT,
+                    },
+                ],
+                vec![
+                    commit(1, &received),
+                    CommitSyncReturned,
+                    commit(1, &received),
+                    JoinGroup,
+                    SyncGroup,
+                ],
+            ),
+            (
+                "a rebalance while commit_sync waits for its response: the commit before \
+                 JoinGroup comes after it",
+                minutes(1),
+                vec![
+                    Poll,
+                    ReceiveRecords,
+                    CommitSyncDuringRebalance {
+                        reply: Drop,
+                        syncs: 1,
+                        within: Duration::from_mins(1),
+                    },
+                ],
+                vec![
+                    commit(1, &received),
+                    CommitSyncReturned,
+                    commit(1, &received),
+                    JoinGroup,
+                    SyncGroup,
+                ],
+            ),
+            (
+                "a rebalance while commit_sync waits for the rebalance: the rebalance does not \
+                 wait for commit_sync",
+                minutes(1),
+                vec![
+                    Poll,
+                    ReceiveRecords,
+                    CommitSyncDuringRebalance {
+                        reply: Error(REBALANCE_IN_PROGRESS),
+                        syncs: 1,
+                        within: REBALANCE_WAIT,
+                    },
+                ],
+                vec![
+                    commit(1, &received),
+                    commit(1, &received),
+                    JoinGroup,
+                    SyncGroup,
+                    CommitSyncReturned,
+                ],
+            ),
+            (
+                "another commit holds the commit lock: JoinGroup at the rebalance timeout, \
+                 without a commit",
+                secs(10),
+                vec![
+                    Poll,
+                    HoldCommitLock,
+                    Rebalance {
+                        syncs: 1,
+                        within: REBALANCE_WAIT,
+                    },
+                ],
+                vec![JoinGroup, SyncGroup],
+            ),
+            (
+                "the coordinator does not answer the commit before JoinGroup: JoinGroup at the \
+                 rebalance timeout",
+                secs(10),
+                vec![
+                    Poll,
+                    ReplyToNextCommit(Drop),
+                    Rebalance {
+                        syncs: 1,
+                        within: REBALANCE_WAIT,
+                    },
+                ],
+                vec![commit(1, &polled), JoinGroup, SyncGroup],
+            ),
+            (
+                "another commit holds the commit lock: close leaves the group after the close \
+                 timeout",
+                minutes(1),
+                vec![Poll, ReceiveRecords, HoldCommitLock, Close],
+                vec![LeaveGroup],
+            ),
+        ];
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, rebalance_timeout, steps, expected) in cases {
+            actual.push((
+                name,
+                run_with_rebalance_timeout(
+                    true,
+                    Assignor::Range,
+                    both_partitions.clone(),
+                    rebalance_timeout,
+                    &steps,
+                )
+                .await,
+            ));
             wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted);

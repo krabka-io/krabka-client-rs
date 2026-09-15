@@ -225,6 +225,7 @@ fn coordinator_state(client: Client) -> CoordinatorState {
         },
         poll_error: PollErrorSlot::default(),
         auto_commit: None,
+        commit_serialization: Arc::new(Mutex::new(())),
         join_prepared: false,
     }
 }

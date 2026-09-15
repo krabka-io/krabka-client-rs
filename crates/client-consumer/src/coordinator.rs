@@ -45,7 +45,7 @@ use krabka_units::{
     Time,
     convert::{StdDurationExt as _, TimeExt as _},
 };
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -413,6 +413,10 @@ pub(crate) struct CoordinatorState {
     /// Kafka's `enable.auto.commit` state, shared with the parent `Consumer`.
     /// `None` when auto commit is off.
     pub auto_commit: Option<crate::commit::AutoCommit>,
+    /// The commit lock of the parent `Consumer`. The commit before a
+    /// `JoinGroup` takes it, so the commits of the consumer reach the
+    /// coordinator in order.
+    pub commit_serialization: Arc<Mutex<()>>,
     /// `true` after the pre-join auto commit ran and before the join completes.
     /// Kafka's `AbstractCoordinator.needsJoinPrepare` is the inverse flag: a
     /// retry of a failed `JoinGroup` does not commit again.
@@ -1097,6 +1101,11 @@ fn build_sync_group_request(
 /// group. This function commits the positions of the latest `poll`; see
 /// [`crate::commit::AutoCommit`]. It runs once per join: a retry of a failed
 /// `JoinGroup` does not commit again.
+///
+/// The commit takes `commit_serialization` before it reads the positions, so
+/// it cannot reach the coordinator after a newer commit of the consumer. The
+/// rebalance timeout bounds the wait for that lock, each `OffsetCommit` and
+/// each coordinator lookup.
 #[tracing::instrument(
     name = "consumer.commit_before_join",
     level = "debug",
@@ -1112,6 +1121,12 @@ async fn commit_before_join(state: &mut CoordinatorState) {
     }
     state.join_prepared = true;
     let deadline = tokio::time::Instant::now() + state.rebalance_timeout.to_std();
+    let Some(_turn) = commit_turn(&state.commit_serialization, &auto_commit, deadline).await else {
+        tracing::error!(
+            "auto commit before the rebalance timed out waiting for another commit; joining the group"
+        );
+        return;
+    };
     loop {
         let identity = state.commit_identity.lock().await.clone();
         let offsets = auto_commit.polled_offsets(&identity.ownership_ids).await;
@@ -1119,18 +1134,19 @@ async fn commit_before_join(state: &mut CoordinatorState) {
             return;
         }
         let coordinator = state.coordinator_id.load(Ordering::Relaxed);
-        let result = state
-            .client
-            .broker(coordinator)
-            .send(build_commit_request(
-                state.group_id.clone(),
-                identity.generation,
-                identity.member_id,
-                state.group_instance_id.clone(),
-                build_commit_topics(offsets),
-            ))
-            .await
-            .map_err(ConsumerError::from);
+        let broker = state.client.broker(coordinator);
+        let send = broker.send(build_commit_request(
+            state.group_id.clone(),
+            identity.generation,
+            identity.member_id,
+            state.group_instance_id.clone(),
+            build_commit_topics(offsets),
+        ));
+        let Ok(result) = tokio::time::timeout_at(deadline, send).await else {
+            tracing::error!("auto commit before the rebalance timed out; joining the group");
+            return;
+        };
+        let result = result.map_err(ConsumerError::from);
         match auto_commit_outcome(&result) {
             AutoCommitOutcome::Committed => return,
             AutoCommitOutcome::Failed => {
@@ -1147,7 +1163,16 @@ async fn commit_before_join(state: &mut CoordinatorState) {
                 };
                 if moved {
                     state.client.evict_broker(coordinator);
-                    refind_after(state, "auto commit").await;
+                    if tokio::time::timeout_at(deadline, refind_after(state, "auto commit"))
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(
+                            ?result,
+                            "auto commit before the rebalance timed out; joining the group"
+                        );
+                        return;
+                    }
                 }
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
@@ -1160,6 +1185,27 @@ async fn commit_before_join(state: &mut CoordinatorState) {
                 tokio::time::sleep(state.retry_policy.initial_backoff.min(deadline - now)).await;
             }
         }
+    }
+}
+
+/// Wait for the turn of the commit before a `JoinGroup` in the commit order.
+///
+/// The function returns `Some(Some(guard))` when the commit holds
+/// `commit_serialization`. It returns `Some(None)` when the commit that holds
+/// the lock waits for this rebalance. That commit sends nothing before the
+/// rebalance publishes the next assignment, so the commit before the
+/// `JoinGroup` goes first. The function returns `None` at `deadline`.
+async fn commit_turn(
+    commit_serialization: &Arc<Mutex<()>>,
+    auto_commit: &crate::commit::AutoCommit,
+    deadline: tokio::time::Instant,
+) -> Option<Option<OwnedMutexGuard<()>>> {
+    let mut parked_commits = auto_commit.parked_commits();
+    tokio::select! {
+        biased;
+        guard = Arc::clone(commit_serialization).lock_owned() => Some(Some(guard)),
+        parked = parked_commits.wait_for(|parked| *parked) => parked.is_ok().then_some(None),
+        () = tokio::time::sleep_until(deadline) => None,
     }
 }
 
@@ -2339,6 +2385,7 @@ mod retry_tests {
             retry_policy: retry(Duration::from_secs(30)),
             poll_error: PollErrorSlot::default(),
             auto_commit: None,
+            commit_serialization: Arc::new(Mutex::new(())),
             join_prepared: false,
         };
 
@@ -2823,6 +2870,7 @@ mod retry_tests {
             },
             poll_error: PollErrorSlot::default(),
             auto_commit: None,
+            commit_serialization: Arc::new(Mutex::new(())),
             join_prepared: false,
         };
         let poll_error = Arc::clone(&state.poll_error);

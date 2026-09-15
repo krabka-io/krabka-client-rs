@@ -89,10 +89,15 @@ fn validate_selected_offsets(
     Ok(())
 }
 
+/// Take the offsets of an asynchronous commit.
+///
+/// With `auto_commit`, the function also raises the positions for the commit
+/// before a `JoinGroup` to these offsets. See [`AutoCommit::record_sent`].
 async fn snapshot_commit_topics(
     commit_identity: &Arc<Mutex<CommitIdentity>>,
     offsets: &Arc<Mutex<HashMap<(String, i32), i64>>>,
     positions: &Arc<Mutex<HashMap<(String, i32), PartitionPosition>>>,
+    auto_commit: Option<&AutoCommit>,
 ) -> Option<(usize, Vec<OffsetCommitRequestTopic>, (i32, String))> {
     let identity = commit_identity.lock().await.clone();
     let mut raw_offsets = offsets.lock().await.clone();
@@ -106,6 +111,11 @@ async fn snapshot_commit_topics(
     let pos = positions.lock().await;
     let offsets = commit_offsets(raw_offsets, &pos);
     drop(pos);
+    if let Some(auto_commit) = auto_commit {
+        auto_commit
+            .record_sent(sent_positions(&offsets, &identity.ownership_ids))
+            .await;
+    }
     Some((
         partitions,
         build_commit_topics(offsets),
@@ -283,6 +293,29 @@ fn owned_offsets(
         .collect()
 }
 
+/// The committable positions of the `(offset, leader_epoch)` pairs that a
+/// commit sends, with the ownership of each partition.
+fn sent_positions(
+    offsets: &HashMap<(String, i32), (i64, i32)>,
+    ownership_ids: &HashMap<(String, i32), u64>,
+) -> Vec<((String, i32), ConsumedPosition)> {
+    offsets
+        .iter()
+        .filter_map(|(partition, (offset, leader_epoch))| {
+            ownership_ids.get(partition).map(|ownership_id| {
+                (
+                    partition.clone(),
+                    ConsumedPosition {
+                        offset: *offset,
+                        leader_epoch: *leader_epoch,
+                        ownership_id: *ownership_id,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 /// How an automatic commit ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AutoCommitOutcome {
@@ -385,14 +418,41 @@ pub(crate) struct AutoCommit {
     /// When the next interval commit from `poll` is due. Kafka's
     /// `ConsumerCoordinator.nextAutoCommitTimer`.
     next_due: Arc<Mutex<tokio::time::Instant>>,
-    /// The positions at the start of the latest `poll`.
+    /// The positions at the start of the latest `poll`, raised to each offset
+    /// that a commit sent after that `poll` for the same ownership.
     ///
     /// Kafka runs `onJoinPrepare` inside `poll`, so its pre-rebalance commit
     /// includes only records that the application received before that `poll`.
     /// The krabka coordinator task rebalances between two polls, while the
     /// application can still process the records of the last `poll`. The task
     /// therefore commits these positions and not the live ones.
+    ///
+    /// A commit of the application can send a newer offset than the positions
+    /// of the latest `poll`. The pre-rebalance commit must not move the
+    /// committed offset back behind it. Kafka's `allConsumed` is never behind a
+    /// `commitSync()` of the same ownership, because both read the positions.
     polled: Arc<Mutex<ConsumedPositions>>,
+    /// `true` while a commit that holds `commit_serialization` waits for the
+    /// coordinator task to finish a rebalance. See [`AutoCommit::park`].
+    commit_parked: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+/// A commit that holds `commit_serialization` and waits for a rebalance.
+///
+/// The commit before a `JoinGroup` waits for `commit_serialization`. A commit
+/// that holds the lock and waits for the rebalance would block that rebalance
+/// until its deadline. While this guard lives, the commit before a `JoinGroup`
+/// does not wait for the lock. The waiting commit sends nothing until the
+/// coordinator task publishes the next assignment, so the order of the commits
+/// stays the same.
+pub(crate) struct ParkedCommit {
+    commit_parked: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Drop for ParkedCommit {
+    fn drop(&mut self) {
+        self.commit_parked.send_replace(false);
+    }
 }
 
 impl AutoCommit {
@@ -401,6 +461,38 @@ impl AutoCommit {
             interval,
             next_due: Arc::new(Mutex::new(tokio::time::Instant::now() + interval)),
             polled: Arc::new(Mutex::new(HashMap::new())),
+            commit_parked: Arc::new(tokio::sync::watch::Sender::new(false)),
+        }
+    }
+
+    /// Mark that the commit that holds `commit_serialization` waits for a
+    /// rebalance, until the returned guard drops.
+    pub(crate) fn park(&self) -> ParkedCommit {
+        self.commit_parked.send_replace(true);
+        ParkedCommit {
+            commit_parked: Arc::clone(&self.commit_parked),
+        }
+    }
+
+    /// A receiver that sees when a commit that holds `commit_serialization`
+    /// waits for a rebalance.
+    pub(crate) fn parked_commits(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.commit_parked.subscribe()
+    }
+
+    /// Raise the positions for the commit before a `JoinGroup` to the offsets
+    /// that a commit sends. Call it while you hold `commit_serialization`,
+    /// before the commit sends its request.
+    pub(crate) async fn record_sent(
+        &self,
+        sent: impl IntoIterator<Item = ((String, i32), ConsumedPosition)>,
+    ) {
+        let mut polled = self.polled.lock().await;
+        for (partition, position) in sent {
+            let known = polled.entry(partition).or_insert(position);
+            if known.ownership_id != position.ownership_id || known.offset < position.offset {
+                *known = position;
+            }
         }
     }
 
@@ -569,21 +661,21 @@ impl Consumer {
         if self.auto_commit.is_none() {
             return;
         }
-        let _commit_guard = self.commit_serialization.lock().await;
-        let (_, consumed) = self.consumed_positions().await;
-        let pending = consumed
-            .into_iter()
-            .map(|(partition, position)| (partition, (position.offset, position.ownership_id)))
-            .collect::<HashMap<_, _>>();
-        if pending.is_empty() {
-            return;
-        }
-        match tokio::time::timeout(
-            AUTO_COMMIT_CLOSE_TIMEOUT,
-            self.commit_pending_offsets(pending),
-        )
-        .await
-        {
+        // The close timeout also bounds the wait for another commit that holds
+        // the commit lock.
+        let commit = async {
+            let _commit_guard = self.commit_serialization.lock().await;
+            let (_, consumed) = self.consumed_positions().await;
+            let pending = consumed
+                .into_iter()
+                .map(|(partition, position)| (partition, (position.offset, position.ownership_id)))
+                .collect::<HashMap<_, _>>();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            self.commit_pending_offsets(pending).await
+        };
+        match tokio::time::timeout(AUTO_COMMIT_CLOSE_TIMEOUT, commit).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(group = %self.group_id, %error, "synchronous auto commit on close failed");
@@ -727,6 +819,15 @@ impl Consumer {
                     .collect(),
                 &position_epochs,
             );
+            if let Some(auto_commit) = &self.auto_commit {
+                let ownership_ids = pending
+                    .iter()
+                    .map(|(partition, (_, ownership_id))| (partition.clone(), *ownership_id))
+                    .collect();
+                auto_commit
+                    .record_sent(sent_positions(&offsets, &ownership_ids))
+                    .await;
+            }
             let topics = build_commit_topics(offsets);
             match self
                 .commit_topics_once(topics, (identity.generation, identity.member_id.clone()))
@@ -756,6 +857,7 @@ impl Consumer {
                     if current_identity.generation == identity.generation
                         && current_identity.member_id == identity.member_id
                     {
+                        let _parked = self.auto_commit.as_ref().map(AutoCommit::park);
                         tokio::select! {
                             () = &mut assignment_changed => {}
                             () = self.coordinator_shutdown.cancelled() => {
@@ -908,6 +1010,7 @@ impl Consumer {
         let offsets = Arc::clone(&self.next_offsets);
         let positions = Arc::clone(&self.positions);
         let commit_async_state = Arc::clone(&self.commit_async_state);
+        let auto_commit = self.auto_commit.clone();
         tokio::spawn(async move {
             loop {
                 {
@@ -915,8 +1018,13 @@ impl Consumer {
                     // Calls queued before this snapshot are represented by the
                     // current offsets, so collapse them into this request.
                     commit_async_state.store(ASYNC_COMMIT_RUNNING, Ordering::Release);
-                    if let Some((_, topics, (generation, member_id))) =
-                        snapshot_commit_topics(&commit_identity, &offsets, &positions).await
+                    if let Some((_, topics, (generation, member_id))) = snapshot_commit_topics(
+                        &commit_identity,
+                        &offsets,
+                        &positions,
+                        auto_commit.as_ref(),
+                    )
+                    .await
                         && let Err(error) = route.send(topics, generation, &member_id).await
                     {
                         tracing::warn!(%error, "commit_async failed");
@@ -1558,7 +1666,7 @@ mod tests {
         let offsets = Arc::new(Mutex::new(HashMap::new()));
         let positions = Arc::new(Mutex::new(HashMap::new()));
 
-        let snapshot = snapshot_commit_topics(&identity, &offsets, &positions).await;
+        let snapshot = snapshot_commit_topics(&identity, &offsets, &positions, None).await;
 
         assert2::assert!(snapshot.is_none());
     }
@@ -1582,7 +1690,7 @@ mod tests {
             },
         )])));
         let (partition_count, topics, seen_identity) =
-            snapshot_commit_topics(&identity, &offsets, &positions)
+            snapshot_commit_topics(&identity, &offsets, &positions, None)
                 .await
                 .expect("non-empty offsets are snapshotted");
         let mut topics = topics;

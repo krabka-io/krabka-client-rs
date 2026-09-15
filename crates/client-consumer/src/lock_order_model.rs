@@ -45,9 +45,17 @@
 //! plus single-lock regions for completeness). Citations are to the real code.
 //!
 //! `commit_serialization` is intentionally held across commit RPCs and rebalance
-//! waits, but no coordinator path needs that lock. All other guards are dropped
-//! before RPCs. The model abstracts network waits and keeps every nested mutex
-//! acquisition, because only those acquisitions can form lock-order cycles.
+//! waits. The coordinator takes it only in `commit_before_join`, while it holds
+//! no other lock. All other guards are dropped before RPCs. The model abstracts
+//! network waits and keeps every nested mutex acquisition, because only those
+//! acquisitions can form lock-order cycles.
+//!
+//! A commit that holds `commit_serialization` can wait for a rebalance
+//! (`commit_pending_offsets`, the deferred response). That is a wait for a
+//! notification, not for a lock, so this model does not show it. The commit
+//! marks that wait with `AutoCommit::park`, and `commit_before_join` then stops
+//! its wait for the lock (`commit_turn`). The rebalance timeout also bounds that
+//! wait.
 //!
 //! ### poll task (`poll.rs`, `seek.rs`, `validate.rs`, `commit.rs`)
 //! - `apply_pending_seeks` (seek.rs): PS fast-path probe (released) → A
@@ -85,8 +93,9 @@
 //!   cooperative `next_offsets`→`positions` prunes). A is never held while N or
 //!   P is acquired.
 //! - `run` after `UNKNOWN_MEMBER_ID`: **CI alone** while clearing identity.
-//! - `commit_before_join` (at the start of `join_and_sync`): CI alone, then AP
-//!   alone. At the end of `join_and_sync`, `restart_interval` takes ND alone.
+//! - `commit_before_join` (at the start of `join_and_sync`): **CS**, and under
+//!   it CI alone, then AP alone. At the end of `join_and_sync`,
+//!   `restart_interval` takes ND alone.
 //! - `prime_offsets`: T alone (`topic_ids.clone()`), then **N→P**
 //!   (`next_offsets`→`positions`).
 //! - `join_and_sync` (leader branch): **T alone** (`topic_ids` merge).
@@ -95,8 +104,10 @@
 //! - Every commit holds **CS** for its complete operation. Synchronous commits
 //!   initially nest **CI→N** under CS. The asynchronous snapshot takes CI and N
 //!   separately under CS. Retry snapshots take CI alone under CS, followed by
-//!   P and T alone under CS. This serializes concurrent commits without blocking
-//!   coordinator publication, because the coordinator never takes CS.
+//!   P, AP (`AutoCommit::record_sent`) and T alone under CS. The asynchronous
+//!   snapshot also takes AP alone under CS. This serializes concurrent commits
+//!   without blocking coordinator publication, because the coordinator takes
+//!   CS only in `commit_before_join`, before it publishes anything.
 //! - `auto_commit_on_close` holds CS, takes CI, N and P each alone under it,
 //!   and then runs the synchronous commit regions.
 //!
@@ -104,9 +115,9 @@
 //!
 //! Collecting every "hold L1 while acquiring L2" edge actually observed:
 //!   PS → N, N → P, N → E, A → N, A → CI, CS → CI, CI → N, CS → N, CS → P,
-//!   CS → T, CS → ND.
+//!   CS → T, CS → ND, CS → AP.
 //! The resulting partial order is acyclic: `A < CI < N < P`,
-//! `CS < CI < N < P`, `PS < N < P`, `CS < T`, and `CS < ND`.
+//! `CS < CI < N < P`, `PS < N < P`, `CS < T`, `CS < ND`, and `CS < AP`.
 //! This is acyclic ⇒ the prediction is **deadlock-free**, and the model proves
 //! it exhaustively across all task interleavings.
 
@@ -314,11 +325,14 @@ fn coordinator_program() -> Vec<Op> {
         // rejoin: owned snapshot (`assigned.clone()`)
         Acquire(A),
         Release(A),
-        // commit_before_join: identity snapshot, then polled positions.
+        // commit_before_join: the commit lock, and under it the identity
+        // snapshot, then the polled positions.
+        Acquire(CS),
         Acquire(CI),
         Release(CI),
         Acquire(AP),
         Release(AP),
+        Release(CS),
         // join_and_sync → topic_ids merge (leader branch, T alone)
         Acquire(T),
         Release(T),
@@ -374,6 +388,9 @@ fn commit_program() -> Vec<Op> {
         // positions snapshot.
         Acquire(P),
         Release(P),
+        // AutoCommit::record_sent raises the polled positions.
+        Acquire(AP),
+        Release(AP),
         // topic_ids snapshot.
         Acquire(T),
         Release(T),
@@ -396,6 +413,9 @@ fn async_commit_program() -> Vec<Op> {
         Release(N),
         Acquire(P),
         Release(P),
+        // snapshot_commit_topics: AutoCommit::record_sent.
+        Acquire(AP),
+        Release(AP),
         Acquire(T),
         Release(T),
         Release(CS),
@@ -419,11 +439,14 @@ fn close_auto_commit_program() -> Vec<Op> {
         Release(N),
         Acquire(P),
         Release(P),
-        // commit_pending_offsets identity and positions snapshots.
+        // commit_pending_offsets identity and positions snapshots, then
+        // AutoCommit::record_sent.
         Acquire(CI),
         Release(CI),
         Acquire(P),
         Release(P),
+        Acquire(AP),
+        Release(AP),
         Release(CS),
     ]
 }
