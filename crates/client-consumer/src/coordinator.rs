@@ -722,14 +722,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     HeartbeatOutcome::Ok | HeartbeatOutcome::Transient => {}
                     HeartbeatOutcome::NeedRejoin => needs_rejoin = true,
                     HeartbeatOutcome::RejoinFromScratch => {
-                        state.member_id.clear();
-                        let mut identity = state.commit_identity.lock().await;
-                        identity.member_id.clear();
-                        identity.ownership_ids.clear();
-                        identity.generation = -1;
-                        drop(identity);
-                        set_generation(&mut state, -1);
-                        state.assignment_changed.notify_waiters();
+                        forget_member(&mut state).await;
                         needs_rejoin = true;
                     }
                     HeartbeatOutcome::Fenced => {
@@ -750,6 +743,19 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
     // its session expires, stalling the rest of the group's rebalance.
     // Best-effort and bounded: a hung broker must not block `close()`.
     leave_group(&state).await;
+}
+
+/// Forget the member id, the generation and the partition ownership after
+/// `UNKNOWN_MEMBER_ID`, so the next join starts from scratch.
+async fn forget_member(state: &mut CoordinatorState) {
+    state.member_id.clear();
+    let mut identity = state.commit_identity.lock().await;
+    identity.member_id.clear();
+    identity.ownership_ids.clear();
+    identity.generation = -1;
+    drop(identity);
+    set_generation(state, -1);
+    state.assignment_changed.notify_waiters();
 }
 
 /// Stop the member after the coordinator fenced its `group.instance.id`.
@@ -1102,26 +1108,103 @@ fn build_sync_group_request(
 /// [`crate::commit::AutoCommit`]. It runs once per join: a retry of a failed
 /// `JoinGroup` does not commit again.
 ///
-/// The commit takes `commit_serialization` before it reads the positions, so
-/// it cannot reach the coordinator after a newer commit of the consumer. The
-/// rebalance timeout bounds the wait for that lock, each `OffsetCommit` and
-/// each coordinator lookup.
+/// Kafka's heartbeat thread keeps the session alive while `onJoinPrepare`
+/// waits. This function sends a heartbeat each heartbeat interval while the
+/// commit runs. When a heartbeat says that the coordinator does not know the
+/// member, the function stops the commit, forgets the member and joins from
+/// scratch.
+///
+/// # Errors
+///
+/// Returns `FencedInstanceId` when a heartbeat says that another consumer
+/// joined with the same `group.instance.id`.
 #[tracing::instrument(
     name = "consumer.commit_before_join",
     level = "debug",
     skip_all,
     fields(group_id = %state.group_id, generation = state.generation_id)
 )]
-async fn commit_before_join(state: &mut CoordinatorState) {
+async fn commit_before_join(state: &mut CoordinatorState) -> Result<(), ConsumerError> {
     let Some(auto_commit) = state.auto_commit.clone() else {
-        return;
+        return Ok(());
     };
     if state.join_prepared {
-        return;
+        return Ok(());
     }
     state.join_prepared = true;
+    let heartbeat = {
+        let state = &*state;
+        let commit_done = CancellationToken::new();
+        let stop_commit = CancellationToken::new();
+        let commit = async {
+            tokio::select! {
+                () = commit_consumed_before_join(state, &auto_commit) => {}
+                () = stop_commit.cancelled() => {}
+            }
+            commit_done.cancel();
+        };
+        let heartbeats = async {
+            let outcome = heartbeat_during_join_prepare(state, &commit_done).await;
+            stop_commit.cancel();
+            outcome
+        };
+        tokio::join!(commit, heartbeats).1
+    };
+    match heartbeat {
+        Some(HeartbeatOutcome::Fenced) => Err(ConsumerError::FencedInstanceId(
+            state.group_instance_id.clone().unwrap_or_default(),
+        )),
+        Some(HeartbeatOutcome::RejoinFromScratch) => {
+            tracing::warn!(
+                "the coordinator does not know the member; joining the group from scratch"
+            );
+            forget_member(state).await;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Send a heartbeat each heartbeat interval until `commit_done` is cancelled,
+/// or until a heartbeat says that the member is fenced or unknown. Return that
+/// outcome.
+///
+/// The function does not stop a heartbeat that is in flight, so the `JoinGroup`
+/// goes out after its response.
+async fn heartbeat_during_join_prepare(
+    state: &CoordinatorState,
+    commit_done: &CancellationToken,
+) -> Option<HeartbeatOutcome> {
+    let interval = state.heartbeat_interval.to_std();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            () = commit_done.cancelled() => return None,
+            _ = ticker.tick() => {}
+        }
+        match heartbeat_once(state).await {
+            HeartbeatOutcome::Ok | HeartbeatOutcome::NeedRejoin | HeartbeatOutcome::Transient => {}
+            outcome @ (HeartbeatOutcome::RejoinFromScratch | HeartbeatOutcome::Fenced) => {
+                return Some(outcome);
+            }
+        }
+    }
+}
+
+/// Commit the positions of the latest `poll` before a `JoinGroup`.
+///
+/// The commit takes `commit_serialization` before it reads the positions, so
+/// it cannot reach the coordinator after a newer commit of the consumer. The
+/// rebalance timeout bounds the wait for that lock, each `OffsetCommit` and
+/// each coordinator lookup.
+async fn commit_consumed_before_join(
+    state: &CoordinatorState,
+    auto_commit: &crate::commit::AutoCommit,
+) {
     let deadline = tokio::time::Instant::now() + state.rebalance_timeout.to_std();
-    let Some(_turn) = commit_turn(&state.commit_serialization, &auto_commit, deadline).await else {
+    let Some(_turn) = commit_turn(&state.commit_serialization, auto_commit, deadline).await else {
         tracing::error!(
             "auto commit before the rebalance timed out waiting for another commit; joining the group"
         );
@@ -1365,7 +1448,7 @@ async fn join_and_sync(
     state: &mut CoordinatorState,
     owned: &[(String, i32)],
 ) -> Result<JoinOutcome, ConsumerError> {
-    commit_before_join(state).await;
+    commit_before_join(state).await?;
     let join_resp = perform_join(state, owned).await?;
     // The broker may have refreshed our member_id on this join too.
     if !join_resp.member_id.is_empty() {

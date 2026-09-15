@@ -2521,6 +2521,7 @@ mod auto_commit_tests {
     /// `REBALANCE_IN_PROGRESS`.
     const REBALANCE_IN_PROGRESS: i16 = 27;
     const AUTO_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
+    const SESSION_TIMEOUT: Duration = Duration::from_secs(45);
     /// How long a rebalance step waits for the `SyncGroup` requests. The first
     /// heartbeat comes after 3 s.
     const REBALANCE_WAIT: Duration = Duration::from_secs(30);
@@ -2540,6 +2541,9 @@ mod auto_commit_tests {
         SyncGroupLate,
         /// `close` did not return in the time of the step.
         CloseTimedOut,
+        /// The `JoinGroup` came more than the session timeout after the last
+        /// heartbeat. A broker would have removed the member.
+        SessionExpired,
     }
 
     /// How the mock coordinator answers one `OffsetCommit`.
@@ -2584,6 +2588,8 @@ mod auto_commit_tests {
         /// When `true`, the next `OffsetCommit` makes the next `Heartbeat`
         /// answer `REBALANCE_IN_PROGRESS`.
         rebalance_on_commit: std::sync::atomic::AtomicBool,
+        /// When the last `Heartbeat` or `JoinGroup` came.
+        last_heartbeat: std::sync::Mutex<tokio::time::Instant>,
     }
 
     fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
@@ -2626,14 +2632,25 @@ mod auto_commit_tests {
                     0,
                 )),
                 metadata_request::API_KEY => Some(encode(&MetadataResponse::default(), version)),
-                heartbeat_request::API_KEY => Some(encode(
-                    &HeartbeatResponse {
-                        error_code: self.heartbeat_error.swap(0, Ordering::SeqCst),
-                        ..Default::default()
-                    },
-                    version,
-                )),
+                heartbeat_request::API_KEY => {
+                    *self.last_heartbeat.lock().expect("last heartbeat lock") =
+                        tokio::time::Instant::now();
+                    Some(encode(
+                        &HeartbeatResponse {
+                            error_code: self.heartbeat_error.swap(0, Ordering::SeqCst),
+                            ..Default::default()
+                        },
+                        version,
+                    ))
+                }
                 join_group_request::API_KEY => {
+                    let mut last_heartbeat =
+                        self.last_heartbeat.lock().expect("last heartbeat lock");
+                    if last_heartbeat.elapsed() > SESSION_TIMEOUT {
+                        self.record(GroupRequest::SessionExpired);
+                    }
+                    *last_heartbeat = tokio::time::Instant::now();
+                    drop(last_heartbeat);
                     self.record(GroupRequest::JoinGroup);
                     Some(encode(
                         &JoinGroupResponse {
@@ -2766,7 +2783,7 @@ mod auto_commit_tests {
             bootstrap,
             client_id: "auto-commit-test".into(),
             group_id: GROUP.into(),
-            session_timeout: secs(45),
+            session_timeout: Time::from_std(SESSION_TIMEOUT),
             rebalance_timeout,
             heartbeat_interval: secs(3),
             subscription_metadata_refresh_interval: minutes(60),
@@ -2874,6 +2891,7 @@ mod auto_commit_tests {
             generation: AtomicI32::new(1),
             commit_replies: std::sync::Mutex::new(VecDeque::new()),
             rebalance_on_commit: std::sync::atomic::AtomicBool::new(false),
+            last_heartbeat: std::sync::Mutex::new(tokio::time::Instant::now()),
         });
         let in_mock = Arc::clone(&coordinator);
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
@@ -3217,6 +3235,20 @@ mod auto_commit_tests {
                     Rebalance {
                         syncs: 1,
                         within: REBALANCE_WAIT,
+                    },
+                ],
+                vec![JoinGroup, SyncGroup],
+            ),
+            (
+                "another commit holds the commit lock past the session timeout: heartbeats keep \
+                 the member in the group",
+                minutes(1),
+                vec![
+                    Poll,
+                    HoldCommitLock,
+                    Rebalance {
+                        syncs: 1,
+                        within: Duration::from_secs(90),
                     },
                 ],
                 vec![JoinGroup, SyncGroup],
