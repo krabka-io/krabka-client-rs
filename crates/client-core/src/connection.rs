@@ -231,6 +231,45 @@ struct DispatchItem {
     bytes: Bytes,
 }
 
+/// Classify a failed TLS handshake.
+///
+/// Kafka's `SslTransportLayer.maybeProcessHandshakeFailure` raises an
+/// `SslAuthenticationException` for an error from the TLS engine, and keeps a
+/// `close_notify` during the handshake and a plain I/O error retriable.
+/// `tokio-rustls` wraps an error from the TLS engine as the inner error of the
+/// `io::Error`.
+fn tls_handshake_error(addr: SocketAddr, source: std::io::Error) -> ClientError {
+    let rejected = source
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .is_some_and(|error| {
+            !matches!(
+                error,
+                rustls::Error::AlertReceived(rustls::AlertDescription::CloseNotify)
+            )
+        });
+    if rejected {
+        ClientError::Authentication {
+            addr,
+            source: crate::error::AuthenticationError::Tls(source),
+        }
+    } else {
+        ClientError::Tls { addr, source }
+    }
+}
+
+/// Classify a failed SASL exchange. Only a rejection is an authentication
+/// failure.
+fn sasl_error(addr: SocketAddr, source: crate::sasl::OutboundSaslError) -> ClientError {
+    match source {
+        crate::sasl::OutboundSaslError::Authentication(error) => ClientError::Authentication {
+            addr,
+            source: error.into(),
+        },
+        source => ClientError::Sasl { addr, source },
+    }
+}
+
 impl Connection {
     /// Connect to `addr`, negotiate API versions, return a usable `Connection`.
     #[tracing::instrument(level = "debug", skip_all, fields(addr = %addr), err)]
@@ -285,8 +324,9 @@ impl Connection {
     /// # Errors
     ///
     /// Returns [`ClientError::Connect`] / [`ClientError::Timeout`] on the
-    /// TCP dial, [`ClientError::Tls`] if the TLS handshake fails,
-    /// [`ClientError::Sasl`] if SASL authentication fails, or
+    /// TCP dial, [`ClientError::Tls`] or [`ClientError::Sasl`] if the TLS
+    /// handshake or the SASL exchange fails with no verdict from the peer,
+    /// [`ClientError::Authentication`] if the peer rejects authentication, or
     /// [`ClientError::Io`] if the security policy is internally inconsistent
     /// (e.g. a TLS protocol with no TLS config).
     #[tracing::instrument(
@@ -324,7 +364,7 @@ impl Connection {
             let s = connector
                 .connect(sni, tcp)
                 .await
-                .map_err(|source| ClientError::Tls { addr, source })?;
+                .map_err(|source| tls_handshake_error(addr, source))?;
             Box::new(s)
         } else {
             Box::new(tcp)
@@ -349,7 +389,7 @@ impl Connection {
                 options.frame_max,
             )
             .await
-            .map_err(|source| ClientError::Sasl { addr, source })?;
+            .map_err(|source| sasl_error(addr, source))?;
         }
 
         Self::from_stream(stream, options).await
@@ -936,6 +976,95 @@ mod secured_tests {
             .expect("secured connect completes");
         conn.close();
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tls_handshake_failure_tests {
+    use krabka_security::ListenerProtocol;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::*;
+    use crate::{
+        error::AuthenticationError,
+        security::{ClientSecurity, TlsConnectorConfig},
+    };
+
+    /// What the TLS listener does after it accepts the connection.
+    #[derive(Clone, Copy, Debug)]
+    enum Peer {
+        /// Answer the `ClientHello` with plaintext, as a plaintext listener
+        /// does.
+        Plaintext,
+        /// Close the connection before the handshake completes.
+        Close,
+    }
+
+    /// How the handshake failed, as a caller classifies it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Failure {
+        Rejected(std::io::ErrorKind),
+        Transport(std::io::ErrorKind),
+        Other(String),
+    }
+
+    async fn listener(peer: Peer) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            if matches!(peer, Peer::Plaintext) {
+                let _ = stream.write_all(b"HTTP/1.0 400 Bad Request\r\n\r\n").await;
+                while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+            }
+        });
+        addr
+    }
+
+    /// Kafka's `SslTransportLayer.maybeProcessHandshakeFailure` raises an
+    /// `SslAuthenticationException` for "Unrecognized SSL message", and keeps
+    /// a disconnect during the handshake retriable.
+    #[tokio::test]
+    async fn tls_rejection_is_an_authentication_failure_and_eof_is_not() {
+        let security = ClientSecurity {
+            protocol: ListenerProtocol::Ssl,
+            tls: Some(TlsConnectorConfig {
+                trust_roots_pem: None,
+                server_name: String::new(),
+                client_identity: None,
+            }),
+            sasl: None,
+            sasl_host: None,
+        };
+        for (peer, expected) in [
+            (
+                Peer::Plaintext,
+                Failure::Rejected(std::io::ErrorKind::InvalidData),
+            ),
+            (
+                Peer::Close,
+                Failure::Transport(std::io::ErrorKind::UnexpectedEof),
+            ),
+        ] {
+            let addr = listener(peer).await;
+            let result =
+                Connection::connect_secured(addr, ConnectionOptions::default(), &security).await;
+            let failure = match result {
+                Err(ClientError::Authentication {
+                    source: AuthenticationError::Tls(source),
+                    ..
+                }) => Failure::Rejected(source.kind()),
+                Err(ClientError::Tls { source, .. }) => Failure::Transport(source.kind()),
+                Err(error) => Failure::Other(error.to_string()),
+                Ok(_) => Failure::Other("connected".into()),
+            };
+            assert2::check!(failure == expected, "{peer:?}");
+        }
     }
 }
 

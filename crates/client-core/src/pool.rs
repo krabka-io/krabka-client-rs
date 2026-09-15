@@ -265,6 +265,9 @@ impl<C: BrokerConnector> BrokerPool<C> {
                     self.by_id.insert(BOOTSTRAP_ID, Arc::clone(&arc));
                     return Ok(arc);
                 }
+                // Kafka raises an authentication failure from the next call
+                // and does not try another node (`Metadata.fatalError`).
+                Err(e) if e.is_authentication_failure() => return Err(e),
                 Err(e) => last_err = Some(e),
             }
         }

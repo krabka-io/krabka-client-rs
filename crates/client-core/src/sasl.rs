@@ -88,15 +88,92 @@ impl SaslCredentials {
     }
 }
 
+/// Kafka `Errors.UNSUPPORTED_SASL_MECHANISM`.
+const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
+/// Kafka `Errors.ILLEGAL_SASL_STATE`.
+const ILLEGAL_SASL_STATE: i16 = 34;
+/// Kafka `Errors.SASL_AUTHENTICATION_FAILED`.
+const SASL_AUTHENTICATION_FAILED: i16 = 58;
+
 /// Errors raised during the outbound SASL handshake.
+///
+/// Only [`OutboundSaslError::Authentication`] is a rejection. The other
+/// variants give no verdict from the broker, and the caller can connect again.
 #[derive(Debug, Error)]
 pub enum OutboundSaslError {
+    /// The stream failed before the broker answered, for example on EOF or a
+    /// reset. Kafka's `NetworkClient` keeps a disconnect in the `AUTHENTICATE`
+    /// state retriable.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("sasl: {0}")]
-    Sasl(String),
+    /// The client could not encode a request, or a response frame was larger
+    /// than the frame limit.
     #[error("codec: {0}")]
     Codec(String),
+    /// The broker answered `SaslAuthenticate` with an error code that is not
+    /// an `AuthenticationException` in Kafka. Kafka's `Selector` closes the
+    /// connection in the `AUTHENTICATE` state, and the client retries.
+    #[error("SaslAuthenticate error_code={error_code} error_message={error_message:?}")]
+    Server {
+        error_code: i16,
+        error_message: Option<String>,
+    },
+    /// The broker or the SASL mechanism rejected authentication.
+    #[error(transparent)]
+    Authentication(#[from] SaslAuthenticationError),
+}
+
+/// A SASL authentication rejection. Each variant is a subclass of Kafka's
+/// `AuthenticationException`, which the client raises to the application
+/// without a retry.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum SaslAuthenticationError {
+    /// Kafka `UnsupportedSaslMechanismException`: the broker does not enable
+    /// the client mechanism (`UNSUPPORTED_SASL_MECHANISM`, 33).
+    #[error("unsupported SASL mechanism: {0}")]
+    UnsupportedMechanism(String),
+    /// Kafka `IllegalSaslStateException`: `ILLEGAL_SASL_STATE` (34), an
+    /// unknown `SaslHandshake` error code, or a response that the client
+    /// cannot parse.
+    #[error("illegal SASL state: {0}")]
+    IllegalState(String),
+    /// Kafka `SaslAuthenticationException`: `SASL_AUTHENTICATION_FAILED` (58),
+    /// or a failure of the mechanism on the client.
+    #[error("SASL authentication failed: {0}")]
+    Failed(String),
+}
+
+/// Map a `SaslAuthenticate` response with a non-zero error code to the error
+/// that Kafka's `SaslClientAuthenticator.receiveToken` raises
+/// (`Errors.exception`).
+fn authenticate_error(mechanism: &str, response: &SaslAuthenticateResponse) -> OutboundSaslError {
+    let message = format!(
+        "SaslAuthenticate({mechanism}) error_code={} error_message={:?}",
+        response.error_code, response.error_message
+    );
+    match response.error_code {
+        UNSUPPORTED_SASL_MECHANISM => SaslAuthenticationError::UnsupportedMechanism(message).into(),
+        ILLEGAL_SASL_STATE => SaslAuthenticationError::IllegalState(message).into(),
+        SASL_AUTHENTICATION_FAILED => SaslAuthenticationError::Failed(message).into(),
+        error_code => OutboundSaslError::Server {
+            error_code,
+            error_message: response.error_message.clone(),
+        },
+    }
+}
+
+/// A failure of the mechanism on the client. Kafka's
+/// `SaslClientAuthenticator.createSaslToken` raises it as a
+/// `SaslAuthenticationException`.
+fn mechanism_failure(message: String) -> OutboundSaslError {
+    SaslAuthenticationError::Failed(message).into()
+}
+
+/// A response that the client cannot parse. Kafka's
+/// `SaslClientAuthenticator.receiveKafkaResponse` raises it as an
+/// `IllegalSaslStateException`.
+fn unparsable_response(message: String) -> OutboundSaslError {
+    SaslAuthenticationError::IllegalState(message).into()
 }
 
 /// Run the outbound SASL handshake to completion over `stream`.
@@ -163,7 +240,7 @@ where
         }
         SaslCredentials::OAuthBearer { token_path } => {
             let token = tokio::fs::read(token_path).await.map_err(|error| {
-                OutboundSaslError::Sasl(format!(
+                mechanism_failure(format!(
                     "cannot read OAUTHBEARER token {}: {error}",
                     token_path.display()
                 ))
@@ -189,7 +266,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
 {
     if token.is_empty() || token.contains(&b'\x01') {
-        return Err(OutboundSaslError::Sasl(
+        return Err(mechanism_failure(
             "OAUTHBEARER token must be non-empty and contain no RFC 7628 separator".into(),
         ));
     }
@@ -201,19 +278,19 @@ where
 
     let response = send_sasl_authenticate(stream, initial, corr_id, policy).await?;
     if response.error_code != 0 {
-        return Err(OutboundSaslError::Sasl(format!(
-            "SaslAuthenticate(OAUTHBEARER) error_code={} error_message={:?}",
-            response.error_code, response.error_message
-        )));
+        return Err(authenticate_error("OAUTHBEARER", &response));
     }
     if response.auth_bytes.is_empty() {
         return Ok(());
     }
 
     let final_response = send_sasl_authenticate(stream, vec![b'\x01'], corr_id, policy).await?;
-    Err(OutboundSaslError::Sasl(format!(
-        "SaslAuthenticate(OAUTHBEARER) rejected bearer token (final error_code={})",
-        final_response.error_code
+    if final_response.error_code != 0 {
+        return Err(authenticate_error("OAUTHBEARER", &final_response));
+    }
+    Err(mechanism_failure(format!(
+        "SaslAuthenticate(OAUTHBEARER) rejected bearer token: {}",
+        String::from_utf8_lossy(&response.auth_bytes)
     )))
 }
 
@@ -252,15 +329,34 @@ where
     *corr_id += 1;
     let mut cur: &[u8] = &resp_bytes;
     let resp = SaslHandshakeResponse::decode(&mut cur, 1)
-        .map_err(|e| OutboundSaslError::Codec(format!("SaslHandshake decode: {e}")))?;
-    if resp.error_code != 0 {
-        return Err(OutboundSaslError::Sasl(format!(
-            "SaslHandshake error_code={} (mechanism={})",
-            resp.error_code,
-            mechanism.wire_name()
-        )));
-    }
-    Ok(())
+        .map_err(|e| unparsable_response(format!("SaslHandshake decode: {e}")))?;
+    handshake_result(mechanism, &resp)
+}
+
+/// Map a `SaslHandshake` response to the result that Kafka's
+/// `SaslClientAuthenticator.handleSaslHandshakeResponse` gives.
+fn handshake_result(
+    mechanism: SaslMechanism,
+    response: &SaslHandshakeResponse,
+) -> Result<(), OutboundSaslError> {
+    let mechanism = mechanism.wire_name();
+    let enabled = &response.mechanisms;
+    let error = match response.error_code {
+        0 => return Ok(()),
+        UNSUPPORTED_SASL_MECHANISM => SaslAuthenticationError::UnsupportedMechanism(format!(
+            "client SASL mechanism '{mechanism}' not enabled in the server, enabled mechanisms \
+             are {enabled:?}"
+        )),
+        ILLEGAL_SASL_STATE => SaslAuthenticationError::IllegalState(format!(
+            "unexpected handshake request with client mechanism {mechanism}, enabled mechanisms \
+             are {enabled:?}"
+        )),
+        code => SaslAuthenticationError::IllegalState(format!(
+            "unknown error code {code}, client mechanism is {mechanism}, enabled mechanisms are \
+             {enabled:?}"
+        )),
+    };
+    Err(error.into())
 }
 
 /// Send `SaslAuthenticate v2` with PLAIN payload `\0user\0password`, read
@@ -283,10 +379,7 @@ where
 
     let resp = send_sasl_authenticate(stream, payload, corr_id, policy).await?;
     if resp.error_code != 0 {
-        return Err(OutboundSaslError::Sasl(format!(
-            "SaslAuthenticate(PLAIN) error_code={} error_message={:?}",
-            resp.error_code, resp.error_message
-        )));
+        return Err(authenticate_error("PLAIN", &resp));
     }
     Ok(())
 }
@@ -312,31 +405,25 @@ where
     // Round 1: client-first → server-first.
     let (client_first, exch) = exch
         .client_first()
-        .map_err(|e| OutboundSaslError::Sasl(format!("scram client_first: {e:?}")))?;
+        .map_err(|e| mechanism_failure(format!("scram client_first: {e:?}")))?;
     let resp1 = send_sasl_authenticate(stream, client_first, corr_id, policy).await?;
     if resp1.error_code != 0 {
-        return Err(OutboundSaslError::Sasl(format!(
-            "SaslAuthenticate(SCRAM round 1) error_code={} error_message={:?}",
-            resp1.error_code, resp1.error_message
-        )));
+        return Err(authenticate_error("SCRAM round 1", &resp1));
     }
     let server_first = resp1.auth_bytes.to_vec();
 
     // Round 2: client-final → server-final.
     let (client_final, exch) = exch
         .step(&server_first)
-        .map_err(|e| OutboundSaslError::Sasl(format!("scram client step: {e:?}")))?;
+        .map_err(|e| mechanism_failure(format!("scram client step: {e:?}")))?;
     let resp2 = send_sasl_authenticate(stream, client_final, corr_id, policy).await?;
     if resp2.error_code != 0 {
-        return Err(OutboundSaslError::Sasl(format!(
-            "SaslAuthenticate(SCRAM round 2) error_code={} error_message={:?}",
-            resp2.error_code, resp2.error_message
-        )));
+        return Err(authenticate_error("SCRAM round 2", &resp2));
     }
     // Server-final verification proves the broker holds the matching
     // `server_key` — not just any compatible `stored_key`.
     exch.verify_server_final(&resp2.auth_bytes)
-        .map_err(|e| OutboundSaslError::Sasl(format!("server-final verify: {e:?}")))?;
+        .map_err(|e| mechanism_failure(format!("server-final verify: {e:?}")))?;
     Ok(())
 }
 
@@ -379,34 +466,28 @@ where
     let target_spn = format!("{service_name}/{server_name}");
     let keytab = keytab_path.to_string_lossy();
     let initiator = SspiInitiator::new(&keytab, client_principal, &target_spn, kdc_url)
-        .map_err(|e| OutboundSaslError::Sasl(format!("GSSAPI initiator init failed: {e}")))?;
+        .map_err(|e| mechanism_failure(format!("GSSAPI initiator init failed: {e}")))?;
     let exchange = GssapiClientExchange::new(Box::new(initiator), GSSAPI_MAX_RECV, None);
 
     // Seed the exchange with no server token; this produces the AP-REQ.
     let mut step = exchange
         .step(None)
-        .map_err(|e| OutboundSaslError::Sasl(format!("GSSAPI initiate failed: {e}")))?;
+        .map_err(|e| mechanism_failure(format!("GSSAPI initiate failed: {e}")))?;
     loop {
         match step {
             ClientStep::Token(token, next) => {
                 let resp = send_sasl_authenticate(stream, token, corr_id, policy).await?;
                 if resp.error_code != 0 {
-                    return Err(OutboundSaslError::Sasl(format!(
-                        "SaslAuthenticate(GSSAPI) error_code={} error_message={:?}",
-                        resp.error_code, resp.error_message
-                    )));
+                    return Err(authenticate_error("GSSAPI", &resp));
                 }
                 step = next
                     .step(Some(&resp.auth_bytes))
-                    .map_err(|e| OutboundSaslError::Sasl(format!("GSSAPI step failed: {e}")))?;
+                    .map_err(|e| mechanism_failure(format!("GSSAPI step failed: {e}")))?;
             }
             ClientStep::Final(token) => {
                 let resp = send_sasl_authenticate(stream, token, corr_id, policy).await?;
                 if resp.error_code != 0 {
-                    return Err(OutboundSaslError::Sasl(format!(
-                        "SaslAuthenticate(GSSAPI) error_code={} error_message={:?}",
-                        resp.error_code, resp.error_message
-                    )));
+                    return Err(authenticate_error("GSSAPI", &resp));
                 }
                 return Ok(());
             }
@@ -445,7 +526,7 @@ where
     *corr_id += 1;
     let mut cur: &[u8] = &resp_bytes;
     let resp = SaslAuthenticateResponse::decode(&mut cur, 2)
-        .map_err(|e| OutboundSaslError::Codec(format!("SaslAuthenticate decode: {e}")))?;
+        .map_err(|e| unparsable_response(format!("SaslAuthenticate decode: {e}")))?;
     Ok(resp)
 }
 
@@ -526,13 +607,13 @@ where
     // by the Kafka spec — its response header is always v0.
     let mut cur = &resp[..];
     if cur.len() < 4 {
-        return Err(OutboundSaslError::Codec("response missing corr_id".into()));
+        return Err(unparsable_response("response missing corr_id".into()));
     }
     let _resp_corr_id = cur.get_i32();
     let uses_v1_header = flexible && api_key != 18;
     if uses_v1_header {
         if cur.is_empty() {
-            return Err(OutboundSaslError::Codec(
+            return Err(unparsable_response(
                 "flexible response missing tagged-fields byte".into(),
             ));
         }
@@ -762,7 +843,13 @@ mod tests {
         )
         .await
         .expect_err("invalid bearer token is rejected");
-        check!(error.to_string().contains("final error_code=58"));
+        check!(matches!(
+            error,
+            OutboundSaslError::Authentication(SaslAuthenticationError::Failed(message))
+                if message
+                    == "SaslAuthenticate(OAUTHBEARER) error_code=58 \
+                        error_message=Some(\"oauthbearer token rejected\")"
+        ));
         timeout(Duration::from_secs(1), server_task)
             .await
             .expect("server observed RFC 7628 final message")
@@ -845,7 +932,7 @@ mod tests {
 
             let mut au = BytesMut::new();
             SaslAuthenticateResponse {
-                error_code: 42,
+                error_code: SASL_AUTHENTICATION_FAILED,
                 error_message: Some("nope".into()),
                 ..Default::default()
             }
@@ -869,7 +956,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, OutboundSaslError::Sasl(msg) if msg.contains("round 1")));
+        assert2::assert!(
+            let OutboundSaslError::Authentication(SaslAuthenticationError::Failed(msg)) = err
+        );
+        check!(msg.contains("round 1"));
         timeout(Duration::from_secs(1), server_task)
             .await
             .expect("server observed SCRAM first round")
@@ -920,7 +1010,7 @@ mod tests {
 
             let mut second_resp = BytesMut::new();
             SaslAuthenticateResponse {
-                error_code: 43,
+                error_code: SASL_AUTHENTICATION_FAILED,
                 error_message: Some("second nope".into()),
                 ..Default::default()
             }
@@ -944,7 +1034,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, OutboundSaslError::Sasl(msg) if msg.contains("round 2")));
+        assert2::assert!(
+            let OutboundSaslError::Authentication(SaslAuthenticationError::Failed(msg)) = err
+        );
+        check!(msg.contains("round 2"));
         timeout(Duration::from_secs(1), server_task)
             .await
             .expect("server observed SCRAM second round")
@@ -977,7 +1070,11 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, OutboundSaslError::Codec(msg) if msg == "response missing corr_id"));
+        check!(matches!(
+            err,
+            OutboundSaslError::Authentication(SaslAuthenticationError::IllegalState(msg))
+                if msg == "response missing corr_id"
+        ));
         server_task.await.unwrap();
     }
 
@@ -1007,9 +1104,11 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            matches!(err, OutboundSaslError::Codec(msg) if msg == "flexible response missing tagged-fields byte")
-        );
+        check!(matches!(
+            err,
+            OutboundSaslError::Authentication(SaslAuthenticationError::IllegalState(msg))
+                if msg == "flexible response missing tagged-fields byte"
+        ));
         server_task.await.unwrap();
     }
 
@@ -1090,6 +1189,100 @@ mod tests {
         assert!(error.to_string().contains("announced 17"));
         assert!(error.to_string().contains("maximum 16"));
         server_task.await.unwrap();
+    }
+
+    /// How the client classifies one SASL response.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Verdict {
+        Ok,
+        Rejected(SaslAuthenticationError),
+        Server(i16),
+        Other(String),
+    }
+
+    fn verdict(result: Result<(), OutboundSaslError>) -> Verdict {
+        match result {
+            Ok(()) => Verdict::Ok,
+            Err(OutboundSaslError::Authentication(error)) => Verdict::Rejected(error),
+            Err(OutboundSaslError::Server { error_code, .. }) => Verdict::Server(error_code),
+            Err(error) => Verdict::Other(error.to_string()),
+        }
+    }
+
+    /// `SaslClientAuthenticator.handleSaslHandshakeResponse` raises
+    /// `UnsupportedSaslMechanismException` for 33 and
+    /// `IllegalSaslStateException` for 34 and any other code. Both extend
+    /// `AuthenticationException`.
+    #[test]
+    fn handshake_error_codes_map_to_kafka_authentication_exceptions() {
+        let enabled = "enabled mechanisms are [\"GSSAPI\"]";
+        for (error_code, expected) in [
+            (0, Verdict::Ok),
+            (
+                UNSUPPORTED_SASL_MECHANISM,
+                Verdict::Rejected(SaslAuthenticationError::UnsupportedMechanism(format!(
+                    "client SASL mechanism 'PLAIN' not enabled in the server, {enabled}"
+                ))),
+            ),
+            (
+                ILLEGAL_SASL_STATE,
+                Verdict::Rejected(SaslAuthenticationError::IllegalState(format!(
+                    "unexpected handshake request with client mechanism PLAIN, {enabled}"
+                ))),
+            ),
+            (
+                87,
+                Verdict::Rejected(SaslAuthenticationError::IllegalState(format!(
+                    "unknown error code 87, client mechanism is PLAIN, {enabled}"
+                ))),
+            ),
+        ] {
+            let response = SaslHandshakeResponse {
+                error_code,
+                mechanisms: vec!["GSSAPI".into()],
+                ..Default::default()
+            };
+            check!(
+                verdict(handshake_result(SaslMechanism::Plain, &response)) == expected,
+                "error_code {error_code}"
+            );
+        }
+    }
+
+    /// `SaslClientAuthenticator.receiveToken` raises `Errors.exception()`.
+    /// Only 33, 34 and 58 give an `AuthenticationException`. Another code
+    /// closes the connection in the `AUTHENTICATE` state, which Kafka retries.
+    #[test]
+    fn authenticate_error_codes_map_to_kafka_exceptions() {
+        let message = |code: i16| {
+            format!("SaslAuthenticate(PLAIN) error_code={code} error_message=Some(\"no\")")
+        };
+        for (error_code, expected) in [
+            (
+                UNSUPPORTED_SASL_MECHANISM,
+                Verdict::Rejected(SaslAuthenticationError::UnsupportedMechanism(message(33))),
+            ),
+            (
+                ILLEGAL_SASL_STATE,
+                Verdict::Rejected(SaslAuthenticationError::IllegalState(message(34))),
+            ),
+            (
+                SASL_AUTHENTICATION_FAILED,
+                Verdict::Rejected(SaslAuthenticationError::Failed(message(58))),
+            ),
+            (35, Verdict::Server(35)),
+            (-1, Verdict::Server(-1)),
+        ] {
+            let response = SaslAuthenticateResponse {
+                error_code,
+                error_message: Some("no".into()),
+                ..Default::default()
+            };
+            check!(
+                verdict(Err(authenticate_error("PLAIN", &response))) == expected,
+                "error_code {error_code}"
+            );
+        }
     }
 
     fn assert_request_header(

@@ -415,8 +415,14 @@ pub(crate) struct CoordinatorState {
 pub(crate) type PollErrorSlot = Arc<std::sync::Mutex<Option<ConsumerError>>>;
 
 /// Keep `error` for the next `poll()` if the application must see it.
+///
+/// An authentication failure is such an error. Kafka's heartbeat thread makes
+/// an `AuthenticationException` its failure cause, and `poll` raises it
+/// (`AbstractCoordinator.HeartbeatThread.run`).
 pub(crate) fn report_rejoin_error(slot: &PollErrorSlot, error: ConsumerError) {
-    if error.is_fatal_offset_fetch_error() {
+    if error.is_fatal_offset_fetch_error()
+        || matches!(&error, ConsumerError::Client(client) if client.is_authentication_failure())
+    {
         *slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
@@ -496,7 +502,7 @@ fn update_ownership(
 
 /// Outcome of a single heartbeat RPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeartbeatOutcome {
+pub(crate) enum HeartbeatOutcome {
     /// `error_code == 0`.
     Ok,
     /// `REBALANCE_IN_PROGRESS (27)` or `ILLEGAL_GENERATION (22)`. Rejoin with
@@ -768,7 +774,7 @@ async fn leave_group(state: &CoordinatorState) {
         generation = state.generation_id,
     )
 )]
-async fn heartbeat_once(state: &CoordinatorState) -> HeartbeatOutcome {
+pub(crate) async fn heartbeat_once(state: &CoordinatorState) -> HeartbeatOutcome {
     let result = state
         .client
         .broker(state.coordinator_id.load(Ordering::Relaxed))
@@ -803,6 +809,7 @@ async fn heartbeat_once(state: &CoordinatorState) -> HeartbeatOutcome {
         }
         Err(e) => {
             tracing::warn!(error = %e, "heartbeat send failed");
+            report_rejoin_error(&state.poll_error, ConsumerError::Client(e));
             HeartbeatOutcome::Transient
         }
     }
