@@ -27,16 +27,21 @@ pub(crate) struct RetryPolicy {
     pub(crate) max_backoff: Duration,
     /// The random jitter factor of each wait, from 0 to 1.
     pub(crate) jitter: f64,
+    /// The call stops after this many retries (`retries`), as Kafka's
+    /// `Call.fail` does when `tries > maxRetries`.
+    pub(crate) max_retries: u32,
 }
 
 /// Apache Kafka's admin client defaults: `default.api.timeout.ms` (60000),
 /// `retry.backoff.ms` (100), `retry.backoff.max.ms` (1000) and a jitter of
 /// 0.2, from `AdminClientConfig` and `CommonClientConfigs`.
+#[cfg(test)]
 pub(crate) const KAFKA_ADMIN_RETRY: RetryPolicy = RetryPolicy {
     timeout: Duration::from_mins(1),
     initial_backoff: Duration::from_millis(100),
     max_backoff: Duration::from_secs(1),
     jitter: 0.2,
+    max_retries: u32::MAX,
 };
 
 /// `CommonClientConfigs.RETRY_BACKOFF_EXP_BASE`.
@@ -114,6 +119,12 @@ impl RetryDeadline {
             "admin call deadline passed with an unresolved retriable result"
         );
         AdminError::Transport(ClientError::Timeout(Time::from_std(self.policy.timeout)))
+    }
+
+    /// Whether the call must stop instead of retrying: the deadline has
+    /// passed, or the call has used all its retries.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.expired() || self.retries >= self.policy.max_retries
     }
 
     /// Run one attempt, but not past the call deadline. An attempt that is
@@ -257,9 +268,10 @@ impl ControllerRetry {
     ) -> Result<(), AdminError> {
         self.bounded(admin.refresh_controller_after_not_controller())
             .await?;
-        if !self.deadline.expired() {
-            self.deadline.backoff().await;
+        if self.deadline.exhausted() {
+            return Err(self.timeout_error("NOT_CONTROLLER"));
         }
+        self.deadline.backoff().await;
         if self.deadline.expired() {
             return Err(self.timeout_error("NOT_CONTROLLER"));
         }
@@ -271,9 +283,10 @@ impl ControllerRetry {
     /// the backoff. Returns the `REQUEST_TIMED_OUT` error when the deadline
     /// has passed.
     pub(crate) async fn after_retriable(&mut self, last: &str) -> Result<(), AdminError> {
-        if !self.deadline.expired() {
-            self.deadline.backoff().await;
+        if self.deadline.exhausted() {
+            return Err(self.timeout_error(last));
         }
+        self.deadline.backoff().await;
         if self.deadline.expired() {
             return Err(self.timeout_error(last));
         }
@@ -383,7 +396,7 @@ impl CoordinatorRetry {
             RetryAction::SameCoordinator(last) => (last, false),
             RetryAction::FindCoordinator(last) => (last, true),
         };
-        if self.deadline.expired() {
+        if self.deadline.exhausted() {
             return Some(Err(self.deadline.timeout(&last)));
         }
         tracing::debug!(
@@ -437,6 +450,7 @@ mod tests {
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_millis(200),
             jitter: 0.2,
+            max_retries: u32::MAX,
         };
         assert!(
             [0, 3, 9].map(|attempts| policy.backoff_with(attempts, 0.9))

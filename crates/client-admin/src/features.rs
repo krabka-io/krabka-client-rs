@@ -119,8 +119,7 @@ impl AdminClient {
         updates: &[FeatureUpdate],
         timeout: Time,
     ) -> Result<Vec<FeatureUpdateOutcome>, AdminError> {
-        let mut retry =
-            crate::retry::ControllerRetry::new("UpdateFeatures", crate::retry::KAFKA_ADMIN_RETRY);
+        let mut retry = crate::retry::ControllerRetry::new("UpdateFeatures", self.retry);
         loop {
             let response = retry
                 .bounded(self.conn.send(update_request(updates, timeout)))

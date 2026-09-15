@@ -16,9 +16,7 @@ use krabka_units::{Time, convert::TimeExt as _};
 
 use crate::{
     AdminClient, AdminError, kafka_error_name,
-    retry::{
-        CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, connection_failure_action,
-    },
+    retry::{CoordinatorRetry, RetryAction, RetryDeadline, RetryPolicy, connection_failure_action},
 };
 
 /// `COORDINATOR_LOAD_IN_PROGRESS`: the coordinator is loading its state.
@@ -273,7 +271,7 @@ impl AdminClient {
             ));
         }
 
-        self.force_terminate_transaction_with_retry(transactional_id, KAFKA_ADMIN_RETRY)
+        self.force_terminate_transaction_with_retry(transactional_id, self.retry)
             .await
     }
 
@@ -364,7 +362,7 @@ impl AdminClient {
             ));
         }
 
-        self.describe_transaction_with_retry(transactional_id, KAFKA_ADMIN_RETRY)
+        self.describe_transaction_with_retry(transactional_id, self.retry)
             .await
     }
 
@@ -373,8 +371,19 @@ impl AdminClient {
         transactional_id: &str,
         retry: RetryPolicy,
     ) -> Result<TransactionDescription, AdminError> {
+        self.describe_transaction_until(transactional_id, retry.start())
+            .await
+    }
+
+    /// `describe_transaction` with a call deadline that already runs, so that
+    /// the IDs of one `describe_transactions` call share one deadline.
+    async fn describe_transaction_until(
+        &self,
+        transactional_id: &str,
+        deadline: RetryDeadline,
+    ) -> Result<TransactionDescription, AdminError> {
         let mut coordinator = None;
-        let mut retry = CoordinatorRetry::new(retry);
+        let mut retry = CoordinatorRetry::from_deadline(deadline);
         loop {
             let action = retry
                 .run(self.describe_transaction_attempt(
@@ -482,9 +491,20 @@ impl AdminClient {
         &self,
         transactional_ids: &[&str],
     ) -> Result<Vec<TransactionDescription>, AdminError> {
+        // Kafka's `describeTransactions` runs all IDs under one deadline
+        // (`invokeDriver` with one `deadlineMs`).
+        let deadline = self.retry.start();
         let mut descriptions = Vec::with_capacity(transactional_ids.len());
         for transactional_id in transactional_ids {
-            descriptions.push(self.describe_transaction(transactional_id).await?);
+            if transactional_id.is_empty() {
+                return Err(AdminError::Protocol(
+                    "transactional id must not be empty".to_owned(),
+                ));
+            }
+            descriptions.push(
+                self.describe_transaction_until(transactional_id, deadline)
+                    .await?,
+            );
         }
         Ok(descriptions)
     }
@@ -1044,6 +1064,7 @@ mod tests {
             initial_backoff: backoff,
             max_backoff: backoff,
             jitter: 0.0,
+            max_retries: u32::MAX,
         };
 
         let started = tokio::time::Instant::now();
@@ -1286,6 +1307,51 @@ mod tests {
         ] {
             run_transaction_case(case).await;
         }
+    }
+
+    /// Kafka's `describeTransactions` runs every ID under one call deadline
+    /// (`invokeDriver`), so a slow first ID leaves less time for the next.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn describe_transactions_shares_one_deadline_across_ids() {
+        let mut coordinator_codes = vec![14; 8];
+        coordinator_codes.extend([0, 14]);
+        let script = Arc::new(Mutex::new(CoordinatorScript {
+            find_coordinator: vec![0],
+            coordinator: coordinator_codes,
+            ..CoordinatorScript::default()
+        }));
+        let coordinator_addr = Arc::new(Mutex::new(None));
+        let coordinator =
+            scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr)).await;
+        *coordinator_addr.lock().expect("coordinator lock") = Some(coordinator.addr);
+        let bootstrap =
+            scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr)).await;
+        let admin = AdminClient::connect_with_config(
+            &[bootstrap.addr.to_string()],
+            crate::AdminClientConfig {
+                request_timeout: krabka_units::millis(200),
+                default_api_timeout: Some(krabka_units::millis(1500)),
+                retry_backoff: krabka_units::millis(100),
+                retry_backoff_max: krabka_units::millis(100),
+                ..crate::AdminClientConfig::default()
+            },
+        )
+        .await
+        .expect("admin connects");
+
+        let started = tokio::time::Instant::now();
+        let result = admin.describe_transactions(&["payments", "payments"]).await;
+        let elapsed = started.elapsed();
+
+        bootstrap.stop();
+        coordinator.stop();
+        // The first ID needs about 800 ms. The second ID gets the rest of the
+        // 1.5 s deadline, not a new 1.5 s.
+        assert2::assert!(matches!(
+            result,
+            Err(AdminError::Transport(ClientError::Timeout(_)))
+        ));
+        assert2::assert!(elapsed < Duration::from_millis(2200), "{elapsed:?}");
     }
 
     fn assert_send<T: Send>(_: T) {}

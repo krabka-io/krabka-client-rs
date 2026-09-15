@@ -28,7 +28,7 @@ use crate::{
     AdminClient, AdminError, KafkaError, RecoveringConnection, format_host_port,
     groups::list_groups_kafka_error,
     kafka_error_if, kafka_error_name,
-    retry::{CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, is_connection_failure},
+    retry::{CoordinatorRetry, RetryAction, RetryPolicy, is_connection_failure},
 };
 
 /// `UNKNOWN_SERVER_ERROR`.
@@ -105,7 +105,7 @@ impl AdminClient {
         &mut self,
         assignments: &BTreeMap<TopicPartitionReplica, String>,
     ) -> BTreeMap<TopicPartitionReplica, BrokerResult<()>> {
-        self.alter_replica_log_dirs_with_retry(assignments, KAFKA_ADMIN_RETRY)
+        self.alter_replica_log_dirs_with_retry(assignments, self.retry)
             .await
     }
 
@@ -170,7 +170,7 @@ impl AdminClient {
         brokers: &[i32],
         filter: Option<&BTreeMap<String, Vec<i32>>>,
     ) -> BTreeMap<i32, BrokerResult<Vec<LogDirInfo>>> {
-        self.describe_log_dirs_with_retry(brokers, filter, KAFKA_ADMIN_RETRY)
+        self.describe_log_dirs_with_retry(brokers, filter, self.retry)
             .await
     }
 
@@ -791,6 +791,7 @@ mod tests {
             initial_backoff: backoff,
             max_backoff: backoff,
             jitter: 0.0,
+            max_retries: u32::MAX,
         }
     }
 
