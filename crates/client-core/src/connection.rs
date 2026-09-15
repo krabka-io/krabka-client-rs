@@ -439,9 +439,12 @@ impl Connection {
         addr: SocketAddr,
         options: ConnectionOptions,
     ) -> Result<Self, ClientError> {
+        // The TLS and SASL handshakes make a large future. Boxing it keeps the
+        // futures of the callers small, and it keeps the type depth of a
+        // caller that nests several connections below the compiler limit.
         match options.security.clone() {
-            Some(sec) => Self::connect_secured(addr, options, sec.as_ref()).await,
-            None => Self::connect(addr, options).await,
+            Some(sec) => Box::pin(Self::connect_secured(addr, options, sec.as_ref())).await,
+            None => Box::pin(Self::connect(addr, options)).await,
         }
     }
 
