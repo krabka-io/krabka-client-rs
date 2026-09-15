@@ -1487,6 +1487,10 @@ impl Producer {
     /// Enqueue a record and return a future that resolves when the broker
     /// acks, or when the producer fences or closes.
     ///
+    /// A record with a negative partition or timestamp fails at once with
+    /// [`ProducerError::InvalidPartition`] or
+    /// [`ProducerError::InvalidTimestamp`], and the producer sends nothing.
+    ///
     /// This returns a `oneshot::Receiver`. The outer call is `async` because
     /// it waits for metadata that holds the topic, for at most `max_block`, as
     /// Kafka's `KafkaProducer.waitOnMetadata` does. When the wait fails, the
@@ -1508,6 +1512,13 @@ impl Producer {
         &self,
         record: ProducerRecord,
     ) -> oneshot::Receiver<Result<RecordMetadata, ProducerError>> {
+        // Kafka checks the record when the application creates it, before
+        // `send` makes any other check.
+        if let Err(e) = record.validate() {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Err(e));
+            return rx;
+        }
         if let Err(e) = self.is_active() {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Err(e));
@@ -2599,11 +2610,16 @@ mod tests {
     }
 
     /// Start a broker with the topic `orders` of three partitions. It answers
-    /// Produce only while `answer_produce` is set.
-    async fn three_partition_broker(answer_produce: Arc<AtomicBool>) -> MockBroker {
+    /// Produce only while `answer_produce` is set. It gives back the number of
+    /// Produce requests that it got.
+    async fn three_partition_broker(
+        answer_produce: Arc<AtomicBool>,
+    ) -> (MockBroker, Arc<AtomicUsize>) {
         let port = Arc::new(AtomicU16::new(0));
         let handler_port = Arc::clone(&port);
         let handler_answer = answer_produce;
+        let produce_requests = Arc::new(AtomicUsize::new(0));
+        let handler_produce_requests = Arc::clone(&produce_requests);
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
             if api_key == api_versions_request::API_KEY {
                 return Some(encode_v0(&ApiVersionsResponse {
@@ -2635,6 +2651,9 @@ mod tests {
                     true,
                 );
             }
+            if api_key == produce_request::API_KEY {
+                handler_produce_requests.fetch_add(1, Ordering::SeqCst);
+            }
             if api_key == produce_request::API_KEY && handler_answer.load(Ordering::SeqCst) {
                 let mut request_body = &body[2 + CLIENT_ID.len()..];
                 let request =
@@ -2645,7 +2664,105 @@ mod tests {
         })
         .await;
         port.store(mock.addr.port(), Ordering::SeqCst);
-        mock
+        (mock, produce_requests)
+    }
+
+    /// What a send of one record gave, and the Produce requests that the
+    /// broker got.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ValidatedSend {
+        delivered: Result<(), String>,
+        produce_requests: usize,
+    }
+
+    /// Kafka's `ProducerRecord` constructor rejects a negative timestamp, and
+    /// then a negative partition, with `IllegalArgumentException`. The record
+    /// never reaches `send`, so no request goes to the broker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_rejects_a_negative_partition_or_timestamp() {
+        let cases = [
+            (
+                "negative partition",
+                Some(-1),
+                None,
+                ValidatedSend {
+                    delivered: Err("Invalid partition: -1. Partition number should always be \
+                                    non-negative or null."
+                        .to_owned()),
+                    produce_requests: 0,
+                },
+            ),
+            (
+                "negative timestamp",
+                None,
+                Some(-5),
+                ValidatedSend {
+                    delivered: Err("Invalid timestamp: -5. Timestamp should always be \
+                                    non-negative or null."
+                        .to_owned()),
+                    produce_requests: 0,
+                },
+            ),
+            (
+                "both negative reports the timestamp first",
+                Some(-2),
+                Some(-3),
+                ValidatedSend {
+                    delivered: Err("Invalid timestamp: -3. Timestamp should always be \
+                                    non-negative or null."
+                        .to_owned()),
+                    produce_requests: 0,
+                },
+            ),
+            (
+                "partition 0 and timestamp 0",
+                Some(0),
+                Some(0),
+                ValidatedSend {
+                    delivered: Ok(()),
+                    produce_requests: 1,
+                },
+            ),
+        ];
+        for (name, partition, timestamp_ms, expected) in cases {
+            let (mock, produce_requests) =
+                three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+            let producer = Producer::builder()
+                .bootstrap(mock.addr.to_string())
+                .client_id(CLIENT_ID)
+                .enable_idempotence(false)
+                .max_block(Duration::from_secs(2))
+                .build()
+                .await
+                .expect("producer connects to mock broker");
+            let receiver = producer
+                .send(ProducerRecord {
+                    topic: METADATA_TOPIC.into(),
+                    partition,
+                    timestamp_ms,
+                    value: Some(Bytes::from_static(b"v")),
+                    ..Default::default()
+                })
+                .await;
+            let delivered = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .map_or_else(
+                    |_| Err("pending".to_owned()),
+                    |answer| {
+                        answer
+                            .expect("the producer answers the send")
+                            .map(drop)
+                            .map_err(|error| error.to_string())
+                    },
+                );
+            let actual = ValidatedSend {
+                delivered,
+                produce_requests: produce_requests.load(Ordering::SeqCst),
+            };
+            mock.stop();
+            drop(producer);
+            assert2::assert!(actual == expected, "{name}");
+        }
     }
 
     /// A record that does not fit the current batch closes that batch before
@@ -2654,7 +2771,7 @@ mod tests {
     /// and the memory it frees serves the new batch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_record_that_does_not_fit_sends_the_full_batch_to_free_memory() {
-        let mock = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+        let (mock, _) = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
             .client_id(CLIENT_ID)
@@ -2697,7 +2814,7 @@ mod tests {
     /// larger than `buffer.memory` before it takes any memory.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_fails_a_record_larger_than_buffer_memory() {
-        let mock = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+        let (mock, _) = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
             .client_id(CLIENT_ID)
@@ -2758,7 +2875,7 @@ mod tests {
     ) -> BlockedSendOutcome {
         const BATCH_BYTES: usize = 16 * 1024 * 1024;
         let answer_produce = Arc::new(AtomicBool::new(false));
-        let mock = three_partition_broker(Arc::clone(&answer_produce)).await;
+        let (mock, _) = three_partition_broker(Arc::clone(&answer_produce)).await;
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
             .client_id(CLIENT_ID)

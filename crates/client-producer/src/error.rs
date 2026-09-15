@@ -18,6 +18,16 @@ pub enum ProducerError {
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
+    /// The record names a negative partition. Kafka's `ProducerRecord`
+    /// constructor throws `IllegalArgumentException` with the same message.
+    #[error("Invalid partition: {0}. Partition number should always be non-negative or null.")]
+    InvalidPartition(i32),
+
+    /// The record carries a negative timestamp. Kafka's `ProducerRecord`
+    /// constructor throws `IllegalArgumentException` with the same message.
+    #[error("Invalid timestamp: {0}. Timestamp should always be non-negative or null.")]
+    InvalidTimestamp(i64),
+
     #[error("batch too large: {batch_size} > max")]
     BatchTooLarge { batch_size: usize },
 

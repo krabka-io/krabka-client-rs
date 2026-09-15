@@ -4,18 +4,41 @@
 
 use bytes::Bytes;
 
+use crate::error::ProducerError;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProducerRecord {
     pub topic: String,
     /// If `Some(p)`, the producer bypasses the partitioner and uses partition
-    /// `p`.
+    /// `p`. `send` fails a negative `p` with
+    /// [`ProducerError::InvalidPartition`].
     pub partition: Option<i32>,
     pub key: Option<Bytes>,
     pub value: Option<Bytes>,
     pub headers: Vec<Header>,
     /// If `None`, the producer fills in the current wall-clock time at
-    /// accumulator append time.
+    /// accumulator append time. `send` fails a negative value with
+    /// [`ProducerError::InvalidTimestamp`].
     pub timestamp_ms: Option<i64>,
+}
+
+impl ProducerRecord {
+    /// Check the record as Kafka's `ProducerRecord` constructor does: first
+    /// the timestamp, then the partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProducerError::InvalidTimestamp`] for a negative timestamp,
+    /// and [`ProducerError::InvalidPartition`] for a negative partition.
+    pub(crate) fn validate(&self) -> Result<(), ProducerError> {
+        if let Some(timestamp) = self.timestamp_ms.filter(|timestamp| *timestamp < 0) {
+            return Err(ProducerError::InvalidTimestamp(timestamp));
+        }
+        if let Some(partition) = self.partition.filter(|partition| *partition < 0) {
+            return Err(ProducerError::InvalidPartition(partition));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
