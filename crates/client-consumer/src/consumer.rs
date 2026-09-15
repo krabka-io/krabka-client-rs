@@ -2590,6 +2590,9 @@ mod auto_commit_tests {
         rebalance_on_commit: std::sync::atomic::AtomicBool,
         /// When the last `Heartbeat` or `JoinGroup` came.
         last_heartbeat: std::sync::Mutex<tokio::time::Instant>,
+        /// When `true`, the mock does not answer a `Heartbeat` without an error
+        /// in `heartbeat_error`.
+        drop_heartbeats: std::sync::atomic::AtomicBool,
     }
 
     fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
@@ -2635,9 +2638,13 @@ mod auto_commit_tests {
                 heartbeat_request::API_KEY => {
                     *self.last_heartbeat.lock().expect("last heartbeat lock") =
                         tokio::time::Instant::now();
+                    let error_code = self.heartbeat_error.swap(0, Ordering::SeqCst);
+                    if error_code == 0 && self.drop_heartbeats.load(Ordering::SeqCst) {
+                        return None;
+                    }
                     Some(encode(
                         &HeartbeatResponse {
-                            error_code: self.heartbeat_error.swap(0, Ordering::SeqCst),
+                            error_code,
                             ..Default::default()
                         },
                         version,
@@ -2843,6 +2850,9 @@ mod auto_commit_tests {
         ReplyToNextCommit(CommitReply),
         /// Take the commit lock and keep it until the scenario ends.
         HoldCommitLock,
+        /// The mock stops to answer heartbeats, except a heartbeat that
+        /// answers an error.
+        DropHeartbeats,
         /// Run `close`, or record `CloseTimedOut` after two minutes.
         Close,
     }
@@ -2892,6 +2902,7 @@ mod auto_commit_tests {
             commit_replies: std::sync::Mutex::new(VecDeque::new()),
             rebalance_on_commit: std::sync::atomic::AtomicBool::new(false),
             last_heartbeat: std::sync::Mutex::new(tokio::time::Instant::now()),
+            drop_heartbeats: std::sync::atomic::AtomicBool::new(false),
         });
         let in_mock = Arc::clone(&coordinator);
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
@@ -2980,6 +2991,9 @@ mod auto_commit_tests {
                         .lock()
                         .expect("commit replies lock")
                         .push_back(*reply);
+                }
+                Step::DropHeartbeats => {
+                    coordinator.drop_heartbeats.store(true, Ordering::SeqCst);
                 }
                 Step::HoldCommitLock => {
                     let consumer = consumer.as_ref().expect("open consumer");
@@ -3155,8 +3169,8 @@ mod auto_commit_tests {
         use CommitReply::{Drop, Error};
         use GroupRequest::{CommitSyncReturned, JoinGroup, LeaveGroup, SyncGroup};
         use Step::{
-            Close, CommitSync, CommitSyncDuringRebalance, HoldCommitLock, Poll, Rebalance,
-            ReceiveRecords, ReplyToNextCommit,
+            Close, CommitSync, CommitSyncDuringRebalance, DropHeartbeats, HoldCommitLock, Poll,
+            Rebalance, ReceiveRecords, ReplyToNextCommit,
         };
 
         let polled = [(0, 12, 3), (1, 7, -1)];
@@ -3249,6 +3263,21 @@ mod auto_commit_tests {
                     Rebalance {
                         syncs: 1,
                         within: Duration::from_secs(90),
+                    },
+                ],
+                vec![JoinGroup, SyncGroup],
+            ),
+            (
+                "the coordinator does not answer a heartbeat during the commit before JoinGroup: \
+                 JoinGroup at the rebalance timeout",
+                secs(10),
+                vec![
+                    Poll,
+                    HoldCommitLock,
+                    DropHeartbeats,
+                    Rebalance {
+                        syncs: 1,
+                        within: Duration::from_secs(20),
                     },
                 ],
                 vec![JoinGroup, SyncGroup],

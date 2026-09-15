@@ -179,6 +179,11 @@ impl MockBroker {
                 tokio::select! {
                     () = task_shutdown.cancelled() => break,
                     Ok((stream, _)) = listener.accept() => {
+                        // A real broker sends each response without a Nagle
+                        // delay. Without this, a response can wait for the
+                        // delayed ACK of the client, and a paused-time test
+                        // then jumps to a request timeout.
+                        stream.set_nodelay(true).ok();
                         let h = Arc::clone(&task_handler);
                         let sd = task_shutdown.clone();
                         tokio::spawn(async move {

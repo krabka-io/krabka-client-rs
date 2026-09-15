@@ -852,16 +852,41 @@ async fn leave_group(state: &CoordinatorState) {
     )
 )]
 pub(crate) async fn heartbeat_once(state: &CoordinatorState) -> HeartbeatOutcome {
-    let result = state
-        .client
-        .broker(state.coordinator_id.load(Ordering::Relaxed))
-        .send(build_heartbeat_request(
-            state.group_id.clone(),
-            state.generation_id,
-            state.member_id.clone(),
-            state.group_instance_id.clone(),
-        ))
-        .await;
+    let result = send_heartbeat(state).await;
+    heartbeat_result_outcome(state, result).await
+}
+
+/// The `Heartbeat` RPC of the current member. The future owns its inputs, so
+/// a task can run it to its end.
+fn send_heartbeat(
+    state: &CoordinatorState,
+) -> impl std::future::Future<
+    Output = Result<
+        krabka_protocol::owned::heartbeat_response::HeartbeatResponse,
+        krabka_client_core::ClientError,
+    >,
+> + Send
++ 'static {
+    let client = state.client.clone();
+    let coordinator = state.coordinator_id.load(Ordering::Relaxed);
+    let request = build_heartbeat_request(
+        state.group_id.clone(),
+        state.generation_id,
+        state.member_id.clone(),
+        state.group_instance_id.clone(),
+    );
+    async move { client.broker(coordinator).send(request).await }
+}
+
+/// Classify a `Heartbeat` result, and find the coordinator again after a
+/// coordinator or transport error.
+async fn heartbeat_result_outcome(
+    state: &CoordinatorState,
+    result: Result<
+        krabka_protocol::owned::heartbeat_response::HeartbeatResponse,
+        krabka_client_core::ClientError,
+    >,
+) -> HeartbeatOutcome {
     match result {
         Ok(r) => {
             let outcome = heartbeat_outcome(r.error_code);
@@ -1169,8 +1194,11 @@ async fn commit_before_join(state: &mut CoordinatorState) -> Result<(), Consumer
 /// or until a heartbeat says that the member is fenced or unknown. Return that
 /// outcome.
 ///
-/// The function does not stop a heartbeat that is in flight, so the `JoinGroup`
-/// goes out after its response.
+/// The function returns as soon as `commit_done` is cancelled, also while a
+/// heartbeat is in flight, so the heartbeat does not delay the `JoinGroup`, as
+/// in Kafka, where the heartbeat thread and the `JoinGroup` do not wait for
+/// each other. A task runs the `Heartbeat` RPC, so the request runs to its end
+/// on the connection.
 async fn heartbeat_during_join_prepare(
     state: &CoordinatorState,
     commit_done: &CancellationToken,
@@ -1184,7 +1212,22 @@ async fn heartbeat_during_join_prepare(
             () = commit_done.cancelled() => return None,
             _ = ticker.tick() => {}
         }
-        match heartbeat_once(state).await {
+        let mut request = tokio::spawn(send_heartbeat(state));
+        let result = tokio::select! {
+            biased;
+            () = commit_done.cancelled() => return None,
+            result = &mut request => result,
+        };
+        let Ok(result) = result else {
+            // The heartbeat task panicked. The next tick sends a new heartbeat.
+            continue;
+        };
+        let outcome = tokio::select! {
+            biased;
+            () = commit_done.cancelled() => return None,
+            outcome = heartbeat_result_outcome(state, result) => outcome,
+        };
+        match outcome {
             HeartbeatOutcome::Ok | HeartbeatOutcome::NeedRejoin | HeartbeatOutcome::Transient => {}
             outcome @ (HeartbeatOutcome::RejoinFromScratch | HeartbeatOutcome::Fenced) => {
                 return Some(outcome);
