@@ -1174,3 +1174,293 @@ mod bootstrap_failover_tests {
         assert2::assert!(metadata_calls.load(Ordering::SeqCst) == 1);
     }
 }
+
+#[cfg(test)]
+mod authentication_failure_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use bytes::BytesMut;
+    use krabka_protocol::{
+        Encode,
+        owned::{
+            api_versions_request,
+            api_versions_response::{ApiVersion, ApiVersionsResponse},
+            metadata_request::{self, MetadataRequest},
+            metadata_response::{MetadataResponse, MetadataResponseBroker},
+            sasl_handshake_request,
+        },
+    };
+    use krabka_security::ListenerProtocol;
+
+    use super::*;
+    use crate::{
+        OutboundSaslError, SaslAuthenticationError,
+        error::AuthenticationError,
+        mock::{MockBroker, MockReply, MockSaslAnswer},
+        security::{ClientSecurity, SaslCredentials},
+    };
+
+    const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
+    const ILLEGAL_SASL_STATE: i16 = 34;
+    const UNSUPPORTED_VERSION: i16 = 35;
+    const SASL_AUTHENTICATION_FAILED: i16 = 58;
+    const BROKER_ID: i32 = 1;
+
+    /// The request that the test sends after the SASL listener starts.
+    #[derive(Clone, Copy, Debug)]
+    enum Route {
+        /// `Client::refresh_metadata` over the bootstrap connection.
+        Bootstrap,
+        /// `BrokerHandle::send` to a broker that a first metadata refresh
+        /// registered.
+        Broker,
+    }
+
+    /// How a call ended, as a caller classifies it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        Ok,
+        Rejected(SaslAuthenticationError),
+        SaslServerError(i16),
+        Other(String),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Observed {
+        outcome: Outcome,
+        handshakes: usize,
+    }
+
+    fn classify<T>(result: &Result<T, ClientError>) -> Outcome {
+        match result {
+            Ok(_) => Outcome::Ok,
+            Err(ClientError::Authentication {
+                source: AuthenticationError::Sasl(error),
+                ..
+            }) => Outcome::Rejected(error.clone()),
+            Err(ClientError::Sasl {
+                source: OutboundSaslError::Server { error_code, .. },
+                ..
+            }) => Outcome::SaslServerError(*error_code),
+            Err(error) => Outcome::Other(error.to_string()),
+        }
+    }
+
+    fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
+        let mut body = BytesMut::new();
+        response.encode(&mut body, version).unwrap();
+        body.to_vec()
+    }
+
+    /// A SASL listener that answers the exchange of connection `n` with
+    /// `script[n]`, or with the last entry once the script runs out. It also
+    /// answers `ApiVersions` and a `Metadata` that names itself as broker 1.
+    async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) -> MockBroker {
+        let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let handler_port = Arc::clone(&port);
+        let mut answer = *script.last().unwrap();
+        let broker = MockBroker::start_with_replies(move |api_key, version, _corr, _body| {
+            if api_key == sasl_handshake_request::API_KEY {
+                let connection = handshakes.fetch_add(1, Ordering::SeqCst);
+                answer = script
+                    .get(connection)
+                    .copied()
+                    .unwrap_or_else(|| *script.last().unwrap());
+            }
+            if let Some(reply) = answer.reply(api_key, version) {
+                return reply;
+            }
+            match api_key {
+                api_versions_request::API_KEY => MockReply::Respond(encode(
+                    &ApiVersionsResponse {
+                        api_keys: vec![
+                            ApiVersion {
+                                api_key: api_versions_request::API_KEY,
+                                min_version: 0,
+                                max_version: 3,
+                                ..Default::default()
+                            },
+                            ApiVersion {
+                                api_key: metadata_request::API_KEY,
+                                min_version: 0,
+                                max_version: 8,
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    0,
+                )),
+                metadata_request::API_KEY => MockReply::Respond(encode(
+                    &MetadataResponse {
+                        brokers: vec![MetadataResponseBroker {
+                            node_id: BROKER_ID,
+                            host: "127.0.0.1".into(),
+                            port: i32::from(handler_port.load(Ordering::SeqCst)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    version,
+                )),
+                _ => MockReply::Silent,
+            }
+        })
+        .await;
+        port.store(broker.addr.port(), Ordering::SeqCst);
+        broker
+    }
+
+    fn plain_security() -> ClientSecurity {
+        ClientSecurity {
+            protocol: ListenerProtocol::SaslPlaintext,
+            tls: None,
+            sasl: Some(SaslCredentials::Plain {
+                username: "alice".into(),
+                password: "secret".into(),
+            }),
+            sasl_host: None,
+        }
+    }
+
+    fn authenticate_failed() -> SaslAuthenticationError {
+        SaslAuthenticationError::Failed(
+            "SaslAuthenticate(PLAIN) error_code=58 error_message=Some(\"rejected by mock broker\")"
+                .into(),
+        )
+    }
+
+    fn unsupported_mechanism() -> SaslAuthenticationError {
+        SaslAuthenticationError::UnsupportedMechanism(
+            "client SASL mechanism 'PLAIN' not enabled in the server, enabled mechanisms are \
+             [\"PLAIN\"]"
+                .into(),
+        )
+    }
+
+    fn illegal_state() -> SaslAuthenticationError {
+        SaslAuthenticationError::IllegalState(
+            "unexpected handshake request with client mechanism PLAIN, enabled mechanisms are \
+             [\"PLAIN\"]"
+                .into(),
+        )
+    }
+
+    /// Kafka's `NetworkClient.processDisconnection` stores an
+    /// `AuthenticationException` for the node, and the next call raises it
+    /// with no retry. A disconnect during authentication with no broker error
+    /// stays retriable. The client must not evict and redial on a rejection.
+    #[tokio::test]
+    async fn sasl_rejection_is_raised_without_a_retry() {
+        use MockSaslAnswer::{Accept, AuthenticateError, CloseAfterHandshake, HandshakeError};
+
+        let cases = [
+            (
+                "bootstrap: SaslAuthenticate 58",
+                Route::Bootstrap,
+                vec![AuthenticateError(SASL_AUTHENTICATION_FAILED)],
+                Observed {
+                    outcome: Outcome::Rejected(authenticate_failed()),
+                    handshakes: 1,
+                },
+            ),
+            (
+                "bootstrap: SaslHandshake 33",
+                Route::Bootstrap,
+                vec![HandshakeError(UNSUPPORTED_SASL_MECHANISM)],
+                Observed {
+                    outcome: Outcome::Rejected(unsupported_mechanism()),
+                    handshakes: 1,
+                },
+            ),
+            (
+                "bootstrap: SaslHandshake 34",
+                Route::Bootstrap,
+                vec![HandshakeError(ILLEGAL_SASL_STATE)],
+                Observed {
+                    outcome: Outcome::Rejected(illegal_state()),
+                    handshakes: 1,
+                },
+            ),
+            (
+                "bootstrap: SaslAuthenticate code that is not an authentication error",
+                Route::Bootstrap,
+                vec![AuthenticateError(UNSUPPORTED_VERSION)],
+                Observed {
+                    outcome: Outcome::SaslServerError(UNSUPPORTED_VERSION),
+                    handshakes: 2,
+                },
+            ),
+            (
+                "bootstrap: close after SaslHandshake, then accept",
+                Route::Bootstrap,
+                vec![CloseAfterHandshake, Accept],
+                Observed {
+                    outcome: Outcome::Ok,
+                    handshakes: 2,
+                },
+            ),
+            (
+                "broker: SaslAuthenticate 58",
+                Route::Broker,
+                vec![Accept, AuthenticateError(SASL_AUTHENTICATION_FAILED)],
+                Observed {
+                    outcome: Outcome::Rejected(authenticate_failed()),
+                    handshakes: 2,
+                },
+            ),
+            (
+                "broker: SaslHandshake 33",
+                Route::Broker,
+                vec![Accept, HandshakeError(UNSUPPORTED_SASL_MECHANISM)],
+                Observed {
+                    outcome: Outcome::Rejected(unsupported_mechanism()),
+                    handshakes: 2,
+                },
+            ),
+            (
+                "broker: close after SaslHandshake, then accept",
+                Route::Broker,
+                vec![Accept, CloseAfterHandshake, Accept],
+                Observed {
+                    outcome: Outcome::Ok,
+                    handshakes: 3,
+                },
+            ),
+        ];
+
+        for (name, route, script, expected) in cases {
+            let handshakes = Arc::new(AtomicUsize::new(0));
+            let broker = sasl_broker(script, Arc::clone(&handshakes)).await;
+            let client = Client::builder()
+                .bootstrap(broker.addr.to_string())
+                .security(plain_security())
+                .build()
+                .await
+                .unwrap();
+
+            let outcome = match route {
+                Route::Bootstrap => classify(&client.refresh_metadata().await),
+                Route::Broker => {
+                    client.refresh_metadata().await.unwrap();
+                    classify(
+                        &client
+                            .broker(BROKER_ID)
+                            .send(MetadataRequest::default())
+                            .await,
+                    )
+                }
+            };
+            let observed = Observed {
+                outcome,
+                handshakes: handshakes.load(Ordering::SeqCst),
+            };
+
+            broker.stop();
+            assert2::check!(observed == expected, "case {name}");
+        }
+    }
+}

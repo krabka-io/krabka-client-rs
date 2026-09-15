@@ -1,9 +1,12 @@
-//! `AdminError::Connect` keeps the cause of the last bootstrap failure.
+//! A failed bootstrap keeps its cause.
 //!
 //! A caller must be able to tell an unreachable broker from a TLS failure and
 //! from a SASL rejection without a probe of its own. Each case here makes
 //! `AdminClient::connect_secured` fail in one of those ways, and then reads the
-//! cause the way a caller does.
+//! cause the way a caller does. An unreachable broker gives
+//! `AdminError::Connect` with the last cause. A rejected authentication stops
+//! the bootstrap at once, as Kafka's `AdminMetadataManager` makes an
+//! `AuthenticationException` fatal.
 
 use std::net::SocketAddr;
 
@@ -11,7 +14,7 @@ use assert2::assert;
 use bytes::BytesMut;
 use krabka_client_admin::{AdminClient, AdminError};
 use krabka_client_core::{
-    ClientError, MockBroker, OutboundSaslError,
+    AuthenticationError, ClientError, MockBroker, SaslAuthenticationError,
     security::{ClientSecurity, SaslCredentials, TlsConnectorConfig},
 };
 use krabka_protocol::{
@@ -39,32 +42,35 @@ const REJECTED_MESSAGE: &str = "Authentication failed: Invalid username or passw
 #[derive(Debug, PartialEq, Eq)]
 enum Cause {
     Unreachable(SocketAddr, std::io::ErrorKind),
-    Tls(SocketAddr, std::io::ErrorKind),
+    TlsRejected(SocketAddr, std::io::ErrorKind),
     Rejected(SocketAddr, String),
 }
 
-fn classify(error: &AdminError) -> Option<(usize, Cause)> {
-    let AdminError::Connect {
-        tried,
-        source: Some(source),
-    } = error
-    else {
-        return None;
+/// The number of addresses tried (`None` for an error that stops the
+/// bootstrap at once) and the cause.
+fn classify(error: &AdminError) -> Option<(Option<usize>, Cause)> {
+    let (tried, source) = match error {
+        AdminError::Connect {
+            tried,
+            source: Some(source),
+        } => (Some(*tried), source.as_ref()),
+        error => (None, error),
     };
-    let cause = match source.as_ref() {
+    let cause = match source {
         AdminError::Transport(ClientError::Connect { addr, source }) => {
             Cause::Unreachable(*addr, source.kind())
         }
-        AdminError::Transport(ClientError::Tls { addr, source }) => {
-            Cause::Tls(*addr, source.kind())
-        }
-        AdminError::Transport(ClientError::Sasl {
+        AdminError::Transport(ClientError::Authentication {
             addr,
-            source: OutboundSaslError::Sasl(message),
+            source: AuthenticationError::Tls(source),
+        }) => Cause::TlsRejected(*addr, source.kind()),
+        AdminError::Transport(ClientError::Authentication {
+            addr,
+            source: AuthenticationError::Sasl(SaslAuthenticationError::Failed(message)),
         }) => Cause::Rejected(*addr, message.clone()),
         _ => return None,
     };
-    Some((*tried, cause))
+    Some((tried, cause))
 }
 
 /// An address that refuses TCP connects.
@@ -180,7 +186,7 @@ async fn connect_error_keeps_the_last_bootstrap_cause() {
                     vec![addr],
                     None,
                     (
-                        1,
+                        Some(1),
                         Cause::Unreachable(addr, std::io::ErrorKind::ConnectionRefused),
                     ),
                 )
@@ -190,7 +196,10 @@ async fn connect_error_keeps_the_last_bootstrap_cause() {
                 (
                     vec![addr],
                     Some(tls()),
-                    (1, Cause::Tls(addr, std::io::ErrorKind::InvalidData)),
+                    (
+                        None,
+                        Cause::TlsRejected(addr, std::io::ErrorKind::InvalidData),
+                    ),
                 )
             }
             Scenario::RejectedPassword => {
@@ -200,7 +209,7 @@ async fn connect_error_keeps_the_last_bootstrap_cause() {
                 (
                     vec![addr],
                     Some(sasl_plain()),
-                    (1, Cause::Rejected(addr, rejected.clone())),
+                    (None, Cause::Rejected(addr, rejected.clone())),
                 )
             }
             Scenario::UnreachableThenRejectedPassword => {
@@ -210,7 +219,7 @@ async fn connect_error_keeps_the_last_bootstrap_cause() {
                 (
                     vec![refused_addr().await, addr],
                     Some(sasl_plain()),
-                    (2, Cause::Rejected(addr, rejected.clone())),
+                    (None, Cause::Rejected(addr, rejected.clone())),
                 )
             }
         };

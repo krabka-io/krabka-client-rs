@@ -388,6 +388,12 @@ impl Producer {
                         ProducerError::Server(code),
                     )
                 }
+                // Kafka's `Sender.runOnce` makes an authentication failure
+                // fatal for every pending transactional request
+                // (`TransactionManager.authenticationFailed`).
+                Err(error) if error.is_authentication_failure() => {
+                    return Err(ProducerError::Client(error));
+                }
                 Err(error) => (CoordinatorAttempt::Lost, ProducerError::Client(error)),
             };
             let rediscover = match txn_retry::decide_add_partitions(attempt) {
@@ -693,9 +699,20 @@ impl Producer {
             committed,
             ..Default::default()
         };
-        let (decision, producer_identity) = self.send_end_txn_until_decided(coord, request).await;
+        let end_txn = self.send_end_txn_until_decided(coord, request).await;
 
         let mut state = self.txn_state.lock().await;
+        let (decision, producer_identity) = match end_txn {
+            Ok(answer) => answer,
+            Err(error) => {
+                // Kafka's `TransactionManager.authenticationFailed` makes the
+                // producer fail. An earlier attempt may have taken effect, so
+                // a fresh InitProducerId epoch is required before any reuse.
+                self.require_transaction_recovery();
+                *state = TxnState::RecoveryRequired;
+                return Err(ProducerError::Client(error));
+            }
+        };
         match decision {
             EndTxnDecision::Complete => {
                 // KIP-890 (transaction.version 2): the coordinator bumps the
@@ -773,11 +790,16 @@ impl Producer {
     ///
     /// It returns the decision, and the producer identity from a `NONE` answer
     /// when the coordinator sent one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failed authentication with the coordinator at once. Kafka's
+    /// `Sender.runOnce` does not retry it.
     async fn send_end_txn_until_decided(
         &self,
         mut coordinator: Client,
         request: EndTxnRequest,
-    ) -> (EndTxnDecision, Option<(i64, i16)>) {
+    ) -> Result<(EndTxnDecision, Option<(i64, i16)>), ClientError> {
         let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
         let max_backoff = self.retry_backoff_max.to_std();
         let mut backoff = self.init_retry_backoff.to_std();
@@ -790,6 +812,7 @@ impl Producer {
                         .then_some((response.producer_id, response.producer_epoch));
                     (CoordinatorAttempt::Answered(response.error_code), identity)
                 }
+                Err(error) if error.is_authentication_failure() => return Err(error),
                 Err(error) => {
                     tracing::warn!(
                         %error,
@@ -802,14 +825,14 @@ impl Producer {
             let decision = txn_retry::decide_end_txn(attempt, earlier_attempt_lost);
             earlier_attempt_lost |= attempt == CoordinatorAttempt::Lost;
             let EndTxnDecision::Retry { rediscover } = decision else {
-                return (decision, identity);
+                return Ok((decision, identity));
             };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return (
+                return Ok((
                     txn_retry::decide_end_txn_at_deadline(attempt, earlier_attempt_lost),
                     None,
-                );
+                ));
             }
             tokio::time::sleep(backoff.min(remaining)).await;
             backoff = backoff.saturating_mul(2).min(max_backoff);
@@ -1482,7 +1505,7 @@ impl Producer {
             return rx;
         }
 
-        let partition = match record.partition {
+        let resolved = match record.partition {
             Some(p) => {
                 // Produce v13 omits the topic name on the wire and carries
                 // only `topic_id`, so the metadata cache must hold the topic
@@ -1490,12 +1513,19 @@ impl Producer {
                 // partitioner path populates it via `partition_for`; mirror
                 // that here so explicit-partition sends resolve a non-zero
                 // `topic_id` instead of failing with UNKNOWN_TOPIC_OR_PARTITION.
-                self.partitions_for(&record.topic).await;
-                p
+                self.partitions_for(&record.topic).await.map(|_| p)
             }
             None => {
                 self.partition_for(&record.topic, record.key.as_deref())
                     .await
+            }
+        };
+        let partition = match resolved {
+            Ok(partition) => partition,
+            Err(error) => {
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(Err(ProducerError::Client(error)));
+                return rx;
             }
         };
         tracing::Span::current().record("partition", partition);
@@ -1574,14 +1604,20 @@ impl Producer {
         skip_all,
         fields(topic = %topic, keyed = key.is_some()),
     )]
-    async fn partition_for(&self, topic: &str, key: Option<&[u8]>) -> i32 {
-        let num_partitions = self.partitions_for(topic).await;
-        self.partitioner.pick(topic, key, num_partitions)
+    async fn partition_for(&self, topic: &str, key: Option<&[u8]>) -> Result<i32, ClientError> {
+        let num_partitions = self.partitions_for(topic).await?;
+        Ok(self.partitioner.pick(topic, key, num_partitions))
     }
 
     /// Return the partition count for `topic`, and fetch metadata on a cache
     /// miss. It falls back to `1` if the broker reports an error, or if the
     /// topic is absent. Production code can revisit the retry policy here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a metadata refresh that failed authentication.
+    /// Kafka's `KafkaProducer.waitOnMetadata` raises that
+    /// `AuthenticationException` from `send` (`Metadata.maybeThrowExceptionForTopic`).
     ///
     /// On a cache miss this uses [`Client::refresh_metadata`] rather than a
     /// bare `send(MetadataRequest)`. `refresh_metadata` also teaches the
@@ -1595,12 +1631,12 @@ impl Producer {
         skip_all,
         fields(topic = %topic, num_partitions = tracing::field::Empty),
     )]
-    async fn partitions_for(&self, topic: &str) -> i32 {
+    async fn partitions_for(&self, topic: &str) -> Result<i32, ClientError> {
         {
             let m = self.metadata_cache.lock().await;
             if let Some(meta) = m.get(topic) {
                 tracing::Span::current().record("num_partitions", meta.num_partitions);
-                return meta.num_partitions;
+                return Ok(meta.num_partitions);
             }
         }
         // Cache miss: refresh. `refresh_metadata` sends a (full-cluster)
@@ -1649,9 +1685,10 @@ impl Producer {
                     },
                 );
                 tracing::Span::current().record("num_partitions", count);
-                count
+                Ok(count)
             }
-            Err(_) => UNRESOLVED_TOPIC_PARTITION_COUNT,
+            Err(error) if error.is_authentication_failure() => Err(error),
+            Err(_) => Ok(UNRESOLVED_TOPIC_PARTITION_COUNT),
         }
     }
 

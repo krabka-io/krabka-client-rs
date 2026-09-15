@@ -501,9 +501,14 @@ pub enum AdminError {
     /// No bootstrap address gave a usable connection. `source` holds the
     /// error from the last address tried, and is `None` only when the list
     /// was empty. Match it to tell an unreachable or silent broker
-    /// ([`ClientError::Connect`] or [`ClientError::Timeout`]) from a TLS
-    /// failure ([`ClientError::Tls`]) or a SASL rejection
-    /// ([`ClientError::Sasl`]).
+    /// ([`ClientError::Connect`] or [`ClientError::Timeout`]) from a TLS or
+    /// SASL failure with no verdict from the peer ([`ClientError::Tls`] or
+    /// [`ClientError::Sasl`]).
+    ///
+    /// A rejected authentication does not give this error. The client stops
+    /// at the first address that rejects it and returns
+    /// `AdminError::Transport(ClientError::Authentication { .. })`, as Kafka's
+    /// `AdminMetadataManager` makes an `AuthenticationException` fatal.
     #[error("no bootstrap address connected: tried {tried}{cause}",
             cause = .source.as_ref().map(|e| format!("; last error: {e}")).unwrap_or_default())]
     Connect {
@@ -525,6 +530,16 @@ pub enum AdminError {
     Transport(#[from] ClientError),
     #[error("protocol: {0}")]
     Protocol(String),
+}
+
+impl AdminError {
+    /// Whether a peer rejected authentication. Kafka's admin client fails the
+    /// call with the `AuthenticationException` and does not retry
+    /// (`KafkaAdminClient` `handleResponses`, `AdminMetadataManager.updateFailed`).
+    #[must_use]
+    pub const fn is_authentication_failure(&self) -> bool {
+        matches!(self, Self::Transport(error) if error.is_authentication_failure())
+    }
 }
 
 /// A Kafka-level error attached to a single per-resource outcome.
@@ -688,6 +703,7 @@ impl RecoveringConnection {
                     .await
                 {
                     Ok(response) => Ok(response),
+                    Err(retry_error) if retry_error.is_authentication_failure() => Err(retry_error),
                     Err(_) if self.strategy == MetadataRecoveryStrategy::Rebootstrap => {
                         self.send_after_rebootstrap(request, min_version).await
                     }
@@ -814,6 +830,7 @@ impl RecoveringConnection {
                     self.clear_metadata_attempt();
                     return Ok(());
                 }
+                Err(error) if error.is_authentication_failure() => return Err(error),
                 Err(error) => last_error = Some(Box::new(error)),
             }
         }
@@ -845,6 +862,7 @@ impl RecoveringConnection {
                     }
                     return Ok(());
                 }
+                Err(error) if error.is_authentication_failure() => return Err(error),
                 Err(error) => last_error = Some(Box::new(error)),
             }
         }
@@ -1146,6 +1164,7 @@ impl AdminClient {
                         options,
                     });
                 }
+                Err(e) if e.is_authentication_failure() => return Err(e),
                 Err(e) => {
                     tracing::debug!(
                         target: "krabka_client_admin",
@@ -1304,6 +1323,7 @@ impl AdminClient {
                     self.conn.replace(conn).await;
                     return Ok(());
                 }
+                Err(error) if error.is_authentication_failure() => return Err(error),
                 Err(error) => {
                     tracing::debug!(
                         target: "krabka_client_admin",

@@ -186,6 +186,11 @@ impl ShareConsumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn poll(&mut self, timeout: Time) -> Result<Vec<ShareConsumerRecord>, ConsumerError> {
+        // The heartbeat loop leaves a fatal error, such as an authentication
+        // failure, for the application.
+        if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
+            return Err(error);
+        }
         // Snapshot the live assignment; with nothing assigned there is nothing
         // to fetch — sleep out the timeout and return empty (matches classic).
         let assignment = self.assignment.lock().await.clone();
@@ -632,6 +637,7 @@ mod tests {
             prev_delivered: Vec::new(),
             shutdown: CancellationToken::new(),
             hb_handle: None,
+            poll_error: crate::coordinator::PollErrorSlot::default(),
         }
     }
 

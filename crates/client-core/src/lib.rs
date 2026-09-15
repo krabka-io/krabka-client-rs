@@ -82,17 +82,17 @@ pub use coordinator::{
     CoordinatorEndpoint, CoordinatorKeyType, build_find_coordinator, coordinator_endpoint,
     find_coordinator,
 };
-pub use error::ClientError;
+pub use error::{AuthenticationError, ClientError};
 pub use fetch::{
     DEFAULT_FETCH_MIN, DEFAULT_FETCH_RESPONSE_MAX, FetchMinBytes, FetchPartitionResult,
     FetchedHeader, FetchedRecord, IsolatedFetch, fetch_partition, fetch_partition_with_isolation,
     fetch_partition_with_isolation_progress,
 };
 #[cfg(any(test, feature = "mock"))]
-pub use mock::MockBroker;
+pub use mock::{MockBroker, MockReply, MockSaslAnswer};
 pub use offset_for_leader_epoch::{EpochEndOffset, offset_for_leader_epoch};
 pub use pool::{BrokerInfo, BrokerPool};
 pub use request::ProtocolRequest;
-pub use sasl::{OutboundSaslError, SaslCredentials, outbound_sasl};
+pub use sasl::{OutboundSaslError, SaslAuthenticationError, SaslCredentials, outbound_sasl};
 pub use security::{ClientSecurity, TlsConnectorConfig, connection_target_host};
 pub use version::ApiVersionTable;

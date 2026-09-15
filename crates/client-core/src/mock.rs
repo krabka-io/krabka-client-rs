@@ -16,6 +16,9 @@
 //! `MockBroker` prepends the correlation-id header automatically. The handler
 //! only needs to supply the response body, which is the part after the
 //! correlation-id.
+//!
+//! [`MockBroker::start_with_replies`] takes a handler that returns a
+//! [`MockReply`]. That handler can also close the connection.
 
 #![cfg(any(test, feature = "mock"))]
 
@@ -39,9 +42,98 @@ pub struct MockBroker {
     _task: JoinHandle<()>,
 }
 
+/// What a [`MockBroker`] does with one request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MockReply {
+    /// Send this response body after the correlation id.
+    Respond(Vec<u8>),
+    /// Send nothing. The client eventually reaches its `request_timeout`.
+    Silent,
+    /// Close the connection without a response.
+    Close,
+}
+
+/// How a mock SASL listener answers the SASL exchange of one connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MockSaslAnswer {
+    /// `SaslHandshake` and `SaslAuthenticate` succeed.
+    Accept,
+    /// `SaslHandshake` fails with this error code.
+    HandshakeError(i16),
+    /// `SaslHandshake` succeeds, and `SaslAuthenticate` fails with this error
+    /// code.
+    AuthenticateError(i16),
+    /// `SaslHandshake` succeeds, and then the broker closes the connection
+    /// without an error.
+    CloseAfterHandshake,
+}
+
+/// The mechanism that a mock SASL listener enables.
+const MOCK_SASL_MECHANISM: &str = "PLAIN";
+
+impl MockSaslAnswer {
+    /// The reply to a `SaslHandshake` or `SaslAuthenticate` request, or `None`
+    /// for any other API key.
+    ///
+    /// # Panics
+    /// Panics if a SASL response does not encode at `version`.
+    #[must_use]
+    pub fn reply(self, api_key: i16, version: i16) -> Option<MockReply> {
+        use krabka_protocol::{
+            Encode,
+            owned::{
+                sasl_authenticate_request,
+                sasl_authenticate_response::{self, SaslAuthenticateResponse},
+                sasl_handshake_request,
+                sasl_handshake_response::SaslHandshakeResponse,
+            },
+        };
+
+        let mut body = BytesMut::new();
+        match (api_key, self) {
+            (sasl_handshake_request::API_KEY, Self::HandshakeError(error_code)) => {
+                SaslHandshakeResponse {
+                    error_code,
+                    mechanisms: vec![MOCK_SASL_MECHANISM.into()],
+                    ..Default::default()
+                }
+                .encode(&mut body, version)
+                .unwrap();
+            }
+            (sasl_handshake_request::API_KEY, _) => SaslHandshakeResponse {
+                mechanisms: vec![MOCK_SASL_MECHANISM.into()],
+                ..Default::default()
+            }
+            .encode(&mut body, version)
+            .unwrap(),
+            (sasl_authenticate_request::API_KEY, Self::CloseAfterHandshake) => {
+                return Some(MockReply::Close);
+            }
+            (sasl_authenticate_request::API_KEY, answer) => {
+                if version >= sasl_authenticate_response::FLEXIBLE_MIN {
+                    body.extend_from_slice(&[0]);
+                }
+                let error_code = match answer {
+                    Self::AuthenticateError(error_code) => error_code,
+                    _ => 0,
+                };
+                SaslAuthenticateResponse {
+                    error_code,
+                    error_message: (error_code != 0).then(|| "rejected by mock broker".into()),
+                    ..Default::default()
+                }
+                .encode(&mut body, version)
+                .unwrap();
+            }
+            _ => return None,
+        }
+        Some(MockReply::Respond(body.to_vec()))
+    }
+}
+
 /// Handler type: receives `(api_key, version, correlation_id, request_body)`
-/// and returns `Some(response_body)` to reply or `None` to drop the request.
-type Handler = Box<dyn FnMut(i16, i16, i32, &[u8]) -> Option<Vec<u8>> + Send>;
+/// and returns what the broker does with the request.
+type Handler = Box<dyn FnMut(i16, i16, i32, &[u8]) -> MockReply + Send>;
 
 impl MockBroker {
     /// Start a mock broker listening on a random localhost port.
@@ -55,9 +147,25 @@ impl MockBroker {
     ///
     /// # Panics
     /// Panics if synchronized client state is poisoned or a response violates an invariant established by protocol validation.
-    pub async fn start<F>(handler: F) -> Self
+    pub async fn start<F>(mut handler: F) -> Self
     where
         F: FnMut(i16, i16, i32, &[u8]) -> Option<Vec<u8>> + Send + 'static,
+    {
+        Self::start_with_replies(move |api_key, version, correlation_id, body| {
+            handler(api_key, version, correlation_id, body)
+                .map_or(MockReply::Silent, MockReply::Respond)
+        })
+        .await
+    }
+
+    /// Start a mock broker whose handler returns a [`MockReply`] for each
+    /// request.
+    ///
+    /// # Panics
+    /// Panics if the listener cannot bind a localhost port.
+    pub async fn start_with_replies<F>(handler: F) -> Self
+    where
+        F: FnMut(i16, i16, i32, &[u8]) -> MockReply + Send + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -125,8 +233,12 @@ async fn handle_connection(
                     h(api_key, version, corr_id, body)
                 };
 
-                // None => stay silent (client will time out).
-                let Some(response_body) = response_body_opt else { continue; };
+                let response_body = match response_body_opt {
+                    MockReply::Respond(body) => body,
+                    // Stay silent: the client times out.
+                    MockReply::Silent => continue,
+                    MockReply::Close => break,
+                };
 
                 // Build the response frame: corr_id(i32 BE) + body bytes.
                 let mut resp = BytesMut::with_capacity(4 + response_body.len());
