@@ -105,6 +105,10 @@ pub const DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30
 pub const DEFAULT_PRODUCER_INIT_MAX_BACKOFF: Duration = Duration::from_secs(1);
 /// Default transaction timeout.
 pub const DEFAULT_PRODUCER_TRANSACTION_TIMEOUT: Duration = Duration::from_mins(1);
+/// Default longest time that `send` waits for the metadata of its topic.
+///
+/// Kafka's `max.block.ms` has the same default of 60 s.
+pub const DEFAULT_PRODUCER_MAX_BLOCK: Duration = Duration::from_mins(1);
 
 /// Bounded backlog for coalescing internal sender wakeups.
 const SENDER_WAKE_CHANNEL_CAPACITY: usize = 16;
@@ -527,6 +531,7 @@ impl Producer {
         #[builder(default = DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT)] init_retry_timeout: Duration,
         #[builder(default = DEFAULT_PRODUCER_INIT_MAX_BACKOFF)] init_max_backoff: Duration,
         #[builder(default = DEFAULT_PRODUCER_MAX_IN_FLIGHT)] max_in_flight_per_connection: usize,
+        #[builder(default = DEFAULT_PRODUCER_MAX_BLOCK)] max_block: Duration,
         #[builder(default)]
         metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
         #[builder(default = krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
@@ -703,8 +708,10 @@ impl Producer {
             linger,
             request_timeout,
             flush_timeout,
+            max_block,
             max_in_flight: max_in_flight_per_connection,
             metadata_cache,
+            metadata_refresh: crate::metadata_wait::MetadataRefresh::default(),
             partition_leaders,
             accumulators,
             next_seq,

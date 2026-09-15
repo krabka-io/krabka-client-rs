@@ -427,7 +427,7 @@ mod tests {
             init_producer_id_response::{self, InitProducerIdResponse},
             metadata_request,
             metadata_response::{
-                MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
+                self, MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
                 MetadataResponseTopic,
             },
             produce_request,
@@ -938,7 +938,9 @@ mod tests {
             }
             let mut coordinator = handler_shared.lock().expect("scripted coordinator");
             if api_key == metadata_request::API_KEY {
-                return Some(encode_v0(&MetadataResponse {
+                // The producer waits for metadata that holds the topic, so the
+                // answer must decode at the negotiated version.
+                let response = MetadataResponse {
                     brokers: vec![MetadataResponseBroker {
                         node_id: 1,
                         host: "127.0.0.1".into(),
@@ -955,7 +957,13 @@ mod tests {
                         ..Default::default()
                     }],
                     ..Default::default()
-                }));
+                };
+                let mut buf = BytesMut::new();
+                if version >= metadata_response::FLEXIBLE_MIN {
+                    buf.extend_from_slice(&[0]);
+                }
+                response.encode(&mut buf, version).expect("encode Metadata");
+                return Some(buf.to_vec());
             }
             if api_key == produce_request::API_KEY {
                 let Reply::Code(error_code) = coordinator.produce.next() else {

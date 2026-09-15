@@ -78,7 +78,7 @@ use crate::{
     error::ProducerError,
     error_class::{self, ErrorClass},
     partitioner::UniformStickyPartitioner,
-    producer::{Acks, STATE_ACTIVE, STATE_FENCED, TopicMetadata, UNRESOLVED_TOPIC_PARTITION_COUNT},
+    producer::{Acks, STATE_ACTIVE, STATE_FENCED, TopicMetadata},
     record::RecordMetadata,
     transactional::{AbortableErrorSlot, TxnState},
     transport::ProduceTransport,
@@ -1746,18 +1746,18 @@ async fn update_leaders_from_metadata(cfg: &SenderConfig) {
                 cfg.partition_leaders
                     .insert((name.clone(), p.partition_index), p.leader_id);
             }
-            // Correct a previously-cached unresolved entry now that the topic
-            // exists. `partitions_for` caches `{count: 1, topic_id: ZERO}` when a
-            // produce races ahead of the topic's creation at cold boot; left
-            // frozen, that ZERO `topic_id` makes a v≥13 Produce (name dropped on
-            // the wire) come back as an un-correlatable UNKNOWN_TOPIC response the
-            // sender retries forever. Refreshing the id here lets a parked batch
-            // backfill it on resend (see `send_one_batch`). Only update topics we
-            // already track, so a full-cluster refresh doesn't bloat the cache.
-            if let Some(entry) = cache.get_mut(name) {
-                entry.num_partitions = i32::try_from(t.partitions.len())
-                    .unwrap_or(UNRESOLVED_TOPIC_PARTITION_COUNT)
-                    .max(UNRESOLVED_TOPIC_PARTITION_COUNT);
+            // Take the count and id of a tracked topic from the refresh. A
+            // topic can get a new id when it is deleted and created again, and a
+            // parked batch backfills the id on resend (see `send_one_batch`).
+            // A topic without partitions has no count, as in Kafka's
+            // `Cluster.partitionCountForTopic`, so it keeps the cached entry.
+            // Only update topics we already track, so a full-cluster refresh
+            // doesn't bloat the cache.
+            if let Some(entry) = cache.get_mut(name)
+                && let Ok(num_partitions) = i32::try_from(t.partitions.len())
+                && num_partitions > 0
+            {
+                entry.num_partitions = num_partitions;
                 entry.topic_id = t.topic_id;
             }
         }
