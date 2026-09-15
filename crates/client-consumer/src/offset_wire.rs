@@ -31,7 +31,10 @@ use krabka_protocol::{
     primitives::uuid::Uuid as WireUuid,
 };
 
-use crate::coordinator::{COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR};
+use crate::{
+    commit::OffsetAndMetadata,
+    coordinator::{COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR},
+};
 
 /// An `OffsetFetch` request that names its topics, capped at v9.
 ///
@@ -336,11 +339,11 @@ impl ProtocolRequest for TopicNameOffsetCommit {
 /// `ConsumerCoordinator.sendOffsetCommitRequest`. `offsets` maps `(topic,
 /// partition)` to `(committed_offset, committed_leader_epoch)`.
 pub(crate) fn build_commit_topics(
-    offsets: HashMap<(String, i32), (i64, i32)>,
+    offsets: HashMap<(String, i32), OffsetAndMetadata>,
 ) -> Vec<OffsetCommitRequestTopic> {
-    let mut by_topic: HashMap<String, Vec<(i32, i64, i32)>> = HashMap::new();
-    for ((t, p), (off, epoch)) in offsets {
-        by_topic.entry(t).or_default().push((p, off, epoch));
+    let mut by_topic: HashMap<String, Vec<(i32, OffsetAndMetadata)>> = HashMap::new();
+    for ((t, p), offset) in offsets {
+        by_topic.entry(t).or_default().push((p, offset));
     }
     by_topic
         .into_iter()
@@ -348,11 +351,11 @@ pub(crate) fn build_commit_topics(
             name,
             partitions: parts
                 .into_iter()
-                .map(|(p, off, epoch)| OffsetCommitRequestPartition {
+                .map(|(p, offset)| OffsetCommitRequestPartition {
                     partition_index: p,
-                    committed_offset: off,
-                    committed_leader_epoch: epoch,
-                    committed_metadata: Some(String::new()),
+                    committed_offset: offset.offset,
+                    committed_leader_epoch: offset.leader_epoch.unwrap_or(-1),
+                    committed_metadata: Some(offset.metadata),
                     ..Default::default()
                 })
                 .collect(),
@@ -642,7 +645,14 @@ mod tests {
     #[test]
     fn build_commit_topics_names_each_topic() {
         let mut offsets = HashMap::new();
-        offsets.insert(("t".to_string(), 3), (100, 5));
+        offsets.insert(
+            ("t".to_string(), 3),
+            OffsetAndMetadata {
+                offset: 100,
+                leader_epoch: Some(5),
+                metadata: "note".into(),
+            },
+        );
         let topics = build_commit_topics(offsets);
         assert2::assert!(
             topics
@@ -653,7 +663,7 @@ mod tests {
                         partition_index: 3,
                         committed_offset: 100,
                         committed_leader_epoch: 5,
-                        committed_metadata: Some(String::new()),
+                        committed_metadata: Some("note".into()),
                         unknown_tagged_fields: UnknownTaggedFields(vec![]),
                     }],
                     unknown_tagged_fields: UnknownTaggedFields(vec![]),

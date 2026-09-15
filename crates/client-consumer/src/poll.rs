@@ -595,7 +595,7 @@ impl Consumer {
         if !self.prepare_poll().await? {
             return Ok(Vec::new());
         }
-        if !self.wait_for_rebalance(deadline).await {
+        if !self.wait_for_rebalance(deadline).await? {
             return Ok(Vec::new());
         }
 
@@ -636,26 +636,74 @@ impl Consumer {
     /// `poll` fetches nothing until the join completes. The cooperative
     /// protocol keeps the owned partitions, and `poll` fetches them while the
     /// join runs. A member without partitions has nothing to fetch either.
-    pub(crate) async fn wait_for_rebalance(&mut self, deadline: tokio::time::Instant) -> bool {
+    ///
+    /// The rebalance listener calls that the join asks for run here, inside
+    /// `poll`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::RebalanceListenerFailed`] when a listener
+    /// callback failed.
+    pub(crate) async fn wait_for_rebalance(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ConsumerError> {
+        // Kafka's `onJoinComplete` keeps the first callback error and throws
+        // it after the rebalance step. A failed callback therefore does not
+        // end this `poll` while the join that queued it still runs.
+        let mut first_error = self.run_pending_listener_calls().await.err();
         if !*self.rebalance_pending.borrow() {
-            return true;
+            return first_error.map_or(Ok(true), Err);
         }
         let eager = self.rebalance_protocol == crate::assignor::RebalanceProtocol::Eager;
-        if !eager && !self.assigned.lock().await.is_empty() {
-            return true;
+        if first_error.is_none() && !eager && !self.assigned.lock().await.is_empty() {
+            return Ok(true);
         }
         // The coordinator task can request the rejoin after the start of this
         // `poll` signalled it. Signal again, so that this `poll` starts the
         // join that it waits for, as Kafka's `ensureActiveGroup` does.
         crate::coordinator::note_poll(&self.poll_signal);
-        let joined = tokio::time::timeout_at(
-            deadline,
-            self.rebalance_pending.wait_for(|pending| !*pending),
-        )
-        .await;
-        // A closed channel means that the coordinator task stopped. `poll`
-        // then continues with the assignment that it has.
-        joined.is_ok()
+        let joined = loop {
+            // A slow callback must not keep this `poll` past its timeout. The
+            // next `poll` runs the calls that come later.
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            let call = tokio::select! {
+                biased;
+                call = self.listener_calls.recv() => call,
+                joined = self.rebalance_pending.wait_for(|pending| !*pending) => {
+                    // A closed channel means that the coordinator task
+                    // stopped. `poll` then continues with the assignment that
+                    // it has.
+                    let _ = joined;
+                    break true;
+                }
+                () = tokio::time::sleep_until(deadline) => break false,
+            };
+            match call {
+                Some(call) => {
+                    if let Err(error) = self.complete_listener_call(call).await {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                // No listener calls can come: wait for the join alone.
+                None => {
+                    break tokio::time::timeout_at(
+                        deadline,
+                        self.rebalance_pending.wait_for(|pending| !*pending),
+                    )
+                    .await
+                    .is_ok();
+                }
+            }
+        };
+        // The join can end with calls that are still waiting, for example the
+        // assign callback.
+        if let Err(error) = self.run_pending_listener_calls().await {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(joined), Err)
     }
 
     /// Return up to `max_poll_records` buffered records, and move the consumed
@@ -1156,6 +1204,11 @@ impl Consumer {
     }
 
     async fn group_fetches(&mut self, assigned: &[(String, i32)]) -> FetchByLeader {
+        let awaiting_callback = self
+            .assigned_callback_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut grouped: FetchByLeader = HashMap::new();
         let now = tokio::time::Instant::now();
         let mut refresh_metadata = false;
@@ -1163,6 +1216,9 @@ impl Consumer {
             let offsets = self.next_offsets.lock().await;
             let positions = self.positions.lock().await;
             for (t, p) in assigned {
+                if awaiting_callback.contains(&(t.clone(), *p)) {
+                    continue;
+                }
                 // Skip partitions still awaiting validation — they must not be
                 // fetched until proven consistent.
                 if positions
@@ -1231,7 +1287,6 @@ impl Consumer {
         if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
             return Err(error);
         }
-        self.apply_pending_seeks().await;
         // Kafka's `ConsumerCoordinator.poll` sends the interval auto commit
         // before `updateFetchPositions`.
         self.maybe_auto_commit_async().await;
@@ -2413,6 +2468,7 @@ pub(crate) mod partition_error_tests {
             })),
             commit_serialization: Arc::new(Mutex::new(())),
             commit_async_state: Arc::new(AtomicU8::new(0)),
+            commit_async_callbacks: Arc::default(),
             group_instance_id: None,
             current_generation: Arc::new(AtomicI32::new(1)),
             subscribed_topics: vec!["orders".into()],
@@ -2421,7 +2477,6 @@ pub(crate) mod partition_error_tests {
             next_offsets: Arc::new(Mutex::new(HashMap::from([(("orders".into(), 0), 5)]))),
             end_offsets: Arc::new(Mutex::new(HashMap::new())),
             positions: Arc::new(Mutex::new(HashMap::new())),
-            pending_seeks: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::from([("orders".into(), TOPIC_ID)]))),
             session_timeout: secs(45),
             heartbeat_interval: secs(3),
@@ -2446,6 +2501,9 @@ pub(crate) mod partition_error_tests {
             close_operation: tokio::sync::watch::Sender::new(
                 crate::GroupMembershipOperation::Default,
             ),
+            rebalance_listener: None,
+            listener_calls: tokio::sync::mpsc::unbounded_channel().1,
+            assigned_callback_pending: Arc::default(),
         }
     }
 
@@ -2629,7 +2687,8 @@ pub(crate) mod partition_error_tests {
             let start = tokio::time::Instant::now();
             let joined = consumer
                 .wait_for_rebalance(start + Duration::from_millis(500))
-                .await;
+                .await
+                .expect("no listener");
             let elapsed_ms = u64::try_from(start.elapsed().as_millis()).expect("millis");
             if let Some(completion) = completion {
                 completion.abort();
@@ -3896,6 +3955,97 @@ mod fetch_path_tests {
                 leaders
             ) == (0, true, vec![1, 2, 3])
         );
+    }
+
+    /// A partition that waits for its assign callback gets no Fetch. Kafka's
+    /// `SubscriptionState.isFetchable` is false while
+    /// `pendingOnAssignedCallback` is set.
+    #[tokio::test]
+    async fn fetch_leaves_out_a_partition_that_waits_for_its_assign_callback() {
+        let respond = vec![FetchAnswer::Respond {
+            error_code: 0,
+            session_id: 0,
+        }];
+        let sent = SentFetches::default();
+        let brokers = start_brokers(&[respond.clone(), respond], &sent).await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer.refresh_leader_epochs().await.expect("metadata");
+        let gate = crate::rebalance_listener::AssignedCallbackGate::new(
+            &consumer.assigned_callback_pending,
+            &[("orders".to_owned(), 0)],
+        );
+        consumer.poll(millis(200)).await.expect("poll");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let leaders = |sent: &SentFetches| {
+            let mut leaders: Vec<i32> = sent
+                .lock()
+                .expect("sent lock")
+                .drain(..)
+                .map(|(node_id, _)| node_id)
+                .collect();
+            leaders.sort_unstable();
+            leaders
+        };
+        let waiting = leaders(&sent);
+        drop(gate);
+        consumer.poll(millis(200)).await.expect("poll");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after = leaders(&sent);
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!((waiting, after) == (vec![2], vec![1, 2]));
+    }
+
+    /// Kafka's `seek` sets the position of an assigned partition at once, and
+    /// `SubscriptionState.assignedState` throws for a partition that the
+    /// consumer does not own. The next Fetch uses the sought offset.
+    #[tokio::test]
+    async fn seek_moves_an_owned_position_and_rejects_an_unowned_partition() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, partition, expected_error, expected_offset) in [
+            ("owned partition", 0, None, 2),
+            (
+                "unowned partition",
+                9,
+                Some("no current assignment for partition orders-9"),
+                5,
+            ),
+        ] {
+            let sent = SentFetches::default();
+            let brokers = start_brokers(
+                &[vec![FetchAnswer::Respond {
+                    error_code: 0,
+                    session_id: 0,
+                }]],
+                &sent,
+            )
+            .await;
+            let mut consumer = consumer_on(&brokers).await;
+            let error = consumer
+                .seek("orders", partition, 2)
+                .await
+                .err()
+                .map(|error| error.to_string());
+            consumer.poll(millis(200)).await.expect("poll");
+            let offsets: Vec<i64> = sent
+                .lock()
+                .expect("sent lock")
+                .iter()
+                .flat_map(|(_, request)| &request.topics)
+                .flat_map(|topic| &topic.partitions)
+                .map(|partition| partition.fetch_offset)
+                .collect();
+            drop(consumer);
+            stop(brokers);
+            actual.push((name, error, offsets));
+            wanted.push((
+                name,
+                expected_error.map(str::to_owned),
+                vec![expected_offset],
+            ));
+        }
+        assert2::assert!(actual == wanted);
     }
 
     /// One step of a read replica case.

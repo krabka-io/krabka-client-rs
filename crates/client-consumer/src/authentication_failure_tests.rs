@@ -163,6 +163,7 @@ fn consumer(client: Client) -> Consumer {
         })),
         commit_serialization: Arc::new(Mutex::new(())),
         commit_async_state: Arc::new(AtomicU8::new(0)),
+        commit_async_callbacks: Arc::default(),
         group_instance_id: None,
         current_generation: Arc::new(AtomicI32::new(1)),
         subscribed_topics: vec!["orders".into()],
@@ -171,7 +172,6 @@ fn consumer(client: Client) -> Consumer {
         next_offsets: Arc::new(Mutex::new(HashMap::new())),
         end_offsets: Arc::new(Mutex::new(HashMap::new())),
         positions: Arc::new(Mutex::new(HashMap::new())),
-        pending_seeks: Arc::new(Mutex::new(HashMap::new())),
         topic_ids: Arc::new(Mutex::new(HashMap::new())),
         session_timeout: secs(45),
         heartbeat_interval: secs(3),
@@ -194,6 +194,9 @@ fn consumer(client: Client) -> Consumer {
         max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
         fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
         close_operation: tokio::sync::watch::Sender::new(crate::GroupMembershipOperation::Default),
+        rebalance_listener: None,
+        listener_calls: tokio::sync::mpsc::unbounded_channel().1,
+        assigned_callback_pending: Arc::default(),
     }
 }
 
@@ -244,6 +247,11 @@ fn coordinator_state(client: Client) -> CoordinatorState {
         rebalance_pending: tokio::sync::watch::Sender::new(false),
         close_operation: tokio::sync::watch::channel(crate::GroupMembershipOperation::Default).1,
         rejoin_reason: String::new(),
+        listener_calls: None,
+        assigned_callback_pending: Arc::default(),
+        poll_timer: crate::coordinator::PollTimer::new(krabka_units::secs(300)),
+        poll_timeout_in_callback: false,
+        lost_partitions: Vec::new(),
     }
 }
 

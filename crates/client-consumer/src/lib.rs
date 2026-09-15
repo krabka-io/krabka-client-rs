@@ -88,12 +88,14 @@ mod lock_order_model;
 mod offset_wire;
 mod poll;
 mod position;
+mod rebalance_listener;
 mod seek;
 mod share;
 mod validate;
 
 pub use assignor::Assignor;
 pub use builder::{AutoOffsetReset, IsolationLevel};
+pub use commit::{OffsetAndMetadata, OffsetCommitCallback};
 pub use consumer::{
     Consumer, ConsumerFetchMaxBytes, ConsumerFetchPartitionMaxBytes, ConsumerLeaveGroupTimeout,
     ConsumerRecord, ConsumerRetryPolicy, ConsumerSubscriptionMetadataRefreshInterval,
@@ -104,6 +106,7 @@ pub use consumer::{
 };
 pub use error::ConsumerError;
 pub use group_metadata::ConsumerGroupMetadata;
+pub use rebalance_listener::{ConsumerRebalanceListener, RebalanceListenerError};
 pub use share::{
     DEFAULT_SHARE_CONSUMER_FETCH_MAX, DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS,
     DEFAULT_SHARE_CONSUMER_FETCH_MIN, DEFAULT_SHARE_CONSUMER_LEAVE_HEARTBEAT_TIMEOUT, ShareAckMode,
