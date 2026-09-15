@@ -6,7 +6,14 @@
 //! (`ProducerMetadata.retainTopic`). The refresh gives the producer a larger
 //! partition count and moved leaders without a send error.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use krabka_client_core::Client;
@@ -14,8 +21,8 @@ use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    builder::ProducerRetryPolicy, error::ProducerError, metadata_wait::MetadataRefresh,
-    producer::TopicMetadata, sender::adopt_metadata,
+    accumulator::AccumulatorMap, builder::ProducerRetryPolicy, error::ProducerError,
+    metadata_wait::MetadataRefresh, producer::TopicMetadata, sender::adopt_metadata,
 };
 
 /// Kafka's producer `metadata.max.age.ms` default (5 minutes).
@@ -37,45 +44,52 @@ pub(crate) struct MetadataAge {
     retry_backoff_max: Duration,
     metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
     partition_leaders: Arc<DashMap<(String, i32), i32>>,
-    metadata_refresh: Arc<MetadataRefresh>,
+    metadata_refresh: Weak<MetadataRefresh>,
+    /// Cancelled when the producer drops its `MetadataRefresh`.
+    producer_dropped: CancellationToken,
+    accumulators: AccumulatorMap,
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Validate `metadata_max_idle`.
+///
+/// # Errors
+/// Returns [`ProducerError::InvalidConfig`] for a value below 5 s, as Kafka's
+/// `ProducerConfig` defines `metadata.max.idle.ms` with `atLeast(5000)`.
+pub(crate) fn validate_metadata_max_idle(max_idle: Duration) -> Result<(), ProducerError> {
+    if max_idle < MIN_PRODUCER_METADATA_MAX_IDLE {
+        return Err(ProducerError::InvalidConfig(format!(
+            "metadata_max_idle must be at least 5 s, got {max_idle:?}"
+        )));
+    }
+    Ok(())
 }
 
 impl MetadataAge {
-    /// A refresh for `client` with `(max_age, max_idle)` and the retry backoff
-    /// of `retry_policy`.
-    ///
-    /// # Errors
-    /// Returns [`ProducerError::InvalidConfig`] for a `max_idle` below 5 s, as
-    /// Kafka's `ProducerConfig` defines `metadata.max.idle.ms` with
-    /// `atLeast(5000)`.
-    pub(crate) fn new(
-        client: &Client,
-        (max_age, max_idle): (Duration, Duration),
-        retry_policy: &ProducerRetryPolicy,
-    ) -> Result<Self, ProducerError> {
-        if max_idle < MIN_PRODUCER_METADATA_MAX_IDLE {
-            return Err(ProducerError::InvalidConfig(format!(
-                "metadata_max_idle must be at least 5 s, got {max_idle:?}"
-            )));
-        }
-        Ok(Self::unchecked(client, (max_age, max_idle), retry_policy))
-    }
-
-    fn unchecked(
-        client: &Client,
-        (max_age, max_idle): (Duration, Duration),
-        retry_policy: &ProducerRetryPolicy,
-    ) -> Self {
+    /// A refresh for `client` with Kafka's default ages and the retry backoff
+    /// of `retry_policy`. [`validate_metadata_max_idle`] checks the idle time
+    /// before the producer connects.
+    pub(crate) fn new(client: &Client, retry_policy: &ProducerRetryPolicy) -> Self {
         Self {
             client: client.clone(),
-            max_age,
-            max_idle,
+            max_age: DEFAULT_PRODUCER_METADATA_MAX_AGE,
+            max_idle: DEFAULT_PRODUCER_METADATA_MAX_IDLE,
             retry_backoff: retry_policy.retry_backoff(),
             retry_backoff_max: retry_policy.retry_backoff_max(),
             metadata_cache: Arc::default(),
             partition_leaders: Arc::default(),
-            metadata_refresh: Arc::default(),
+            metadata_refresh: Weak::new(),
+            producer_dropped: CancellationToken::new(),
+            accumulators: AccumulatorMap::default(),
+            in_flight: Arc::default(),
         }
+    }
+
+    /// Use `metadata.max.age.ms` and `metadata.max.idle.ms`.
+    pub(crate) const fn with_ages(mut self, max_age: Duration, max_idle: Duration) -> Self {
+        self.max_age = max_age;
+        self.max_idle = max_idle;
+        self
     }
 
     /// Use the caches of the producer.
@@ -87,7 +101,19 @@ impl MetadataAge {
     ) -> Self {
         self.metadata_cache = Arc::clone(metadata_cache);
         self.partition_leaders = Arc::clone(partition_leaders);
-        self.metadata_refresh = Arc::clone(metadata_refresh);
+        self.metadata_refresh = Arc::downgrade(metadata_refresh);
+        self.producer_dropped = metadata_refresh.dropped();
+        self
+    }
+
+    /// Use the record queues of the producer. A topic with queued or in-flight
+    /// records does not expire.
+    pub(crate) fn with_queues(
+        mut self,
+        (accumulators, in_flight): (&AccumulatorMap, &Arc<AtomicUsize>),
+    ) -> Self {
+        self.accumulators = Arc::clone(accumulators);
+        self.in_flight = Arc::clone(in_flight);
         self
     }
 
@@ -106,6 +132,7 @@ impl MetadataAge {
             let last = topics.last_refreshed().unwrap_or(started);
             tokio::select! {
                 () = shutdown.cancelled() => return,
+                () = self.producer_dropped.cancelled() => return,
                 () = tokio::time::sleep_until(last + self.max_age) => {}
             }
             if topics
@@ -133,15 +160,45 @@ impl MetadataAge {
         }
     }
 
+    /// Whether an accumulator of `topic` holds a record.
+    async fn has_queued_records(&self, topic: &str) -> bool {
+        let queues = self
+            .accumulators
+            .iter()
+            .filter(|entry| entry.key().0 == topic)
+            .map(|entry| Arc::clone(entry.value()))
+            .collect::<Vec<_>>();
+        for queue in queues {
+            if queue.lock().await.queue_size() > 0 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Drop the topics with no send for `max_idle` from the requests and the
     /// caches. The next send to such a topic waits for its metadata again.
     async fn expire_idle_topics(&self) {
-        let expired = self.client.metadata_topics().remove_idle(self.max_idle);
+        // Kafka's `Sender.sendProducerData` adds a topic with batched records
+        // to the metadata again, so such a topic never leaves it. The same
+        // holds here for queued records and for records in flight.
+        let topics = self.client.metadata_topics();
+        if self.in_flight.load(Ordering::Acquire) > 0 {
+            return;
+        }
+        for topic in topics.names() {
+            if self.has_queued_records(&topic).await {
+                topics.add(&topic);
+            }
+        }
+        let expired = topics.remove_idle(self.max_idle);
         if expired.is_empty() {
             return;
         }
         tracing::debug!(topics = ?expired, "producer metadata topics expired");
-        self.metadata_refresh.forget(&expired);
+        if let Some(refresh) = self.metadata_refresh.upgrade() {
+            refresh.forget(&expired);
+        }
         let mut cache = self.metadata_cache.lock().await;
         for topic in &expired {
             cache.remove(topic);
@@ -366,10 +423,29 @@ mod tests {
         }
     }
 
-    /// Kafka's `ProducerMetadata.retainTopic`: a topic with no send for
-    /// `metadata.max.idle.ms` leaves the requests and the caches.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_idle_topic_leaves_the_requests_and_the_caches() {
+    /// What the idle expiry left.
+    #[derive(Debug, PartialEq, Eq)]
+    struct AfterIdle {
+        last_request: Option<MetadataRequest>,
+        cached: bool,
+        leaders: usize,
+        task_finished: bool,
+    }
+
+    /// How the producer holds the topic while it is idle.
+    #[derive(Clone, Copy, Debug)]
+    enum Idle {
+        /// No record of the topic waits.
+        NoRecords,
+        /// A record waits in an accumulator.
+        QueuedRecord,
+        /// A batch is in flight.
+        InFlight,
+    }
+
+    /// Run a periodic refresh with a 300 ms age and a 200 ms idle time for
+    /// 500 ms, then drop the producer's `MetadataRefresh`.
+    async fn idle_expiry(idle: Idle) -> AfterIdle {
         let broker = changing_broker().await;
         let client = Client::builder()
             .bootstrap(broker.mock.addr.to_string())
@@ -389,43 +465,95 @@ mod tests {
             },
         )])));
         let partition_leaders = Arc::new(DashMap::from_iter([((TOPIC.to_owned(), 0), 1)]));
-        let shutdown = CancellationToken::new();
+        let accumulators = AccumulatorMap::default();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        match idle {
+            Idle::NoRecords => {}
+            Idle::QueuedRecord => {
+                let mut accumulator = crate::accumulator::Accumulator::new(1024);
+                let _ = accumulator.append(None, Some("v".into()), Vec::new(), 0, None, None);
+                accumulators.insert((TOPIC.to_owned(), 0), Arc::new(Mutex::new(accumulator)));
+            }
+            Idle::InFlight => in_flight.store(1, Ordering::SeqCst),
+        }
         let retry_policy = ProducerRetryPolicy::default();
         let metadata_refresh = Arc::new(MetadataRefresh::default());
         let task = tokio::spawn(
-            MetadataAge::unchecked(
-                &client,
-                (Duration::from_millis(300), Duration::from_millis(200)),
-                &retry_policy,
-            )
-            .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
-            .run(shutdown.clone()),
+            MetadataAge::new(&client, &retry_policy)
+                .with_ages(Duration::from_millis(300), Duration::from_millis(200))
+                .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
+                .with_queues((&accumulators, &in_flight))
+                .run(CancellationToken::new()),
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-        shutdown.cancel();
-        task.await.unwrap();
-        let last = broker.requests.lock().unwrap().last().cloned();
-        let observed = (
-            last,
-            metadata_cache.lock().await.contains_key(TOPIC),
-            partition_leaders.len(),
-        );
+        // The producer drops its `MetadataRefresh` when it drops.
+        drop(metadata_refresh);
+        let task_finished = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .is_ok();
+        let observed = AfterIdle {
+            last_request: broker.requests.lock().unwrap().last().cloned(),
+            cached: metadata_cache.lock().await.contains_key(TOPIC),
+            leaders: partition_leaders.len(),
+            task_finished,
+        };
         broker.mock.stop();
-        check!(
-            observed
-                == (
-                    Some(krabka_client_core::topics_request(Vec::new(), true)),
-                    false,
-                    0
-                )
-        );
+        observed
+    }
+
+    /// Kafka's `ProducerMetadata.retainTopic`: a topic with no send for
+    /// `metadata.max.idle.ms` leaves the requests and the caches. Kafka's
+    /// `Sender` adds a topic with batched records again, so a topic with
+    /// queued or in-flight records stays. The task ends when the producer
+    /// drops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_topic_leaves_the_requests_and_the_caches_unless_records_wait() {
+        let named = |topics: &[&str]| {
+            Some(krabka_client_core::topics_request(
+                topics.iter().map(|&topic| topic.to_owned()),
+                true,
+            ))
+        };
+        for (name, idle, expected) in [
+            (
+                "no records",
+                Idle::NoRecords,
+                AfterIdle {
+                    last_request: named(&[]),
+                    cached: false,
+                    leaders: 0,
+                    task_finished: true,
+                },
+            ),
+            (
+                "a queued record",
+                Idle::QueuedRecord,
+                AfterIdle {
+                    last_request: named(&[TOPIC]),
+                    cached: true,
+                    leaders: 4,
+                    task_finished: true,
+                },
+            ),
+            (
+                "a batch in flight",
+                Idle::InFlight,
+                AfterIdle {
+                    last_request: named(&[TOPIC]),
+                    cached: true,
+                    leaders: 4,
+                    task_finished: true,
+                },
+            ),
+        ] {
+            check!(idle_expiry(idle).await == expected, "{name}");
+        }
     }
 
     #[tokio::test]
     async fn metadata_max_idle_below_five_seconds_is_rejected() {
         let result = Producer::builder()
-            .bootstrap("127.0.0.1:9")
-            .enable_idempotence(false)
+            .bootstrap("unused.invalid:9092")
             .metadata_max_idle(Duration::from_millis(4999))
             .build()
             .await;

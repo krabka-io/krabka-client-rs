@@ -52,6 +52,15 @@ pub(crate) struct MetadataRefresh {
     /// The topics that the requests name. The lock is never held across an
     /// `.await`.
     topics: std::sync::Mutex<ProducerTopics>,
+    /// Cancelled when the producer drops this value, so the periodic refresh
+    /// task ends with the producer.
+    dropped: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for MetadataRefresh {
+    fn drop(&mut self) {
+        self.dropped.cancel();
+    }
 }
 
 /// A response and the topics that its request named.
@@ -106,6 +115,11 @@ pub(crate) fn metadata_request(topics: Vec<String>) -> MetadataRequest {
 }
 
 impl MetadataRefresh {
+    /// A token that is cancelled when this value drops.
+    pub(crate) fn dropped(&self) -> tokio_util::sync::CancellationToken {
+        self.dropped.clone()
+    }
+
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }

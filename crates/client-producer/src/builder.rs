@@ -758,6 +758,7 @@ impl Producer {
             transactional_id.as_deref(),
         )?;
         let client_id = resolve_client_id(client_id, transactional_id.as_deref());
+        crate::metadata_age::validate_metadata_max_idle(metadata_max_idle)?;
         let transaction_timeout = resolve_transaction_timeout(
             transaction_two_phase_commit_enable,
             transaction_timeout,
@@ -889,13 +890,11 @@ impl Producer {
         let txn_abortable_error = Arc::new(AbortableErrorSlot::default());
 
         let metadata_refresh = Arc::new(crate::metadata_wait::MetadataRefresh::default());
-        MetadataAge::new(
-            &client,
-            (metadata_max_age, metadata_max_idle),
-            &retry_policy,
-        )?
-        .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
-        .spawn(shutdown.clone());
+        MetadataAge::new(&client, &retry_policy)
+            .with_ages(metadata_max_age, metadata_max_idle)
+            .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
+            .with_queues((&accumulators, &in_flight))
+            .spawn(shutdown.clone());
         let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
             transport: Box::new(ClientTransport::new(client.clone())),
             producer_id,
