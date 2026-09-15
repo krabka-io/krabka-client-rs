@@ -65,6 +65,36 @@ pub struct PartitionInfo {
     pub offline_replicas: Vec<Node>,
 }
 
+/// A `ListOffsets` request that searches by timestamp, from version 1. Kafka's
+/// `ListOffsetsRequest.Builder.forConsumer(requireTimestamp = true, ..)` sets
+/// the oldest allowed version to 1, because version 0 has no timestamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimestampListOffsets(ListOffsetsRequest);
+
+impl krabka_protocol::Encode for TimestampListOffsets {
+    fn encode<B: bytes::BufMut>(
+        &self,
+        buf: &mut B,
+        version: i16,
+    ) -> Result<(), krabka_protocol::ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl krabka_protocol::ProtocolRequest for TimestampListOffsets {
+    const API_KEY: i16 = krabka_protocol::owned::list_offsets_request::API_KEY;
+    const MIN_VERSION: i16 = 1;
+    const MAX_VERSION: i16 = krabka_protocol::owned::list_offsets_request::MAX_VERSION;
+    const LATEST_STABLE_VERSION: i16 =
+        krabka_protocol::owned::list_offsets_request::LATEST_STABLE_VERSION;
+    const FLEXIBLE_MIN: i16 = krabka_protocol::owned::list_offsets_request::FLEXIBLE_MIN;
+    type Response = ListOffsetsResponse;
+}
+
 /// What a query takes from one `ListOffsets` partition row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryRow {
@@ -367,13 +397,20 @@ impl Consumer {
             let (topic, partition) = key;
             return Err(ConsumerError::NoCurrentAssignment { topic, partition });
         }
-        let position = self
-            .next_offsets
+        let offsets = self.next_offsets.lock().await;
+        // Kafka's `partitionLag` needs a valid position: not a pending reset,
+        // and not one that waits for validation.
+        let awaiting_validation = self
+            .positions
             .lock()
             .await
             .get(&key)
+            .is_some_and(|position| position.awaiting_validation);
+        let position = offsets
+            .get(&key)
             .copied()
-            .filter(|offset| !is_reset_sentinel(*offset));
+            .filter(|offset| !is_reset_sentinel(*offset) && !awaiting_validation);
+        drop(offsets);
         drop(assigned);
         let end = self.end_offsets.lock().await.get(&key).copied();
         Ok(position.zip(end).map(|(position, end)| end - position))
@@ -445,12 +482,15 @@ impl Consumer {
                     for (leader, partitions) in by_leader {
                         let request = query_request(&partitions, self.isolation_level);
                         let broker = self.client.broker(leader);
-                        let answer = if require_timestamps
-                            || self.isolation_level == IsolationLevel::ReadCommitted
-                        {
+                        // Kafka's `ListOffsetsRequest.Builder.forConsumer`:
+                        // version 2 for `read_committed`, version 1 for a
+                        // timestamp search.
+                        let answer = if self.isolation_level == IsolationLevel::ReadCommitted {
                             broker
                                 .send(crate::poll::ReadCommittedListOffsets(request))
                                 .await
+                        } else if require_timestamps {
+                            broker.send(TimestampListOffsets(request)).await
                         } else {
                             broker.send(request).await
                         };
@@ -689,6 +729,7 @@ mod tests {
     async fn query_broker(
         rows: Option<Rows>,
         metadata_error: i16,
+        list_offsets_max_version: i16,
         sent: SentRequests,
     ) -> MockBroker {
         use bytes::Buf as _;
@@ -700,7 +741,7 @@ mod tests {
                     api_keys: [
                         (api_versions_request::API_KEY, 3),
                         (metadata_request::API_KEY, 8),
-                        (list_offsets_request::API_KEY, 5),
+                        (list_offsets_request::API_KEY, list_offsets_max_version),
                     ]
                     .into_iter()
                     .map(|(api_key, max_version)| ApiVersion {
@@ -816,12 +857,12 @@ mod tests {
         let unauthorized: Rows = |_, _| (29, -1, -1, -1);
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
-        for (name, isolation, query, (rows, metadata_error), expected, expected_requests) in [
+        for (name, isolation, query, (rows, metadata_error, list_offsets_max), expected, expected_requests) in [
             (
                 "beginning offsets",
                 IsolationLevel::ReadUncommitted,
                 Query::Beginning,
-                (Some(found), 0),
+                (Some(found), 0, 5),
                 Answer::Offsets(HashMap::from([(key(0), 3), (key(1), 4)])),
                 vec![request(0, [-2, -2])],
             ),
@@ -829,7 +870,7 @@ mod tests {
                 "end offsets with read committed",
                 IsolationLevel::ReadCommitted,
                 Query::End,
-                (Some(found), 0),
+                (Some(found), 0, 5),
                 Answer::Offsets(HashMap::from([(key(0), 3), (key(1), 4)])),
                 vec![request(1, [-1, -1])],
             ),
@@ -837,7 +878,7 @@ mod tests {
                 "offsets for times",
                 IsolationLevel::ReadUncommitted,
                 Query::Times([1000, 2000]),
-                (Some(found), 0),
+                (Some(found), 0, 5),
                 Answer::Times(HashMap::from([
                     (
                         key(0),
@@ -855,7 +896,7 @@ mod tests {
                 "negative timestamp",
                 IsolationLevel::ReadUncommitted,
                 Query::Times([-1, 2000]),
-                (Some(found), 0),
+                (Some(found), 0, 5),
                 Answer::Error(
                     "invalid argument: The target time for partition orders-0 is -1. The target time cannot be negative."
                         .into(),
@@ -866,7 +907,7 @@ mod tests {
                 "unauthorized topic",
                 IsolationLevel::ReadUncommitted,
                 Query::Beginning,
-                (Some(unauthorized), 0),
+                (Some(unauthorized), 0, 5),
                 Answer::Error("not authorized to access topics: [orders]".into()),
                 vec![request(0, [-2, -2])],
             ),
@@ -874,7 +915,7 @@ mod tests {
                 "metadata does not authorize the topic",
                 IsolationLevel::ReadUncommitted,
                 Query::Beginning,
-                (Some(found), 29),
+                (Some(found), 29, 5),
                 Answer::Error("not authorized to access topics: [orders]".into()),
                 vec![],
             ),
@@ -882,7 +923,7 @@ mod tests {
                 "metadata names the topic invalid",
                 IsolationLevel::ReadUncommitted,
                 Query::End,
-                (Some(found), 17),
+                (Some(found), 17, 5),
                 Answer::Error("topic 'orders' is invalid".into()),
                 vec![],
             ),
@@ -890,13 +931,49 @@ mod tests {
                 "a silent leader ends by the API timeout",
                 IsolationLevel::ReadUncommitted,
                 Query::Times([1000, 2000]),
-                (None, 0),
+                (None, 0, 5),
                 Answer::Error("timeout".into()),
                 vec![request(0, [1000, 2000])],
             ),
+            (
+                "offsets for times on a broker with ListOffsets v1",
+                IsolationLevel::ReadUncommitted,
+                Query::Times([1000, 2000]),
+                (Some(found), 0, 1),
+                Answer::Times(HashMap::from([
+                    (
+                        key(0),
+                        Some(OffsetAndTimestamp {
+                            offset: 42,
+                            timestamp: 1005,
+                            leader_epoch: None,
+                        }),
+                    ),
+                    (key(1), None),
+                ])),
+                vec![ListOffsetsRequest {
+                    replica_id: -1,
+                    topics: vec![ListOffsetsTopic {
+                        name: "orders".into(),
+                        partitions: [1000, 2000]
+                            .into_iter()
+                            .zip(0..)
+                            .map(|(timestamp, partition_index)| ListOffsetsPartition {
+                                partition_index,
+                                current_leader_epoch: -1,
+                                timestamp,
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            ),
         ] {
             let sent = SentRequests::default();
-            let broker = query_broker(rows, metadata_error, Arc::clone(&sent)).await;
+            let broker =
+                query_broker(rows, metadata_error, list_offsets_max, Arc::clone(&sent)).await;
             let client = Client::builder()
                 .bootstrap(broker.addr.to_string())
                 .request_timeout(secs(30))
@@ -998,7 +1075,7 @@ mod tests {
     /// unassigned partition (`SubscriptionState.partitionLag`).
     #[tokio::test]
     async fn current_lag_follows_kafkas_partition_lag() {
-        let broker = query_broker(Some(|_, _| (0, 0, 0, 0)), 0, SentRequests::default()).await;
+        let broker = query_broker(Some(|_, _| (0, 0, 0, 0)), 0, 5, SentRequests::default()).await;
         let client = Client::builder()
             .bootstrap(broker.addr.to_string())
             .build()
@@ -1008,16 +1085,18 @@ mod tests {
         let key = ("orders".to_string(), 0);
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
-        for (name, partition, position, end, seek, expected) in [
-            ("known", 0, 5, Some(12), None, Ok(Some(7))),
-            ("after a seek", 0, 5, Some(12), Some(8), Ok(Some(4))),
-            ("no end offset", 0, 5, None, None, Ok(None)),
+        for (name, partition, position, end, seek, awaiting_validation, expected) in [
+            ("known", 0, 5, Some(12), None, false, Ok(Some(7))),
+            ("after a seek", 0, 5, Some(12), Some(8), false, Ok(Some(4))),
+            ("no end offset", 0, 5, None, None, false, Ok(None)),
+            ("awaiting validation", 0, 5, Some(12), None, true, Ok(None)),
             (
                 "awaiting reset",
                 0,
                 crate::poll::END_SENTINEL,
                 Some(12),
                 None,
+                false,
                 Ok(None),
             ),
             (
@@ -1026,9 +1105,17 @@ mod tests {
                 5,
                 Some(12),
                 None,
+                false,
                 Err("no current assignment for partition orders-9".to_string()),
             ),
         ] {
+            consumer
+                .positions
+                .lock()
+                .await
+                .entry(key.clone())
+                .or_default()
+                .awaiting_validation = awaiting_validation;
             consumer
                 .next_offsets
                 .lock()
