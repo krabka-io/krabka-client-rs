@@ -122,7 +122,7 @@ impl Consumer {
                 if let Some(offset) = self.valid_position(&key).await {
                     return Ok(offset);
                 }
-                self.update_fetch_positions().await?;
+                self.update_fetch_positions(None).await?;
                 if self.valid_position(&key).await.is_none() {
                     tokio::time::sleep(self.retry_policy.initial_backoff).await;
                 }

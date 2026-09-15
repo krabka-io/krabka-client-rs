@@ -78,6 +78,7 @@ mod authentication_failure_tests;
 mod builder;
 mod commit;
 mod consumer;
+mod control;
 mod coordinator;
 mod error;
 mod fetch_buffer;
@@ -93,6 +94,7 @@ mod queries;
 mod rebalance_listener;
 mod seek;
 mod share;
+mod subscription;
 mod validate;
 
 pub use assignor::Assignor;
@@ -107,6 +109,7 @@ pub use consumer::{
     DEFAULT_CONSUMER_SUBSCRIPTION_METADATA_REFRESH_INTERVAL, GroupMembershipOperation, Header,
     TimestampType,
 };
+pub use control::{CloseOptions, DEFAULT_CONSUMER_CLOSE_TIMEOUT, WakeupHandle};
 pub use error::ConsumerError;
 pub use group_metadata::ConsumerGroupMetadata;
 pub use queries::{Node, OffsetAndTimestamp, PartitionInfo};
@@ -118,3 +121,4 @@ pub use share::{
     ShareConsumerFetchMaxRecords, ShareConsumerFetchMinBytes, ShareConsumerLeaveHeartbeatTimeout,
     ShareConsumerRecord,
 };
+pub use subscription::TopicPattern;
