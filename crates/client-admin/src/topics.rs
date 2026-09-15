@@ -33,7 +33,9 @@ use uuid::Uuid;
 
 use crate::{
     AdminClient, AdminError, KafkaError, NOT_CONTROLLER, kafka_error_if,
-    retry::{ControllerRetry, KAFKA_ADMIN_RETRY, RetryPolicy, call_timeout_error},
+    retry::{
+        ControllerRetry, KAFKA_ADMIN_RETRY, RetryPolicy, call_timeout_error, is_connection_failure,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -574,23 +576,36 @@ impl AdminClient {
         let mut throttled = HashMap::<String, (T, Instant)>::new();
         let mut deadline = policy.start();
         let mut attempts = 0_u32;
-        let mut last_error = "none";
+        let mut last_error = "none".to_owned();
         while !pending.is_empty() {
             attempts = attempts.saturating_add(1);
             let request = build(&pending, deadline.remaining_millis());
             // A request still in flight at the deadline stops the call, as
             // Kafka's `KafkaAdminClient` times out a call in flight.
             let Some(response) = deadline.bounded(self.conn.send(request)).await else {
-                last_error = "the request was in flight at the deadline";
+                "the request was in flight at the deadline".clone_into(&mut last_error);
                 break;
             };
-            let outcomes = parse(response?);
+            let outcomes = match response {
+                Ok(response) => parse(response),
+                // A lost or failed connection is a disconnect, which Kafka's
+                // `Call.fail` retries with the backoff until the deadline.
+                Err(error) if is_connection_failure(&error) => {
+                    last_error = error.to_string();
+                    deadline.backoff().await;
+                    if deadline.expired() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let controller_bootstrap = self.conn.uses_controller_bootstrap();
             if outcomes
                 .iter()
                 .any(|outcome| is_not_controller(outcome.error_code(), controller_bootstrap))
             {
-                last_error = "NOT_CONTROLLER";
+                "NOT_CONTROLLER".clone_into(&mut last_error);
                 if deadline
                     .bounded(self.refresh_controller_after_not_controller())
                     .await
@@ -642,7 +657,7 @@ impl AdminClient {
             if pending.is_empty() {
                 break;
             }
-            last_error = "THROTTLING_QUOTA_EXCEEDED";
+            "THROTTLING_QUOTA_EXCEEDED".clone_into(&mut last_error);
             // Kafka's `NetworkClient` mutes the connection for the throttle
             // time of the response (KIP-219) before the retry goes out. A
             // zero throttle time falls back to the retry backoff, so a broken
@@ -664,7 +679,7 @@ impl AdminClient {
                         .saturating_sub(received.elapsed());
                     outcome.with_throttle_duration(remaining)
                 }
-                None => T::failed(&topic, call_timeout_error(api, attempts, last_error)),
+                None => T::failed(&topic, call_timeout_error(api, attempts, &last_error)),
             };
             done.insert(topic, outcome);
         }
@@ -1954,7 +1969,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bytes::{Buf, BytesMut};
-    use krabka_client_core::MockBroker;
+    use krabka_client_core::{MockBroker, MockReply};
     use krabka_protocol::{
         Decode, Encode,
         owned::{
@@ -1987,6 +2002,8 @@ mod tests {
         throttle_time_ms: i32,
         /// The controller does not answer the request.
         silent: bool,
+        /// The controller closes the connection with no answer.
+        closed: bool,
     }
 
     fn answer(codes: &[(&'static str, i16)]) -> Answer {
@@ -1994,6 +2011,7 @@ mod tests {
             codes: codes.to_vec(),
             throttle_time_ms: 0,
             silent: false,
+            closed: false,
         }
     }
 
@@ -2002,6 +2020,7 @@ mod tests {
             codes: codes.to_vec(),
             throttle_time_ms,
             silent: false,
+            closed: false,
         }
     }
 
@@ -2010,6 +2029,16 @@ mod tests {
             codes: Vec::new(),
             throttle_time_ms: 0,
             silent: true,
+            closed: false,
+        }
+    }
+
+    fn closed() -> Answer {
+        Answer {
+            codes: Vec::new(),
+            throttle_time_ms: 0,
+            silent: false,
+            closed: true,
         }
     }
 
@@ -2061,7 +2090,9 @@ mod tests {
         let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
         let handler_port = Arc::clone(&port);
         let mut next = 0_usize;
-        let broker = MockBroker::start(move |api_key, version, _, request| {
+        let close = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_close = Arc::clone(&close);
+        let mut handler = move |api_key: i16, version: i16, request: &[u8]| {
             let api_version = |api_key, max_version| ApiVersion {
                 api_key,
                 min_version: 0,
@@ -2075,6 +2106,7 @@ mod tests {
                     .push((names, timeout_ms));
                 let entry = script[next.min(script.len() - 1)].clone();
                 next += 1;
+                handler_close.store(entry.closed, std::sync::atomic::Ordering::SeqCst);
                 entry
             };
             match api_key {
@@ -2204,6 +2236,13 @@ mod tests {
                 }
                 _ => None,
             }
+        };
+        let broker = MockBroker::start_with_replies(move |api_key, version, _, request| {
+            let reply = handler(api_key, version, request);
+            if close.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return MockReply::Close;
+            }
+            reply.map_or(MockReply::Silent, MockReply::Respond)
         })
         .await;
         port.store(broker.addr.port(), std::sync::atomic::Ordering::SeqCst);
@@ -2374,6 +2413,14 @@ mod tests {
                 retry_quota,
                 names(&[&["a", "b"]]),
                 vec![failed("a", 7), failed("b", 7)],
+            ),
+            (
+                "a lost connection is retried after the backoff",
+                vec![closed(), closed(), closed(), answer(&[("a", 0), ("b", 0)])],
+                LONG,
+                retry_quota,
+                names(&[&["a", "b"], &["a", "b"], &["a", "b"], &["a", "b"]]),
+                vec![ok("a"), ok("b")],
             ),
             (
                 "a topic with no result fails",
