@@ -1,12 +1,28 @@
 //! Client-side TLS/SASL security surface for [`crate::Client`].
 //!
-//! This module mirrors the broker's inter-broker credential + TLS shapes so
-//! the public clients and the inter-broker dialer negotiate the same way.
+//! This module mirrors the TLS settings of Kafka's `SslConfigs` and the
+//! trust and key store handling of `DefaultSslEngineFactory`. The public
+//! clients and the inter-broker dialer negotiate the same way.
 
-use std::{path::PathBuf, sync::Arc};
+mod stores;
+
+use std::{
+    fmt,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use krabka_security::ListenerProtocol;
-use rustls_pki_types::pem::PemObject;
+use rustls::{
+    CertificateError, DigitallySignedStruct, SignatureScheme, SupportedProtocolVersion,
+    client::{
+        WebPkiServerVerifier,
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    },
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
+use thiserror::Error;
 use tokio_rustls::TlsConnector;
 
 pub use crate::sasl::SaslCredentials;
@@ -22,79 +38,428 @@ pub fn connection_target_host(address: &str) -> &str {
     }
 }
 
-/// Client-side TLS trust + SNI.
+/// A secret configuration value, such as Kafka's `ssl.key.password`.
 ///
-/// This struct mirrors the trust-roots half of the broker's
-/// `krabka_security::TlsConfig::build_client_config`.
-#[derive(Debug, Clone)]
+/// `Debug` prints `[hidden]`, as Kafka's `Password.toString` does, so a
+/// logged configuration does not show the secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Password(String);
+
+impl Password {
+    /// Wrap a secret value.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Return the secret value.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Password {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[hidden]")
+    }
+}
+
+impl From<&str> for Password {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for Password {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// The certificates that verify the broker certificate (Kafka
+/// `ssl.truststore.*`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TrustStore {
+    /// The platform trust store. Kafka uses the JVM default trust store when
+    /// `ssl.truststore.location` and `ssl.truststore.certificates` are not
+    /// set (`DefaultSslEngineFactory.getTrustManagers` with a null
+    /// `KeyStore`).
+    #[default]
+    Platform,
+    /// A PEM file of CA certificates (`ssl.truststore.type=PEM` with
+    /// `ssl.truststore.location`).
+    PemFile(PathBuf),
+    /// PEM CA certificates in the configuration
+    /// (`ssl.truststore.certificates`).
+    Pem(String),
+    /// A PKCS#12 trust store file (`ssl.truststore.type=PKCS12`). The client
+    /// trusts each certificate entry that has no private key.
+    Pkcs12 { path: PathBuf, password: Password },
+    /// A JKS trust store file (`ssl.truststore.type=JKS`). Without a password
+    /// the client does not check the store digest, as Java's
+    /// `KeyStore.load(stream, null)` does.
+    Jks {
+        path: PathBuf,
+        password: Option<Password>,
+    },
+}
+
+/// The client certificate chain and private key for mutual TLS (Kafka
+/// `ssl.keystore.*`).
+///
+/// A private key can be PKCS#8 (`PRIVATE KEY`) or PKCS#8 encrypted with
+/// PBES2 (`ENCRYPTED PRIVATE KEY`). An encrypted key needs `key_password`
+/// (`ssl.key.password`), as Kafka's `PemStore.privateKey` does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyStore {
+    /// One PEM file with the private key and the certificate chain
+    /// (`ssl.keystore.type=PEM` with `ssl.keystore.location`).
+    PemFile {
+        path: PathBuf,
+        key_password: Option<Password>,
+    },
+    /// A PEM certificate chain file and a separate PEM private key file.
+    PemFiles {
+        certificate_chain: PathBuf,
+        private_key: PathBuf,
+        key_password: Option<Password>,
+    },
+    /// A PEM certificate chain and private key in the configuration
+    /// (`ssl.keystore.certificate.chain` and `ssl.keystore.key`).
+    Pem {
+        certificate_chain: String,
+        private_key: String,
+        key_password: Option<Password>,
+    },
+    /// A PKCS#12 key store file (`ssl.keystore.type=PKCS12`). The store
+    /// password also decrypts the key.
+    Pkcs12 { path: PathBuf, password: Password },
+    /// A JKS key store file (`ssl.keystore.type=JKS`). `key_password`
+    /// decrypts the key. Without it, the store password decrypts the key, as
+    /// Kafka's `FileBasedStore` does when `ssl.key.password` is not set.
+    Jks {
+        path: PathBuf,
+        password: Password,
+        key_password: Option<Password>,
+    },
+}
+
+/// A TLS protocol version name of `ssl.protocol` and `ssl.enabled.protocols`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TlsVersion {
+    /// `TLSv1.2`.
+    Tls12,
+    /// `TLSv1.3`.
+    Tls13,
+}
+
+impl TlsVersion {
+    /// Parse a Kafka protocol name, `TLSv1.2` or `TLSv1.3`.
+    ///
+    /// # Errors
+    /// Returns [`TlsConfigError::UnsupportedProtocol`] for any other name,
+    /// such as `TLSv1.1`, which this client does not implement.
+    pub fn parse(name: &str) -> Result<Self, TlsConfigError> {
+        match name {
+            "TLSv1.2" => Ok(Self::Tls12),
+            "TLSv1.3" => Ok(Self::Tls13),
+            other => Err(TlsConfigError::UnsupportedProtocol(other.to_owned())),
+        }
+    }
+
+    const fn rustls(self) -> &'static SupportedProtocolVersion {
+        match self {
+            Self::Tls12 => &rustls::version::TLS12,
+            Self::Tls13 => &rustls::version::TLS13,
+        }
+    }
+}
+
+/// An invalid TLS configuration. Kafka raises these as an
+/// `InvalidConfigurationException` or a `KafkaException` when it builds the
+/// SSL engine factory.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum TlsConfigError {
+    /// A store file could not be read.
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A PEM value holds no certificate or no usable private key.
+    #[error("invalid PEM: {0}")]
+    Pem(String),
+    /// A private key could not be decrypted or decoded.
+    #[error("invalid private key: {0}")]
+    PrivateKey(String),
+    /// A PKCS#12 store could not be read.
+    #[error("invalid PKCS#12 store: {0}")]
+    Pkcs12(String),
+    /// A JKS store could not be read.
+    #[error("invalid JKS store: {0}")]
+    Jks(String),
+    /// The platform trust store holds no certificate.
+    #[error("the platform trust store holds no certificate: {0}")]
+    PlatformTrustStore(String),
+    /// A trust store holds no certificate that can be a trust anchor.
+    #[error("the trust store holds no usable CA certificate")]
+    EmptyTrustStore,
+    /// A protocol name is not `TLSv1.2` or `TLSv1.3`.
+    #[error("unsupported TLS protocol {0:?}")]
+    UnsupportedProtocol(String),
+    /// No enabled protocol is at or below `ssl.protocol`.
+    #[error("no enabled TLS protocol is at or below {0:?}")]
+    NoProtocol(TlsVersion),
+    /// A cipher suite name is not a TLS cipher suite name.
+    #[error("unknown cipher suite {0:?}")]
+    UnknownCipherSuite(String),
+    /// None of the configured cipher suites is available.
+    #[error("no configured cipher suite is supported: {0:?}")]
+    NoCipherSuite(Vec<String>),
+    /// rustls rejected the configuration.
+    #[error("TLS configuration: {0}")]
+    Rustls(String),
+}
+
+/// Client-side TLS settings, as Kafka's `SslConfigs` defines them.
+///
+/// `Default` gives Kafka's defaults: the platform trust store, no client
+/// certificate, hostname verification on, `ssl.protocol=TLSv1.3`,
+/// `ssl.enabled.protocols=TLSv1.2,TLSv1.3`, and the default cipher suites.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlsConnectorConfig {
-    /// PEM file of CA certs the client trusts to verify the broker's
-    /// server cert. `None` gives an empty root store. The handshake then
-    /// fails unless the server cert chains to a webpki default, which this
-    /// crate does not install. This mirrors the broker's strict
-    /// `build_client_config`.
-    pub trust_roots_pem: Option<PathBuf>,
+    /// The CA certificates that verify the broker certificate.
+    pub trust_store: TrustStore,
+    /// The client certificate and key for mutual TLS. `None` presents no
+    /// client certificate.
+    pub key_store: Option<KeyStore>,
     /// Explicit SNI / server-name override. An empty string uses each
     /// connection's target hostname, including brokers learned from metadata.
     pub server_name: String,
-    /// Optional mTLS client identity: `(cert_chain_pem, private_key_pem)`.
-    ///
-    /// When `Some`, the client loads the cert chain and key from the given
-    /// PEM files and presents them to the server during the TLS handshake.
-    /// This is mutual TLS, also called client authentication. `None` gives
-    /// one-way TLS: the client does not present a certificate
-    /// (`with_no_client_auth`).
-    pub client_identity: Option<(PathBuf, PathBuf)>,
+    /// Whether the client checks that the broker certificate names the host
+    /// it connects to. Kafka's `ssl.endpoint.identification.algorithm=https`
+    /// (the default) turns it on, and an empty value turns it off. With the
+    /// check off, the client still verifies the certificate chain.
+    pub hostname_verification: bool,
+    /// The highest protocol version that the client uses (`ssl.protocol`).
+    pub protocol: TlsVersion,
+    /// The protocol versions that the client offers
+    /// (`ssl.enabled.protocols`).
+    pub enabled_protocols: Vec<TlsVersion>,
+    /// The cipher suites that the client offers, by IANA name
+    /// (`ssl.cipher.suites`). `None` offers the default suites. The client
+    /// skips a known suite name that it does not implement, such as a CBC
+    /// suite.
+    pub cipher_suites: Option<Vec<String>>,
+}
+
+impl Default for TlsConnectorConfig {
+    fn default() -> Self {
+        Self {
+            trust_store: TrustStore::Platform,
+            key_store: None,
+            server_name: String::new(),
+            hostname_verification: true,
+            protocol: TlsVersion::Tls13,
+            enabled_protocols: vec![TlsVersion::Tls12, TlsVersion::Tls13],
+            cipher_suites: None,
+        }
+    }
+}
+
+/// The platform trust store, loaded once for the process as the JVM loads its
+/// default trust store once.
+fn platform_roots() -> Result<Arc<rustls::RootCertStore>, TlsConfigError> {
+    static ROOTS: OnceLock<Result<Arc<rustls::RootCertStore>, String>> = OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let loaded = rustls_native_certs::load_native_certs();
+            let mut roots = rustls::RootCertStore::empty();
+            let (_, ignored) = roots.add_parsable_certificates(loaded.certs);
+            if roots.is_empty() {
+                let errors = loaded
+                    .errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                return Err(format!(
+                    "{ignored} unparsable certificates, errors {errors:?}"
+                ));
+            }
+            Ok(Arc::new(roots))
+        })
+        .clone()
+        .map_err(TlsConfigError::PlatformTrustStore)
 }
 
 impl TlsConnectorConfig {
     /// Build a `rustls::ClientConfig`.
     ///
-    /// When [`Self::client_identity`] is `Some`, this method loads the cert
-    /// chain and key and builds the config with mutual TLS client
-    /// authentication. When `None`, the client presents no certificate
-    /// (`with_no_client_auth`).
-    ///
     /// # Errors
-    /// Returns a string error if any PEM file fails to load or parse.
-    pub fn build(&self) -> Result<Arc<rustls::ClientConfig>, String> {
-        let mut roots = rustls::RootCertStore::empty();
-        if let Some(path) = &self.trust_roots_pem {
-            for cert in rustls::pki_types::CertificateDer::pem_file_iter(path)
-                .map_err(|e| format!("trust roots load {}: {e}", path.display()))?
-            {
-                let cert = cert.map_err(|e| format!("trust roots parse: {e}"))?;
-                roots
-                    .add(cert)
-                    .map_err(|e| format!("trust roots add: {e}"))?;
-            }
-        }
-        let cfg = if let Some((cert_pem, key_pem)) = &self.client_identity {
-            let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-                rustls::pki_types::CertificateDer::pem_file_iter(cert_pem)
-                    .map_err(|e| format!("client cert load {}: {e}", cert_pem.display()))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| format!("client cert parse: {e}"))?;
-            let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key_pem)
-                .map_err(|e| format!("client key load {}: {e}", key_pem.display()))?;
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| format!("client auth cert: {e}"))?
-        } else {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
+    /// Returns [`TlsConfigError`] when a store does not load, when a protocol
+    /// or cipher suite setting leaves nothing to offer, or when the platform
+    /// trust store is empty.
+    pub fn build(&self) -> Result<Arc<rustls::ClientConfig>, TlsConfigError> {
+        self.build_with_platform_roots(platform_roots)
+    }
+
+    /// Build the client configuration. `platform` supplies the trust store
+    /// for [`TrustStore::Platform`], which lets a test use its own CA as the
+    /// platform store.
+    fn build_with_platform_roots(
+        &self,
+        platform: impl FnOnce() -> Result<Arc<rustls::RootCertStore>, TlsConfigError>,
+    ) -> Result<Arc<rustls::ClientConfig>, TlsConfigError> {
+        let roots = match &self.trust_store {
+            TrustStore::Platform => platform()?,
+            store => Arc::new(stores::trust_anchors(store)?),
         };
-        Ok(Arc::new(cfg))
+        let provider = Arc::new(self.crypto_provider()?);
+        let versions = self.protocol_versions()?;
+        let webpki = WebPkiServerVerifier::builder_with_provider(roots, Arc::clone(&provider))
+            .build()
+            .map_err(|error| TlsConfigError::Rustls(error.to_string()))?;
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&versions)
+            .map_err(|error| TlsConfigError::Rustls(error.to_string()))?;
+        let builder = if self.hostname_verification {
+            builder.with_webpki_verifier(webpki)
+        } else {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(ChainOnlyVerifier { inner: webpki }))
+        };
+        let config = match &self.key_store {
+            Some(store) => {
+                let (chain, key) = stores::key_pair(store)?;
+                builder
+                    .with_client_auth_cert(chain, key)
+                    .map_err(|error| TlsConfigError::Rustls(error.to_string()))?
+            }
+            None => builder.with_no_client_auth(),
+        };
+        Ok(Arc::new(config))
     }
 
     /// Build a ready `TlsConnector`.
     ///
     /// # Errors
     /// Propagates [`Self::build`] failures.
-    pub fn connector(&self) -> Result<TlsConnector, String> {
+    pub fn connector(&self) -> Result<TlsConnector, TlsConfigError> {
         Ok(TlsConnector::from(self.build()?))
+    }
+
+    /// The enabled protocol versions at or below [`Self::protocol`].
+    fn protocol_versions(&self) -> Result<Vec<&'static SupportedProtocolVersion>, TlsConfigError> {
+        let mut enabled = self
+            .enabled_protocols
+            .iter()
+            .copied()
+            .filter(|version| *version <= self.protocol)
+            .collect::<Vec<_>>();
+        enabled.sort_unstable();
+        enabled.dedup();
+        if enabled.is_empty() {
+            return Err(TlsConfigError::NoProtocol(self.protocol));
+        }
+        Ok(enabled.into_iter().map(TlsVersion::rustls).collect())
+    }
+
+    /// The process crypto provider, limited to [`Self::cipher_suites`].
+    fn crypto_provider(&self) -> Result<CryptoProvider, TlsConfigError> {
+        let mut provider = CryptoProvider::get_default()
+            .map_or_else(rustls::crypto::ring::default_provider, |provider| {
+                provider.as_ref().clone()
+            });
+        let Some(names) = &self.cipher_suites else {
+            return Ok(provider);
+        };
+        let mut wanted = Vec::with_capacity(names.len());
+        for name in names {
+            wanted.push(cipher_suite(name)?);
+        }
+        provider
+            .cipher_suites
+            .retain(|suite| wanted.contains(&suite.suite()));
+        if provider.cipher_suites.is_empty() {
+            return Err(TlsConfigError::NoCipherSuite(names.clone()));
+        }
+        Ok(provider)
+    }
+}
+
+/// Map an IANA cipher suite name, as Kafka's `ssl.cipher.suites` holds it, to
+/// the rustls suite. rustls names the TLS 1.3 suites `TLS13_*` where IANA
+/// names them `TLS_*`.
+fn cipher_suite(name: &str) -> Result<rustls::CipherSuite, TlsConfigError> {
+    let tls13 = name
+        .strip_prefix("TLS_")
+        .map(|rest| format!("TLS13_{rest}"));
+    (0..=u16::MAX)
+        .map(rustls::CipherSuite::from)
+        .find(|suite| {
+            suite
+                .as_str()
+                .is_some_and(|known| known == name || tls13.as_deref() == Some(known))
+        })
+        .ok_or_else(|| TlsConfigError::UnknownCipherSuite(name.to_owned()))
+}
+
+/// A server certificate verifier that checks the chain and skips the host
+/// name, as Kafka's empty `ssl.endpoint.identification.algorithm` does.
+#[derive(Debug)]
+struct ChainOnlyVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for ChainOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        // rustls-webpki checks the chain before the name, so a name error
+        // means that the chain is valid.
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => Ok(ServerCertVerified::assertion()),
+            result => result,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -159,149 +524,4 @@ impl ClientSecurity {
 }
 
 #[cfg(test)]
-mod tests {
-    use assert2::assert;
-    use krabka_security::ListenerProtocol;
-
-    use super::*;
-
-    #[test]
-    fn plaintext_security_has_no_tls_or_sasl() {
-        let s = ClientSecurity {
-            protocol: ListenerProtocol::Plaintext,
-            tls: None,
-            sasl: None,
-            sasl_host: None,
-        };
-        assert!(!s.protocol.requires_tls());
-        assert!(!s.protocol.requires_sasl());
-    }
-
-    #[test]
-    fn sasl_plaintext_carries_creds() {
-        let s = ClientSecurity {
-            protocol: ListenerProtocol::SaslPlaintext,
-            tls: None,
-            sasl: Some(SaslCredentials::Plain {
-                username: "u".into(),
-                password: "p".into(),
-            }),
-            sasl_host: None,
-        };
-        assert!(s.protocol.requires_sasl());
-        assert!(matches!(s.sasl, Some(SaslCredentials::Plain { .. })));
-    }
-
-    #[test]
-    fn sasl_handshake_host_prefers_explicit_field() {
-        // SASL_PLAINTEXT (no TLS) with an explicit host: GSSAPI must get
-        // the real SPN host, not "localhost" or the target host.
-        let s = ClientSecurity {
-            protocol: ListenerProtocol::SaslPlaintext,
-            tls: None,
-            sasl: None,
-            sasl_host: Some("kdc-broker.example.com".into()),
-        };
-        assert!(s.sasl_handshake_host(Some("10.0.0.5")) == "kdc-broker.example.com");
-    }
-
-    #[test]
-    fn sasl_handshake_host_falls_back_to_tls_then_target_then_localhost() {
-        // No explicit sasl_host → TLS SNI wins.
-        let with_tls = ClientSecurity {
-            protocol: ListenerProtocol::SaslSsl,
-            tls: Some(TlsConnectorConfig {
-                trust_roots_pem: None,
-                server_name: "tls-host".into(),
-                client_identity: None,
-            }),
-            sasl: None,
-            sasl_host: None,
-        };
-        assert!(with_tls.sasl_handshake_host(Some("10.0.0.5")) == "tls-host");
-
-        // No sasl_host, no TLS → target host wins.
-        let no_tls = ClientSecurity {
-            protocol: ListenerProtocol::SaslPlaintext,
-            tls: None,
-            sasl: None,
-            sasl_host: None,
-        };
-        assert!(no_tls.sasl_handshake_host(Some("10.0.0.5")) == "10.0.0.5");
-
-        // Nothing set at all → localhost.
-        assert!(no_tls.sasl_handshake_host(None) == "localhost");
-    }
-
-    #[test]
-    fn target_host_fills_dynamic_tls_name_but_preserves_an_override() {
-        let policy = |server_name| ClientSecurity {
-            protocol: ListenerProtocol::Ssl,
-            tls: Some(TlsConnectorConfig {
-                trust_roots_pem: None,
-                server_name,
-                client_identity: None,
-            }),
-            sasl: None,
-            sasl_host: None,
-        };
-
-        assert!(
-            policy(String::new())
-                .for_target_host("broker-2.example")
-                .tls
-                .unwrap()
-                .server_name
-                == "broker-2.example"
-        );
-        assert!(
-            policy("shared.example".into())
-                .for_target_host("broker-2.example")
-                .tls
-                .unwrap()
-                .server_name
-                == "shared.example"
-        );
-    }
-
-    #[test]
-    fn tls_connector_config_builds_client_config() {
-        // Empty trust roots → webpki defaults disabled; we only assert it builds.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let cfg = TlsConnectorConfig {
-            trust_roots_pem: None,
-            server_name: "broker".into(),
-            client_identity: None,
-        };
-        cfg.build().expect("client config builds with empty roots");
-    }
-
-    #[test]
-    fn tls_connector_config_client_identity_none_builds_and_bogus_path_errors() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        // None path: one-way TLS builds successfully.
-        let no_id = TlsConnectorConfig {
-            trust_roots_pem: None,
-            server_name: "broker".into(),
-            client_identity: None,
-        };
-        no_id
-            .build()
-            .expect("one-way TLS builds with client_identity=None");
-
-        // Bogus path: mTLS arm must return Err (files don't exist).
-        let bogus = TlsConnectorConfig {
-            trust_roots_pem: None,
-            server_name: "broker".into(),
-            client_identity: Some((
-                "/nonexistent/cert.pem".into(),
-                "/nonexistent/key.pem".into(),
-            )),
-        };
-        assert!(
-            bogus.build().is_err(),
-            "bogus client-identity path returns Err"
-        );
-    }
-}
+mod tests;

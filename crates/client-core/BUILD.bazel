@@ -7,4 +7,9 @@ exports_files(["Cargo.toml"])
 
 crate_library(name = "client-core")
 
-crate_tests(lib = "client-core")
+crate_tests(
+    # `src/security/tests.rs` embeds the TLS fixtures with `include_str!` and
+    # `include_bytes!`.
+    compile_data = glob(["tests/fixtures/**"]),
+    lib = "client-core",
+)

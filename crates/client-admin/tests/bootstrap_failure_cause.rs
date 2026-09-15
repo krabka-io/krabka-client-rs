@@ -136,11 +136,7 @@ async fn rejecting_broker() -> MockBroker {
 fn tls() -> ClientSecurity {
     ClientSecurity {
         protocol: ListenerProtocol::Ssl,
-        tls: Some(TlsConnectorConfig {
-            trust_roots_pem: None,
-            server_name: String::new(),
-            client_identity: None,
-        }),
+        tls: Some(TlsConnectorConfig::default()),
         sasl: None,
         sasl_host: None,
     }

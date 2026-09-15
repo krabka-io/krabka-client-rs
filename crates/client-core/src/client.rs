@@ -159,6 +159,12 @@ impl Client {
         let metadata_recovery_rebootstrap_trigger =
             MetadataRecoveryRebootstrapTrigger::new(metadata_recovery_rebootstrap_trigger)
                 .map_err(ClientError::InvalidConfig)?;
+        // Kafka builds the SSL engine factory when it builds the client, so a
+        // store that does not load fails the client before any connection.
+        if let Some(tls) = security.as_ref().and_then(|security| security.tls.as_ref()) {
+            tls.build()
+                .map_err(|error| ClientError::InvalidConfig(error.to_string()))?;
+        }
         let options = ConnectionOptions {
             client_id,
             dns_timeout,

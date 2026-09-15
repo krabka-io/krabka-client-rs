@@ -326,7 +326,8 @@ impl Connection {
     /// Returns [`ClientError::Connect`] / [`ClientError::Timeout`] on the
     /// TCP dial, [`ClientError::Tls`] or [`ClientError::Sasl`] if the TLS
     /// handshake or the SASL exchange fails with no verdict from the peer,
-    /// [`ClientError::Authentication`] if the peer rejects authentication, or
+    /// [`ClientError::Authentication`] if the peer rejects authentication,
+    /// [`ClientError::InvalidConfig`] if the TLS settings do not build, or
     /// [`ClientError::Io`] if the security policy is internally inconsistent
     /// (e.g. a TLS protocol with no TLS config).
     #[tracing::instrument(
@@ -353,7 +354,7 @@ impl Connection {
             })?;
             let connector = tls
                 .connector()
-                .map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
+                .map_err(|error| ClientError::InvalidConfig(error.to_string()))?;
             let server_name = if tls.server_name.is_empty() {
                 addr.ip().to_string()
             } else {
@@ -1033,11 +1034,7 @@ mod tls_handshake_failure_tests {
     async fn tls_rejection_is_an_authentication_failure_and_eof_is_not() {
         let security = ClientSecurity {
             protocol: ListenerProtocol::Ssl,
-            tls: Some(TlsConnectorConfig {
-                trust_roots_pem: None,
-                server_name: String::new(),
-                client_identity: None,
-            }),
+            tls: Some(TlsConnectorConfig::default()),
             sasl: None,
             sasl_host: None,
         };
