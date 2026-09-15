@@ -536,54 +536,68 @@ async fn call_listener(
     kind: crate::rebalance_listener::ListenerCallKind,
     partitions: Vec<(String, i32)>,
 ) -> Result<(), ConsumerError> {
-    let Some(calls) = &state.listener_calls else {
-        return Ok(());
-    };
-    let (done, ran) = tokio::sync::oneshot::channel();
-    if calls
-        .send(crate::rebalance_listener::ListenerCall {
-            kind,
-            partitions,
-            done,
-        })
-        .is_err()
-    {
-        // The consumer is gone.
-        return Ok(());
-    }
-    let (ran_in_time, heartbeat) = {
-        let state = &*state;
-        let call_done = CancellationToken::new();
-        let wait = async {
-            let ran_in_time = wait_for_listener_call(state, ran).await;
-            call_done.cancel();
-            ran_in_time
+    loop {
+        let Some(calls) = &state.listener_calls else {
+            return Ok(());
         };
-        tokio::join!(wait, heartbeat_during_join_prepare(state, &call_done))
-    };
-    match ran_in_time {
-        CallWait::Ran => state.poll_timer.reset(),
-        CallWait::PollsReset(deadline) => state.poll_timer.deadline = deadline,
-        CallWait::PollTimeout => {
-            // Kafka's heartbeat thread leaves the group when the poll timer
-            // expires, also while a callback runs (`AbstractCoordinator.
-            // HeartbeatThread.run`, `handlePollTimeoutExpiry`).
-            state.poll_timeout_in_callback = true;
-            return Err(ConsumerError::RebalanceFailed(
-                "max_poll_interval expired while a rebalance listener callback waited".into(),
-            ));
+        let (done, ran) = tokio::sync::oneshot::channel();
+        if calls
+            .send(crate::rebalance_listener::ListenerCall {
+                kind,
+                partitions: partitions.clone(),
+                done,
+            })
+            .is_err()
+        {
+            // The consumer is gone.
+            return Ok(());
         }
-    }
-    match heartbeat {
-        Some(HeartbeatOutcome::Fenced) => Err(ConsumerError::FencedInstanceId(
-            state.group_instance_id.clone().unwrap_or_default(),
-        )),
-        Some(HeartbeatOutcome::RejoinFromScratch) => {
-            forget_member(state).await;
-            state.rejoin_reason = heartbeat_rejoin_reason(UNKNOWN_MEMBER_ID);
-            Ok(())
+        let (ran_in_time, heartbeat) = {
+            let state = &*state;
+            let call_done = CancellationToken::new();
+            let wait = async {
+                let ran_in_time = wait_for_listener_call(state, ran).await;
+                call_done.cancel();
+                ran_in_time
+            };
+            tokio::join!(wait, heartbeat_during_join_prepare(state, &call_done))
+        };
+        let resend = match ran_in_time {
+            CallWait::Ran => {
+                state.poll_timer.reset();
+                false
+            }
+            // A cancelled `poll` dropped the call before the callback ended.
+            // The next `poll` runs it again, as Kafka runs each callback to
+            // its end before the rebalance continues.
+            CallWait::Dropped(deadline) => {
+                state.poll_timer.deadline = deadline;
+                true
+            }
+            CallWait::PollTimeout => {
+                // Kafka's heartbeat thread leaves the group when the poll timer
+                // expires, also while a callback runs (`AbstractCoordinator.
+                // HeartbeatThread.run`, `handlePollTimeoutExpiry`).
+                state.poll_timeout_in_callback = true;
+                return Err(ConsumerError::RebalanceFailed(
+                    "max_poll_interval expired while a rebalance listener callback waited".into(),
+                ));
+            }
+        };
+        match heartbeat {
+            Some(HeartbeatOutcome::Fenced) => {
+                return Err(ConsumerError::FencedInstanceId(
+                    state.group_instance_id.clone().unwrap_or_default(),
+                ));
+            }
+            Some(HeartbeatOutcome::RejoinFromScratch) => {
+                forget_member(state).await;
+                state.rejoin_reason = heartbeat_rejoin_reason(UNKNOWN_MEMBER_ID);
+                return Ok(());
+            }
+            _ if resend => {}
+            _ => return Ok(()),
         }
-        _ => Ok(()),
     }
 }
 
@@ -592,9 +606,9 @@ async fn call_listener(
 enum CallWait {
     /// The callback ran. `poll` ran it, so the poll timer starts again.
     Ran,
-    /// The consumer dropped the call, with the poll timer deadline after the
-    /// last `poll`.
-    PollsReset(tokio::time::Instant),
+    /// The consumer dropped the call before the callback ended, with the poll
+    /// timer deadline after the last `poll`.
+    Dropped(tokio::time::Instant),
     /// No `poll` came before the poll timer expired.
     PollTimeout,
 }
@@ -615,7 +629,7 @@ async fn wait_for_listener_call(
                 return if result.is_ok() {
                     CallWait::Ran
                 } else {
-                    CallWait::PollsReset(deadline)
+                    CallWait::Dropped(deadline)
                 };
             }
             () = tokio::time::sleep_until(deadline) => {

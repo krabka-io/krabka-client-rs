@@ -128,7 +128,7 @@ pub struct Consumer {
     /// when it stops.
     pub(crate) close_operation: tokio::sync::watch::Sender<GroupMembershipOperation>,
     /// The rebalance listener, Kafka's `ConsumerRebalanceListener`.
-    pub(crate) rebalance_listener: Option<Box<dyn crate::ConsumerRebalanceListener>>,
+    pub(crate) rebalance_listener: Option<crate::rebalance_listener::SharedListener>,
     /// The listener calls that the coordinator task asks `poll` to run.
     pub(crate) listener_calls:
         tokio::sync::mpsc::UnboundedReceiver<crate::rebalance_listener::ListenerCall>,
@@ -1056,7 +1056,8 @@ impl Consumer {
             .await
             {
                 Ok(Ok(mut consumer)) => {
-                    consumer.rebalance_listener = rebalance_listener;
+                    consumer.rebalance_listener =
+                        rebalance_listener.map(crate::rebalance_listener::shared);
                     return Ok(consumer);
                 }
                 Ok(Err(error)) => {
@@ -5048,12 +5049,12 @@ mod rebalance_listener_tests {
         .await
         .expect("spawn consumer");
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        consumer.rebalance_listener = Some(Box::new(Recorder {
+        consumer.rebalance_listener = Some(crate::rebalance_listener::shared(Box::new(Recorder {
             calls: Arc::clone(&calls),
             commit_on_revoke: case.commit_on_revoke,
             fail_revoke: case.fail_revoke,
             seek_on_assign: case.seek_on_assign,
-        }));
+        })));
 
         // The first poll runs the assign callback of the build.
         consumer.poll(millis(20)).await.expect("first poll");
@@ -5114,6 +5115,141 @@ mod rebalance_listener_tests {
     /// The order and the partitions of Kafka's `ConsumerRebalanceListener`
     /// calls (`ConsumerCoordinator.onJoinPrepare`, `onJoinComplete` and
     /// `onLeavePrepare`).
+    /// What the listener of the cancellation test saw.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Step {
+        Started(&'static str, Vec<(String, i32)>),
+        Ended(&'static str, Vec<(String, i32)>),
+    }
+
+    /// A listener whose first assign callback for partition 1 takes long, so a
+    /// timeout cancels the `poll` that runs it.
+    struct SlowOnce {
+        steps: Arc<std::sync::Mutex<Vec<Step>>>,
+        slow: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ConsumerRebalanceListener for SlowOnce {
+        async fn on_partitions_revoked(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), RebalanceListenerError> {
+            let mut steps = self.steps.lock().expect("steps lock");
+            steps.push(Step::Started("revoked", partitions.to_vec()));
+            steps.push(Step::Ended("revoked", partitions.to_vec()));
+            Ok(())
+        }
+
+        async fn on_partitions_assigned(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), RebalanceListenerError> {
+            self.steps
+                .lock()
+                .expect("steps lock")
+                .push(Step::Started("assigned", partitions.to_vec()));
+            if self.slow && partitions.contains(&partition(1)) {
+                self.slow = false;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            self.steps
+                .lock()
+                .expect("steps lock")
+                .push(Step::Ended("assigned", partitions.to_vec()));
+            Ok(())
+        }
+    }
+
+    /// A cancelled `poll` keeps the listener, and the callback that it did not
+    /// finish runs again in the next `poll`. Kafka runs each callback to its
+    /// end on the application thread.
+    #[tokio::test]
+    async fn a_cancelled_poll_keeps_the_listener_and_runs_the_callback_again() {
+        let coordinator = MockCoordinator::new(
+            Assignor::CooperativeSticky,
+            vec![vec![partition(0), partition(1)]],
+        );
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut config = start_config(
+            mock.addr.to_string(),
+            Assignor::CooperativeSticky,
+            false,
+            minutes(1),
+        );
+        config.heartbeat_interval = millis(50);
+        config.has_rebalance_listener = true;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = spawn_consumer(
+            config,
+            client,
+            Arc::new(AtomicI32::new(0)),
+            MEMBER.into(),
+            StartupState {
+                generation_id: 1,
+                assigned_partitions: vec![partition(0)],
+                next_offsets: HashMap::from([(partition(0), 12)]),
+                positions: HashMap::new(),
+                topic_ids: HashMap::new(),
+                topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
+            },
+        )
+        .await
+        .expect("spawn consumer");
+        let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        consumer.rebalance_listener = Some(crate::rebalance_listener::shared(Box::new(SlowOnce {
+            steps: Arc::clone(&steps),
+            slow: true,
+        })));
+        consumer.poll(millis(20)).await.expect("first poll");
+        coordinator.heartbeat_error.store(27, Ordering::SeqCst);
+        let ended = |steps: &std::sync::Mutex<Vec<Step>>| {
+            steps
+                .lock()
+                .expect("steps lock")
+                .contains(&Step::Ended("assigned", vec![partition(1)]))
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !ended(&steps) && tokio::time::Instant::now() < deadline {
+            // The timeout cancels the `poll` that runs the slow callback.
+            let _ =
+                tokio::time::timeout(Duration::from_millis(100), consumer.poll(millis(20))).await;
+        }
+        let awaiting = consumer
+            .assigned_callback_pending
+            .lock()
+            .expect("pending lock")
+            .len();
+        consumer.close().await.expect("close");
+        mock.stop();
+        let steps = steps.lock().expect("steps lock").clone();
+        assert2::assert!(
+            (steps, awaiting)
+                == (
+                    vec![
+                        Step::Started("assigned", vec![partition(0)]),
+                        Step::Ended("assigned", vec![partition(0)]),
+                        Step::Started("assigned", vec![partition(1)]),
+                        Step::Started("assigned", vec![partition(1)]),
+                        Step::Ended("assigned", vec![partition(1)]),
+                        Step::Started("revoked", vec![partition(0), partition(1)]),
+                        Step::Ended("revoked", vec![partition(0), partition(1)]),
+                    ],
+                    0
+                )
+        );
+    }
+
     /// An assign callback that takes longer than `max_poll_interval` the first
     /// time that it gets the added partition.
     struct SlowAssign {
@@ -5188,7 +5324,10 @@ mod rebalance_listener_tests {
         )
         .await
         .expect("spawn consumer");
-        consumer.rebalance_listener = Some(Box::new(SlowAssign { slept: false }));
+        consumer.rebalance_listener =
+            Some(crate::rebalance_listener::shared(Box::new(SlowAssign {
+                slept: false,
+            })));
         consumer.poll(millis(20)).await.expect("first poll");
         coordinator.heartbeat_error.store(27, Ordering::SeqCst);
         // Poll until the slow assign callback of the join has run.

@@ -73,6 +73,15 @@ pub trait ConsumerRebalanceListener: Send + Sync {
     }
 }
 
+/// The rebalance listener of a consumer. A cancelled `poll` drops only its
+/// lock guard, so the listener stays with the consumer.
+pub(crate) type SharedListener = Arc<tokio::sync::Mutex<Box<dyn ConsumerRebalanceListener>>>;
+
+/// Share `listener` for the consumer.
+pub(crate) fn shared(listener: Box<dyn ConsumerRebalanceListener>) -> SharedListener {
+    Arc::new(tokio::sync::Mutex::new(listener))
+}
+
 /// Which callback a [`ListenerCall`] runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ListenerCallKind {
@@ -105,17 +114,19 @@ impl Consumer {
         kind: ListenerCallKind,
         partitions: &[(String, i32)],
     ) -> Result<(), ConsumerError> {
-        let Some(mut listener) = self.rebalance_listener.take() else {
+        let Some(listener) = self.rebalance_listener.clone() else {
             return Ok(());
         };
+        let mut listener = listener.lock().await;
         let mut sorted = partitions.to_vec();
         sorted.sort();
+        let consumer = &*self;
         let result = match kind {
-            ListenerCallKind::Revoked => listener.on_partitions_revoked(self, &sorted).await,
-            ListenerCallKind::Assigned => listener.on_partitions_assigned(self, &sorted).await,
-            ListenerCallKind::Lost => listener.on_partitions_lost(self, &sorted).await,
+            ListenerCallKind::Revoked => listener.on_partitions_revoked(consumer, &sorted).await,
+            ListenerCallKind::Assigned => listener.on_partitions_assigned(consumer, &sorted).await,
+            ListenerCallKind::Lost => listener.on_partitions_lost(consumer, &sorted).await,
         };
-        self.rebalance_listener = Some(listener);
+        drop(listener);
         result.map_err(|error| ConsumerError::RebalanceListenerFailed(error.to_string()))
     }
 
