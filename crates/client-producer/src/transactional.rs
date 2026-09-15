@@ -527,7 +527,7 @@ mod tests {
             .request_timeout(Duration::from_millis(100))
             .retry_backoff(Duration::from_millis(1))
             .init_retry_timeout(Duration::from_millis(100))
-            .init_max_backoff(Duration::from_millis(1))
+            .retry_backoff_max(Duration::from_millis(1))
             .build()
             .await
             .expect("producer connects");
@@ -613,7 +613,7 @@ mod tests {
             .request_timeout(std::time::Duration::from_millis(100))
             .retry_backoff(Duration::from_millis(1))
             .init_retry_timeout(Duration::from_millis(400))
-            .init_max_backoff(Duration::from_millis(20))
+            .retry_backoff_max(Duration::from_millis(20))
             .build()
             .await
             .expect("producer connects to the mock");
@@ -1074,7 +1074,7 @@ mod tests {
             .request_timeout(Duration::from_millis(100))
             .retry_backoff(Duration::from_millis(1))
             .init_retry_timeout(Duration::from_millis(1500))
-            .init_max_backoff(Duration::from_millis(20))
+            .retry_backoff_max(Duration::from_millis(20))
             .build()
             .await
             .expect("producer connects to the mock");

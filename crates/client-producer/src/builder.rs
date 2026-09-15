@@ -94,15 +94,17 @@ pub const DEFAULT_PRODUCER_FLUSH_TIMEOUT: Duration = Duration::from_secs(50);
 pub const DEFAULT_PRODUCER_RETRIES: i32 = i32::MAX;
 /// Default producer retry backoff.
 pub const DEFAULT_PRODUCER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
-/// Default wall-clock routing retry budget per batch.
-pub const DEFAULT_PRODUCER_ROUTING_RETRY_BUDGET: Duration = Duration::from_secs(30);
+/// Default producer delivery timeout. Kafka's `delivery.timeout.ms` default is
+/// 120000.
+pub const DEFAULT_PRODUCER_DELIVERY_TIMEOUT: Duration = Duration::from_mins(2);
 /// Default producer-ID initialization retry timeout.
 ///
 /// The same timeout limits the retries of a transaction coordinator request:
 /// `AddPartitionsToTxn`, and an `EndTxn` whose outcome a transport failure hid.
 pub const DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default producer-ID initialization backoff cap.
-pub const DEFAULT_PRODUCER_INIT_MAX_BACKOFF: Duration = Duration::from_secs(1);
+/// Default upper bound of the exponential retry backoff. Kafka's
+/// `retry.backoff.max.ms` default is 1000.
+pub const DEFAULT_PRODUCER_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
 /// Default transaction timeout.
 pub const DEFAULT_PRODUCER_TRANSACTION_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -234,9 +236,8 @@ pub struct ProducerRetryPolicy {
     request_timeout: Duration,
     retries: i32,
     retry_backoff: Duration,
-    routing_retry_budget: Duration,
+    retry_backoff_max: Duration,
     init_retry_timeout: Duration,
-    init_max_backoff: Duration,
     transaction_timeout: Duration,
 }
 
@@ -246,15 +247,17 @@ impl ProducerRetryPolicy {
     /// # Errors
     ///
     /// Returns an error for non-positive durations, retry durations above
-    /// `i32::MAX` milliseconds, negative retries, protocol timeouts that are
-    /// not whole milliseconds, or an initial retry backoff above its cap.
+    /// `i32::MAX` milliseconds, negative retries, or protocol timeouts that are
+    /// not whole milliseconds.
+    ///
+    /// A `retry_backoff` above `retry_backoff_max` is valid. Kafka's
+    /// `ExponentialBackoff` then uses `retry_backoff_max` for every retry.
     pub fn new(
         request_timeout: Duration,
         retries: i32,
         retry_backoff: Duration,
-        routing_retry_budget: Duration,
+        retry_backoff_max: Duration,
         init_retry_timeout: Duration,
-        init_max_backoff: Duration,
         transaction_timeout: Duration,
     ) -> Result<Self, String> {
         let request_timeout = validated_protocol_duration(request_timeout, "request timeout")?;
@@ -262,28 +265,20 @@ impl ProducerRetryPolicy {
             .map_err(|error| format!("producer retries: {error}"))?
             .into_value();
         let retry_backoff = validated_duration(retry_backoff, "producer retry backoff")?;
-        let routing_retry_budget =
-            validated_duration(routing_retry_budget, "routing retry budget")?;
+        let retry_backoff_max =
+            validated_duration(retry_backoff_max, "producer retry backoff maximum")?;
         let init_retry_timeout = validated_duration(
             init_retry_timeout,
             "producer-ID initialization retry timeout",
         )?;
-        let init_max_backoff = validated_duration(
-            init_max_backoff,
-            "producer-ID initialization maximum backoff",
-        )?;
         let transaction_timeout =
             validated_protocol_duration(transaction_timeout, "transaction timeout")?;
-        if retry_backoff > init_max_backoff {
-            return Err("producer retry backoff exceeds producer-ID backoff cap".to_owned());
-        }
         Ok(Self {
             request_timeout,
             retries,
             retry_backoff,
-            routing_retry_budget,
+            retry_backoff_max,
             init_retry_timeout,
-            init_max_backoff,
             transaction_timeout,
         })
     }
@@ -304,18 +299,13 @@ impl ProducerRetryPolicy {
     }
 
     #[must_use]
-    pub const fn routing_retry_budget(self) -> Duration {
-        self.routing_retry_budget
-    }
-
-    #[must_use]
     pub const fn init_retry_timeout(self) -> Duration {
         self.init_retry_timeout
     }
 
     #[must_use]
-    pub const fn init_max_backoff(self) -> Duration {
-        self.init_max_backoff
+    pub const fn retry_backoff_max(self) -> Duration {
+        self.retry_backoff_max
     }
 
     #[must_use]
@@ -340,9 +330,8 @@ impl Default for ProducerRetryPolicy {
             DEFAULT_PRODUCER_REQUEST_TIMEOUT,
             DEFAULT_PRODUCER_RETRIES,
             DEFAULT_PRODUCER_RETRY_BACKOFF,
-            DEFAULT_PRODUCER_ROUTING_RETRY_BUDGET,
+            DEFAULT_PRODUCER_RETRY_BACKOFF_MAX,
             DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT,
-            DEFAULT_PRODUCER_INIT_MAX_BACKOFF,
             DEFAULT_PRODUCER_TRANSACTION_TIMEOUT,
         )
         .expect("default producer retry policy is valid")
@@ -353,6 +342,40 @@ fn validated_duration(value: Duration, name: &str) -> Result<Duration, String> {
     MinMaxU128::<1, { i32::MAX as u128 * 1_000_000 }>::new(value.as_nanos())
         .map(|_| value)
         .map_err(|error| format!("{name}: {error}"))
+}
+
+/// Give the delivery timeout, with the rule of Kafka's
+/// `KafkaProducer.configureDeliveryTimeout`.
+///
+/// The delivery timeout must be at least `linger + request_timeout`. When the
+/// application set it, a smaller value is an error. When it did not, a default
+/// smaller than that sum becomes the sum.
+///
+/// # Errors
+///
+/// Returns an error when the configured delivery timeout is out of range or
+/// smaller than `linger + request_timeout`.
+fn resolve_delivery_timeout(
+    delivery_timeout: Option<Duration>,
+    linger: Duration,
+    request_timeout: Duration,
+) -> Result<Duration, String> {
+    let smallest = linger
+        .saturating_add(request_timeout)
+        .min(Duration::from_millis(i32::MAX.unsigned_abs().into()));
+    match delivery_timeout {
+        Some(configured) => {
+            let configured = validated_duration(configured, "delivery timeout")?;
+            if configured < smallest {
+                return Err(
+                    "delivery_timeout should be equal to or larger than linger + request_timeout"
+                        .to_owned(),
+                );
+            }
+            Ok(configured)
+        }
+        None => Ok(DEFAULT_PRODUCER_DELIVERY_TIMEOUT.max(smallest)),
+    }
 }
 
 fn validated_protocol_duration(value: Duration, name: &str) -> Result<Duration, String> {
@@ -523,9 +546,9 @@ impl Producer {
         #[builder(default = DEFAULT_PRODUCER_FLUSH_TIMEOUT)] flush_timeout: Duration,
         #[builder(default = DEFAULT_PRODUCER_RETRIES)] retries: i32,
         #[builder(default = DEFAULT_PRODUCER_RETRY_BACKOFF)] retry_backoff: Duration,
-        #[builder(default = DEFAULT_PRODUCER_ROUTING_RETRY_BUDGET)] routing_retry_budget: Duration,
+        #[builder(default = DEFAULT_PRODUCER_RETRY_BACKOFF_MAX)] retry_backoff_max: Duration,
+        delivery_timeout: Option<Duration>,
         #[builder(default = DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT)] init_retry_timeout: Duration,
-        #[builder(default = DEFAULT_PRODUCER_INIT_MAX_BACKOFF)] init_max_backoff: Duration,
         #[builder(default = DEFAULT_PRODUCER_MAX_IN_FLIGHT)] max_in_flight_per_connection: usize,
         #[builder(default)]
         metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
@@ -576,18 +599,30 @@ impl Producer {
             request_timeout,
             retries,
             retry_backoff,
-            routing_retry_budget,
+            retry_backoff_max,
             init_retry_timeout,
-            init_max_backoff,
             transaction_timeout,
+        )
+        .map_err(ProducerError::InvalidConfig)?;
+        let delivery_timeout = resolve_delivery_timeout(
+            delivery_timeout,
+            throughput_policy.linger(),
+            retry_policy.request_timeout(),
         )
         .map_err(ProducerError::InvalidConfig)?;
         // The validated retry policy derives `Eq`, so it holds `Duration`s;
         // the domain past this point holds quantities.
         let request_timeout = retry_policy.request_timeout().as_time();
         let retries = retry_policy.retries();
-        let retry_backoff = retry_policy.retry_backoff();
-        let routing_retry_budget = retry_policy.routing_retry_budget();
+        let retry_backoff = sender::RetryBackoff::new(
+            retry_policy.retry_backoff(),
+            retry_policy.retry_backoff_max(),
+        );
+        // A coordinator retry starts at the first backoff of the same policy.
+        let first_backoff = retry_policy
+            .retry_backoff()
+            .min(retry_policy.retry_backoff_max())
+            .as_time();
         let flush_timeout =
             ProducerFlushTimeout::new(flush_timeout).map_err(ProducerError::InvalidConfig)?;
 
@@ -627,8 +662,8 @@ impl Producer {
                 &client,
                 build_init_producer_id_request(),
                 retry_policy.init_retry_timeout().as_time(),
-                retry_backoff.as_time(),
-                retry_policy.init_max_backoff().as_time(),
+                first_backoff,
+                retry_policy.retry_backoff_max().as_time(),
             )
             .await?;
             producer_identity_from_init(&init)?
@@ -666,8 +701,8 @@ impl Producer {
             linger,
             request_timeout_ms: retry_policy.request_timeout_ms(),
             retries,
-            retry_backoff: retry_backoff.as_time(),
-            routing_retry_budget: routing_retry_budget.as_time(),
+            retry_backoff,
+            delivery_timeout: delivery_timeout.as_time(),
             max_in_flight: max_in_flight_per_connection,
             metadata_cache: Arc::clone(&metadata_cache),
             partition_leaders: Arc::clone(&partition_leaders),
@@ -719,8 +754,8 @@ impl Producer {
             transaction_timeout_ms: retry_policy.transaction_timeout_ms(),
             two_phase_commit_enabled: transaction_two_phase_commit_enable,
             init_retry_timeout: retry_policy.init_retry_timeout().as_time(),
-            init_retry_backoff: retry_policy.retry_backoff().as_time(),
-            init_max_backoff: retry_policy.init_max_backoff().as_time(),
+            init_retry_backoff: first_backoff,
+            retry_backoff_max: retry_policy.retry_backoff_max().as_time(),
             txn_state,
             txn_recovery_required,
             txn_recovery_generation,
@@ -772,9 +807,8 @@ mod security_arg_tests {
                 defaults.request_timeout(),
                 defaults.retries(),
                 defaults.retry_backoff(),
-                defaults.routing_retry_budget(),
+                defaults.retry_backoff_max(),
                 defaults.init_retry_timeout(),
-                defaults.init_max_backoff(),
                 defaults.transaction_timeout(),
                 defaults.request_timeout_ms(),
                 defaults.transaction_timeout_ms(),
@@ -782,9 +816,8 @@ mod security_arg_tests {
                 Duration::from_secs(30),
                 i32::MAX,
                 Duration::from_millis(100),
-                Duration::from_secs(30),
-                Duration::from_secs(30),
                 Duration::from_secs(1),
+                Duration::from_secs(30),
                 Duration::from_mins(1),
                 30_000,
                 60_000,
@@ -797,7 +830,6 @@ mod security_arg_tests {
             Duration::from_millis(13),
             Duration::from_millis(14),
             Duration::from_millis(15),
-            Duration::from_millis(16),
             Duration::from_millis(17),
         )
         .expect("distinct policy");
@@ -806,9 +838,8 @@ mod security_arg_tests {
                 policy.request_timeout(),
                 policy.retries(),
                 policy.retry_backoff(),
-                policy.routing_retry_budget(),
+                policy.retry_backoff_max(),
                 policy.init_retry_timeout(),
-                policy.init_max_backoff(),
                 policy.transaction_timeout(),
                 policy.request_timeout_ms(),
                 policy.transaction_timeout_ms(),
@@ -818,7 +849,6 @@ mod security_arg_tests {
                 Duration::from_millis(13),
                 Duration::from_millis(14),
                 Duration::from_millis(15),
-                Duration::from_millis(16),
                 Duration::from_millis(17),
                 11,
                 17,
@@ -936,140 +966,58 @@ mod security_arg_tests {
 
     #[test]
     fn producer_retry_policy_rejects_invalid_bounds() {
-        let valid = [
-            Duration::from_millis(1),
-            Duration::from_millis(1),
-            Duration::from_millis(1),
-            Duration::from_millis(1),
-            Duration::from_millis(1),
-            Duration::from_millis(1),
-        ];
-        for (_name, request, retries, backoff, routing, init, max, transaction) in [
-            (
-                "zero request",
-                Duration::ZERO,
-                0,
-                valid[0],
-                valid[1],
-                valid[2],
-                valid[3],
-                valid[4],
-            ),
-            (
-                "negative retries",
-                valid[0],
-                -1,
-                valid[1],
-                valid[2],
-                valid[3],
-                valid[4],
-                valid[5],
-            ),
-            (
-                "zero backoff",
-                valid[0],
-                0,
-                Duration::ZERO,
-                valid[2],
-                valid[3],
-                valid[4],
-                valid[5],
-            ),
-            (
-                "zero routing",
-                valid[0],
-                0,
-                valid[1],
-                Duration::ZERO,
-                valid[3],
-                valid[4],
-                valid[5],
-            ),
-            (
-                "zero init",
-                valid[0],
-                0,
-                valid[1],
-                valid[2],
-                Duration::ZERO,
-                valid[4],
-                valid[5],
-            ),
-            (
-                "zero max",
-                valid[0],
-                0,
-                valid[1],
-                valid[2],
-                valid[3],
-                Duration::ZERO,
-                valid[5],
-            ),
-            (
-                "zero transaction",
-                valid[0],
-                0,
-                valid[1],
-                valid[2],
-                valid[3],
-                valid[4],
-                Duration::ZERO,
-            ),
-            (
-                "request protocol overflow",
-                Duration::from_millis(i32::MAX as u64 + 1),
-                0,
-                valid[1],
-                valid[2],
-                valid[3],
-                valid[4],
-                valid[5],
-            ),
+        let one = Duration::from_millis(1);
+        let zero = Duration::ZERO;
+        let overflow = Duration::from_millis(i32::MAX as u64 + 1);
+        let cases = [
+            ("zero request", zero, 0, one, one, one, one),
+            ("negative retries", one, -1, one, one, one, one),
+            ("zero backoff", one, 0, zero, one, one, one),
+            ("zero backoff maximum", one, 0, one, zero, one, one),
+            ("zero init", one, 0, one, one, zero, one),
+            ("zero transaction", one, 0, one, one, one, zero),
+            ("request protocol overflow", overflow, 0, one, one, one, one),
             (
                 "transaction protocol overflow",
-                valid[0],
+                one,
                 0,
-                valid[1],
-                valid[2],
-                valid[3],
-                valid[4],
-                Duration::from_millis(i32::MAX as u64 + 1),
+                one,
+                one,
+                one,
+                overflow,
             ),
             (
-                "initial exceeds max",
-                valid[0],
+                "backoff maximum overflow",
+                one,
                 0,
-                Duration::from_millis(2),
-                valid[2],
-                valid[3],
-                Duration::from_millis(1),
-                valid[5],
-            ),
-        ] {
-            assert2::assert!(
-                ProducerRetryPolicy::new(
-                    request,
-                    retries,
-                    backoff,
-                    routing,
-                    init,
-                    max,
-                    transaction,
-                )
-                .is_err()
-            );
-        }
-        assert2::assert!(
-            ProducerRetryPolicy::new(
-                valid[0],
-                0,
-                valid[1],
+                one,
                 Duration::MAX,
-                valid[3],
-                valid[4],
-                valid[5],
+                one,
+                one,
+            ),
+        ];
+        let rejected = cases
+            .iter()
+            .map(
+                |&(name, request, retries, backoff, max, init, transaction)| {
+                    (
+                        name,
+                        ProducerRetryPolicy::new(request, retries, backoff, max, init, transaction)
+                            .is_err(),
+                    )
+                },
             )
-            .is_err()
+            .collect::<Vec<_>>();
+        let expected = cases
+            .iter()
+            .map(|&(name, ..)| (name, true))
+            .collect::<Vec<_>>();
+        assert2::assert!(rejected == expected);
+
+        // Kafka's `ExponentialBackoff` accepts an initial backoff above the
+        // maximum, and uses the maximum.
+        assert2::assert!(
+            ProducerRetryPolicy::new(one, 0, Duration::from_millis(2), one, one, one).is_ok()
         );
     }
 
@@ -1077,20 +1025,88 @@ mod security_arg_tests {
     fn producer_retry_policy_names_invalid_retry_duration() {
         let valid = Duration::from_millis(1);
         let oversized = Duration::from_millis(i32::MAX as u64 + 1);
-        let error = |backoff, routing, init, max| {
-            ProducerRetryPolicy::new(valid, 0, backoff, routing, init, max, valid)
+        let error = |backoff, max, init| {
+            ProducerRetryPolicy::new(valid, 0, backoff, max, init, valid)
                 .expect_err("invalid retry duration")
         };
 
-        assert!(error(oversized, valid, valid, valid).contains("producer retry backoff"));
-        assert!(error(valid, oversized, valid, valid).contains("routing retry budget"));
-        assert!(
-            error(valid, valid, oversized, valid)
-                .contains("producer-ID initialization retry timeout")
+        let messages = [
+            error(oversized, valid, valid),
+            error(valid, oversized, valid),
+            error(valid, valid, oversized),
+        ]
+        .map(|message| message.split(':').next().unwrap_or_default().to_owned());
+        assert2::assert!(
+            messages
+                == [
+                    "producer retry backoff",
+                    "producer retry backoff maximum",
+                    "producer-ID initialization retry timeout",
+                ]
         );
-        assert!(
-            error(valid, valid, valid, oversized)
-                .contains("producer-ID initialization maximum backoff")
+    }
+
+    /// Kafka's `KafkaProducer.configureDeliveryTimeout` requires
+    /// `delivery.timeout.ms >= linger.ms + request.timeout.ms`. A configured
+    /// value below it is an error, and the default grows to it.
+    #[test]
+    fn delivery_timeout_follows_kafka_rule() {
+        let ms = Duration::from_millis;
+        let rule = "delivery_timeout should be equal to or larger than linger + request_timeout";
+        let cases = [
+            ("default", None, ms(5), ms(30_000), Ok(ms(120_000))),
+            (
+                "configured equal",
+                Some(ms(30_005)),
+                ms(5),
+                ms(30_000),
+                Ok(ms(30_005)),
+            ),
+            (
+                "configured below",
+                Some(ms(30_004)),
+                ms(5),
+                ms(30_000),
+                Err(rule.to_owned()),
+            ),
+            ("default below", None, ms(5), ms(200_000), Ok(ms(200_005))),
+            (
+                "sum above i32 range",
+                None,
+                ms(i32::MAX as u64),
+                ms(i32::MAX as u64),
+                Ok(ms(i32::MAX as u64)),
+            ),
+        ];
+        let actual = cases
+            .iter()
+            .map(|(name, configured, linger, request, _)| {
+                (
+                    *name,
+                    resolve_delivery_timeout(*configured, *linger, *request),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = cases
+            .into_iter()
+            .map(|(name, .., want)| (name, want))
+            .collect::<Vec<_>>();
+        assert2::assert!(actual == expected);
+    }
+
+    #[tokio::test]
+    async fn producer_builder_rejects_delivery_timeout_below_linger_and_request_timeout() {
+        let error = Producer::builder()
+            .bootstrap("127.0.0.1:1")
+            .linger(Duration::from_millis(5))
+            .request_timeout(Duration::from_secs(1))
+            .delivery_timeout(Duration::from_millis(1_004))
+            .build()
+            .await
+            .expect_err("delivery timeout below linger + request timeout");
+        assert2::assert!(
+            error.to_string()
+                == "invalid config: delivery_timeout should be equal to or larger than linger + request_timeout"
         );
     }
 
@@ -1231,7 +1247,7 @@ mod security_arg_tests {
             .bootstrap(mock.addr.to_string())
             .request_timeout(Duration::from_millis(100))
             .retry_backoff(Duration::from_millis(10))
-            .init_max_backoff(Duration::from_millis(10))
+            .retry_backoff_max(Duration::from_millis(10))
             .init_retry_timeout(Duration::from_millis(100))
             .build();
         let error = tokio::time::timeout(Duration::from_millis(500), build)
@@ -1418,7 +1434,7 @@ mod security_arg_tests {
             .bootstrap(mock.addr.to_string())
             .request_timeout(Duration::from_secs(5))
             .retry_backoff(Duration::from_millis(1))
-            .init_max_backoff(Duration::from_millis(1))
+            .retry_backoff_max(Duration::from_millis(1))
             .init_retry_timeout(Duration::from_millis(10))
             .build();
         let error = tokio::time::timeout(Duration::from_millis(200), build)
@@ -1463,16 +1479,16 @@ mod security_arg_tests {
                 format!("invalid config: producer retry backoff: {zero}"),
             ),
             (
-                invalid!(routing_retry_budget, Duration::ZERO),
-                format!("invalid config: routing retry budget: {zero}"),
+                invalid!(delivery_timeout, Duration::ZERO),
+                format!("invalid config: delivery timeout: {zero}"),
             ),
             (
                 invalid!(init_retry_timeout, Duration::ZERO),
                 format!("invalid config: producer-ID initialization retry timeout: {zero}"),
             ),
             (
-                invalid!(init_max_backoff, Duration::ZERO),
-                format!("invalid config: producer-ID initialization maximum backoff: {zero}"),
+                invalid!(retry_backoff_max, Duration::ZERO),
+                format!("invalid config: producer retry backoff maximum: {zero}"),
             ),
             (
                 invalid!(transaction_timeout, Duration::ZERO),

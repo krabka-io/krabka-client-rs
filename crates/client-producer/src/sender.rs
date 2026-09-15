@@ -46,10 +46,12 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    hash::{BuildHasher as _, RandomState},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use dashmap::DashMap;
@@ -195,8 +197,12 @@ pub(crate) struct SenderConfig {
     pub linger: Time,
     pub request_timeout_ms: i32,
     pub retries: i32,
-    pub retry_backoff: Time,
-    pub routing_retry_budget: Time,
+    /// The wait before each resend of a batch. See [`RetryBackoff`].
+    pub retry_backoff: RetryBackoff,
+    /// The time from the creation of a batch to its failure with
+    /// [`ProducerError::SendTimeout`], when no send acknowledged it. Kafka's
+    /// `delivery.timeout.ms`.
+    pub delivery_timeout: Time,
     /// Maximum number of Produce requests fired **concurrently per drain
     /// cycle**, across all partitions. This is the cross-partition, or
     /// per-connection, pipelining bound, which Kafka calls
@@ -276,6 +282,76 @@ struct Schedule {
     settled: bool,
 }
 
+/// The multiplier of each retry backoff step. Kafka's
+/// `CommonClientConfigs.RETRY_BACKOFF_EXP_BASE`.
+const RETRY_BACKOFF_EXP_BASE: f64 = 2.0;
+/// The random spread of a retry backoff. Kafka's
+/// `CommonClientConfigs.RETRY_BACKOFF_JITTER`.
+const RETRY_BACKOFF_JITTER: f64 = 0.2;
+
+/// The retry backoff of Kafka's `ExponentialBackoff`, with the settings that
+/// `RecordAccumulator` gives it.
+///
+/// The backoff after `attempts` earlier retries is
+/// `initial * 2^attempts * random(0.8, 1.2)`, and never more than `max`. When
+/// `max` is not more than `initial`, the backoff is `max` with no jitter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetryBackoff {
+    initial: Duration,
+    max: Duration,
+}
+
+impl RetryBackoff {
+    /// Kafka's `ExponentialBackoff` uses the smaller of `initial` and `max` as
+    /// the first interval.
+    pub(crate) fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            initial: initial.min(max),
+            max,
+        }
+    }
+
+    /// The backoff after `attempts` earlier retries. `unit` is a random value
+    /// from 0 (inclusive) to 1 (exclusive), which picks the jitter factor.
+    fn backoff(self, attempts: u32, unit: f64) -> Duration {
+        if self.max <= self.initial {
+            return self.initial;
+        }
+        // Kafka counts in whole milliseconds and divides by `max(initial, 1)`.
+        // This backoff accepts a sub-millisecond initial interval, so it
+        // divides by the interval itself, and only a zero interval takes the
+        // smallest unit.
+        let smallest = self.initial.max(Duration::from_nanos(1));
+        let exp_max =
+            (self.max.as_secs_f64() / smallest.as_secs_f64()).ln() / RETRY_BACKOFF_EXP_BASE.ln();
+        let exp = f64::from(attempts).min(exp_max);
+        let factor = 1.0 - RETRY_BACKOFF_JITTER + 2.0 * RETRY_BACKOFF_JITTER * unit;
+        let value = self.initial.as_secs_f64() * RETRY_BACKOFF_EXP_BASE.powf(exp) * factor;
+        Duration::try_from_secs_f64(value).map_or(self.max, |backoff| backoff.min(self.max))
+    }
+}
+
+/// A random value from 0 (inclusive) to 1 (exclusive) for the backoff jitter.
+///
+/// Each `RandomState` has new random keys, so its hash of a fixed value is a
+/// random number. This needs no extra dependency.
+fn jitter_unit() -> f64 {
+    let bits = RandomState::new().hash_one(0_u8) >> 32;
+    f64::from(u32::try_from(bits).unwrap_or(u32::MAX)) / 4_294_967_296.0
+}
+
+/// The instant a batch created at `created_at` reaches the delivery timeout,
+/// or `None` when that instant is out of range.
+fn delivery_deadline(created_at: Instant, delivery_timeout: Time) -> Option<Instant> {
+    created_at.checked_add(delivery_timeout.to_std())
+}
+
+/// Kafka's `ProducerBatch.hasReachedDeliveryTimeout`:
+/// `deliveryTimeoutMs <= now - createdMs`.
+fn reached_delivery_timeout(created_at: Instant, delivery_timeout: Time, now: Instant) -> bool {
+    delivery_deadline(created_at, delivery_timeout).is_some_and(|deadline| deadline <= now)
+}
+
 fn include_deadline(schedule: &mut Schedule, deadline: Instant, now: Instant) {
     if deadline <= now {
         schedule.immediate = true;
@@ -298,21 +374,9 @@ async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Sch
             schedule.immediate = true;
             continue;
         }
-        let Some(first_sent) = batch.first_sent else {
-            if let Some(backoff_until) = batch.backoff_until {
-                include_deadline(&mut schedule, backoff_until, now);
-            } else {
-                schedule.immediate = true;
-            }
-            continue;
-        };
-        include_deadline(
-            &mut schedule,
-            first_sent
-                .checked_add(cfg.routing_retry_budget.to_std())
-                .unwrap_or(now),
-            now,
-        );
+        if let Some(deadline) = delivery_deadline(batch.created_at, cfg.delivery_timeout) {
+            include_deadline(&mut schedule, deadline, now);
+        }
         if let Some(backoff_until) = batch.backoff_until {
             include_deadline(&mut schedule, backoff_until, now);
         } else {
@@ -343,6 +407,16 @@ async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Sch
             continue;
         }
         schedule.settled = false;
+        // The oldest batch of the partition reaches the delivery timeout
+        // first, also while the partition waits for its resend.
+        if let Some(deadline) = accumulator
+            .ready
+            .front()
+            .or(accumulator.current.as_ref())
+            .and_then(|batch| delivery_deadline(batch.first_append_at, cfg.delivery_timeout))
+        {
+            include_deadline(&mut schedule, deadline, now);
+        }
         let has_recovery_invalid =
             accumulator.current.as_ref().is_some_and(|batch| {
                 batch_crosses_recovery_barrier(cfg, batch.transaction_generation)
@@ -464,11 +538,9 @@ struct PreparedBatch {
     base_sequence: i32,
     record_batch: RecordBatch,
     records: Vec<PendingRecord>,
-    /// Wall-clock time the batch was first handed to the transport. The sender
-    /// sets it on the first send and keeps it across resends, so it measures
-    /// the routing retry budget from the first attempt, not from the most
-    /// recent one. A batch that keeps failing to route gives up by about 30s.
-    first_sent: Option<Instant>,
+    /// The time the first record went into the batch. The delivery timeout
+    /// counts from it, as Kafka's `ProducerBatch.createdMs`.
+    created_at: Instant,
     /// When `Some`, the batch must not be resent until this instant after a
     /// transport failure, missing response, or retriable/routing broker
     /// response. This prevents failed sends from hot-looping the drain
@@ -476,8 +548,11 @@ struct PreparedBatch {
     backoff_until: Option<Instant>,
     /// Resends already admitted after the initial send.
     retries_used: i32,
+    /// Backoffs already taken. The next backoff grows with it, as Kafka's
+    /// `ProducerBatch.attempts`.
+    backoff_attempts: u32,
     /// Why the last send did not ack the batch. It becomes the error of the
-    /// records when the retries or the routing budget run out.
+    /// records when the retries or the delivery timeout ends.
     last_failure: Option<SendFailure>,
     transaction_generation: Option<u64>,
 }
@@ -524,7 +599,7 @@ impl SendFailure {
 /// `in_flight` accounting works like this. `fetch_add` runs only when a NEW
 /// batch is drained from an accumulator, because resends were counted when they
 /// were first drained. `fetch_sub` runs only when a batch reaches a terminal
-/// outcome: an ack, a terminal failure, a fence, or an exhausted routing budget.
+/// outcome: an ack, a terminal failure, a fence, or a reached delivery timeout.
 /// `flush_notify` wakes when `in_flight` hits zero, and when there is nothing to
 /// send.
 #[tracing::instrument(
@@ -542,15 +617,16 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
     // 1. Fail undrained batches that crossed transaction recovery, then process
     //    resends: each partition's single failed batch must precede any new
     //    batch for that partition. `collect_retries` drains the retry slots
-    //    and returns batches whose routing budget elapsed, which we fail here
+    //    and returns batches that reached the delivery timeout, which we fail here
     //    (their in-flight slot was counted at first drain, so `finish_in_flight`
     //    once).
     fail_recovered_accumulator_batches(cfg).await;
     fail_recovered_retry_slots(cfg, &mut state.retry);
+    fail_expired_accumulator_batches(cfg, now).await;
     let (mut to_send, expired) = collect_retries(
         &mut state.retry,
         now,
-        cfg.routing_retry_budget,
+        cfg.delivery_timeout,
         cfg.max_in_flight,
     );
     if !expired.is_empty() {
@@ -627,8 +703,7 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
             finish_in_flight(cfg);
             continue;
         }
-        let mut pb = prepare_batch(cfg, &key.0, key.1, batch).await;
-        pb.first_sent = Some(now);
+        let pb = prepare_batch(cfg, &key.0, key.1, batch).await;
         occupied.insert(key);
         to_send.push(pb);
     }
@@ -643,8 +718,8 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
     send_batches(cfg, state, to_send).await;
 }
 
-/// Fail every batch whose routing budget ended, and park the rest of this
-/// cycle's send list for the next cycle.
+/// Fail every batch that reached the delivery timeout, and park the rest of
+/// this cycle's send list for the next cycle.
 ///
 /// Kafka's `Sender.sendProducerData` fails an expired batch with a
 /// `TimeoutException` and calls `TransactionManager.handleFailedBatch`, which
@@ -670,7 +745,7 @@ fn expire_batches(
             topic = %pb.topic,
             partition = pb.partition,
             base_sequence = pb.base_sequence,
-            "the routing retry budget of the batch ended; failing its records",
+            "the batch reached the delivery timeout; failing its records",
         );
         failed.push(pb);
     }
@@ -706,22 +781,69 @@ fn expire_batches(
     }
 }
 
+/// Fail the batches in the accumulators that reached the delivery timeout
+/// before the sender drained them.
+///
+/// Kafka's `RecordAccumulator.expiredBatches` takes the batches at the front
+/// of each partition queue while they reached the delivery timeout, and
+/// `Sender.failExpiredBatches` fails them with a `TimeoutException`. These
+/// batches have no sequence yet, so no sequence repair applies. A batch of a
+/// transaction moves the transaction to the abortable error, as
+/// `TransactionManager.handleFailedBatch` does.
+async fn fail_expired_accumulator_batches(cfg: &SenderConfig, now: Instant) {
+    let accumulators = cfg
+        .accumulators
+        .iter()
+        .map(|entry| Arc::clone(entry.value()))
+        .collect::<Vec<_>>();
+    let mut expired = Vec::new();
+    for accumulator in accumulators {
+        let mut accumulator = accumulator.lock().await;
+        while accumulator.ready.front().is_some_and(|batch| {
+            reached_delivery_timeout(batch.first_append_at, cfg.delivery_timeout, now)
+        }) {
+            expired.extend(accumulator.ready.pop_front());
+        }
+        if accumulator.ready.is_empty()
+            && accumulator.current.as_ref().is_some_and(|batch| {
+                !batch.is_empty()
+                    && reached_delivery_timeout(batch.first_append_at, cfg.delivery_timeout, now)
+            })
+        {
+            expired.extend(accumulator.current.take());
+        }
+    }
+    if expired.is_empty() {
+        return;
+    }
+    for batch in expired {
+        tracing::warn!(
+            records = batch.records.len(),
+            "a batch reached the delivery timeout before its first send; failing its records",
+        );
+        if batch.transaction_generation.is_some() {
+            cfg.txn_abortable_error.set_timeout();
+        }
+        fail_batch(batch.records, ProducerError::SendTimeout);
+    }
+    cfg.flush_notify.notify_waiters();
+}
+
 /// Drain the per-partition retry slots into an ordered send list, in the
 /// one-slot model.
 ///
 /// Each partition holds **at most one** failed batch that awaits a verbatim
-/// resend. A batch whose routing budget has elapsed, measured from its first
-/// send, goes into `expired`, and the caller fails it instead of resending it.
-/// Every resent batch keeps its allocated `base_sequence` and its bytes, and the
-/// broker dedups a re-landed write with `DUPLICATE_SEQUENCE_NUMBER`. If
-/// `first_sent` is unset, this function initializes it defensively.
+/// resend. A batch that reached the delivery timeout, measured from its
+/// creation, goes into `expired`, and the caller fails it instead of resending
+/// it. Every resent batch keeps its allocated `base_sequence` and its bytes,
+/// and the broker dedups a re-landed write with `DUPLICATE_SEQUENCE_NUMBER`.
 ///
 /// The function is pure over the retry map, with no `Client` and no I/O, so the
-/// budget-expiry logic is unit-testable without a broker.
+/// expiry logic is unit-testable without a broker.
 fn collect_retries(
     retry: &mut HashMap<(String, i32), PreparedBatch>,
     now: Instant,
-    routing_retry_budget: Time,
+    delivery_timeout: Time,
     max_to_send: usize,
 ) -> (Vec<PreparedBatch>, Vec<PreparedBatch>) {
     let mut to_send: Vec<PreparedBatch> = Vec::new();
@@ -731,10 +853,7 @@ fn collect_retries(
     let mut parked: Vec<((String, i32), PreparedBatch)> = Vec::new();
 
     for (key, mut pb) in retry.drain() {
-        if pb
-            .first_sent
-            .is_some_and(|t| now.duration_since(t).as_time() >= routing_retry_budget)
-        {
+        if reached_delivery_timeout(pb.created_at, delivery_timeout, now) {
             expired.push(pb);
             continue;
         }
@@ -749,9 +868,6 @@ fn collect_retries(
         if to_send.len() >= max_to_send {
             parked.push((key, pb));
             continue;
-        }
-        if pb.first_sent.is_none() {
-            pb.first_sent = Some(now);
         }
         pb.backoff_until = None;
         to_send.push(pb);
@@ -1031,9 +1147,10 @@ async fn prepare_batch(
         base_sequence,
         record_batch,
         records: batch.records,
-        first_sent: None,
+        created_at: batch.first_append_at,
         backoff_until: None,
         retries_used: 0,
+        backoff_attempts: 0,
         last_failure: None,
         transaction_generation: batch.transaction_generation,
     }
@@ -1405,8 +1522,8 @@ async fn split_and_requeue(cfg: &SenderConfig, pb: PreparedBatch, epoch_bumped: 
         let mut accumulator = accumulator.lock().await;
         // The front of the queue takes the parts in reverse, so the first part
         // ends up first.
-        accumulator.push_front(second, pb.transaction_generation);
-        accumulator.push_front(records, pb.transaction_generation);
+        accumulator.push_front(second, pb.transaction_generation, pb.created_at);
+        accumulator.push_front(records, pb.transaction_generation, pb.created_at);
     }
     // The batch itself is no longer in flight. Each part counts itself when
     // the sender drains it.
@@ -1456,12 +1573,15 @@ fn fence(cfg: &SenderConfig, state: &mut PipelineState, to_fail: Vec<PreparedBat
     }
 }
 
-/// The instant a transport-failed batch becomes eligible to resend, that is
-/// `now` plus the configured `retry_backoff`. It is a separate function so that
-/// the offset direction is unit-testable: the deadline must be in the
-/// *future*.
-fn backoff_deadline(now: Instant, retry_backoff: Time) -> Instant {
-    now.checked_add(retry_backoff.to_std()).unwrap_or(now)
+/// Park `pb` until its next backoff ends, and count the backoff.
+///
+/// Kafka's `RecordAccumulator` holds a retried batch back for
+/// `ExponentialBackoff.backoff(attempts - 1)` after `ProducerBatch.reenqueued`
+/// counts the attempt.
+fn back_off(pb: &mut PreparedBatch, retry_backoff: RetryBackoff, now: Instant) {
+    let backoff = retry_backoff.backoff(pb.backoff_attempts, jitter_unit());
+    pb.backoff_until = Some(now.checked_add(backoff).unwrap_or(now));
+    pb.backoff_attempts = pb.backoff_attempts.saturating_add(1);
 }
 
 /// Send a single batch as its own single-partition `ProduceRequest`, and
@@ -1543,7 +1663,7 @@ async fn send_one_batch(
                     error = %error,
                     "acks=0 produce enqueue failed; will re-route",
                 );
-                pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+                back_off(&mut pb, cfg.retry_backoff, Instant::now());
                 pb.last_failure = Some(SendFailure::Transport);
                 BatchSendResult {
                     pb,
@@ -1572,7 +1692,7 @@ async fn send_one_batch(
             );
             // Park the batch for a verbatim resend after backoff, and refresh
             // metadata so the resend targets the current leader.
-            pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+            back_off(&mut pb, cfg.retry_backoff, Instant::now());
             pb.last_failure = Some(SendFailure::Transport);
             return BatchSendResult {
                 pb,
@@ -1617,7 +1737,7 @@ fn interpret_response(
             base_sequence = pb.base_sequence,
             "produce response carried no matching partition; resending"
         );
-        pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+        back_off(&mut pb, cfg.retry_backoff, Instant::now());
         pb.last_failure = Some(SendFailure::Transport);
         return BatchSendResult {
             pb,
@@ -1661,7 +1781,7 @@ fn interpret_response(
                     | BatchVerdict::BumpEpochAndRetry
                     | BatchVerdict::RestartSequenceAndRetry
             ) {
-                pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+                back_off(&mut pb, cfg.retry_backoff, Instant::now());
                 pb.last_failure = Some(SendFailure::Code(answer.error_code));
             }
             BatchSendResult {
@@ -1688,7 +1808,7 @@ fn interpret_response(
             // starve the reconcile that would make the partition writable —
             // leaving the producer stuck (observed: traces/logs WAL never advances
             // on some cold boots). Backing off lets the partition become ready.
-            pb.backoff_until = Some(backoff_deadline(Instant::now(), cfg.retry_backoff));
+            back_off(&mut pb, cfg.retry_backoff, Instant::now());
             pb.last_failure = Some(SendFailure::Code(part_resp.error_code));
             BatchSendResult {
                 pb,
@@ -1987,7 +2107,7 @@ mod tests {
         topic: &str,
         partition: i32,
         base_sequence: i32,
-        first_sent: Option<Instant>,
+        created_at: Instant,
     ) -> (
         PreparedBatch,
         oneshot::Receiver<Result<RecordMetadata, ProducerError>>,
@@ -2019,9 +2139,10 @@ mod tests {
                 records: Vec::new(),
             },
             records: vec![record],
-            first_sent,
+            created_at,
             backoff_until: None,
             retries_used: 0,
+            backoff_attempts: 0,
             last_failure: None,
             transaction_generation: None,
         };
@@ -2275,14 +2396,14 @@ mod tests {
     #[test]
     fn collect_retries_splits_expired_and_drains_map() {
         // Two partitions, each holding one retry batch (one slot per partition).
-        // The batch past its routing budget is split off as expired; the recent
+        // The batch past its delivery timeout is split off as expired; the recent
         // one is returned to send. The map is fully drained either way.
         let mut retry: HashMap<(String, i32), PreparedBatch> = HashMap::new();
         let long_ago = Instant::now()
             .checked_sub(Duration::from_secs(31))
             .expect("instant in range");
-        let (old, _rx_old) = prepared("t", 0, 0, Some(long_ago));
-        let (recent, _rx_recent) = prepared("t", 1, 16, Some(Instant::now()));
+        let (old, _rx_old) = prepared("t", 0, 0, long_ago);
+        let (recent, _rx_recent) = prepared("t", 1, 16, Instant::now());
         retry.insert(("t".to_string(), 0), old);
         retry.insert(("t".to_string(), 1), recent);
 
@@ -2307,8 +2428,8 @@ mod tests {
             .expect("instant in range");
         let mut retry = HashMap::new();
         for partition in 0..5 {
-            let first_sent = Some(if partition == 4 { long_ago } else { now });
-            let (batch, _rx) = prepared("t", partition, partition * 16, first_sent);
+            let created_at = if partition == 4 { long_ago } else { now };
+            let (batch, _rx) = prepared("t", partition, partition * 16, created_at);
             retry.insert(("t".to_owned(), partition), batch);
         }
 
@@ -2321,37 +2442,30 @@ mod tests {
 
     #[test]
     fn retry_count_exhausts_after_configured_resends() {
-        let (mut batch, _rx) = prepared("t", 0, 0, None);
+        let (mut batch, _rx) = prepared("t", 0, 0, Instant::now());
 
         assert2::assert!(!take_retry(&mut batch, 1));
         assert2::assert!(take_retry(&mut batch, 1));
     }
 
+    /// `ProducerBatch.hasReachedDeliveryTimeout` is
+    /// `deliveryTimeoutMs <= now - createdMs`, so a batch expires exactly at
+    /// the timeout.
     #[test]
-    fn routing_budget_uses_configured_duration() {
-        let mut retry = HashMap::new();
+    fn delivery_timeout_uses_configured_duration() {
         let now = Instant::now();
-        let first_sent = now
-            .checked_sub(Duration::from_millis(11))
-            .expect("instant in range");
-        let (old, _rx) = prepared("t", 0, 0, Some(first_sent));
-        retry.insert(("t".to_owned(), 0), old);
+        let collect = |age: u64| {
+            let mut retry = HashMap::new();
+            let created_at = now
+                .checked_sub(Duration::from_millis(age))
+                .expect("instant in range");
+            let (batch, _rx) = prepared("t", 0, 0, created_at);
+            retry.insert(("t".to_owned(), 0), batch);
+            let (to_send, expired) = collect_retries(&mut retry, now, millis(10), usize::MAX);
+            (age, to_send.len(), expired.len())
+        };
 
-        let (to_send, expired) = collect_retries(&mut retry, now, millis(10), usize::MAX);
-
-        assert2::assert!((to_send.len(), expired.len()) == (0, 1));
-    }
-
-    #[test]
-    fn collect_retries_sets_first_sent_when_unset() {
-        let mut retry: HashMap<(String, i32), PreparedBatch> = HashMap::new();
-        let (pb, _rx) = prepared("t", 0, 0, None);
-        retry.insert(("t".to_string(), 0), pb);
-
-        let now = Instant::now();
-        let (to_send, expired) = collect_retries(&mut retry, now, secs(30), usize::MAX);
-
-        check!((expired.is_empty(), to_send.len(), to_send[0].first_sent) == (true, 1, Some(now)));
+        assert2::assert!([9, 10, 11].map(collect) == [(9, 1, 0), (10, 0, 1), (11, 0, 1)]);
     }
 
     #[test]
@@ -2368,7 +2482,7 @@ mod tests {
         // backing off until `now + backoff`.
         let collect_after = |elapsed: Duration| -> (usize, usize) {
             let mut retry: HashMap<(String, i32), PreparedBatch> = HashMap::new();
-            let (mut pb, _rx) = prepared("t", 0, 0, Some(now));
+            let (mut pb, _rx) = prepared("t", 0, 0, now);
             pb.backoff_until = Some(now + backoff);
             retry.insert(("t".to_string(), 0), pb);
             let (to_send, expired) =
@@ -2390,14 +2504,55 @@ mod tests {
         }
     }
 
+    /// Kafka's `ExponentialBackoff.backoff`, with `retry.backoff.ms` 100,
+    /// `retry.backoff.max.ms` 1000, base 2 and jitter 0.2. The lowest random
+    /// value gives the factor 0.8, and the middle value gives 1.0.
     #[test]
-    fn backoff_deadline_is_in_the_future() {
-        // The resend deadline must be `now + retry_backoff` — strictly after
-        // `now`. A `+` -> `-` (deadline in the past) would disable the backoff
-        // and re-admit the connection-refused hot loop.
-        let now = Instant::now();
-        let d = millis(100);
-        assert2::assert!(backoff_deadline(now, d) == now + d.to_std());
+    fn retry_backoff_matches_kafka_exponential_backoff() {
+        let ms = Duration::from_millis;
+        let policy = RetryBackoff::new(ms(100), ms(1000));
+        let cases = [
+            (0, 0.0, ms(80)),
+            (0, 0.5, ms(100)),
+            (1, 0.5, ms(200)),
+            (2, 0.0, ms(320)),
+            (3, 0.5, ms(800)),
+            (4, 0.0, ms(800)),
+            (4, 0.5, ms(1000)),
+            (30, 0.999, ms(1000)),
+        ];
+        let actual =
+            cases.map(|(attempts, unit, _)| (attempts, policy.backoff(attempts, unit).as_millis()));
+        let expected = cases.map(|(attempts, _, want)| (attempts, want.as_millis()));
+        assert2::assert!(actual == expected);
+
+        // A maximum at or below the initial backoff gives a constant backoff
+        // of the maximum, with no jitter.
+        let constant = RetryBackoff::new(ms(100), ms(50));
+        assert2::assert!(
+            [0, 5].map(|attempts| constant.backoff(attempts, 0.0)) == [ms(50), ms(50)]
+        );
+
+        // A sub-millisecond initial backoff grows from its own value up to the
+        // maximum.
+        let us = Duration::from_micros;
+        let small = RetryBackoff::new(us(500), us(750));
+        assert2::assert!(
+            [(0, 0.5), (1, 0.0), (5, 0.999)]
+                .map(|(attempts, unit)| small.backoff(attempts, unit).as_micros())
+                == [500, 600, 750]
+        );
+    }
+
+    #[test]
+    fn jitter_unit_is_in_the_unit_interval() {
+        let units = (0..1000).map(|_| jitter_unit()).collect::<Vec<_>>();
+        assert2::assert!(units.iter().all(|unit| (0.0..1.0).contains(unit)));
+        assert2::assert!(
+            units
+                .iter()
+                .any(|unit| (unit - units[0]).abs() > f64::EPSILON)
+        );
     }
 
     #[test]
@@ -2575,6 +2730,8 @@ mod harness {
         offsets_seen: AtomicI64,
         /// Calls made through the dedicated one-way Produce transport path.
         no_response_sends: AtomicUsize,
+        /// The instant of every `send_produce` call, in order.
+        sent_at: StdMutex<Vec<Instant>>,
     }
 
     /// A one-shot synthesized broker response, keyed by `base_sequence`. A
@@ -2627,7 +2784,12 @@ mod harness {
                 refreshes: AtomicUsize::new(0),
                 offsets_seen: AtomicI64::new(0),
                 no_response_sends: AtomicUsize::new(0),
+                sent_at: StdMutex::new(Vec::new()),
             })
+        }
+
+        fn sent_at(self: &Arc<Self>) -> Vec<Instant> {
+            self.sent_at.lock().unwrap().clone()
         }
 
         fn fail_once_on(self: &Arc<Self>, seq: i32) {
@@ -2819,6 +2981,7 @@ mod harness {
             self.peak_active_sends.fetch_max(active, Ordering::AcqRel);
             let _active_send = ActiveSend(&self.active_sends);
             self.sent_leaders.lock().unwrap().push(leader);
+            self.sent_at.lock().unwrap().push(Instant::now());
             self.sent_topic_ids
                 .lock()
                 .unwrap()
@@ -3019,14 +3182,14 @@ mod harness {
         max_in_flight: usize,
         linger: Time,
         retries: i32,
-        routing_retry_budget: Time,
+        delivery_timeout: Time,
     ) -> Harness {
         spawn_sender_with_acks(
             transport,
             max_in_flight,
             linger,
             retries,
-            routing_retry_budget,
+            delivery_timeout,
             Acks::All,
         )
     }
@@ -3036,7 +3199,7 @@ mod harness {
         max_in_flight: usize,
         linger: Time,
         retries: i32,
-        routing_retry_budget: Time,
+        delivery_timeout: Time,
         acks: Acks,
     ) -> Harness {
         spawn_sender_full(
@@ -3044,7 +3207,7 @@ mod harness {
             max_in_flight,
             linger,
             retries,
-            routing_retry_budget,
+            delivery_timeout,
             acks,
             BatchMode::Idempotent,
         )
@@ -3068,10 +3231,65 @@ mod harness {
         max_in_flight: usize,
         linger: Time,
         retries: i32,
-        routing_retry_budget: Time,
+        delivery_timeout: Time,
         acks: Acks,
         mode: BatchMode,
     ) -> Harness {
+        spawn_sender_policy(
+            transport,
+            HarnessPolicy {
+                max_in_flight,
+                linger,
+                retries,
+                delivery_timeout,
+                acks,
+                mode,
+                ..HarnessPolicy::default()
+            },
+        )
+    }
+
+    /// The sender settings of a harness.
+    #[derive(Clone, Copy)]
+    struct HarnessPolicy {
+        max_in_flight: usize,
+        linger: Time,
+        retries: i32,
+        delivery_timeout: Time,
+        retry_backoff: Time,
+        /// The default equals `retry_backoff`, so the backoff is constant
+        /// with no jitter, and paused-time tests see exact instants.
+        retry_backoff_max: Time,
+        acks: Acks,
+        mode: BatchMode,
+    }
+
+    impl Default for HarnessPolicy {
+        fn default() -> Self {
+            Self {
+                max_in_flight: 1,
+                linger: millis(1),
+                retries: i32::MAX,
+                delivery_timeout: secs(30),
+                retry_backoff: millis(1),
+                retry_backoff_max: millis(1),
+                acks: Acks::All,
+                mode: BatchMode::Idempotent,
+            }
+        }
+    }
+
+    fn spawn_sender_policy(transport: Arc<MockTransport>, policy: HarnessPolicy) -> Harness {
+        let HarnessPolicy {
+            max_in_flight,
+            linger,
+            retries,
+            delivery_timeout,
+            retry_backoff,
+            retry_backoff_max,
+            acks,
+            mode,
+        } = policy;
         let (producer_id, producer_epoch) = if mode == BatchMode::Plain {
             (-1, -1)
         } else {
@@ -3109,8 +3327,8 @@ mod harness {
             linger,
             request_timeout_ms: 5_000,
             retries,
-            retry_backoff: millis(1),
-            routing_retry_budget,
+            retry_backoff: RetryBackoff::new(retry_backoff.to_std(), retry_backoff_max.to_std()),
+            delivery_timeout,
             max_in_flight,
             metadata_cache: Arc::clone(&metadata_cache),
             partition_leaders: Arc::clone(&partition_leaders),
@@ -4566,7 +4784,7 @@ mod harness {
         shutdown(h).await;
     }
 
-    /// The same rule for a batch that ran out of its routing budget with no
+    /// The same rule for a batch that reached the delivery timeout with no
     /// broker code at all: the abortable slot stores that the transaction
     /// timed out, since there is no code to report.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4674,7 +4892,7 @@ mod harness {
     /// timeout and raises the epoch of an idempotent producer. It does not
     /// fence.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exhausted_routing_budget_fails_the_batch_and_bumps_the_epoch() {
+    async fn reached_delivery_timeout_fails_the_batch_and_bumps_the_epoch() {
         let transport = MockTransport::new(Duration::ZERO);
         transport.inject_code_once(0, test_codes::NOT_LEADER_OR_FOLLOWER);
         let h = spawn_sender_with_policy(transport.clone(), 1, millis(1), i32::MAX, millis(1));
@@ -4697,6 +4915,77 @@ mod harness {
             .expect("sender remains")
             .expect("the producer still sends after the expired batch");
         assert2::assert!(metadata.partition == 0);
+        shutdown(h).await;
+    }
+
+    /// Kafka's `RecordAccumulator.expiredBatches` and
+    /// `ProducerBatch.hasReachedDeliveryTimeout` measure the delivery timeout
+    /// from the creation of the batch. A batch that waits in the accumulator
+    /// behind a retrying batch of the same partition expires with it, before
+    /// its first send.
+    #[tokio::test(start_paused = true)]
+    async fn delivery_timeout_counts_from_batch_creation() {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.fail_next(usize::MAX);
+        let h = spawn_sender_policy(
+            transport.clone(),
+            HarnessPolicy {
+                retry_backoff: millis(100),
+                retry_backoff_max: millis(100),
+                delivery_timeout: millis(300),
+                ..HarnessPolicy::default()
+            },
+        );
+        let start = Instant::now();
+
+        let mut elapsed = Vec::new();
+        for ack in produce_burst(&h, "t", 0, 2).await {
+            let result = ack.await.expect("sender remains");
+            let waited = Instant::now().duration_since(start);
+            elapsed.push((
+                matches!(result, Err(ProducerError::SendTimeout)),
+                waited.as_millis(),
+            ));
+        }
+
+        assert2::assert!(elapsed == vec![(true, 300), (true, 300)]);
+        shutdown(h).await;
+    }
+
+    /// Kafka's `RecordAccumulator` waits
+    /// `ExponentialBackoff.backoff(attempts - 1)` before a retry:
+    /// `retry.backoff.ms * 2^attempts`, with a random factor from 0.8 to 1.2,
+    /// and never more than `retry.backoff.max.ms`.
+    #[tokio::test(start_paused = true)]
+    async fn produce_retries_back_off_exponentially_with_jitter() {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.fail_next(5);
+        let h = spawn_sender_policy(
+            transport.clone(),
+            HarnessPolicy {
+                retry_backoff: millis(100),
+                retry_backoff_max: secs(1),
+                ..HarnessPolicy::default()
+            },
+        );
+
+        let ack = produce_burst(&h, "t", 0, 1).await.pop().expect("ack");
+        ack.await
+            .expect("sender remains")
+            .expect("the sixth send is acknowledged");
+
+        let sent_at = transport.sent_at();
+        let gaps = sent_at
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]).as_millis())
+            .collect::<Vec<_>>();
+        let bounds = [(80, 120), (160, 240), (320, 480), (640, 960), (800, 1000)];
+        let outside = gaps
+            .iter()
+            .zip(bounds)
+            .filter(|(gap, (low, high))| !(*low..=*high).contains(*gap))
+            .collect::<Vec<_>>();
+        assert2::assert!((gaps.len(), outside) == (5, Vec::new()), "gaps: {gaps:?}");
         shutdown(h).await;
     }
 
@@ -4738,9 +5027,10 @@ mod harness {
                 records: Vec::new(),
             },
             records: vec![record],
-            first_sent: None,
+            created_at: Instant::now(),
             backoff_until: None,
             retries_used: 0,
+            backoff_attempts: 0,
             last_failure: None,
             transaction_generation: None,
         };
@@ -4748,7 +5038,7 @@ mod harness {
     }
 
     /// `expire_batches` must not rewrite the epoch, sequence, or bytes of a
-    /// batch that did not itself run out of its routing budget. Kafka's
+    /// batch that did not itself reach the delivery timeout. Kafka's
     /// `maybeUpdateProducerIdAndEpoch` moves a partition to the new identity
     /// only once it has no batch in flight, so an unrelated parked batch keeps
     /// its original identity: a broker that already durably wrote it must
@@ -4772,8 +5062,8 @@ mod harness {
             linger: millis(1),
             request_timeout_ms: 5_000,
             retries: i32::MAX,
-            retry_backoff: millis(1),
-            routing_retry_budget: secs(30),
+            retry_backoff: RetryBackoff::new(Duration::from_millis(1), Duration::from_secs(1)),
+            delivery_timeout: secs(30),
             max_in_flight: 5,
             metadata_cache: Arc::new(Mutex::new(HashMap::new())),
             partition_leaders: Arc::new(DashMap::new()),
@@ -4794,7 +5084,7 @@ mod harness {
         };
         let mut state = PipelineState::default();
 
-        // Partition 0's batch ran out of its routing budget; it is the one
+        // Partition 0's batch reached the delivery timeout; it is the one
         // passed as `expired`.
         let (expired_batch, mut expired_rx) = idempotent_batch("t", 0, 0, 3);
 
