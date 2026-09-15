@@ -69,15 +69,16 @@ pub enum ConsumerError {
 
     /// The coordinator answered `FENCED_INSTANCE_ID` (82) for this
     /// `group.instance.id`, because another consumer joined with the same
-    /// id. The consumer stops. Kafka's consumer raises
-    /// `FencedInstanceIdException`.
+    /// id. `poll` returns this error once. The next `poll` joins the group
+    /// again. Kafka's consumer raises `FencedInstanceIdException`.
     #[error(
         "fenced group.instance.id {0}: another consumer with the same group.instance.id joined the group"
     )]
     FencedInstanceId(String),
 
-    /// A commit found that the consumer is not part of an active group,
-    /// because its coordinator task stopped. Kafka's consumer raises
+    /// A commit found that the consumer is not part of an active group:
+    /// a fatal coordinator error removed the member and no `poll` joined the
+    /// group again yet, or the coordinator task stopped. Kafka's consumer raises
     /// `CommitFailedException`.
     #[error(
         "offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group"

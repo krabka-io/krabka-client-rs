@@ -159,6 +159,7 @@ fn consumer(client: Client) -> Consumer {
             generation: 1,
             member_id: "member-a".into(),
             ownership_ids: HashMap::new(),
+            rejoin_on_poll: false,
         })),
         commit_serialization: Arc::new(Mutex::new(())),
         commit_async_state: Arc::new(AtomicU8::new(0)),
@@ -184,6 +185,7 @@ fn consumer(client: Client) -> Consumer {
         auto_offset_reset: AutoOffsetReset::Latest,
         poll_error: PollErrorSlot::default(),
         auto_commit: None,
+        poll_signal: crate::coordinator::PollSignal::default(),
     }
 }
 
@@ -197,6 +199,7 @@ fn coordinator_state(client: Client) -> CoordinatorState {
             generation: 1,
             member_id: "member-a".into(),
             ownership_ids: HashMap::new(),
+            rejoin_on_poll: false,
         })),
         group_instance_id: None,
         generation_id: 1,
@@ -227,6 +230,7 @@ fn coordinator_state(client: Client) -> CoordinatorState {
         auto_commit: None,
         commit_serialization: Arc::new(Mutex::new(())),
         join_prepared: false,
+        polls: crate::coordinator::PollSignal::default().subscribe(),
     }
 }
 

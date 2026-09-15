@@ -421,6 +421,9 @@ pub(crate) struct CoordinatorState {
     /// Kafka's `AbstractCoordinator.needsJoinPrepare` is the inverse flag: a
     /// retry of a failed `JoinGroup` does not commit again.
     pub join_prepared: bool,
+    /// The `poll` count of the parent `Consumer`. After a fatal error the task
+    /// waits for a `poll` that comes after the one that returned the error.
+    pub polls: tokio::sync::watch::Receiver<u64>,
 }
 
 /// A fatal coordinator error that waits for the next `poll()`.
@@ -428,6 +431,52 @@ pub(crate) struct CoordinatorState {
 /// The guard of this `std::sync::Mutex` never lives across an `.await` or
 /// while another lock is held.
 pub(crate) type PollErrorSlot = Arc<std::sync::Mutex<Option<ConsumerError>>>;
+
+/// The `poll` count of a `Consumer`. `poll` increments it when it returns no
+/// error that a coordinator failure left. See [`note_poll`].
+pub(crate) type PollSignal = tokio::sync::watch::Sender<u64>;
+
+/// Tell the coordinator task that the application called `poll`, and that the
+/// `poll` returned no error that a coordinator failure left.
+pub(crate) fn note_poll(signal: &PollSignal) {
+    signal.send_modify(|polls| *polls = polls.wrapping_add(1));
+}
+
+/// Whether an error waits in `slot` for the next `poll`.
+pub(crate) fn poll_error_pending(slot: &PollErrorSlot) -> bool {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+}
+
+/// Wait until the application calls `poll` again after `poll` returned the
+/// error in `poll_error`.
+///
+/// Kafka's `AbstractCoordinator.pollHeartbeat` raises the failure cause of the
+/// heartbeat thread once. The next `poll` then calls `ensureActiveGroup`, which
+/// joins the group again. The function returns `false` when `shutdown` fires
+/// or when the `Consumer` is gone.
+async fn wait_for_poll_after_error(
+    polls: &mut tokio::sync::watch::Receiver<u64>,
+    poll_error: &PollErrorSlot,
+    shutdown: &CancellationToken,
+) -> bool {
+    polls.borrow_and_update();
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return false,
+            changed = polls.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+                // A `poll` that ran before it took the error does not count.
+                if !poll_error_pending(poll_error) {
+                    return true;
+                }
+            }
+        }
+    }
+}
 
 /// Keep `error` for the next `poll()` if the application must see it.
 ///
@@ -471,6 +520,19 @@ async fn publish_assignment(
     preserve_retained: bool,
     generation_id: i32,
 ) {
+    install_assignment(state, assignment, preserve_retained, generation_id, false).await;
+}
+
+/// Publish `assignment` at `generation_id` to the shared state of the
+/// `Consumer`. `rejoin_on_poll` goes to the commit identity in the same
+/// critical section as the ownership.
+async fn install_assignment(
+    state: &mut CoordinatorState,
+    assignment: &[(String, i32)],
+    preserve_retained: bool,
+    generation_id: i32,
+    rejoin_on_poll: bool,
+) {
     let mut next_id = state.next_ownership_id;
     let mut assigned = state.assigned.lock().await;
     let mut identity = state.commit_identity.lock().await;
@@ -484,6 +546,7 @@ async fn publish_assignment(
     assigned.extend_from_slice(assignment);
     identity.generation = generation_id;
     identity.member_id.clone_from(&state.member_id);
+    identity.rejoin_on_poll = rejoin_on_poll;
     drop(identity);
     drop(assigned);
     // A high watermark belongs to an ownership snapshot.  Re-learn it from
@@ -531,10 +594,10 @@ pub(crate) enum HeartbeatOutcome {
     /// `UNKNOWN_MEMBER_ID (25)`. Clear `member_id` and rejoin from scratch.
     RejoinFromScratch,
     /// `FENCED_INSTANCE_ID (82)`. Another consumer joined with the same
-    /// `group.instance.id`. The member stops. Kafka's
-    /// `AbstractCoordinator.HeartbeatResponseHandler` resets the member and
-    /// raises `FencedInstanceIdException`, and the heartbeat thread keeps it as
-    /// its failure cause.
+    /// `group.instance.id`. The member leaves the group until the next `poll`.
+    /// Kafka's `AbstractCoordinator.HeartbeatResponseHandler` resets the member
+    /// and raises `FencedInstanceIdException`, and the heartbeat thread keeps
+    /// it as its failure cause.
     Fenced,
     /// Transport error or unexpected non-fatal broker code. Retry on the next tick.
     Transient,
@@ -706,8 +769,10 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                         merge_counts(&mut known_counts, &snapshot);
                     }
                     Err(ConsumerError::FencedInstanceId(group_instance_id)) => {
-                        stop_fenced_member(&mut state, &shutdown, group_instance_id).await;
-                        break;
+                        fence_member(&mut state, group_instance_id).await;
+                        if !wait_for_poll_after_error(&mut state.polls, &state.poll_error, &shutdown).await {
+                            break;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "rejoin failed; will retry on next tick");
@@ -727,8 +792,11 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     }
                     HeartbeatOutcome::Fenced => {
                         let group_instance_id = state.group_instance_id.clone().unwrap_or_default();
-                        stop_fenced_member(&mut state, &shutdown, group_instance_id).await;
-                        break;
+                        fence_member(&mut state, group_instance_id).await;
+                        if !wait_for_poll_after_error(&mut state.polls, &state.poll_error, &shutdown).await {
+                            break;
+                        }
+                        needs_rejoin = true;
                     }
                 },
             }
@@ -758,27 +826,25 @@ async fn forget_member(state: &mut CoordinatorState) {
     state.assignment_changed.notify_waiters();
 }
 
-/// Stop the member after the coordinator fenced its `group.instance.id`.
+/// Remove the member from the group after the coordinator fenced its
+/// `group.instance.id`.
 ///
-/// This function cancels `shutdown`, so a commit fails from now on. It then
+/// The function marks the commit identity with `rejoin_on_poll`, so a commit
+/// fails with `CommitFailed` until the member joins again. In the same step it
 /// clears the assignment, the member id and the generation, so `poll()` fetches
-/// nothing. It then keeps the fenced error for the next `poll()`. The caller stops the task. The shutdown
-/// path sends no `LeaveGroup`, because the member id is empty. Kafka resets the
-/// generation to `NO_GENERATION`, so `AbstractCoordinator.maybeLeaveGroup`
-/// sends no `LeaveGroup` either.
-async fn stop_fenced_member(
-    state: &mut CoordinatorState,
-    shutdown: &CancellationToken,
-    group_instance_id: String,
-) {
+/// nothing. It then keeps the fenced error for the next `poll()`. The caller
+/// waits for the `poll` after that, and then joins the group from scratch with
+/// an empty member id. Kafka's `AbstractCoordinator.resetStateOnResponseError`
+/// resets the generation and requests a rejoin in the same way. A shutdown
+/// before the rejoin sends no `LeaveGroup`, because the member id is empty.
+async fn fence_member(state: &mut CoordinatorState, group_instance_id: String) {
     tracing::error!(
         group = %state.group_id,
         group_instance_id = %group_instance_id,
-        "another consumer joined with the same group.instance.id; the member stops"
+        "another consumer joined with the same group.instance.id; the member joins again on the next poll"
     );
-    shutdown.cancel();
     state.member_id.clear();
-    publish_assignment(state, &[], false, -1).await;
+    install_assignment(state, &[], false, -1, true).await;
     *state
         .poll_error
         .lock()
@@ -2487,6 +2553,7 @@ mod retry_tests {
                 generation: 1,
                 member_id: "member-a".into(),
                 ownership_ids: HashMap::new(),
+                rejoin_on_poll: false,
             })),
             group_instance_id: None,
             generation_id: 1,
@@ -2513,6 +2580,7 @@ mod retry_tests {
             auto_commit: None,
             commit_serialization: Arc::new(Mutex::new(())),
             join_prepared: false,
+            polls: PollSignal::default().subscribe(),
         };
 
         tokio::time::timeout(Duration::from_secs(1), leave_group(&state))
@@ -2856,6 +2924,7 @@ mod retry_tests {
         assigned: Vec<(String, i32)>,
         generation: i32,
         commit_member_id: String,
+        rejoin_on_poll: bool,
         group_requests: BTreeSet<&'static str>,
     }
 
@@ -2959,6 +3028,8 @@ mod retry_tests {
             .await
             .expect("client");
         let orders_0 = (ORDERS.to_string(), 0);
+        // The application does not poll during the case.
+        let poll_signal = PollSignal::default();
         let state = CoordinatorState {
             client,
             group_id: "group-a".into(),
@@ -2968,6 +3039,7 @@ mod retry_tests {
                 generation: 1,
                 member_id: "member-a".into(),
                 ownership_ids: HashMap::from([(orders_0.clone(), 1)]),
+                rejoin_on_poll: false,
             })),
             group_instance_id: Some("instance-a".into()),
             generation_id: 1,
@@ -2998,6 +3070,7 @@ mod retry_tests {
             auto_commit: None,
             commit_serialization: Arc::new(Mutex::new(())),
             join_prepared: false,
+            polls: poll_signal.subscribe(),
         };
         let poll_error = Arc::clone(&state.poll_error);
         let assigned = Arc::clone(&state.assigned);
@@ -3013,13 +3086,15 @@ mod retry_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .map(ToString::to_string);
+            let identity = commit_identity.lock().await.clone();
             let observation = TaskObservation {
                 task_exited: task.is_finished(),
                 shutdown_cancelled: shutdown.is_cancelled(),
                 poll_error,
                 assigned: assigned.lock().await.clone(),
                 generation: generation.load(Ordering::SeqCst),
-                commit_member_id: commit_identity.lock().await.member_id.clone(),
+                commit_member_id: identity.member_id,
+                rejoin_on_poll: identity.rejoin_on_poll,
                 group_requests: group_requests.lock().expect("requests lock").clone(),
             };
             if observation == *expected || tokio::time::Instant::now() >= deadline {
@@ -3033,19 +3108,21 @@ mod retry_tests {
             .await
             .expect("coordinator task stops on shutdown")
             .expect("coordinator task does not panic");
+        drop(poll_signal);
         mock.stop();
         observation
     }
 
     /// A heartbeat, `JoinGroup` or `SyncGroup` answer of
-    /// `FENCED_INSTANCE_ID (82)` stops the coordinator task, clears the
-    /// assignment and the member, and leaves the fenced error for the next
-    /// `poll()`. The task sends no `LeaveGroup`. Kafka's
-    /// `AbstractCoordinator.HeartbeatResponseHandler` resets the member and
-    /// raises `FencedInstanceIdException`, which the heartbeat thread keeps as
-    /// its failure cause. Other heartbeat answers keep the assignment.
+    /// `FENCED_INSTANCE_ID (82)` clears the assignment and the member, marks
+    /// the commit identity with `rejoin_on_poll`, and leaves the fenced error
+    /// for the next `poll()`. The task keeps running, sends no `LeaveGroup`,
+    /// and sends no further group request while the application does not poll.
+    /// Kafka's `AbstractCoordinator.HeartbeatResponseHandler` resets the member
+    /// and raises `FencedInstanceIdException`, which the heartbeat thread keeps
+    /// as its failure cause. Other heartbeat answers keep the assignment.
     #[tokio::test]
-    async fn coordinator_task_stops_a_fenced_static_member() {
+    async fn coordinator_task_removes_a_fenced_static_member_until_the_next_poll() {
         let fenced = "fenced group.instance.id instance-a: another consumer with the same group.instance.id joined the group";
         let owned = vec![(ORDERS.to_string(), 0)];
         let requests = |names: &[&'static str]| names.iter().copied().collect::<BTreeSet<_>>();
@@ -3064,6 +3141,7 @@ mod retry_tests {
                     assigned: owned.clone(),
                     generation: 1,
                     commit_member_id: "member-a".into(),
+                    rejoin_on_poll: false,
                     group_requests: requests(&["Heartbeat"]),
                 },
             ),
@@ -3075,12 +3153,13 @@ mod retry_tests {
                     sync_group: None,
                 },
                 TaskObservation {
-                    task_exited: true,
-                    shutdown_cancelled: true,
+                    task_exited: false,
+                    shutdown_cancelled: false,
                     poll_error: Some(fenced.into()),
                     assigned: Vec::new(),
                     generation: -1,
                     commit_member_id: String::new(),
+                    rejoin_on_poll: true,
                     group_requests: requests(&["Heartbeat"]),
                 },
             ),
@@ -3098,6 +3177,7 @@ mod retry_tests {
                     assigned: owned.clone(),
                     generation: 1,
                     commit_member_id: "member-a".into(),
+                    rejoin_on_poll: false,
                     group_requests: requests(&["Heartbeat", "JoinGroup"]),
                 },
             ),
@@ -3115,6 +3195,7 @@ mod retry_tests {
                     assigned: owned.clone(),
                     generation: 1,
                     commit_member_id: "member-a".into(),
+                    rejoin_on_poll: false,
                     group_requests: requests(&["FindCoordinator", "Heartbeat"]),
                 },
             ),
@@ -3126,12 +3207,13 @@ mod retry_tests {
                     sync_group: None,
                 },
                 TaskObservation {
-                    task_exited: true,
-                    shutdown_cancelled: true,
+                    task_exited: false,
+                    shutdown_cancelled: false,
                     poll_error: Some(fenced.into()),
                     assigned: Vec::new(),
                     generation: -1,
                     commit_member_id: String::new(),
+                    rejoin_on_poll: true,
                     group_requests: requests(&["Heartbeat", "JoinGroup"]),
                 },
             ),
@@ -3143,12 +3225,13 @@ mod retry_tests {
                     sync_group: Some(82),
                 },
                 TaskObservation {
-                    task_exited: true,
-                    shutdown_cancelled: true,
+                    task_exited: false,
+                    shutdown_cancelled: false,
                     poll_error: Some(fenced.into()),
                     assigned: Vec::new(),
                     generation: -1,
                     commit_member_id: String::new(),
+                    rejoin_on_poll: true,
                     group_requests: requests(&["Heartbeat", "JoinGroup", "SyncGroup"]),
                 },
             ),

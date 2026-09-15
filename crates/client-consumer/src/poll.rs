@@ -732,6 +732,9 @@ impl Consumer {
         if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
             return Err(error);
         }
+        // After a fatal coordinator error, this `poll` makes the coordinator
+        // task join the group again, as Kafka's `ensureActiveGroup` does.
+        crate::coordinator::note_poll(&self.poll_signal);
         self.apply_pending_seeks().await;
         // Kafka's `ConsumerCoordinator.poll` sends the interval auto commit
         // before `updateFetchPositions`.
@@ -1857,6 +1860,7 @@ mod partition_error_tests {
                 generation: 1,
                 member_id: "member-a".into(),
                 ownership_ids: HashMap::from([(("orders".into(), 0), 1)]),
+                rejoin_on_poll: false,
             })),
             commit_serialization: Arc::new(Mutex::new(())),
             commit_async_state: Arc::new(AtomicU8::new(0)),
@@ -1882,6 +1886,7 @@ mod partition_error_tests {
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
+            poll_signal: crate::coordinator::PollSignal::default(),
         }
     }
 
