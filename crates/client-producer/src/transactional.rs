@@ -407,7 +407,7 @@ mod tests {
     use bytes::BytesMut;
     use krabka_client_core::{ClientError, MockBroker};
     use krabka_protocol::{
-        Encode,
+        Decode, Encode,
         owned::{
             add_offsets_to_txn_request,
             add_offsets_to_txn_response::AddOffsetsToTxnResponse,
@@ -423,7 +423,7 @@ mod tests {
             end_txn_response::{self, EndTxnResponse},
             find_coordinator_request,
             find_coordinator_response::FindCoordinatorResponse,
-            init_producer_id_request,
+            init_producer_id_request::{self, InitProducerIdRequest},
             init_producer_id_response::{self, InitProducerIdResponse},
             metadata_request,
             metadata_response::{
@@ -467,6 +467,23 @@ mod tests {
         }
     }
 
+    /// Tell if an `InitProducerId` request body carries a `transactional.id`.
+    ///
+    /// The builder of an idempotent producer sends one request without it, and
+    /// `init_transactions` sends the requests with it. The body starts with the
+    /// request header client id, and a flexible version adds a tagged-field
+    /// byte after it.
+    fn is_transactional_init(body: &[u8], version: i16) -> bool {
+        let client_id_len = usize::try_from(i16::from_be_bytes([body[0], body[1]]).max(0))
+            .expect("non-negative client id length");
+        let flexible = usize::from(version >= init_producer_id_request::FLEXIBLE_MIN);
+        let mut request = &body[2 + client_id_len + flexible..];
+        InitProducerIdRequest::decode(&mut request, version)
+            .expect("decode InitProducerId")
+            .transactional_id
+            .is_some()
+    }
+
     fn encode_v0(resp: &impl Encode) -> Vec<u8> {
         let mut buf = BytesMut::new();
         resp.encode(&mut buf, 0).unwrap();
@@ -493,7 +510,7 @@ mod tests {
         let handler_port = Arc::clone(&port_cell);
         let attempts = Arc::new(AtomicU16::new(0));
         let observed = Arc::clone(&attempts);
-        let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
             if api_key == api_versions_request::API_KEY {
                 return Some(encode_v0(&ApiVersionsResponse::default()));
             }
@@ -507,6 +524,12 @@ mod tests {
                 }));
             }
             if api_key == init_producer_id_request::API_KEY {
+                if !is_transactional_init(body, version) {
+                    return Some(encode_v0(&InitProducerIdResponse {
+                        producer_id: 1,
+                        ..Default::default()
+                    }));
+                }
                 let attempt = observed.fetch_add(1, Ordering::SeqCst);
                 return Some(encode_v0(&InitProducerIdResponse {
                     error_code: if attempt == 0 { 14 } else { 0 },
@@ -522,7 +545,6 @@ mod tests {
 
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
-            .enable_idempotence(false)
             .transactional_id("test-txn")
             .request_timeout(Duration::from_millis(100))
             .retry_backoff(Duration::from_millis(1))
@@ -556,7 +578,7 @@ mod tests {
         let handler_port = port_cell.clone();
         let next_epoch = Arc::new(AtomicI16::new(3));
         let handler_epoch = Arc::clone(&next_epoch);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
             if api_key == api_versions_request::API_KEY {
                 return Some(encode_v0(&ApiVersionsResponse {
                     api_keys: vec![ApiVersion {
@@ -578,11 +600,18 @@ mod tests {
                 }));
             }
             if api_key == init_producer_id_request::API_KEY {
-                let response = InitProducerIdResponse {
-                    error_code: 0,
-                    producer_id: 7,
-                    producer_epoch: handler_epoch.fetch_add(1, Ordering::SeqCst),
-                    ..Default::default()
+                let response = if is_transactional_init(body, version) {
+                    InitProducerIdResponse {
+                        error_code: 0,
+                        producer_id: 7,
+                        producer_epoch: handler_epoch.fetch_add(1, Ordering::SeqCst),
+                        ..Default::default()
+                    }
+                } else {
+                    InitProducerIdResponse {
+                        producer_id: 1,
+                        ..Default::default()
+                    }
                 };
                 let mut buf = BytesMut::new();
                 if version >= init_producer_id_response::FLEXIBLE_MIN {
@@ -607,7 +636,6 @@ mod tests {
 
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
-            .enable_idempotence(false)
             .transactional_id("test-txn")
             .transaction_two_phase_commit_enable(two_phase_commit_enabled)
             .request_timeout(std::time::Duration::from_millis(100))
@@ -1069,7 +1097,6 @@ mod tests {
         port_cell.store(mock.addr.port(), Ordering::SeqCst);
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
-            .enable_idempotence(false)
             .transactional_id("test-txn")
             .request_timeout(Duration::from_millis(100))
             .retry_backoff(Duration::from_millis(1))
@@ -1809,7 +1836,6 @@ mod tests {
             port_cell.store(mock.addr.port(), Ordering::SeqCst);
             let producer = Producer::builder()
                 .bootstrap(mock.addr.to_string())
-                .enable_idempotence(false)
                 .transactional_id("test-txn")
                 .request_timeout(Duration::from_millis(100))
                 .build()

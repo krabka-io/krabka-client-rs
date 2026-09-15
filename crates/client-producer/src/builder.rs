@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize},
+        atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -81,7 +81,20 @@ impl ProtocolRequest for StableInitProducerId {
 /// Default producer compression.
 pub const DEFAULT_PRODUCER_COMPRESSION: Compression = Compression::None;
 /// Default delay before sending a partial producer batch.
-pub const DEFAULT_PRODUCER_LINGER: Duration = Duration::ZERO;
+///
+/// Kafka's `linger.ms` default is 5 (KIP-1030).
+pub const DEFAULT_PRODUCER_LINGER: Duration = Duration::from_millis(5);
+/// Default producer acknowledgement mode. Kafka's `acks` default is `all`.
+pub const DEFAULT_PRODUCER_ACKS: Acks = Acks::All;
+/// The largest `max_in_flight_per_connection` an idempotent producer accepts.
+///
+/// Kafka's `ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE`.
+const MAX_IN_FLIGHT_FOR_IDEMPOTENCE: usize = 5;
+
+/// The number of the next generated `producer-<n>` client id.
+///
+/// Kafka's `ProducerConfig.PRODUCER_CLIENT_ID_SEQUENCE` starts at 1.
+static PRODUCER_CLIENT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Default producer batch size in bytes.
 pub const DEFAULT_PRODUCER_BATCH_BYTES: usize = 16 * 1024;
 /// Default cross-partition in-flight request limit.
@@ -407,13 +420,83 @@ fn next_backoff(backoff: Duration, max_backoff: Duration) -> Duration {
     backoff.saturating_mul(2).min(max_backoff)
 }
 
-fn validated_acks(enable_idempotence: bool, acks: Acks) -> Result<Acks, ProducerError> {
-    if enable_idempotence && acks == Acks::Zero {
+/// Decide if the producer is idempotent, with the rules of Kafka's
+/// `ProducerConfig.postProcessAndValidateIdempotenceConfigs`.
+///
+/// `enable_idempotence` is `None` when the application did not set it. Then
+/// idempotence is on, and `retries=0` or an `acks` other than `All` turns it
+/// off. When the application set it to `true`, those settings are errors. An
+/// idempotent producer accepts at most 5 in-flight requests per connection,
+/// and a `transactional_id` requires idempotence.
+///
+/// # Errors
+///
+/// Returns [`ProducerError::InvalidConfig`] with Kafka's `ConfigException`
+/// message for each conflict.
+fn resolve_idempotence(
+    enable_idempotence: Option<bool>,
+    acks: Acks,
+    retries: i32,
+    max_in_flight: usize,
+    transactional_id: Option<&str>,
+) -> Result<bool, ProducerError> {
+    let configured = enable_idempotence.is_some();
+    let mut enabled = enable_idempotence.unwrap_or(true);
+    if enabled {
+        let mut disable = false;
+        if retries == 0 {
+            if configured {
+                return Err(ProducerError::InvalidConfig(
+                    "Must set retries to non-zero when using the idempotent producer.".to_owned(),
+                ));
+            }
+            tracing::info!("Idempotence will be disabled because retries is set to 0.");
+            disable = true;
+        }
+        if acks != Acks::All {
+            if configured {
+                return Err(ProducerError::InvalidConfig(
+                    "Must set acks to all in order to use the idempotent producer. \
+                     Otherwise we cannot guarantee idempotence."
+                        .to_owned(),
+                ));
+            }
+            tracing::info!(
+                acks = ?acks,
+                "Idempotence will be disabled because acks is not set to all."
+            );
+            disable = true;
+        }
+        if max_in_flight > MAX_IN_FLIGHT_FOR_IDEMPOTENCE {
+            return Err(ProducerError::InvalidConfig(format!(
+                "To use the idempotent producer, max_in_flight_per_connection must be set to \
+                 at most {MAX_IN_FLIGHT_FOR_IDEMPOTENCE}. Current value is {max_in_flight}."
+            )));
+        }
+        enabled = !disable;
+    }
+    if !enabled && transactional_id.is_some() {
         return Err(ProducerError::InvalidConfig(
-            "enable_idempotence=true requires acks=all (not Zero)".to_owned(),
+            "Cannot set a transactional_id without also enabling idempotence.".to_owned(),
         ));
     }
-    Ok(if enable_idempotence { Acks::All } else { acks })
+    Ok(enabled)
+}
+
+/// Give the client id, with the rule of Kafka's
+/// `ProducerConfig.maybeOverrideClientId`.
+///
+/// A configured client id is kept, also when it is empty. Otherwise the id is
+/// `producer-<transactional_id>`, or `producer-<n>` from a process-wide
+/// sequence.
+fn resolve_client_id(client_id: Option<String>, transactional_id: Option<&str>) -> String {
+    client_id.unwrap_or_else(|| match transactional_id {
+        Some(transactional_id) => format!("producer-{transactional_id}"),
+        None => format!(
+            "producer-{}",
+            PRODUCER_CLIENT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ),
+    })
 }
 
 fn disabled_idempotence_identity() -> (i64, i16) {
@@ -511,9 +594,17 @@ pub(crate) async fn init_producer_id_with_retry(
 impl Producer {
     /// Build a [`Producer`] pointed at the given bootstrap address.
     ///
-    /// `enable_idempotence` defaults to `true`, which forces `acks=All`.
-    /// `acks=Zero` together with idempotence is rejected with
-    /// [`ProducerError::InvalidConfig`].
+    /// The defaults are Kafka's: `acks=All`, a linger of 5 ms, and
+    /// idempotence on. The builder applies the rules of Kafka's
+    /// `ProducerConfig`. When `enable_idempotence` is not set, `retries=0` or
+    /// an `acks` other than `All` turns idempotence off. When it is set to
+    /// `true`, those settings fail with [`ProducerError::InvalidConfig`]. An
+    /// idempotent producer accepts at most 5 in-flight requests per
+    /// connection, and a `transactional_id` requires idempotence.
+    ///
+    /// When `client_id` is not set, the client id is
+    /// `producer-<transactional_id>`, or `producer-<n>` with a process-wide
+    /// sequence number.
     #[builder(start_fn = builder, finish_fn = build)]
     // bon builder; each arg is an independent knob
     #[tracing::instrument(
@@ -521,9 +612,9 @@ impl Producer {
         skip_all,
         fields(
             bootstrap = %bootstrap,
-            client_id = %client_id,
+            client_id = client_id.as_deref(),
             acks = ?acks,
-            enable_idempotence,
+            enable_idempotence = ?enable_idempotence,
             transactional_id = transactional_id.as_deref(),
         ),
         err,
@@ -532,10 +623,10 @@ impl Producer {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn start(
         #[builder(into)] bootstrap: String,
-        #[builder(into, default = "krabka-producer".to_string())] client_id: String,
+        #[builder(into)] client_id: Option<String>,
         #[builder(default = DEFAULT_PRODUCER_COMPRESSION)] compression: Compression,
-        #[builder(default = true)] enable_idempotence: bool,
-        #[builder(default = Acks::One)] acks: Acks,
+        enable_idempotence: Option<bool>,
+        #[builder(default = DEFAULT_PRODUCER_ACKS)] acks: Acks,
         #[builder(default = DEFAULT_PRODUCER_LINGER)] linger: Duration,
         #[builder(default = DEFAULT_PRODUCER_BATCH_BYTES)] batch_size: usize,
         #[builder(default = DEFAULT_CLIENT_DNS_TIMEOUT)] dns_timeout: Time,
@@ -559,6 +650,14 @@ impl Producer {
         #[builder(default)] transaction_two_phase_commit_enable: bool,
         security: Option<krabka_client_core::security::ClientSecurity>,
     ) -> Result<Self, ProducerError> {
+        let enable_idempotence = resolve_idempotence(
+            enable_idempotence,
+            acks,
+            retries,
+            max_in_flight_per_connection,
+            transactional_id.as_deref(),
+        )?;
+        let client_id = resolve_client_id(client_id, transactional_id.as_deref());
         if transaction_two_phase_commit_enable && transaction_timeout.is_some() {
             return Err(ProducerError::InvalidConfig(
                 "transaction_timeout cannot be set when transaction_two_phase_commit_enable=true"
@@ -625,10 +724,6 @@ impl Producer {
             .as_time();
         let flush_timeout =
             ProducerFlushTimeout::new(flush_timeout).map_err(ProducerError::InvalidConfig)?;
-
-        // Validate config: idempotence forces acks=All, and acks=Zero is
-        // incompatible with idempotence.
-        let acks = validated_acks(enable_idempotence, acks)?;
 
         // 1. Build inner client. `security` is cloned (not moved) so it can be
         //    retained on the `Producer` and reused for the secondary
@@ -891,15 +986,14 @@ mod security_arg_tests {
     #[test]
     fn producer_throughput_policy_defaults_and_distinct_values_are_exact() {
         let defaults = ProducerThroughputPolicy::default();
-        assert_eq!(
+        assert2::assert!(
             (
                 defaults.compression(),
                 defaults.linger(),
                 defaults.batch_bytes(),
                 defaults.max_in_flight(),
                 defaults.linger_ms(),
-            ),
-            (Compression::None, Duration::ZERO, 16_384, 5, 0,)
+            ) == (Compression::None, Duration::from_millis(5), 16_384, 5, 5)
         );
 
         let policy =
@@ -1140,16 +1234,282 @@ mod security_arg_tests {
         }
     }
 
-    #[test]
-    fn validated_acks_forces_idempotence_to_all_and_rejects_zero() {
-        for (_name, idempotent, acks, want) in [
-            ("idempotent forces all", true, Acks::One, Acks::All),
-            ("non-idempotent keeps one", false, Acks::One, Acks::One),
-            ("non-idempotent keeps zero", false, Acks::Zero, Acks::Zero),
-        ] {
-            assert2::assert!(validated_acks(idempotent, acks).unwrap() == want);
+    /// The settings that Kafka's `ProducerConfig.postProcessParsedConfig`
+    /// derives from the producer inputs.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ResolvedConfig {
+        client_id: String,
+        enable_idempotence: bool,
+        acks: Acks,
+        linger: Duration,
+    }
+
+    /// The inputs of one builder case. `None` leaves the setter uncalled.
+    #[derive(Default)]
+    struct BuilderInputs {
+        client_id: Option<&'static str>,
+        enable_idempotence: Option<bool>,
+        acks: Option<Acks>,
+        retries: Option<i32>,
+        max_in_flight: Option<usize>,
+        transactional_id: Option<&'static str>,
+    }
+
+    /// Replaces the sequence number of a generated `producer-<n>` client id,
+    /// because tests that run in parallel also take numbers.
+    fn without_sequence(client_id: String) -> String {
+        match client_id.strip_prefix("producer-") {
+            Some(rest) if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) => {
+                "producer-<n>".to_owned()
+            }
+            _ => client_id,
         }
-        assert2::assert!(validated_acks(true, Acks::Zero).is_err());
+    }
+
+    async fn resolved_config(
+        bootstrap: &str,
+        inputs: BuilderInputs,
+    ) -> Result<ResolvedConfig, String> {
+        let result = Producer::builder()
+            .bootstrap(bootstrap)
+            .maybe_client_id(inputs.client_id)
+            .maybe_enable_idempotence(inputs.enable_idempotence)
+            .maybe_acks(inputs.acks)
+            .maybe_retries(inputs.retries)
+            .maybe_max_in_flight_per_connection(inputs.max_in_flight)
+            .maybe_transactional_id(inputs.transactional_id)
+            .request_timeout(Duration::from_millis(500))
+            .build()
+            .await;
+        match result {
+            Ok(producer) => {
+                let resolved = ResolvedConfig {
+                    client_id: without_sequence(producer.client_id.clone()),
+                    enable_idempotence: producer.producer_id() >= 0,
+                    acks: producer.acks,
+                    linger: producer.linger.to_std(),
+                };
+                producer.close().await.expect("close producer");
+                Ok(resolved)
+            }
+            Err(ProducerError::InvalidConfig(message)) => Err(message),
+            Err(error) => panic!("unexpected build error: {error:?}"),
+        }
+    }
+
+    /// The builder applies Kafka's producer defaults and the rules of
+    /// `ProducerConfig.postProcessAndValidateIdempotenceConfigs` and
+    /// `ProducerConfig.maybeOverrideClientId`.
+    #[tokio::test]
+    async fn producer_builder_resolves_kafka_defaults_and_idempotence_rules() {
+        let mock = MockBroker::start(|api_key, _version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(encode_v0(&ApiVersionsResponse::default()));
+            }
+            (api_key == init_producer_id_request::API_KEY).then(|| {
+                encode_v0(&InitProducerIdResponse {
+                    producer_id: 1,
+                    ..Default::default()
+                })
+            })
+        })
+        .await;
+        let bootstrap = mock.addr.to_string();
+        let five_ms = Duration::from_millis(5);
+        let acks_error = "Must set acks to all in order to use the idempotent producer. \
+                          Otherwise we cannot guarantee idempotence.";
+        let retries_error = "Must set retries to non-zero when using the idempotent producer.";
+        let in_flight_error = "To use the idempotent producer, max_in_flight_per_connection \
+                               must be set to at most 5. Current value is 6.";
+        let transactional_error =
+            "Cannot set a transactional_id without also enabling idempotence.";
+        let cases: Vec<(&str, BuilderInputs, Result<ResolvedConfig, String>)> = vec![
+            (
+                "nothing set",
+                BuilderInputs::default(),
+                Ok(ResolvedConfig {
+                    client_id: "producer-<n>".to_owned(),
+                    enable_idempotence: true,
+                    acks: Acks::All,
+                    linger: five_ms,
+                }),
+            ),
+            (
+                "idempotence set, acks one",
+                BuilderInputs {
+                    enable_idempotence: Some(true),
+                    acks: Some(Acks::One),
+                    ..BuilderInputs::default()
+                },
+                Err(acks_error.to_owned()),
+            ),
+            (
+                "idempotence set, acks zero",
+                BuilderInputs {
+                    enable_idempotence: Some(true),
+                    acks: Some(Acks::Zero),
+                    ..BuilderInputs::default()
+                },
+                Err(acks_error.to_owned()),
+            ),
+            (
+                "idempotence not set, acks one",
+                BuilderInputs {
+                    acks: Some(Acks::One),
+                    ..BuilderInputs::default()
+                },
+                Ok(ResolvedConfig {
+                    client_id: "producer-<n>".to_owned(),
+                    enable_idempotence: false,
+                    acks: Acks::One,
+                    linger: five_ms,
+                }),
+            ),
+            (
+                "idempotence not set, acks zero",
+                BuilderInputs {
+                    acks: Some(Acks::Zero),
+                    ..BuilderInputs::default()
+                },
+                Ok(ResolvedConfig {
+                    client_id: "producer-<n>".to_owned(),
+                    enable_idempotence: false,
+                    acks: Acks::Zero,
+                    linger: five_ms,
+                }),
+            ),
+            (
+                "idempotence set, retries zero",
+                BuilderInputs {
+                    enable_idempotence: Some(true),
+                    acks: Some(Acks::All),
+                    retries: Some(0),
+                    ..BuilderInputs::default()
+                },
+                Err(retries_error.to_owned()),
+            ),
+            (
+                "idempotence not set, retries zero",
+                BuilderInputs {
+                    acks: Some(Acks::All),
+                    retries: Some(0),
+                    ..BuilderInputs::default()
+                },
+                Ok(ResolvedConfig {
+                    client_id: "producer-<n>".to_owned(),
+                    enable_idempotence: false,
+                    acks: Acks::All,
+                    linger: five_ms,
+                }),
+            ),
+            (
+                "idempotence set, six in flight",
+                BuilderInputs {
+                    enable_idempotence: Some(true),
+                    acks: Some(Acks::All),
+                    max_in_flight: Some(6),
+                    ..BuilderInputs::default()
+                },
+                Err(in_flight_error.to_owned()),
+            ),
+            (
+                "idempotence not set, six in flight",
+                BuilderInputs {
+                    max_in_flight: Some(6),
+                    ..BuilderInputs::default()
+                },
+                Err(in_flight_error.to_owned()),
+            ),
+            (
+                "idempotence not set, retries zero, six in flight",
+                BuilderInputs {
+                    retries: Some(0),
+                    max_in_flight: Some(6),
+                    ..BuilderInputs::default()
+                },
+                Err(in_flight_error.to_owned()),
+            ),
+            (
+                "idempotence off, six in flight",
+                BuilderInputs {
+                    enable_idempotence: Some(false),
+                    max_in_flight: Some(6),
+                    ..BuilderInputs::default()
+                },
+                Ok(ResolvedConfig {
+                    client_id: "producer-<n>".to_owned(),
+                    enable_idempotence: false,
+                    acks: Acks::All,
+                    linger: five_ms,
+                }),
+            ),
+            (
+                "idempotence off, transactional id",
+                BuilderInputs {
+                    enable_idempotence: Some(false),
+                    acks: Some(Acks::All),
+                    transactional_id: Some("t"),
+                    ..BuilderInputs::default()
+                },
+                Err(transactional_error.to_owned()),
+            ),
+            (
+                "idempotence turned off by acks, transactional id",
+                BuilderInputs {
+                    acks: Some(Acks::One),
+                    transactional_id: Some("t"),
+                    ..BuilderInputs::default()
+                },
+                Err(transactional_error.to_owned()),
+            ),
+            (
+                "transactional id names the client",
+                BuilderInputs {
+                    transactional_id: Some("t"),
+                    ..BuilderInputs::default()
+                },
+                Ok(ResolvedConfig {
+                    client_id: "producer-t".to_owned(),
+                    enable_idempotence: true,
+                    acks: Acks::All,
+                    linger: five_ms,
+                }),
+            ),
+            (
+                "configured client id wins",
+                BuilderInputs {
+                    client_id: Some("app"),
+                    transactional_id: Some("t"),
+                    ..BuilderInputs::default()
+                },
+                Ok(ResolvedConfig {
+                    client_id: "app".to_owned(),
+                    enable_idempotence: true,
+                    acks: Acks::All,
+                    linger: five_ms,
+                }),
+            ),
+        ];
+        let mut actual = Vec::with_capacity(cases.len());
+        let mut expected = Vec::with_capacity(cases.len());
+        for (name, inputs, want) in cases {
+            actual.push((name, resolved_config(&bootstrap, inputs).await));
+            expected.push((name, want));
+        }
+        mock.stop();
+        assert2::assert!(actual == expected);
+    }
+
+    #[test]
+    fn generated_client_ids_take_distinct_sequence_numbers() {
+        let first = resolve_client_id(None, None);
+        let second = resolve_client_id(None, None);
+        let number = |id: &str| {
+            id.strip_prefix("producer-")
+                .and_then(|n| n.parse::<u64>().ok())
+                .expect("generated client id")
+        };
+        assert2::assert!(number(&second) > number(&first));
     }
 
     #[test]
