@@ -730,12 +730,39 @@ pub(crate) fn reset_starting_offset(auto_offset_reset: AutoOffsetReset) -> i64 {
     match auto_offset_reset {
         AutoOffsetReset::Earliest => 0,
         // Resolved by poll() on first call.
-        AutoOffsetReset::Latest | AutoOffsetReset::None => i64::MAX,
+        AutoOffsetReset::Latest | AutoOffsetReset::None | AutoOffsetReset::ByDuration(_) => {
+            i64::MAX
+        }
     }
 }
 
 /// Kafka's default `max.poll.interval.ms`.
 pub const DEFAULT_CONSUMER_MAX_POLL_INTERVAL: Time = minutes(5);
+
+/// Kafka's `ConsumerConfig.CONSUMER_CLIENT_ID_SEQUENCE`.
+static CONSUMER_CLIENT_ID_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// The `client.id` of a consumer. Kafka's `ConsumerConfig.maybeOverrideClientId`
+/// generates `consumer-<group.id>-<group.instance.id>` for a static member,
+/// and `consumer-<group.id>-<n>` with a process-wide sequence otherwise, when
+/// no client id or an empty one is set.
+fn consumer_client_id(
+    client_id: Option<String>,
+    group_id: &str,
+    group_instance_id: Option<&str>,
+) -> String {
+    match client_id {
+        Some(client_id) if !client_id.is_empty() => client_id,
+        _ => match group_instance_id {
+            Some(group_instance_id) => format!("consumer-{group_id}-{group_instance_id}"),
+            None => format!(
+                "consumer-{group_id}-{}",
+                CONSUMER_CLIENT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ),
+        },
+    }
+}
 
 /// Kafka's default `max.poll.records`.
 pub const DEFAULT_CONSUMER_MAX_POLL_RECORDS: usize = 500;
@@ -842,14 +869,14 @@ impl Consumer {
         name = "consumer.start",
         level = "info",
         skip_all,
-        fields(group_id = %group_id, client_id = %client_id),
+        fields(group_id = %group_id, client_id = ?client_id),
         err
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn start(
         #[builder(into)] bootstrap: String,
-        #[builder(into, default = "krabka-consumer".to_string())] client_id: String,
+        #[builder(into)] client_id: Option<String>,
         #[builder(into)] group_id: String,
         #[builder(default = secs(45))] session_timeout: Time,
         #[builder(default = DEFAULT_CONSUMER_MAX_POLL_INTERVAL)] max_poll_interval: Time,
@@ -891,57 +918,58 @@ impl Consumer {
             return Err(ConsumerError::NotSubscribed);
         }
         if group_id.is_empty() {
-            return Err(ConsumerError::RebalanceFailed("group_id required".into()));
+            return Err(ConsumerError::InvalidConfig("group_id required".into()));
         }
         if group_instance_id.as_deref().is_some_and(str::is_empty) {
-            return Err(ConsumerError::RebalanceFailed(
+            return Err(ConsumerError::InvalidConfig(
                 "group_instance_id must not be empty".into(),
             ));
         }
         let fetch_min = FetchMinBytes::try_from(fetch_min)
-            .map_err(ConsumerError::RebalanceFailed)?
+            .map_err(ConsumerError::InvalidConfig)?
             .size();
         let fetch_max = ConsumerFetchMaxBytes::try_from(fetch_max)
-            .map_err(ConsumerError::RebalanceFailed)?
+            .map_err(ConsumerError::InvalidConfig)?
             .size();
         if fetch_min.bytes_i32() > fetch_max.bytes_i32() {
-            return Err(ConsumerError::RebalanceFailed(
+            return Err(ConsumerError::InvalidConfig(
                 "consumer fetch min must not exceed consumer fetch max".to_owned(),
             ));
         }
         let fetch_partition_max = ConsumerFetchPartitionMaxBytes::try_from(fetch_partition_max)
-            .map_err(ConsumerError::RebalanceFailed)?
+            .map_err(ConsumerError::InvalidConfig)?
             .size();
         // The two validated newtypes below still speak `Duration`: both derive
         // `Eq`, which an `f64`-backed quantity cannot satisfy. Their whole job
         // is to police the whole-millisecond invariant, so the quantity meets
         // them at their own boundary and comes straight back.
         let leave_group_timeout = ConsumerLeaveGroupTimeout::new(leave_group_timeout.to_std())
-            .map_err(ConsumerError::RebalanceFailed)?;
+            .map_err(ConsumerError::InvalidConfig)?;
         let subscription_metadata_refresh_interval =
             ConsumerSubscriptionMetadataRefreshInterval::new(
                 subscription_metadata_refresh_interval.to_std(),
             )
-            .map_err(ConsumerError::RebalanceFailed)?;
+            .map_err(ConsumerError::InvalidConfig)?;
         let dispatch_queue_capacity =
             krabka_client_core::ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
-                .map_err(ConsumerError::RebalanceFailed)?;
+                .map_err(ConsumerError::InvalidConfig)?;
         let frame_max = krabka_client_core::ClientFrameMax::try_from(frame_max)
-            .map_err(ConsumerError::RebalanceFailed)?;
+            .map_err(ConsumerError::InvalidConfig)?;
         let metadata_recovery_rebootstrap_trigger =
             krabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
                 metadata_recovery_rebootstrap_trigger,
             )
-            .map_err(ConsumerError::RebalanceFailed)?
+            .map_err(ConsumerError::InvalidConfig)?
             .time();
         let auto_commit_interval =
             validated_auto_commit_interval(enable_auto_commit, auto_commit_interval)
-                .map_err(ConsumerError::RebalanceFailed)?;
-        let max_poll_interval = validated_max_poll_interval(max_poll_interval)
-            .map_err(ConsumerError::RebalanceFailed)?;
+                .map_err(ConsumerError::InvalidConfig)?;
+        let max_poll_interval =
+            validated_max_poll_interval(max_poll_interval).map_err(ConsumerError::InvalidConfig)?;
         let max_poll_records =
-            validated_max_poll_records(max_poll_records).map_err(ConsumerError::RebalanceFailed)?;
+            validated_max_poll_records(max_poll_records).map_err(ConsumerError::InvalidConfig)?;
 
+        let client_id = consumer_client_id(client_id, &group_id, group_instance_id.as_deref());
         let config = StartConfig {
             bootstrap,
             client_id,
@@ -2361,7 +2389,7 @@ mod security_arg_tests {
             .fetch_min(krabka_units::bytes(0))
             .build()
             .await;
-        assert2::assert!(matches!(min, Err(ConsumerError::RebalanceFailed(_))));
+        assert2::assert!(matches!(min, Err(ConsumerError::InvalidConfig(_))));
 
         let max = Consumer::builder()
             .bootstrap("127.0.0.1:1")
@@ -2370,7 +2398,7 @@ mod security_arg_tests {
             .fetch_max(krabka_units::bytes(0))
             .build()
             .await;
-        assert2::assert!(matches!(max, Err(ConsumerError::RebalanceFailed(_))));
+        assert2::assert!(matches!(max, Err(ConsumerError::InvalidConfig(_))));
 
         let partition_max = Consumer::builder()
             .bootstrap("127.0.0.1:1")
@@ -2381,7 +2409,7 @@ mod security_arg_tests {
             .await;
         assert2::assert!(matches!(
             partition_max,
-            Err(ConsumerError::RebalanceFailed(_))
+            Err(ConsumerError::InvalidConfig(_))
         ));
 
         let inverted = Consumer::builder()
@@ -2394,7 +2422,7 @@ mod security_arg_tests {
             .await;
         assert2::assert!(matches!(
             inverted,
-            Err(ConsumerError::RebalanceFailed(message))
+            Err(ConsumerError::InvalidConfig(message))
                 if message == "consumer fetch min must not exceed consumer fetch max"
         ));
     }
@@ -2621,8 +2649,8 @@ mod security_arg_tests {
             // Permanent misconfig errors — must NOT be retriable.
             ("not subscribed", ConsumerError::NotSubscribed, false),
             (
-                "rebalance failed",
-                ConsumerError::RebalanceFailed("group_id required".into()),
+                "invalid config",
+                ConsumerError::InvalidConfig("group_id required".into()),
                 false,
             ),
             (
@@ -4186,6 +4214,36 @@ mod poll_interval_tests {
             wanted.push((name, vec![expected, expected]));
         }
         assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `ConsumerConfig.maybeOverrideClientId`: an unset or empty
+    /// `client.id` becomes `consumer-<group.id>-<group.instance.id>`, or
+    /// `consumer-<group.id>-<n>` with a process-wide sequence.
+    #[test]
+    fn client_id_is_generated_as_kafka_does() {
+        let first = consumer_client_id(None, "g", None);
+        let sequence: u64 = first
+            .strip_prefix("consumer-g-")
+            .and_then(|n| n.parse().ok())
+            .expect("generated sequence");
+        let actual = [
+            consumer_client_id(None, "g", None),
+            consumer_client_id(Some(String::new()), "g", None),
+            consumer_client_id(None, "g", Some("i-1")),
+            consumer_client_id(Some(String::new()), "g", Some("i-1")),
+            consumer_client_id(Some("app".into()), "g", Some("i-1")),
+        ];
+        let next = |step: u64| format!("consumer-g-{}", sequence + step);
+        assert2::assert!(
+            actual
+                == [
+                    next(1),
+                    next(2),
+                    "consumer-g-i-1".to_owned(),
+                    "consumer-g-i-1".to_owned(),
+                    "app".to_owned(),
+                ]
+        );
     }
 
     #[test]
