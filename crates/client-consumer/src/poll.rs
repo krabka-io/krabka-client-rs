@@ -824,7 +824,21 @@ impl Consumer {
         } else {
             deadline.min(tokio::time::Instant::now() + self.retry_policy.initial_backoff)
         };
-        tokio::time::sleep_until(until).await;
+        // A rebalance that starts during the wait queues listener calls that
+        // this consumer must run, so it ends the wait, as Kafka's
+        // `pollForFetches` waits at most `coordinator.timeToNextPoll`.
+        let mut rebalance_pending = self.rebalance_pending.clone();
+        rebalance_pending.borrow_and_update();
+        let rebalance = async {
+            // Without a coordinator task nothing changes the flag.
+            if rebalance_pending.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep_until(until) => {}
+            () = rebalance => {}
+        }
     }
 
     /// Decode the fetch responses into the fetch buffer, and act on the
@@ -4420,6 +4434,42 @@ mod fetch_path_tests {
         drop(consumer);
         silent.stop();
         assert2::assert!(polled == Ok(Err("the consumer was woken up".to_owned())));
+    }
+
+    /// Kafka's `pollForFetches` waits at most until the coordinator needs the
+    /// application thread: a rebalance that starts while every partition is
+    /// paused ends the wait.
+    #[tokio::test]
+    async fn a_rebalance_ends_the_wait_of_a_poll_with_nothing_to_fetch() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(
+            &[vec![FetchAnswer::Respond {
+                error_code: 0,
+                session_id: 0,
+            }]],
+            &sent,
+        )
+        .await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer
+            .pause(&[("orders".to_owned(), 0)])
+            .await
+            .expect("pause");
+        let (pending, pending_rx) = tokio::sync::watch::channel(false);
+        consumer.rebalance_pending = pending_rx;
+        let rebalance = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pending.send_replace(true);
+            // Keep the sender, as the coordinator task does.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let started = tokio::time::Instant::now();
+        consumer.poll(secs(5)).await.expect("poll");
+        let ended_early = started.elapsed() < Duration::from_secs(2);
+        rebalance.abort();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!(ended_early);
     }
 
     /// One step of a read replica case.

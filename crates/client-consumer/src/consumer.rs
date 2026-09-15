@@ -1020,12 +1020,12 @@ impl Consumer {
             validated_max_poll_records(max_poll_records).map_err(ConsumerError::InvalidConfig)?;
         let fetch_max_wait =
             validated_fetch_max_wait(fetch_max_wait).map_err(ConsumerError::InvalidConfig)?;
-        if metadata_max_age.millis_i64() < 0 || !metadata_max_age.secs_f64().is_finite() {
+        if metadata_max_age.secs_f64() < 0.0 || !metadata_max_age.secs_f64().is_finite() {
             return Err(ConsumerError::InvalidConfig(
                 "consumer metadata max age must not be negative".to_owned(),
             ));
         }
-        if default_api_timeout.millis_i64() < 0 || !default_api_timeout.secs_f64().is_finite() {
+        if default_api_timeout.secs_f64() < 0.0 || !default_api_timeout.secs_f64().is_finite() {
             return Err(ConsumerError::InvalidConfig(
                 "consumer default api timeout must not be negative".to_owned(),
             ));
@@ -2179,6 +2179,51 @@ mod security_arg_tests {
             error
                 .to_string()
                 .contains("consumer subscription metadata refresh interval")
+        );
+    }
+
+    /// A negative time below one millisecond is still negative, and fails the
+    /// build before any request.
+    #[tokio::test]
+    async fn negative_sub_millisecond_times_fail_before_broker_lookup() {
+        let negative = Time::from_secs_f64(-0.0001);
+        let mut actual = Vec::new();
+        for (name, default_api_timeout, metadata_max_age) in [
+            (
+                "default api timeout",
+                negative,
+                DEFAULT_CONSUMER_METADATA_MAX_AGE,
+            ),
+            (
+                "metadata max age",
+                DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
+                negative,
+            ),
+        ] {
+            let build = Consumer::builder()
+                .bootstrap("invalid.invalid:9092")
+                .group_id("negative-times")
+                .subscribe(["topic".to_owned()])
+                .default_api_timeout(default_api_timeout)
+                .metadata_max_age(metadata_max_age)
+                .build();
+            let error = tokio::time::timeout(Duration::from_secs(5), build)
+                .await
+                .map(|result| result.err().map(|error| error.to_string()));
+            actual.push((name, error.ok().flatten()));
+        }
+        assert2::assert!(
+            actual
+                == vec![
+                    (
+                        "default api timeout",
+                        Some("invalid configuration: consumer default api timeout must not be negative".to_owned())
+                    ),
+                    (
+                        "metadata max age",
+                        Some("invalid configuration: consumer metadata max age must not be negative".to_owned())
+                    ),
+                ]
         );
     }
 
