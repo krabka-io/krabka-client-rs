@@ -1525,6 +1525,17 @@ impl Producer {
             rx
         };
 
+        // Kafka's `KafkaProducer.doSend` calls `throwIfInPreparedState` before
+        // `waitOnMetadata`, so a send after `prepare_transaction` does not
+        // wait for metadata. The check before the append covers a
+        // `prepare_transaction` that starts during the wait.
+        if self.transactional_id.is_some() {
+            let state = *self.txn_state.lock().await;
+            if let Err(error) = self.transaction_generation(Some(state)) {
+                return failed(error);
+            }
+        }
+
         // Produce v13 carries only the `topic_id` on the wire, so the cache
         // must hold the topic also when the caller names the partition.
         let metadata_started = tokio::time::Instant::now();
