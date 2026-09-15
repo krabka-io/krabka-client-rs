@@ -4,8 +4,9 @@
 
 use bytes::{Bytes, BytesMut};
 
-/// What to do when a partition has no committed offset.
-#[derive(Debug, Clone, Copy)]
+/// What to do when a partition has no committed offset. Kafka's
+/// `auto.offset.reset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoOffsetReset {
     /// Start from offset 0.
     Earliest,
@@ -15,19 +16,145 @@ pub enum AutoOffsetReset {
     /// Do not reset automatically. On a missing offset or a detected truncation,
     /// `poll` returns `ConsumerError::LogTruncation` and surfaces the error.
     None,
+    /// Start from the first offset whose timestamp is at or after now minus
+    /// this duration (KIP-1106, `by_duration:<ISO-8601 duration>`).
+    /// `Consumer::poll` resolves it with `ListOffsets(timestamp)`.
+    ByDuration(std::time::Duration),
 }
 
 impl std::str::FromStr for AutoOffsetReset {
     type Err = String;
 
+    /// Parse Kafka's `auto.offset.reset` values: `earliest`, `latest`, `none`
+    /// and `by_duration:<ISO-8601 duration>`, as
+    /// `AutoOffsetResetStrategy.fromString` does.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "earliest" => Ok(Self::Earliest),
             "latest" => Ok(Self::Latest),
             "none" => Ok(Self::None),
-            _ => Err(format!("invalid auto offset reset: {value}")),
+            "by_duration" => {
+                Err("<:duration> part is missing in by_duration auto offset reset strategy.".into())
+            }
+            _ => match value.strip_prefix("by_duration:") {
+                Some(duration) => parse_iso_duration(duration).map(Self::ByDuration),
+                None => Err(format!("Unknown auto offset reset strategy: {value}")),
+            },
         }
     }
+}
+
+/// Split the text before `unit` from the front of `part`.
+fn duration_component(part: &str, unit: char) -> (Option<&str>, &str) {
+    match part.find(unit) {
+        Some(end) => (Some(&part[..end]), &part[end + 1..]),
+        None => (None, part),
+    }
+}
+
+/// A decimal integer with an optional sign that fits `i64`, as Java's
+/// `Long.parseLong` in `Duration.parse` requires.
+fn duration_integer(number: &str) -> Option<i128> {
+    let digits = number.strip_prefix(['-', '+']).unwrap_or(number);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    number.parse::<i64>().ok().map(i128::from)
+}
+
+/// `value * unit_seconds` seconds in nanoseconds, added to `nanos`, or `None`
+/// on overflow.
+fn add_duration_part(nanos: i128, value: i128, unit_seconds: i128) -> Option<i128> {
+    const NANOS_PER_SECOND: i128 = 1_000_000_000;
+    value
+        .checked_mul(unit_seconds)?
+        .checked_mul(NANOS_PER_SECOND)
+        .and_then(|part| nanos.checked_add(part))
+}
+
+/// Parse an ISO-8601 duration as Java's `Duration.parse` does:
+/// `[-+]P[nD][T[nH][nM][n[.fffffffff]S]]`, case-insensitive, each number with
+/// an optional sign. `by_duration` rejects a negative result.
+fn parse_iso_duration(text: &str) -> Result<std::time::Duration, String> {
+    const NANOS_PER_SECOND: i128 = 1_000_000_000;
+    let invalid =
+        || "Unable to parse duration string in by_duration offset reset strategy.".to_owned();
+    let upper = text.to_ascii_uppercase();
+    let (negative, rest) = match upper.as_bytes().first() {
+        Some(b'-') => (true, &upper[1..]),
+        Some(b'+') => (false, &upper[1..]),
+        _ => (false, upper.as_str()),
+    };
+    let rest = rest.strip_prefix('P').ok_or_else(invalid)?;
+    let (date, time) = match rest.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (rest, None),
+    };
+    let mut nanos: i128 = 0;
+    let mut components = 0;
+    let (days, date_rest) = duration_component(date, 'D');
+    if !date_rest.is_empty() {
+        return Err(invalid());
+    }
+    if let Some(days) = days {
+        nanos = add_duration_part(nanos, duration_integer(days).ok_or_else(invalid)?, 86_400)
+            .ok_or_else(invalid)?;
+        components += 1;
+    }
+    if let Some(time) = time {
+        let (hours, time) = duration_component(time, 'H');
+        let (minutes, time) = duration_component(time, 'M');
+        let (seconds, time) = duration_component(time, 'S');
+        if !time.is_empty() || (hours.is_none() && minutes.is_none() && seconds.is_none()) {
+            return Err(invalid());
+        }
+        if let Some(hours) = hours {
+            nanos = add_duration_part(nanos, duration_integer(hours).ok_or_else(invalid)?, 3_600)
+                .ok_or_else(invalid)?;
+        }
+        if let Some(minutes) = minutes {
+            nanos = add_duration_part(nanos, duration_integer(minutes).ok_or_else(invalid)?, 60)
+                .ok_or_else(invalid)?;
+        }
+        if let Some(seconds) = seconds {
+            let (whole, fraction) = match seconds.split_once(['.', ',']) {
+                Some((whole, fraction)) => (whole, fraction),
+                None => (seconds, ""),
+            };
+            if fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            let whole_value = duration_integer(whole).ok_or_else(invalid)?;
+            let fraction_value = if fraction.is_empty() {
+                0
+            } else {
+                format!("{fraction:0<9}")
+                    .parse::<i128>()
+                    .map_err(|_| invalid())?
+            };
+            let sign = if whole.starts_with('-') { -1 } else { 1 };
+            nanos = add_duration_part(nanos, whole_value, 1)
+                .and_then(|nanos| nanos.checked_add(sign * fraction_value))
+                .ok_or_else(invalid)?;
+        }
+        components += 1;
+    }
+    if components == 0 {
+        return Err(invalid());
+    }
+    if negative {
+        nanos = -nanos;
+    }
+    if nanos < 0 {
+        return Err(
+            "Negative duration is not supported in by_duration offset reset strategy.".into(),
+        );
+    }
+    // Java's `Duration` holds the seconds in a `long`.
+    let seconds = i64::try_from(nanos / NANOS_PER_SECOND).map_err(|_| invalid())?;
+    let seconds = u64::try_from(seconds).map_err(|_| invalid())?;
+    let subsec = u32::try_from(nanos % NANOS_PER_SECOND).map_err(|_| invalid())?;
+    Ok(std::time::Duration::new(seconds, subsec))
 }
 
 /// Controls which records are visible to this consumer.
@@ -51,9 +178,11 @@ impl std::str::FromStr for IsolationLevel {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Kafka's `ConsumerConfig` accepts exactly these `isolation.level`
+        // values.
         match value {
-            "read-uncommitted" => Ok(Self::ReadUncommitted),
-            "read-committed" => Ok(Self::ReadCommitted),
+            "read_uncommitted" => Ok(Self::ReadUncommitted),
+            "read_committed" => Ok(Self::ReadCommitted),
             _ => Err(format!("invalid isolation level: {value}")),
         }
     }
@@ -222,34 +351,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn consumer_behavior_values_parse_exact_spellings() {
-        assert2::assert!(matches!(
-            "earliest".parse::<AutoOffsetReset>(),
-            Ok(AutoOffsetReset::Earliest)
-        ));
-        assert2::assert!(matches!(
-            "latest".parse::<AutoOffsetReset>(),
-            Ok(AutoOffsetReset::Latest)
-        ));
-        assert2::assert!(matches!(
-            "none".parse::<AutoOffsetReset>(),
-            Ok(AutoOffsetReset::None)
-        ));
-        assert2::assert!("EARLIEST".parse::<AutoOffsetReset>().is_err());
-        assert2::assert!("unknown".parse::<AutoOffsetReset>().is_err());
-    }
-
-    #[test]
-    fn isolation_level_values_parse_exact_spellings() {
-        assert2::assert!(
-            "read-uncommitted".parse::<IsolationLevel>().unwrap()
-                == IsolationLevel::ReadUncommitted
+    fn consumer_behavior_values_parse_kafka_spellings() {
+        use std::time::Duration;
+        let reset = |value: &str| value.parse::<AutoOffsetReset>();
+        let isolation = |value: &str| value.parse::<IsolationLevel>().map_err(|_| ());
+        let actual = (
+            [
+                reset("earliest"),
+                reset("latest"),
+                reset("none"),
+                reset("by_duration:PT1H"),
+                reset("by_duration:P1DT2H3M4.5S"),
+                reset("by_duration:pt0.000000001s"),
+                reset("by_duration:PT1H-30M"),
+                reset("by_duration:+P2D"),
+                reset("by_duration"),
+                reset("by_duration:-PT1H"),
+                reset("by_duration:PT"),
+                reset("by_duration:P"),
+                reset("by_duration:1H"),
+                reset("by_duration:PT1.0000000001S"),
+                reset("by_duration:P9223372036854775807D"),
+                reset("by_duration:PT9223372036854775808H"),
+                reset("by_duration:P106751991167300DT24H"),
+                reset("EARLIEST"),
+                reset("unknown"),
+            ],
+            [
+                isolation("read_committed"),
+                isolation("read_uncommitted"),
+                isolation("read-committed"),
+                isolation("READ_COMMITTED"),
+            ],
         );
-        assert2::assert!(
-            "read-committed".parse::<IsolationLevel>().unwrap() == IsolationLevel::ReadCommitted
+        let unparsable =
+            Err("Unable to parse duration string in by_duration offset reset strategy.".to_owned());
+        let expected = (
+            [
+                Ok(AutoOffsetReset::Earliest),
+                Ok(AutoOffsetReset::Latest),
+                Ok(AutoOffsetReset::None),
+                Ok(AutoOffsetReset::ByDuration(Duration::from_hours(1))),
+                Ok(AutoOffsetReset::ByDuration(Duration::from_millis(
+                    ((24 + 2) * 3600 + 3 * 60 + 4) * 1000 + 500,
+                ))),
+                Ok(AutoOffsetReset::ByDuration(Duration::from_nanos(1))),
+                Ok(AutoOffsetReset::ByDuration(Duration::from_mins(30))),
+                Ok(AutoOffsetReset::ByDuration(Duration::from_hours(48))),
+                Err(
+                    "<:duration> part is missing in by_duration auto offset reset strategy."
+                        .to_owned(),
+                ),
+                Err(
+                    "Negative duration is not supported in by_duration offset reset strategy."
+                        .to_owned(),
+                ),
+                unparsable.clone(),
+                unparsable.clone(),
+                unparsable.clone(),
+                unparsable.clone(),
+                unparsable.clone(),
+                unparsable.clone(),
+                unparsable,
+                Err("Unknown auto offset reset strategy: EARLIEST".to_owned()),
+                Err("Unknown auto offset reset strategy: unknown".to_owned()),
+            ],
+            [
+                Ok(IsolationLevel::ReadCommitted),
+                Ok(IsolationLevel::ReadUncommitted),
+                Err(()),
+                Err(()),
+            ],
         );
-        assert2::assert!("read_committed".parse::<IsolationLevel>().is_err());
-        assert2::assert!("unknown".parse::<IsolationLevel>().is_err());
+        assert2::assert!(actual == expected);
     }
 
     #[test]

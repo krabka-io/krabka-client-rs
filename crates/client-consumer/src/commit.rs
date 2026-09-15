@@ -1526,6 +1526,9 @@ mod tests {
             rebalance_pending: tokio::sync::watch::channel(false).1,
             max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
             fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
+            close_operation: tokio::sync::watch::Sender::new(
+                crate::GroupMembershipOperation::Default,
+            ),
         }
     }
 

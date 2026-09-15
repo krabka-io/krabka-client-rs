@@ -206,8 +206,34 @@ const LATEST_TIMESTAMP: i64 = -1;
 /// `ListOffsets` timestamp that asks for the log start offset.
 const EARLIEST_TIMESTAMP: i64 = -2;
 
-/// Placeholder for "fetch from the log end", resolved before the next Fetch.
+/// Placeholder for "reset with `ListOffsets`", resolved before the next Fetch:
+/// the log end, or the offset for the timestamp of `by_duration`.
 const LATEST_SENTINEL: i64 = i64::MAX;
+
+/// The `ListOffsets` timestamp that resolves a [`LATEST_SENTINEL`] for the
+/// reset policy at `now_ms`.
+///
+/// Kafka's `AutoOffsetResetStrategy.timestamp` gives `-1` for `latest` and
+/// `now - duration` for `by_duration`.
+fn reset_timestamp(policy: AutoOffsetReset, now_ms: i64) -> i64 {
+    match policy {
+        AutoOffsetReset::ByDuration(duration) => {
+            now_ms.saturating_sub(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        }
+        AutoOffsetReset::Earliest | AutoOffsetReset::Latest | AutoOffsetReset::None => {
+            LATEST_TIMESTAMP
+        }
+    }
+}
+
+/// Milliseconds since the Unix epoch.
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
 
 /// `ListOffsets` partitions for one broker, by topic:
 /// `(partition, current_leader_epoch)`.
@@ -480,7 +506,7 @@ impl Consumer {
     /// `poll` fetches nothing until the join completes. The cooperative
     /// protocol keeps the owned partitions, and `poll` fetches them while the
     /// join runs. A member without partitions has nothing to fetch either.
-    async fn wait_for_rebalance(&mut self, deadline: tokio::time::Instant) -> bool {
+    pub(crate) async fn wait_for_rebalance(&mut self, deadline: tokio::time::Instant) -> bool {
         if !*self.rebalance_pending.borrow() {
             return true;
         }
@@ -488,6 +514,10 @@ impl Consumer {
         if !eager && !self.assigned.lock().await.is_empty() {
             return true;
         }
+        // The coordinator task can request the rejoin after the start of this
+        // `poll` signalled it. Signal again, so that this `poll` starts the
+        // join that it waits for, as Kafka's `ensureActiveGroup` does.
+        crate::coordinator::note_poll(&self.poll_signal);
         let joined = tokio::time::timeout_at(
             deadline,
             self.rebalance_pending.wait_for(|pending| !*pending),
@@ -500,17 +530,27 @@ impl Consumer {
 
     /// Return up to `max_poll_records` buffered records, and move the consumed
     /// positions past them.
+    ///
+    /// The `assigned` guard lives until the positions move, so the coordinator
+    /// cannot revoke a partition between the ownership check and the drain.
+    /// The lock order is `assigned`, then `next_offsets`, then `positions`, as
+    /// in the coordinator task.
     async fn drain_fetch_buffer(&mut self) -> Vec<ConsumerRecord> {
+        let assigned_guard = self.assigned.lock().await;
         let assigned: std::collections::HashSet<(String, i32)> =
-            self.assigned.lock().await.iter().cloned().collect();
+            assigned_guard.iter().cloned().collect();
         let mut offsets = self.next_offsets.lock().await;
         let mut positions = self.positions.lock().await;
-        self.fetch_buffer.drain(
+        let records = self.fetch_buffer.drain(
             self.max_poll_records,
             &assigned,
             &mut offsets,
             &mut positions,
-        )
+        );
+        drop(positions);
+        drop(offsets);
+        drop(assigned_guard);
+        records
     }
     /// Decode the fetch responses into the fetch buffer, and act on the
     /// partition errors.
@@ -594,7 +634,7 @@ impl Consumer {
                         // it out of this loop so the true log start can be read once
                         // the offsets guard is released.
                         match self.auto_offset_reset {
-                            AutoOffsetReset::Latest => {
+                            AutoOffsetReset::Latest | AutoOffsetReset::ByDuration(_) => {
                                 offsets.insert(key.clone(), LATEST_SENTINEL);
                                 polled_resets.push((key.clone(), None));
                             }
@@ -1023,8 +1063,9 @@ fn next_offset_after(batches: &[krabka_protocol::records::RecordBatch]) -> Optio
 }
 
 impl Consumer {
-    /// Replace any `LATEST_SENTINEL` in `next_offsets` with the real log-end
-    /// offset from `ListOffsets(timestamp=-1)`.
+    /// Replace any `LATEST_SENTINEL` in `next_offsets` with the offset from
+    /// `ListOffsets`: the log end (`timestamp=-1`), or for `by_duration` the
+    /// first offset at or after now minus the duration.
     ///
     /// `auto_offset_reset = Latest` plants those sentinels at build time, and
     /// the `OFFSET_OUT_OF_RANGE` arm of the poll loop plants them again. This
@@ -1050,7 +1091,8 @@ impl Consumer {
             return Ok(());
         }
         tracing::Span::current().record("sentinels", sentinels.len());
-        let result = self.list_offsets(&sentinels, LATEST_TIMESTAMP).await?;
+        let timestamp = reset_timestamp(self.auto_offset_reset, unix_now_ms());
+        let result = self.list_offsets(&sentinels, timestamp).await?;
         {
             // A seek or a rebalance can change a position while the request
             // is in flight. Replace only a sentinel that is still there.
@@ -1983,6 +2025,9 @@ mod partition_error_tests {
             rebalance_pending: tokio::sync::watch::channel(false).1,
             max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
             fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
+            close_operation: tokio::sync::watch::Sender::new(
+                crate::GroupMembershipOperation::Default,
+            ),
         }
     }
 
@@ -2051,6 +2096,57 @@ mod partition_error_tests {
 
         broker.stop();
         assert2::assert!((first, second) == (Err(Some(topics)), Ok(true)));
+    }
+
+    /// A partition that the coordinator revokes while `poll` drains the fetch
+    /// buffer is either still owned for the whole drain, or not drained at
+    /// all. The drain never returns records of a partition that left the
+    /// assignment before the drain completed.
+    #[tokio::test]
+    async fn drain_never_returns_records_of_a_partition_revoked_during_the_drain() {
+        let broker = metadata_counting_broker(Arc::default()).await;
+        let mut consumer = consumer_on(&broker).await;
+        consumer
+            .fetch_buffer
+            .push(crate::fetch_buffer::BufferedPartition {
+                key: ("orders".into(), 0),
+                position: 5,
+                records: std::collections::VecDeque::from([ConsumerRecord {
+                    topic: "orders".into(),
+                    partition: 0,
+                    offset: 5,
+                    leader_epoch: 0,
+                    timestamp: 0,
+                    timestamp_type: crate::TimestampType::CreateTime,
+                    key: None,
+                    value: None,
+                    headers: Vec::new(),
+                }]),
+                next_offset: 6,
+                last_epoch: None,
+            });
+        let assigned = Arc::clone(&consumer.assigned);
+        let next_offsets = Arc::clone(&consumer.next_offsets);
+        // Block the drain between the ownership check and the position update.
+        let offsets_guard = next_offsets.lock().await;
+        let drain = tokio::spawn(async move {
+            let records = consumer.drain_fetch_buffer().await;
+            (consumer, records)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The coordinator revokes the partition, if it can take the lock.
+        let revoked = match tokio::time::timeout(Duration::from_millis(50), assigned.lock()).await {
+            Ok(mut owned) => {
+                owned.clear();
+                true
+            }
+            Err(_) => false,
+        };
+        drop(offsets_guard);
+        let (consumer, records) = drain.await.expect("drain task");
+        drop(consumer);
+        broker.stop();
+        assert2::assert!(!revoked || records.is_empty());
     }
 
     /// While a join runs, Kafka's eager `onJoinPrepare` has revoked every
@@ -2635,6 +2731,9 @@ mod partition_error_tests {
     enum Reset {
         /// `auto.offset.reset=latest`: a sentinel that `prepare_poll` resolves.
         Latest,
+        /// `auto.offset.reset=by_duration:PT1H`: a sentinel that
+        /// `prepare_poll` resolves with the timestamp of one hour ago.
+        ByOneHour,
         /// `auto.offset.reset=earliest`: a Fetch row with
         /// `OFFSET_OUT_OF_RANGE`.
         EarliestOutOfRange,
@@ -2696,6 +2795,16 @@ mod partition_error_tests {
         let result = match exchange.reset {
             Reset::Latest => {
                 consumer.auto_offset_reset = AutoOffsetReset::Latest;
+                consumer
+                    .next_offsets
+                    .lock()
+                    .await
+                    .insert(("orders".into(), 0), LATEST_SENTINEL);
+                consumer.prepare_poll().await.map(|_| ())
+            }
+            Reset::ByOneHour => {
+                consumer.auto_offset_reset =
+                    AutoOffsetReset::ByDuration(std::time::Duration::from_hours(1));
                 consumer
                     .next_offsets
                     .lock()
@@ -2821,6 +2930,63 @@ mod partition_error_tests {
             let outcome = run_list_offsets_exchange(exchange).await;
             check!(outcome == expected, "case {name}");
         }
+    }
+
+    /// Kafka's `AutoOffsetResetStrategy.timestamp` for `by_duration` is now
+    /// minus the duration, and the reset sends `ListOffsets` with it (KIP-1106).
+    #[tokio::test]
+    async fn by_duration_resets_with_the_timestamp_of_now_minus_the_duration() {
+        let before = unix_now_ms() - 3_600_000;
+        let mut outcome = run_list_offsets_exchange(Exchange {
+            isolation: IsolationLevel::ReadUncommitted,
+            reset: Reset::ByOneHour,
+            row: (0, 40),
+            list_offsets_max_version: list_offsets_request::MAX_VERSION,
+            primed: true,
+        })
+        .await;
+        let after = unix_now_ms() - 3_600_000;
+        // The wall clock moves during the exchange: check the range, then
+        // compare the whole outcome with the timestamp of the start.
+        let mut in_range = Vec::new();
+        for (_, _, request) in &mut outcome.requests {
+            for topic in &mut request.topics {
+                for partition in &mut topic.partitions {
+                    in_range.push((before..=after).contains(&partition.timestamp));
+                    partition.timestamp = before;
+                }
+            }
+        }
+
+        assert2::assert!(
+            (in_range, outcome)
+                == (
+                    vec![true],
+                    ListOffsetsOutcome {
+                        requests: vec![(
+                            "leader",
+                            list_offsets_request::MAX_VERSION,
+                            expected_list_offsets(0, before),
+                        )],
+                        result: Ok(()),
+                        metadata_requests: 1,
+                        next_offset: Some(40),
+                    }
+                )
+        );
+    }
+
+    #[test]
+    fn reset_timestamp_follows_the_reset_policy() {
+        let now = 1_700_000_000_000;
+        let actual = [
+            AutoOffsetReset::Latest,
+            AutoOffsetReset::None,
+            AutoOffsetReset::ByDuration(std::time::Duration::from_hours(1)),
+            AutoOffsetReset::ByDuration(std::time::Duration::from_millis(1500)),
+        ]
+        .map(|policy| reset_timestamp(policy, now));
+        assert2::assert!(actual == [-1, -1, now - 3_600_000, now - 1500]);
     }
 
     /// A new assignment without a committed offset has no leader in the

@@ -17,6 +17,10 @@ pub enum ConsumerError {
     #[error("rebalance failed: {0}")]
     RebalanceFailed(String),
 
+    /// A builder setting is not valid. Kafka's `ConfigException`.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+
     #[error("startup failed after joining group: {0}")]
     StartupAfterJoin(Box<ConsumerError>),
 
@@ -113,6 +117,11 @@ mod tests {
                 "not subscribed to any topic",
             ),
             ("server", ConsumerError::Server(25), "broker error_code 25"),
+            (
+                "invalid config",
+                ConsumerError::InvalidConfig("group_id required".into()),
+                "invalid configuration: group_id required",
+            ),
             (
                 "group authorization failed",
                 ConsumerError::GroupAuthorizationFailed("workers".into()),
