@@ -288,6 +288,8 @@ mod tests {
             .map(|compression| levels(5, 12, 19).level(compression))
                 == [None, Some(5), None, Some(12), Some(19)]
         );
+        let set = levels(5, 12, 19);
+        assert2::assert!([set.gzip(), set.lz4(), set.zstd()] == [5, 12, 19]);
     }
 
     #[test]

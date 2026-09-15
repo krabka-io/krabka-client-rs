@@ -1983,6 +1983,7 @@ mod tests {
     use crate::{
         ProducerRecord,
         accumulator::{Accumulator, AppendResult},
+        compression::Compression,
         error::ProducerError,
         partitioner::partition_for_key,
     };
@@ -2895,6 +2896,42 @@ mod tests {
             drop(producer);
             assert2::assert!(actual == expected, "{name}");
         }
+    }
+
+    /// The `Debug` form of a producer names the level of its codec, and no
+    /// level for a codec without levels.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn debug_names_the_compression_level_of_the_codec() {
+        let (mock, _) = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+        let mut actual = Vec::new();
+        for compression in [Compression::Gzip, Compression::Zstd, Compression::Snappy] {
+            let producer = Producer::builder()
+                .bootstrap(mock.addr.to_string())
+                .client_id(CLIENT_ID)
+                .enable_idempotence(false)
+                .compression(compression)
+                .compression_gzip_level(5)
+                .compression_zstd_level(19)
+                .build()
+                .await
+                .expect("producer connects to mock broker");
+            let debug = format!("{producer:?}");
+            actual.push(
+                debug
+                    .split(", ")
+                    .find(|field| field.starts_with("compression_level"))
+                    .map(str::to_owned),
+            );
+        }
+        mock.stop();
+        assert2::assert!(
+            actual
+                == vec![
+                    Some("compression_level: Some(5)".to_owned()),
+                    Some("compression_level: Some(19)".to_owned()),
+                    Some("compression_level: None".to_owned()),
+                ]
+        );
     }
 
     /// A record that does not fit the current batch closes that batch before
