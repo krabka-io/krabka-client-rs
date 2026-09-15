@@ -109,6 +109,9 @@ pub struct Consumer {
     /// A fatal error from a coordinator rejoin that the next `poll` returns.
     /// The coordinator task holds the same slot.
     pub(crate) poll_error: crate::coordinator::PollErrorSlot,
+    /// Kafka's `enable.auto.commit` state. `None` when auto commit is off.
+    /// The coordinator task holds a clone.
+    pub(crate) auto_commit: Option<crate::commit::AutoCommit>,
 }
 
 #[derive(Clone)]
@@ -144,6 +147,9 @@ struct StartConfig {
     client_rack: Option<String>,
     security: Option<krabka_client_core::security::ClientSecurity>,
     retry_policy: ConsumerRetryPolicy,
+    /// Kafka's `auto.commit.interval.ms`, or `None` when
+    /// `enable.auto.commit` is off.
+    auto_commit_interval: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -649,6 +655,23 @@ pub(crate) fn reset_starting_offset(auto_offset_reset: AutoOffsetReset) -> i64 {
     }
 }
 
+/// The auto commit interval, or `None` when auto commit is off.
+///
+/// Kafka's `ConsumerConfig` defines `auto.commit.interval.ms` as an `int` of at
+/// least 0.
+fn validated_auto_commit_interval(
+    enable_auto_commit: bool,
+    interval: Time,
+) -> Result<Option<Duration>, String> {
+    if !enable_auto_commit {
+        return Ok(None);
+    }
+    if !(0..=i64::from(i32::MAX)).contains(&interval.millis_i64_trunc()) {
+        return Err("consumer auto commit interval must be 0 to i32::MAX milliseconds".to_owned());
+    }
+    Ok(Some(interval.to_std()))
+}
+
 fn primed_position(committed_epoch: i32) -> crate::position::PartitionPosition {
     crate::position::PartitionPosition {
         // Wrap the committed leader epoch (raw wire `int32` from OffsetFetch) at
@@ -679,6 +702,15 @@ impl Consumer {
     /// function then drops the timed-out future, which cancels its in-flight
     /// connections, and starts a fresh attempt. A genuine misconfiguration or a
     /// persistent error surfaces immediately.
+    ///
+    /// With `enable_auto_commit` on (the default, as in Kafka), the consumer
+    /// commits its positions as Kafka's `enable.auto.commit` does: from `poll`
+    /// each `auto_commit_interval` (default 5 s), before each `JoinGroup`, and
+    /// in [`close`](Self::close). The commit before a `JoinGroup` includes only
+    /// records that the application received before its latest `poll`. Set
+    /// `enable_auto_commit(false)` to commit manually, for example in a
+    /// transactional consume-process-produce loop. The consumer then commits
+    /// nothing that the application does not ask for.
     #[builder(start_fn = builder, finish_fn = build)]
     #[tracing::instrument(
         name = "consumer.start",
@@ -719,6 +751,8 @@ impl Consumer {
         #[builder(into)] client_rack: Option<String>,
         security: Option<krabka_client_core::security::ClientSecurity>,
         #[builder(default = ConsumerRetryPolicy::default())] retry_policy: ConsumerRetryPolicy,
+        #[builder(default = true)] enable_auto_commit: bool,
+        #[builder(default = secs(5))] auto_commit_interval: Time,
     ) -> Result<Self, ConsumerError> {
         // Fail fast on misconfig — before any retry loop.
         if subscribe.is_empty() {
@@ -768,6 +802,9 @@ impl Consumer {
             )
             .map_err(ConsumerError::RebalanceFailed)?
             .time();
+        let auto_commit_interval =
+            validated_auto_commit_interval(enable_auto_commit, auto_commit_interval)
+                .map_err(ConsumerError::RebalanceFailed)?;
 
         let config = StartConfig {
             bootstrap,
@@ -796,6 +833,7 @@ impl Consumer {
             client_rack,
             security,
             retry_policy,
+            auto_commit_interval,
         };
 
         let started = tokio::time::Instant::now();
@@ -1275,6 +1313,7 @@ async fn spawn_consumer(
         client_rack,
         security,
         retry_policy,
+        auto_commit_interval,
     } = config;
     let StartupState {
         generation_id,
@@ -1337,6 +1376,7 @@ async fn spawn_consumer(
     let current_generation = Arc::new(AtomicI32::new(generation_id));
 
     let poll_error = crate::coordinator::PollErrorSlot::default();
+    let auto_commit = auto_commit_interval.map(crate::commit::AutoCommit::new);
 
     let shutdown = CancellationToken::new();
     let state = CoordinatorState {
@@ -1372,6 +1412,8 @@ async fn spawn_consumer(
         initial_subscribed_counts: topic_partitions,
         retry_policy: retry_policy.into(),
         poll_error: Arc::clone(&poll_error),
+        auto_commit: auto_commit.clone(),
+        join_prepared: false,
     };
     // IMPORTANT: `tokio::spawn` is the very last operation — no `.await`
     // follows it.  Dropping a timed-out `start_once` future before this
@@ -1408,6 +1450,7 @@ async fn spawn_consumer(
         fetch_partition_max,
         auto_offset_reset,
         poll_error,
+        auto_commit,
     })
 }
 
@@ -1528,6 +1571,9 @@ impl Consumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn close(mut self) -> Result<(), ConsumerError> {
+        // Kafka's `ConsumerCoordinator.close` runs `maybeAutoCommitOffsetsSync`
+        // before the coordinator leaves the group.
+        self.auto_commit_on_close().await;
         self.coordinator_shutdown.cancel();
         if let Some(h) = self.coordinator_handle.take() {
             let _ = h.await;
@@ -2238,6 +2284,7 @@ mod security_arg_tests {
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
+            auto_commit: None,
         }
     }
 
@@ -2429,5 +2476,511 @@ mod security_arg_tests {
             .build()
             .await;
         assert2::assert!(res.is_err());
+    }
+}
+
+#[cfg(test)]
+mod auto_commit_tests {
+    use std::{collections::VecDeque, sync::atomic::AtomicI16};
+
+    use bytes::Buf as _;
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
+        Decode as _, Encode, UnknownTaggedFields,
+        owned::{
+            api_versions_request,
+            api_versions_response::{ApiVersion, ApiVersionsResponse},
+            heartbeat_request,
+            heartbeat_response::HeartbeatResponse,
+            join_group_request, leave_group_request,
+            leave_group_response::LeaveGroupResponse,
+            metadata_request,
+            metadata_response::MetadataResponse,
+            offset_commit_request::{
+                self, OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+            },
+            offset_commit_response::{
+                OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+            },
+            sync_group_request,
+        },
+    };
+
+    use super::*;
+
+    const GROUP: &str = "group-a";
+    const MEMBER: &str = "member-a";
+    const TOPIC: &str = "orders";
+    /// `REBALANCE_IN_PROGRESS`.
+    const REBALANCE_IN_PROGRESS: i16 = 27;
+    const AUTO_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// A group request that the mock coordinator received, in arrival order.
+    #[derive(Clone, Debug, PartialEq)]
+    enum GroupRequest {
+        OffsetCommit(OffsetCommitRequest),
+        JoinGroup,
+        SyncGroup,
+        LeaveGroup,
+    }
+
+    /// The API versions that the mock advertises: `(api_key, min, max)`. Each
+    /// maximum is below the flexible version of its API, so no response needs a
+    /// tagged response header.
+    const API_VERSIONS: [(i16, i16, i16); 7] = [
+        (api_versions_request::API_KEY, 0, 3),
+        (metadata_request::API_KEY, 0, 8),
+        (join_group_request::API_KEY, 0, 5),
+        (sync_group_request::API_KEY, 0, 3),
+        (heartbeat_request::API_KEY, 0, 3),
+        (leave_group_request::API_KEY, 0, 3),
+        (offset_commit_request::API_KEY, 2, 7),
+    ];
+
+    /// A group coordinator that records every group request and answers each
+    /// one with success.
+    struct MockCoordinator {
+        protocol: &'static str,
+        requests: std::sync::Mutex<Vec<GroupRequest>>,
+        /// The error code of the next `Heartbeat` response. The mock sends it
+        /// once and then answers `0`.
+        heartbeat_error: AtomicI16,
+        /// The assignment of each `SyncGroup` response. The mock repeats the
+        /// last one.
+        assignments: std::sync::Mutex<VecDeque<Vec<(String, i32)>>>,
+        generation: AtomicI32,
+    }
+
+    fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
+        let mut buf = bytes::BytesMut::new();
+        response.encode(&mut buf, version).expect("encode response");
+        buf.to_vec()
+    }
+
+    impl MockCoordinator {
+        fn record(&self, request: GroupRequest) {
+            self.requests.lock().expect("requests lock").push(request);
+        }
+
+        fn requests(&self) -> Vec<GroupRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+
+        fn sync_groups(&self) -> usize {
+            self.requests()
+                .iter()
+                .filter(|request| **request == GroupRequest::SyncGroup)
+                .count()
+        }
+
+        fn respond(&self, api_key: i16, version: i16, mut body: &[u8]) -> Option<Vec<u8>> {
+            match api_key {
+                api_versions_request::API_KEY => Some(encode(
+                    &ApiVersionsResponse {
+                        api_keys: API_VERSIONS
+                            .iter()
+                            .map(|(api_key, min_version, max_version)| ApiVersion {
+                                api_key: *api_key,
+                                min_version: *min_version,
+                                max_version: *max_version,
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    },
+                    0,
+                )),
+                metadata_request::API_KEY => Some(encode(&MetadataResponse::default(), version)),
+                heartbeat_request::API_KEY => Some(encode(
+                    &HeartbeatResponse {
+                        error_code: self.heartbeat_error.swap(0, Ordering::SeqCst),
+                        ..Default::default()
+                    },
+                    version,
+                )),
+                join_group_request::API_KEY => {
+                    self.record(GroupRequest::JoinGroup);
+                    Some(encode(
+                        &JoinGroupResponse {
+                            generation_id: self.generation.fetch_add(1, Ordering::SeqCst) + 1,
+                            protocol_name: Some(self.protocol.to_owned()),
+                            leader: "leader".into(),
+                            member_id: MEMBER.into(),
+                            ..Default::default()
+                        },
+                        version,
+                    ))
+                }
+                sync_group_request::API_KEY => {
+                    self.record(GroupRequest::SyncGroup);
+                    let mut assignments = self.assignments.lock().expect("assignments lock");
+                    let assignment = if assignments.len() > 1 {
+                        assignments.pop_front().expect("assignment")
+                    } else {
+                        assignments.front().cloned().expect("assignment")
+                    };
+                    drop(assignments);
+                    Some(encode(
+                        &SyncGroupResponse {
+                            assignment: crate::builder::encode_assignment(&assignment),
+                            ..Default::default()
+                        },
+                        version,
+                    ))
+                }
+                leave_group_request::API_KEY => {
+                    self.record(GroupRequest::LeaveGroup);
+                    Some(encode(&LeaveGroupResponse::default(), version))
+                }
+                offset_commit_request::API_KEY => {
+                    let client_id_len = body.get_i16();
+                    body.advance(usize::try_from(client_id_len.max(0)).expect("client id length"));
+                    let mut request =
+                        OffsetCommitRequest::decode(&mut body, version).expect("decode commit");
+                    request.topics.sort_by(|a, b| a.name.cmp(&b.name));
+                    for topic in &mut request.topics {
+                        topic.partitions.sort_by_key(|p| p.partition_index);
+                    }
+                    let response = OffsetCommitResponse {
+                        topics: request
+                            .topics
+                            .iter()
+                            .map(|topic| OffsetCommitResponseTopic {
+                                name: topic.name.clone(),
+                                partitions: topic
+                                    .partitions
+                                    .iter()
+                                    .map(|p| OffsetCommitResponsePartition {
+                                        partition_index: p.partition_index,
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    };
+                    self.record(GroupRequest::OffsetCommit(request));
+                    Some(encode(&response, version))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn partition(index: i32) -> (String, i32) {
+        (TOPIC.to_owned(), index)
+    }
+
+    /// The `OffsetCommit` that Kafka's `SubscriptionState.allConsumed` makes:
+    /// each `(partition, offset, leader_epoch)` with metadata `""`.
+    fn commit(generation: i32, offsets: &[(i32, i64, i32)]) -> GroupRequest {
+        GroupRequest::OffsetCommit(OffsetCommitRequest {
+            group_id: GROUP.into(),
+            generation_id_or_member_epoch: generation,
+            member_id: MEMBER.into(),
+            group_instance_id: None,
+            retention_time_ms: -1,
+            topics: vec![OffsetCommitRequestTopic {
+                name: TOPIC.into(),
+                partitions: offsets
+                    .iter()
+                    .map(
+                        |(partition_index, committed_offset, committed_leader_epoch)| {
+                            OffsetCommitRequestPartition {
+                                partition_index: *partition_index,
+                                committed_offset: *committed_offset,
+                                committed_leader_epoch: *committed_leader_epoch,
+                                committed_metadata: Some(String::new()),
+                                unknown_tagged_fields: UnknownTaggedFields::default(),
+                            }
+                        },
+                    )
+                    .collect(),
+                ..Default::default()
+            }],
+            unknown_tagged_fields: UnknownTaggedFields::default(),
+        })
+    }
+
+    fn start_config(bootstrap: String, assignor: Assignor, auto_commit: bool) -> StartConfig {
+        StartConfig {
+            bootstrap,
+            client_id: "auto-commit-test".into(),
+            group_id: GROUP.into(),
+            session_timeout: secs(45),
+            rebalance_timeout: minutes(1),
+            heartbeat_interval: secs(3),
+            subscription_metadata_refresh_interval: minutes(60),
+            subscribe: vec![TOPIC.into()],
+            group_instance_id: None,
+            auto_offset_reset: AutoOffsetReset::Earliest,
+            isolation_level: IsolationLevel::ReadUncommitted,
+            assignor,
+            fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
+            fetch_max: crate::poll::DEFAULT_FETCH_MAX,
+            fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
+            request_timeout: secs(30),
+            dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::new(
+                krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY,
+            )
+            .expect("dispatch queue capacity"),
+            frame_max: krabka_client_core::ClientFrameMax::try_from(
+                krabka_client_core::DEFAULT_CLIENT_FRAME_MAX,
+            )
+            .expect("frame max"),
+            metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy::default(),
+            metadata_recovery_rebootstrap_trigger:
+                krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
+            leave_group_timeout: secs(5),
+            client_rack: None,
+            security: None,
+            retry_policy: ConsumerRetryPolicy::default(),
+            auto_commit_interval: auto_commit.then_some(AUTO_COMMIT_INTERVAL),
+        }
+    }
+
+    /// One application or group event of a scenario.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// Run the start of `poll`, and wait for a commit that it sends.
+        Poll,
+        /// Advance the clock by the auto commit interval.
+        AdvanceInterval,
+        /// `poll` returns records of partition 0 up to offset 19. The
+        /// application has not processed them until it polls again.
+        ReceiveRecords,
+        /// The next heartbeat answers `REBALANCE_IN_PROGRESS`. Wait until the
+        /// coordinator received `syncs` `SyncGroup` requests in total.
+        Rebalance {
+            syncs: usize,
+        },
+        Close,
+    }
+
+    /// Start a consumer that owns partitions 0 (next offset 12, leader epoch 3)
+    /// and 1 (next offset 7, no epoch) at generation 1, run `steps`, and return
+    /// the group requests that the coordinator received.
+    async fn run(
+        auto_commit: bool,
+        assignor: Assignor,
+        assignments: Vec<Vec<(String, i32)>>,
+        steps: &[Step],
+    ) -> Vec<GroupRequest> {
+        let coordinator = Arc::new(MockCoordinator {
+            protocol: assignor.protocol_name(),
+            requests: std::sync::Mutex::new(Vec::new()),
+            heartbeat_error: AtomicI16::new(0),
+            assignments: std::sync::Mutex::new(assignments.into()),
+            generation: AtomicI32::new(1),
+        });
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let config = start_config(mock.addr.to_string(), assignor, auto_commit);
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = Some(
+            spawn_consumer(
+                config,
+                client,
+                Arc::new(AtomicI32::new(0)),
+                MEMBER.into(),
+                StartupState {
+                    generation_id: 1,
+                    assigned_partitions: vec![partition(0), partition(1)],
+                    next_offsets: HashMap::from([(partition(0), 12), (partition(1), 7)]),
+                    positions: HashMap::from([(partition(0), primed_position(3))]),
+                    topic_ids: HashMap::new(),
+                    topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
+                },
+            )
+            .await
+            .expect("spawn consumer"),
+        );
+
+        for step in steps {
+            match step {
+                Step::Poll => {
+                    let consumer = consumer.as_ref().expect("open consumer");
+                    consumer.maybe_auto_commit_async().await;
+                    drop(consumer.commit_serialization.lock().await);
+                }
+                Step::AdvanceInterval => tokio::time::advance(AUTO_COMMIT_INTERVAL).await,
+                Step::ReceiveRecords => {
+                    let consumer = consumer.as_ref().expect("open consumer");
+                    consumer.next_offsets.lock().await.insert(partition(0), 20);
+                }
+                Step::Rebalance { syncs } => {
+                    coordinator
+                        .heartbeat_error
+                        .store(REBALANCE_IN_PROGRESS, Ordering::SeqCst);
+                    for _ in 0..600 {
+                        if coordinator.sync_groups() >= *syncs {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    // Let a commit that comes after the last SyncGroup arrive.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Step::Close => {
+                    consumer
+                        .take()
+                        .expect("open consumer")
+                        .close()
+                        .await
+                        .expect("close");
+                }
+            }
+        }
+
+        let requests = coordinator.requests();
+        drop(consumer);
+        mock.stop();
+        requests
+    }
+
+    /// One scenario: name, `enable.auto.commit`, assignor, the `SyncGroup`
+    /// assignments, the steps, and the group requests that Kafka sends.
+    type Case = (
+        &'static str,
+        bool,
+        Assignor,
+        Vec<Vec<(String, i32)>>,
+        Vec<Step>,
+        Vec<GroupRequest>,
+    );
+
+    /// Kafka commits the consumed positions from `poll` each
+    /// `auto.commit.interval.ms`, before each `JoinGroup`, and in `close`, but
+    /// only when `enable.auto.commit` is on. With auto commit off, the consumer
+    /// commits nothing that the application did not ask for.
+    #[tokio::test(start_paused = true)]
+    async fn auto_commit_sends_offset_commit_where_kafka_does() {
+        use GroupRequest::{JoinGroup, LeaveGroup, SyncGroup};
+        use Step::{AdvanceInterval, Close, Poll, Rebalance, ReceiveRecords};
+
+        let both = [(0, 12, 3), (1, 7, -1)];
+        let cases: Vec<Case> = vec![
+            (
+                "on: a poll after the interval commits the positions",
+                true,
+                Assignor::Range,
+                vec![],
+                vec![Poll, AdvanceInterval, Poll],
+                vec![commit(1, &both)],
+            ),
+            (
+                "on: a poll before the interval commits nothing",
+                true,
+                Assignor::Range,
+                vec![],
+                vec![Poll, Poll],
+                vec![],
+            ),
+            (
+                "off: a poll after the interval commits nothing",
+                false,
+                Assignor::Range,
+                vec![],
+                vec![Poll, AdvanceInterval, Poll],
+                vec![],
+            ),
+            (
+                "on, eager: a rebalance commits the positions of the last poll before JoinGroup",
+                true,
+                Assignor::Range,
+                vec![vec![partition(0), partition(1)]],
+                vec![Poll, ReceiveRecords, Rebalance { syncs: 1 }],
+                vec![commit(1, &both), JoinGroup, SyncGroup],
+            ),
+            (
+                "off, eager: a rebalance commits nothing",
+                false,
+                Assignor::Range,
+                vec![vec![partition(0), partition(1)]],
+                vec![Poll, ReceiveRecords, Rebalance { syncs: 1 }],
+                vec![JoinGroup, SyncGroup],
+            ),
+            (
+                "on, cooperative: a revoke of partition 1 commits before each JoinGroup",
+                true,
+                Assignor::CooperativeSticky,
+                vec![vec![partition(0)]],
+                vec![Poll, ReceiveRecords, Rebalance { syncs: 2 }],
+                vec![
+                    commit(1, &both),
+                    JoinGroup,
+                    SyncGroup,
+                    commit(2, &[(0, 12, 3)]),
+                    JoinGroup,
+                    SyncGroup,
+                ],
+            ),
+            (
+                "off, cooperative: a revoke of partition 1 commits nothing",
+                false,
+                Assignor::CooperativeSticky,
+                vec![vec![partition(0)]],
+                vec![Poll, ReceiveRecords, Rebalance { syncs: 2 }],
+                vec![JoinGroup, SyncGroup, JoinGroup, SyncGroup],
+            ),
+            (
+                "on: close commits the current positions, then leaves the group",
+                true,
+                Assignor::Range,
+                vec![],
+                vec![Poll, ReceiveRecords, Close],
+                vec![commit(1, &[(0, 20, 3), (1, 7, -1)]), LeaveGroup],
+            ),
+            (
+                "off: close only leaves the group",
+                false,
+                Assignor::CooperativeSticky,
+                vec![],
+                vec![Poll, ReceiveRecords, Close],
+                vec![LeaveGroup],
+            ),
+        ];
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, auto_commit, assignor, assignments, steps, expected) in cases {
+            actual.push((name, run(auto_commit, assignor, assignments, &steps).await));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    #[test]
+    fn auto_commit_interval_follows_kafka_config_bounds() {
+        for (name, enable, interval, expected) in [
+            ("off", false, Time::from_millis(-1), Ok(None)),
+            ("default", true, secs(5), Ok(Some(Duration::from_secs(5)))),
+            ("zero", true, Time::from_millis(0), Ok(Some(Duration::ZERO))),
+            (
+                "i32::MAX milliseconds",
+                true,
+                Time::from_millis(i64::from(i32::MAX)),
+                Ok(Some(Duration::from_millis(u64::from(
+                    i32::MAX.unsigned_abs(),
+                )))),
+            ),
+            ("negative", true, Time::from_millis(-1), Err(())),
+            (
+                "above i32::MAX milliseconds",
+                true,
+                Time::from_millis(i64::from(i32::MAX) + 1),
+                Err(()),
+            ),
+        ] {
+            let result = validated_auto_commit_interval(enable, interval).map_err(|_| ());
+            assert2::check!(result == expected, "case {name}");
+        }
     }
 }

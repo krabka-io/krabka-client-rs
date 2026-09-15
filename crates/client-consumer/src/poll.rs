@@ -725,6 +725,9 @@ impl Consumer {
             return Err(error);
         }
         self.apply_pending_seeks().await;
+        // Kafka's `ConsumerCoordinator.poll` sends the interval auto commit
+        // before `updateFetchPositions`.
+        self.maybe_auto_commit_async().await;
         // Metadata comes first. A partition that has no position yet (a new
         // assignment without a committed offset) gets its leader id and
         // epoch here, so its first `ListOffsets` goes to the leader and not
@@ -1851,6 +1854,7 @@ mod partition_error_tests {
             fetch_partition_max: DEFAULT_FETCH_PARTITION_MAX,
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
+            auto_commit: None,
         }
     }
 
