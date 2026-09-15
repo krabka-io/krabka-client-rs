@@ -84,7 +84,10 @@ pub use builder::{
     DEFAULT_PRODUCER_RETRY_BACKOFF_MAX, DEFAULT_PRODUCER_TRANSACTION_TIMEOUT, ProducerFlushTimeout,
     ProducerRetryPolicy, ProducerThroughputPolicy,
 };
-pub use compression::Compression;
+pub use compression::{
+    Compression, CompressionLevels, DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL,
+    DEFAULT_PRODUCER_COMPRESSION_LZ4_LEVEL, DEFAULT_PRODUCER_COMPRESSION_ZSTD_LEVEL,
+};
 pub use error::{ProducerError, RecordSizeLimit};
 pub use krabka_client_consumer::ConsumerGroupMetadata;
 pub use partitioner::partition_for_key;

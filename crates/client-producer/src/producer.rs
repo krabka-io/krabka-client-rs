@@ -47,7 +47,7 @@ use crate::{
     },
     buffer_pool::BufferPool,
     builder::{ProducerFlushTimeout, send_init_producer_id},
-    compression::Compression,
+    compression::{Compression, CompressionLevels},
     error::{ProducerError, RecordSizeLimit},
     metadata_wait::{MetadataRefresh, MetadataWait, metadata_request},
     partitioner::{BuiltInPartitioner, StickyPartition, TopicPartitions},
@@ -243,6 +243,8 @@ pub struct Producer {
     #[allow(dead_code)]
     pub(crate) acks: Acks,
     pub(crate) compression: Compression,
+    /// The validated `compression.<codec>.level` settings (KIP-390).
+    pub(crate) compression_levels: CompressionLevels,
     pub(crate) batch_size: usize,
     #[allow(dead_code)]
     pub(crate) linger: Time,
@@ -1901,6 +1903,10 @@ impl std::fmt::Debug for Producer {
             .field("producer_epoch", &self.producer_epoch())
             .field("transactional_id", &self.transactional_id)
             .field("compression", &self.compression)
+            .field(
+                "compression_level",
+                &self.compression_levels.level(self.compression),
+            )
             .finish_non_exhaustive()
     }
 }

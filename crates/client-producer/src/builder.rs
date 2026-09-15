@@ -33,7 +33,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     buffer_pool::BufferPool,
-    compression::Compression,
+    compression::{
+        Compression, CompressionLevels, DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL,
+        DEFAULT_PRODUCER_COMPRESSION_LZ4_LEVEL, DEFAULT_PRODUCER_COMPRESSION_ZSTD_LEVEL,
+    },
     error::ProducerError,
     partitioner::{BuiltInPartitioner, PartitionerConfig},
     producer::{Acks, Producer, ProducerIdentity},
@@ -721,6 +724,14 @@ impl Producer {
     /// larger than `buffer_memory` with [`ProducerError::RecordTooLarge`], and
     /// sends no request for it.
     ///
+    /// `compression_gzip_level`, `compression_lz4_level` and
+    /// `compression_zstd_level` take Kafka's defaults (-1, 9 and 3) and ranges
+    /// (KIP-390), and `build` fails with [`ProducerError::InvalidConfig`] for a
+    /// level out of range. The producer checks the levels but does not yet
+    /// give them to the codec: batches use the default level of each codec
+    /// until the pinned `krabka-protocol` revision has
+    /// `RecordBatch::encode_with_compression_level`.
+    ///
     /// When `client_id` is not set, the client id is
     /// `producer-<transactional_id>`, or `producer-<n>` with a process-wide
     /// sequence number.
@@ -744,6 +755,9 @@ impl Producer {
         #[builder(into)] bootstrap: String,
         #[builder(into)] client_id: Option<String>,
         #[builder(default = DEFAULT_PRODUCER_COMPRESSION)] compression: Compression,
+        #[builder(default = DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL)] compression_gzip_level: i32,
+        #[builder(default = DEFAULT_PRODUCER_COMPRESSION_LZ4_LEVEL)] compression_lz4_level: i32,
+        #[builder(default = DEFAULT_PRODUCER_COMPRESSION_ZSTD_LEVEL)] compression_zstd_level: i32,
         enable_idempotence: Option<bool>,
         #[builder(default = DEFAULT_PRODUCER_ACKS)] acks: Acks,
         #[builder(default = DEFAULT_PRODUCER_LINGER)] linger: Duration,
@@ -810,6 +824,12 @@ impl Producer {
         )
         .map_err(ProducerError::InvalidConfig)?;
         let compression = throughput_policy.compression();
+        let compression_levels = CompressionLevels::new(
+            compression_gzip_level,
+            compression_lz4_level,
+            compression_zstd_level,
+        )
+        .map_err(ProducerError::InvalidConfig)?;
         let linger = throughput_policy.linger().as_time();
         let batch_size = throughput_policy.batch_bytes();
         let max_in_flight_per_connection = throughput_policy.max_in_flight();
@@ -958,6 +978,7 @@ impl Producer {
             },
             acks,
             compression,
+            compression_levels,
             batch_size,
             linger,
             request_timeout,
@@ -2148,6 +2169,18 @@ mod security_arg_tests {
             (
                 invalid!(max_request_size, i32::MAX as usize + 1),
                 "producer max request size",
+            ),
+            (
+                invalid!(compression_gzip_level, 0),
+                "Invalid value 0 for configuration compression_gzip_level",
+            ),
+            (
+                invalid!(compression_lz4_level, 18),
+                "Invalid value 18 for configuration compression_lz4_level",
+            ),
+            (
+                invalid!(compression_zstd_level, 23),
+                "Invalid value 23 for configuration compression_zstd_level",
             ),
         ] {
             assert!(
