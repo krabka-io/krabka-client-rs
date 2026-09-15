@@ -1545,16 +1545,38 @@ impl Producer {
             // holds no lock, so the sender can complete batches and free
             // memory. Kafka's `RecordAccumulator.append` also allocates
             // outside the partition lock, and tries the append again after.
-            if memory.is_none()
-                && acc
-                    .lock()
-                    .await
-                    .needs_new_batch(record_size, self.expected_transaction_generation().await)
-            {
-                let size = self.batch_size.max(record_size);
-                match self.buffer_pool.allocate(size, remaining_block).await {
-                    Ok(reservation) => memory = Some(reservation),
+            //
+            // The state check comes first, so a send that cannot append fails
+            // at once. It releases the state lock before it takes the
+            // accumulator lock: the append below takes the two locks in the
+            // other order.
+            if memory.is_none() {
+                let state = match &self.transactional_id {
+                    Some(_) => Some(*self.txn_state.lock().await),
+                    None => None,
+                };
+                let expected_generation = match self.transaction_generation(state) {
+                    Ok(generation) => generation,
                     Err(error) => return failed(error),
+                };
+                let needs_memory = {
+                    let mut a = acc.lock().await;
+                    let needs_memory = a.needs_new_batch(record_size, expected_generation);
+                    // Kafka closes a batch that the record does not fit, so
+                    // the sender can send it and free its memory during the
+                    // wait.
+                    if needs_memory && a.current.as_ref().is_some_and(|batch| !batch.is_empty()) {
+                        a.seal_current();
+                        let _ = self.wake_tx.try_send(DrainIntent::Ready);
+                    }
+                    needs_memory
+                };
+                if needs_memory {
+                    let size = self.batch_size.max(record_size);
+                    match self.buffer_pool.allocate(size, remaining_block).await {
+                        Ok(reservation) => memory = Some(reservation),
+                        Err(error) => return failed(error),
+                    }
                 }
             }
 
@@ -1567,21 +1589,11 @@ impl Producer {
             } else {
                 None
             };
-            let transaction_generation = if self.transaction_recovery_required() {
-                return failed(ProducerError::RecoveryRequired);
-            } else {
-                match transaction_state.as_deref() {
-                    Some(TxnState::InTransaction) => {
-                        Some(self.txn_recovery_generation.load(Ordering::Acquire))
-                    }
-                    Some(TxnState::Preparing | TxnState::Prepared) => {
-                        return failed(ProducerError::InvalidTransactionState(
-                            "send is not allowed after prepare_transaction",
-                        ));
-                    }
-                    _ => None,
-                }
-            };
+            let transaction_generation =
+                match self.transaction_generation(transaction_state.as_deref().copied()) {
+                    Ok(generation) => generation,
+                    Err(error) => return failed(error),
+                };
             if transaction_generation.is_some()
                 && let Err(error) = self
                     .register_transaction_partition(&record.topic, partition)
@@ -1617,12 +1629,31 @@ impl Producer {
         }
     }
 
-    /// The transaction generation that a send takes now: the recovery
+    /// The transaction generation that a send takes in `state`: the recovery
     /// generation inside a transaction, and `None` otherwise.
-    async fn expected_transaction_generation(&self) -> Option<u64> {
-        self.transactional_id.as_ref()?;
-        matches!(*self.txn_state.lock().await, TxnState::InTransaction)
-            .then(|| self.txn_recovery_generation.load(Ordering::Acquire))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a transaction needs recovery, or when the state
+    /// does not accept a send.
+    fn transaction_generation(
+        &self,
+        state: Option<TxnState>,
+    ) -> Result<Option<u64>, ProducerError> {
+        if self.transaction_recovery_required() {
+            return Err(ProducerError::RecoveryRequired);
+        }
+        match state {
+            Some(TxnState::InTransaction) => {
+                Ok(Some(self.txn_recovery_generation.load(Ordering::Acquire)))
+            }
+            Some(TxnState::Preparing | TxnState::Prepared) => {
+                Err(ProducerError::InvalidTransactionState(
+                    "send is not allowed after prepare_transaction",
+                ))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Return the partition count of `topic`. On a cache miss, or when
@@ -2457,6 +2488,51 @@ mod tests {
         .await;
         port.store(mock.addr.port(), Ordering::SeqCst);
         mock
+    }
+
+    /// A record that does not fit the current batch closes that batch before
+    /// it waits for memory, as Kafka's `RecordAccumulator.append` closes a full
+    /// batch. The sender then sends the closed batch before its linger ends,
+    /// and the memory it frees serves the new batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_record_that_does_not_fit_sends_the_full_batch_to_free_memory() {
+        let mock = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+        let producer = Producer::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id(CLIENT_ID)
+            .enable_idempotence(false)
+            .batch_size(64)
+            .buffer_memory(64)
+            .linger(Duration::from_secs(30))
+            .max_block(Duration::from_secs(2))
+            .build()
+            .await
+            .expect("producer connects to mock broker");
+        let record = || ProducerRecord {
+            topic: METADATA_TOPIC.into(),
+            partition: Some(0),
+            value: Some(Bytes::from_static(&[0; 40])),
+            ..Default::default()
+        };
+
+        let first = producer.send(record()).await;
+        let second = producer.send(record()).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            let first = first.await.expect("first is resolved").map(drop);
+            let second = producer
+                .flush()
+                .await
+                .and(second.await.expect("second is resolved").map(drop));
+            (
+                first.map_err(|e| e.to_string()),
+                second.map_err(|e| e.to_string()),
+            )
+        })
+        .await;
+        mock.stop();
+        drop(producer);
+
+        assert2::assert!(delivered == Ok((Ok(()), Ok(()))));
     }
 
     /// Kafka's `KafkaProducer.ensureValidRecordSize` fails a record that is
