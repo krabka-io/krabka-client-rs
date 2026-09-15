@@ -11,6 +11,11 @@
 //!
 //! [`ClientTransport`] is the thin production adapter over a real `Client`.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use async_trait::async_trait;
 use bytes::BufMut;
 use krabka_client_core::{Client, ClientError};
@@ -120,21 +125,20 @@ type TopicNameProduce = CappedProduce<PRODUCE_TOPIC_NAME_MAX_VERSION>;
 
 /// A Produce request of a transaction that follows transaction version 1.
 ///
-/// This producer sends `AddPartitionsToTxn` for each partition of a
-/// transaction, which is the transaction version 1 protocol. With transaction
+/// With transaction version 1 the producer sends `AddPartitionsToTxn` for
+/// each partition of a transaction. With transaction
 /// version 2 (KIP-890) the broker adds the partition itself when it sees a
 /// transactional Produce at v12 or higher, and the producer sends no
 /// `AddPartitionsToTxn`. The version of the Produce request tells the broker
-/// which protocol the producer follows, so a v12 or higher request from this
-/// producer would make the broker use the wrong one.
+/// which protocol the producer follows, so a v12 or higher request from a
+/// producer on transaction version 1 would make the broker use the wrong one.
 ///
 /// Apache Kafka's producer makes the same choice from the finalized feature
 /// `transaction.version`: `Sender.sendProduceRequest` passes
 /// `useTransactionV1Version = !transactionManager.isTransactionV2Enabled()`,
 /// and `ProduceRequest.builder` then caps the version at
-/// `LAST_STABLE_VERSION_BEFORE_TRANSACTION_V2` (11). This producer does not
-/// implement transaction version 2, so the cap holds for every transactional
-/// request.
+/// `LAST_STABLE_VERSION_BEFORE_TRANSACTION_V2` (11). This producer applies the
+/// cap while it follows transaction version 1.
 type TransactionV1Produce = CappedProduce<PRODUCE_TRANSACTION_V1_MAX_VERSION>;
 
 /// The Produce version cap of one request.
@@ -150,13 +154,16 @@ enum ProduceCap {
     Latest,
 }
 
-/// Give the version cap of `req`. A transactional request takes the lowest
-/// cap: it names its topics too, because v11 is below v12.
-fn produce_cap(req: &ProduceRequest) -> ProduceCap {
-    if req
-        .transactional_id
-        .as_ref()
-        .is_some_and(|id| !id.is_empty())
+/// Give the version cap of `req`. A transactional request of transaction
+/// version 1 takes the lowest cap: it names its topics too, because v11 is
+/// below v12. With transaction version 2 a transactional request takes the
+/// same cap as any other request.
+fn produce_cap(req: &ProduceRequest, transaction_v2: bool) -> ProduceCap {
+    if !transaction_v2
+        && req
+            .transactional_id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty())
     {
         ProduceCap::TransactionV1
     } else if req
@@ -173,11 +180,23 @@ fn produce_cap(req: &ProduceRequest) -> ProduceCap {
 /// Production [`ProduceTransport`] backed by a real [`Client`].
 pub(crate) struct ClientTransport {
     client: Client,
+    /// Shared with the `Producer`. `true` when the producer follows
+    /// transaction version 2, so a transactional Produce is not capped at
+    /// v11.
+    transaction_v2: Arc<AtomicBool>,
 }
 
 impl ClientTransport {
-    pub(crate) fn new(client: Client) -> Self {
-        Self { client }
+    pub(crate) fn new(client: Client, transaction_v2: Arc<AtomicBool>) -> Self {
+        Self {
+            client,
+            transaction_v2,
+        }
+    }
+
+    /// The version cap of `req` for the transaction protocol of the producer.
+    fn cap(&self, req: &ProduceRequest) -> ProduceCap {
+        produce_cap(req, self.transaction_v2.load(Ordering::Acquire))
     }
 
     /// Send `req` to `leader`, which is a broker id, or to the bootstrap
@@ -220,7 +239,7 @@ impl ProduceTransport for ClientTransport {
         leader: Option<i32>,
         req: ProduceRequest,
     ) -> Result<ProduceResponse, ClientError> {
-        match produce_cap(&req) {
+        match self.cap(&req) {
             ProduceCap::TransactionV1 => {
                 self.send_capped(leader, TransactionV1Produce::from(req))
                     .await
@@ -235,7 +254,7 @@ impl ProduceTransport for ClientTransport {
         leader: Option<i32>,
         req: ProduceRequest,
     ) -> Result<(), ClientError> {
-        match produce_cap(&req) {
+        match self.cap(&req) {
             ProduceCap::TransactionV1 => {
                 self.send_capped_no_response(leader, TransactionV1Produce::from(req))
                     .await
@@ -401,7 +420,7 @@ mod tests {
             .build()
             .await
             .expect("client connects to the mock");
-        let transport = ClientTransport::new(client);
+        let transport = ClientTransport::new(client, Arc::new(AtomicBool::new(false)));
 
         // refresh_metadata returns the live broker list (a default would be empty).
         let md = transport
@@ -492,7 +511,7 @@ mod tests {
             .build()
             .await
             .expect("client connects to the mock");
-        let transport = ClientTransport::new(client);
+        let transport = ClientTransport::new(client, Arc::new(AtomicBool::new(false)));
         transport
             .refresh_metadata()
             .await
@@ -579,52 +598,72 @@ mod tests {
         }
     }
 
-    /// The cap of a Produce request: a transaction stops at v11, a topic
-    /// without an id stops at v12, and every other request uses the latest
-    /// version.
+    /// The cap of a Produce request: a transaction of transaction version 1
+    /// stops at v11, a topic without an id stops at v12, and every other
+    /// request uses the latest version. Kafka's `ProduceRequest.builder`
+    /// applies the v11 cap only when `useTransactionV1Version` is true.
     #[test]
     fn a_produce_request_takes_the_cap_of_its_contents() {
         let known = Uuid([7u8; 16]);
         let cases = [
-            ("no topics", None, vec![], ProduceCap::Latest),
+            ("no topics", None, false, vec![], ProduceCap::Latest),
             (
                 "every id known",
                 None,
+                false,
                 vec![topic("a", known)],
                 ProduceCap::Latest,
             ),
             (
                 "one id zero",
                 None,
+                false,
                 vec![topic("a", known), topic("b", Uuid::ZERO)],
                 ProduceCap::TopicNames,
             ),
             (
                 "transactional",
                 Some("tx-1"),
+                false,
                 vec![topic("a", known)],
                 ProduceCap::TransactionV1,
             ),
             (
                 "transactional without a topic id",
                 Some("tx-1"),
+                false,
                 vec![topic("a", Uuid::ZERO)],
                 ProduceCap::TransactionV1,
             ),
             (
                 "empty transactional id",
                 Some(""),
+                false,
                 vec![topic("a", known)],
                 ProduceCap::Latest,
             ),
+            (
+                "transactional, transaction version 2",
+                Some("tx-1"),
+                true,
+                vec![topic("a", known)],
+                ProduceCap::Latest,
+            ),
+            (
+                "transactional without a topic id, transaction version 2",
+                Some("tx-1"),
+                true,
+                vec![topic("a", Uuid::ZERO)],
+                ProduceCap::TopicNames,
+            ),
         ];
-        for (name, transactional_id, topics, expected) in cases {
+        for (name, transactional_id, transaction_v2, topics, expected) in cases {
             let request = ProduceRequest {
                 transactional_id: transactional_id.map(str::to_owned),
                 topic_data: topics,
                 ..Default::default()
             };
-            assert2::assert!(produce_cap(&request) == expected, "{name}");
+            assert2::assert!(produce_cap(&request, transaction_v2) == expected, "{name}");
         }
     }
 }
