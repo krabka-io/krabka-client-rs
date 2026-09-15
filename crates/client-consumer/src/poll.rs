@@ -2144,7 +2144,7 @@ mod partition_error_tests {
         let (consumer, records) = drain.await.expect("drain task");
         drop(consumer);
         broker.stop();
-        assert2::assert!(!(revoked && !records.is_empty()));
+        assert2::assert!(!revoked || records.is_empty());
     }
 
     /// While a join runs, Kafka's eager `onJoinPrepare` has revoked every
