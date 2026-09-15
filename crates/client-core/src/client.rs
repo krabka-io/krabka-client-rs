@@ -14,6 +14,7 @@ use crate::{
         ClientDnsTimeout, ClientFrameMax, ConnectionDispatchQueueCapacity, ConnectionOptions,
     },
     error::ClientError,
+    metadata_topics::{MetadataScope, MetadataTopics},
     pool::{BrokerInfo, BrokerPool},
     request::ProtocolRequest,
 };
@@ -30,6 +31,7 @@ pub struct Client {
     pool: Arc<BrokerPool>,
     options: ConnectionOptions,
     metadata_recovery: Arc<MetadataRecovery>,
+    metadata_topics: Arc<MetadataTopics>,
 }
 
 /// Kafka client behavior when its last-known broker metadata can no longer be
@@ -151,6 +153,10 @@ impl Client {
         #[builder(default = crate::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
         metadata_recovery_rebootstrap_trigger: Time,
         security: Option<crate::security::ClientSecurity>,
+        /// The topics of [`Client::refresh_metadata`]. Kafka's producer and
+        /// consumer name their topics. The default asks for all topics.
+        #[builder(default)]
+        metadata_scope: MetadataScope,
     ) -> Result<Self, ClientError> {
         let dns_timeout = ClientDnsTimeout::new(dns_timeout).map_err(ClientError::InvalidConfig)?;
         let dispatch_queue_capacity = ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
@@ -178,8 +184,11 @@ impl Client {
         Self::start_with_options(
             bootstrap,
             options,
-            metadata_recovery_strategy,
-            metadata_recovery_rebootstrap_trigger,
+            (
+                metadata_recovery_strategy,
+                metadata_recovery_rebootstrap_trigger,
+            ),
+            metadata_scope,
         )
         .await
     }
@@ -195,8 +204,11 @@ impl Client {
     async fn start_with_options(
         bootstrap: String,
         options: ConnectionOptions,
-        metadata_recovery_strategy: MetadataRecoveryStrategy,
-        metadata_recovery_rebootstrap_trigger: MetadataRecoveryRebootstrapTrigger,
+        (metadata_recovery_strategy, metadata_recovery_rebootstrap_trigger): (
+            MetadataRecoveryStrategy,
+            MetadataRecoveryRebootstrapTrigger,
+        ),
+        metadata_scope: MetadataScope,
     ) -> Result<Self, ClientError> {
         let addrs = bootstrap::resolve_with_server_names(&bootstrap, options.dns_timeout).await?;
         let pool = Arc::new(BrokerPool::new_with_server_names(addrs, options.clone()));
@@ -209,6 +221,7 @@ impl Client {
                 trigger: metadata_recovery_rebootstrap_trigger,
                 first_attempt: Mutex::new(None),
             }),
+            metadata_topics: Arc::new(MetadataTopics::new(metadata_scope)),
         })
     }
 
@@ -373,19 +386,30 @@ impl Client {
         self.pool.evict(broker_id);
     }
 
-    /// Send a default `MetadataRequest`, parse the broker list from the response,
-    /// refresh the pool's address registry, and return the typed response.
+    /// The topics that [`refresh_metadata`](Client::refresh_metadata) names.
+    /// The clones of this client share them.
+    #[must_use]
+    pub fn metadata_topics(&self) -> &MetadataTopics {
+        &self.metadata_topics
+    }
+
+    /// Send the `MetadataRequest` of [`metadata_topics`](Client::metadata_topics),
+    /// parse the broker list from the response, refresh the pool's address
+    /// registry, and return the typed response.
     ///
-    /// The default request asks for all topics. Use
-    /// [`refresh_metadata_with`](Client::refresh_metadata_with) to name the
-    /// topics.
+    /// With [`MetadataScope::AllTopics`] the request asks for all topics.
+    /// With [`MetadataScope::Topics`] it names the current topics, as Kafka's
+    /// producer and consumer do. Use
+    /// [`refresh_metadata_with`](Client::refresh_metadata_with) for another
+    /// request.
     ///
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn refresh_metadata(
         &self,
     ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
-        self.refresh_metadata_with(MetadataRequest::default()).await
+        self.refresh_metadata_with(self.metadata_topics.request())
+            .await
     }
 
     /// Send `request`, parse the broker list from the response, refresh the

@@ -1816,6 +1816,9 @@ impl Producer {
         topic: &str,
         partition: Option<i32>,
     ) -> Result<i32, ProducerError> {
+        // Kafka's `KafkaProducer.waitOnMetadata` calls `ProducerMetadata.add`
+        // for each send, so the periodic and error refreshes name the topic.
+        self.client.metadata_topics().add(topic);
         let count = MetadataWait {
             cache: &self.metadata_cache,
             partition_leaders: &self.partition_leaders,
@@ -2692,6 +2695,100 @@ mod tests {
         .await;
         port.store(mock.addr.port(), Ordering::SeqCst);
         (mock, produce_requests)
+    }
+
+    /// Kafka's `ProducerMetadata.newMetadataRequestBuilder` names the topics
+    /// that the producer sends to, with `allowAutoTopicCreation` true. The
+    /// periodic and error refreshes of the client use the same request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_metadata_refreshes_name_the_topics_of_the_sends() {
+        let named = |topics: &[&str]| {
+            krabka_client_core::topics_request(topics.iter().map(|&t| t.to_owned()), true)
+        };
+        for (name, sends, expected) in [
+            ("no send", vec![], named(&[])),
+            ("send to t1", vec!["t1"], named(&["t1"])),
+            (
+                "send to t1, then t2",
+                vec!["t1", "t2", "t1"],
+                named(&["t1", "t2"]),
+            ),
+        ] {
+            let port = Arc::new(AtomicU16::new(0));
+            let handler_port = Arc::clone(&port);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let handler_requests = Arc::clone(&requests);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(encode_v0(&ApiVersionsResponse {
+                        api_keys: vec![ApiVersion {
+                            api_key: metadata_request::API_KEY,
+                            min_version: 0,
+                            max_version: 12,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }));
+                }
+                if api_key != metadata_request::API_KEY {
+                    return None;
+                }
+                let request = requested_topics(body, version);
+                let topics = request.topics.clone().unwrap_or_default();
+                handler_requests.lock().unwrap().push(request);
+                let response = MetadataResponse {
+                    brokers: vec![MetadataResponseBroker {
+                        node_id: 1,
+                        host: "127.0.0.1".into(),
+                        port: i32::from(handler_port.load(Ordering::SeqCst)),
+                        ..Default::default()
+                    }],
+                    topics: topics
+                        .into_iter()
+                        .map(|topic| MetadataResponseTopic {
+                            name: topic.name,
+                            partitions: vec![MetadataResponsePartition {
+                                leader_id: 1,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                if version >= metadata_response::FLEXIBLE_MIN {
+                    buf.extend_from_slice(&[0]);
+                }
+                response.encode(&mut buf, version).expect("encode Metadata");
+                Some(buf.to_vec())
+            })
+            .await;
+            port.store(mock.addr.port(), Ordering::SeqCst);
+            let producer = Producer::builder()
+                .bootstrap(mock.addr.to_string())
+                .client_id(CLIENT_ID)
+                .enable_idempotence(false)
+                .max_block(Duration::from_secs(2))
+                .build()
+                .await
+                .expect("producer connects to mock broker");
+            for topic in sends {
+                producer
+                    .partition_count(topic, None)
+                    .await
+                    .expect("topic metadata");
+            }
+            producer
+                .client
+                .refresh_metadata()
+                .await
+                .expect("refresh metadata");
+            let last = requests.lock().unwrap().last().cloned();
+            mock.stop();
+            drop(producer);
+            assert2::check!(last == Some(expected), "{name}");
+        }
     }
 
     /// What a send of one record gave, and the Produce requests that the
