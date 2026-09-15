@@ -37,6 +37,8 @@ bon = "3"
 bytes = "1"
 crc32c = "0.6"
 dashmap = "6"
+# Reverse DNS for Kafka's client.dns.lookup=resolve_canonical_bootstrap_servers_only.
+dns-lookup = "4"
 futures = "0.3"
 futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"

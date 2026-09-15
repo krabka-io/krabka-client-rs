@@ -51,6 +51,7 @@
 //! - `mock` — exposes `MockBroker` beyond `#[cfg(test)]` for downstream
 //!   testing.
 
+mod backoff;
 mod bootstrap;
 mod client;
 mod connection;
@@ -68,15 +69,19 @@ mod version;
 #[cfg(any(test, feature = "mock"))]
 mod mock;
 
+pub use backoff::{ExponentialBackoff, KAFKA_BACKOFF_JITTER, KAFKA_BACKOFF_MULTIPLIER};
 pub use client::{
     BrokerHandle, Client, DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
     MetadataRecoveryRebootstrapTrigger, MetadataRecoveryStrategy,
 };
 pub use connection::{
-    ClientDnsTimeout, ClientDuplex, ClientFrameMax, Connection, ConnectionDispatchQueueCapacity,
-    ConnectionOptions, DEFAULT_CLIENT_CONNECT_TIMEOUT, DEFAULT_CLIENT_DNS_TIMEOUT,
+    ClientDnsLookup, ClientDnsTimeout, ClientDuplex, ClientFrameMax, Connection,
+    ConnectionDispatchQueueCapacity, ConnectionOptions, DEFAULT_CLIENT_DNS_TIMEOUT,
     DEFAULT_CLIENT_FRAME_MAX, DEFAULT_CLIENT_REQUEST_TIMEOUT,
-    DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY, MAX_CLIENT_FRAME_BYTES,
+    DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY, DEFAULT_CONNECTIONS_MAX_IDLE,
+    DEFAULT_RECEIVE_BUFFER, DEFAULT_RECONNECT_BACKOFF, DEFAULT_RECONNECT_BACKOFF_MAX,
+    DEFAULT_SEND_BUFFER, DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT,
+    DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX, MAX_CLIENT_FRAME_BYTES,
 };
 pub use coordinator::{
     CoordinatorEndpoint, CoordinatorKeyType, build_find_coordinator, coordinator_endpoint,

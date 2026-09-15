@@ -776,7 +776,6 @@ impl Producer {
             .dns_timeout(dns_timeout.time())
             .dispatch_queue_capacity(dispatch_queue_capacity.get())
             .frame_max(frame_max.size())
-            .connect_timeout(request_timeout)
             .request_timeout(request_timeout)
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())

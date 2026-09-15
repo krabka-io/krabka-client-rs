@@ -997,13 +997,13 @@ impl AdminClient {
     /// the supplied security policy.
     fn opts(security: Option<krabka_client_core::security::ClientSecurity>) -> ConnectionOptions {
         ConnectionOptions {
-            dns_timeout: krabka_client_core::ClientDnsTimeout::default(),
-            connect_timeout: secs(5),
             request_timeout: secs(30),
+            // Kafka's admin client closes idle connections after 5 minutes
+            // (`AdminClientConfig` `connections.max.idle.ms`).
+            connections_max_idle: krabka_units::minutes(5),
             client_id: "krabka-operator".to_string(),
-            dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::default(),
-            frame_max: krabka_client_core::ClientFrameMax::default(),
             security: security.map(Box::new),
+            ..ConnectionOptions::default()
         }
     }
 
@@ -1702,8 +1702,8 @@ mod tests {
         ConnectionOptions {
             dns_timeout: krabka_client_core::ClientDnsTimeout::default(),
             client_id: "custom-admin".into(),
-            connect_timeout: krabka_units::millis(100),
-            request_timeout: krabka_units::millis(25),
+            socket_connection_setup_timeout: krabka_units::millis(100),
+            request_timeout: krabka_units::millis(150),
             dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::new(7)
                 .unwrap(),
             frame_max: krabka_client_core::ClientFrameMax::try_from(krabka_units::kibibytes(32))
@@ -1717,6 +1717,7 @@ mod tests {
                 }),
                 sasl_host: Some("broker.example".into()),
             })),
+            ..ConnectionOptions::default()
         }
     }
 
@@ -1728,7 +1729,9 @@ mod tests {
     }
 
     fn assert_custom_connect_timeout_is_stored(admin: &AdminClient) {
-        assert2::assert!(admin.options.connect_timeout == krabka_units::millis(100));
+        assert2::assert!(
+            admin.options.socket_connection_setup_timeout == krabka_units::millis(100)
+        );
         assert2::assert!(admin.options.dispatch_queue_capacity.get() == 7);
         assert2::assert!(admin.options.frame_max.size() == krabka_units::kibibytes(32));
     }
@@ -1992,7 +1995,7 @@ mod tests {
 
         assert2::assert!(admin.options.dns_timeout == timeout);
         assert2::assert!(admin.options.client_id == "krabka-operator");
-        assert2::assert!(admin.options.connect_timeout == secs(5));
+        assert2::assert!(admin.options.socket_connection_setup_timeout == secs(10));
         assert2::assert!(admin.options.request_timeout == secs(30));
         live.stop();
     }
@@ -2151,7 +2154,7 @@ mod tests {
         assert2::assert!(admin.options.dns_timeout == timeout);
         assert2::assert!(admin.options.security.is_some());
         assert2::assert!(admin.options.client_id == "krabka-operator");
-        assert2::assert!(admin.options.connect_timeout == secs(5));
+        assert2::assert!(admin.options.socket_connection_setup_timeout == secs(10));
         assert2::assert!(admin.options.request_timeout == secs(30));
         live.stop();
     }
@@ -2177,7 +2180,7 @@ mod tests {
             admin.reconnect(&slow.addr.to_string()),
         )
         .await
-        .expect("reconnected ApiVersions obeys the stored connect timeout");
+        .expect("reconnected ApiVersions obeys the stored request timeout");
         assert2::assert!(result.is_err());
 
         bootstrap.stop();
@@ -2216,7 +2219,8 @@ mod tests {
         let options = AdminClient::opts(None);
 
         assert2::assert!(options.client_id == "krabka-operator");
-        assert2::assert!(options.connect_timeout == secs(5));
+        assert2::assert!(options.socket_connection_setup_timeout == secs(10));
+        assert2::assert!(options.connections_max_idle == krabka_units::minutes(5));
         assert2::assert!(options.request_timeout == secs(30));
         assert2::assert!(options.security.is_none());
     }

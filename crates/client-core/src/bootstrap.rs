@@ -5,7 +5,11 @@ use std::{future::Future, net::SocketAddr};
 
 use krabka_units::convert::TimeExt as _;
 
-use crate::{connection::ClientDnsTimeout, error::ClientError, security::connection_target_host};
+use crate::{
+    connection::{ClientDnsLookup, ClientDnsTimeout},
+    error::ClientError,
+    security::connection_target_host,
+};
 
 pub(crate) async fn bounded_lookup<F>(
     timeout: ClientDnsTimeout,
@@ -28,7 +32,7 @@ pub async fn resolve(
     bootstrap: &str,
     dns_timeout: ClientDnsTimeout,
 ) -> Result<Vec<SocketAddr>, ClientError> {
-    resolve_with_server_names(bootstrap, dns_timeout)
+    resolve_with_server_names(bootstrap, dns_timeout, ClientDnsLookup::UseAllDnsIps)
         .await
         .map(|addresses| addresses.into_iter().map(|(address, _)| address).collect())
 }
@@ -36,6 +40,7 @@ pub async fn resolve(
 pub(crate) async fn resolve_with_server_names(
     bootstrap: &str,
     dns_timeout: ClientDnsTimeout,
+    lookup: ClientDnsLookup,
 ) -> Result<Vec<(SocketAddr, String)>, ClientError> {
     let mut out = Vec::new();
     for part in bootstrap.split(',') {
@@ -44,9 +49,13 @@ pub(crate) async fn resolve_with_server_names(
             continue;
         }
         match bounded_lookup(dns_timeout, tokio::net::lookup_host(part)).await {
-            Ok(Ok(iter)) => {
-                out.extend(iter.map(|address| (address, connection_target_host(part).to_owned())));
-            }
+            Ok(Ok(iter)) => match lookup {
+                ClientDnsLookup::UseAllDnsIps => out
+                    .extend(iter.map(|address| (address, connection_target_host(part).to_owned()))),
+                ClientDnsLookup::ResolveCanonicalBootstrapServersOnly => {
+                    out.extend(canonical_addresses(part, iter, dns_timeout).await);
+                }
+            },
             Ok(Err(error)) => {
                 tracing::warn!(part, error = %error, "bootstrap resolve failed");
             }
@@ -59,6 +68,60 @@ pub(crate) async fn resolve_with_server_names(
         return Err(ClientError::Disconnected);
     }
     Ok(out)
+}
+
+/// Replace each resolved bootstrap address with the canonical host name of
+/// its reverse lookup, and the address of that name, as Kafka's
+/// `ClientUtils.resolve` does for `resolve_canonical_bootstrap_servers_only`.
+/// An address whose canonical name does not resolve is skipped.
+async fn canonical_addresses(
+    part: &str,
+    addresses: impl Iterator<Item = SocketAddr>,
+    dns_timeout: ClientDnsTimeout,
+) -> Vec<(SocketAddr, String)> {
+    let mut out = Vec::new();
+    for address in addresses {
+        let ip = address.ip();
+        let reverse = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip));
+        // Java's `getCanonicalHostName` gives the address text when the
+        // reverse lookup fails.
+        let canonical = match bounded_lookup(dns_timeout, reverse).await {
+            Ok(Ok(Ok(name))) => name,
+            _ => ip.to_string(),
+        };
+        let resolved = bounded_lookup(
+            dns_timeout,
+            tokio::net::lookup_host((canonical.clone(), address.port())),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|mut resolved| resolved.next());
+        if let Some(resolved) = resolved {
+            out.push((resolved, canonical));
+        } else {
+            tracing::warn!(
+                part,
+                canonical = %canonical,
+                "bootstrap canonical host name did not resolve"
+            );
+        }
+    }
+    out
+}
+
+/// Keep the first address and the later addresses of the same family, as
+/// Kafka's `ClientUtils.filterPreferredAddresses` does.
+pub(crate) fn filter_preferred_addresses(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut addresses = addresses.into_iter();
+    let Some(first) = addresses.next() else {
+        return Vec::new();
+    };
+    std::iter::once(first)
+        .chain(addresses.filter(|address| address.is_ipv4() == first.is_ipv4()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -87,10 +150,13 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_retains_tls_names_before_dns() {
-        let addresses =
-            resolve_with_server_names("localhost:9092,[::1]:9093", ClientDnsTimeout::default())
-                .await
-                .expect("addresses resolve");
+        let addresses = resolve_with_server_names(
+            "localhost:9092,[::1]:9093",
+            ClientDnsTimeout::default(),
+            ClientDnsLookup::UseAllDnsIps,
+        )
+        .await
+        .expect("addresses resolve");
 
         assert!(
             addresses
@@ -120,6 +186,35 @@ mod tests {
         let result = bounded_lookup(timeout, std::future::pending::<()>()).await;
         assert!(result.is_err());
         assert!(started.elapsed() == Duration::from_millis(37));
+    }
+
+    #[test]
+    fn preferred_addresses_keep_the_family_of_the_first_address() {
+        let v4 = |port| SocketAddr::from(([10, 0, 0, 1], port));
+        let v6 = |port| SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
+        for (name, input, expected) in [
+            ("empty", vec![], vec![]),
+            ("IPv4 first", vec![v4(1), v6(2), v4(3)], vec![v4(1), v4(3)]),
+            ("IPv6 first", vec![v6(1), v4(2), v6(3)], vec![v6(1), v6(3)]),
+        ] {
+            assert2::check!(filter_preferred_addresses(input) == expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_lookup_names_each_bootstrap_address_by_its_reverse_lookup() {
+        let addresses = resolve_with_server_names(
+            "127.0.0.1:9092",
+            ClientDnsTimeout::default(),
+            ClientDnsLookup::ResolveCanonicalBootstrapServersOnly,
+        )
+        .await
+        .expect("loopback resolves");
+        let expected_name = dns_lookup::lookup_addr(&"127.0.0.1".parse().unwrap())
+            .unwrap_or_else(|_| "127.0.0.1".to_owned());
+        assert!(addresses.len() == 1);
+        assert!(addresses[0].0.port() == 9092);
+        assert!(addresses[0].1 == expected_name);
     }
 
     #[tokio::test]

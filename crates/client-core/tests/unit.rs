@@ -113,7 +113,7 @@ async fn connect_negotiates_api_versions() {
 }
 
 /// When the mock never responds to `ApiVersions`, `Connection::connect` returns
-/// `ClientError::Timeout` once `connect_timeout` elapses.
+/// `ClientError::Timeout` once the request timeout elapses.
 ///
 /// Design note: the handler returns `None`, the `Option<Vec<u8>>` sentinel in
 /// `MockBroker`'s API, so the broker silently drops the request and does not
@@ -124,14 +124,13 @@ async fn connect_negotiates_api_versions() {
 #[tokio::test]
 async fn timeout_when_handler_silent() {
     let mock = MockBroker::start(|_api_key, _version, _corr_id, _body| {
-        // Return None to drop the request; the client's connect_timeout fires.
+        // Return None to drop the request; the client's request timeout fires.
         None
     })
     .await;
 
     let opts = ConnectionOptions {
-        connect_timeout: krabka_units::millis(200),
-        request_timeout: krabka_units::secs(30),
+        request_timeout: krabka_units::millis(200),
         ..ConnectionOptions::default()
     };
 
