@@ -1539,6 +1539,18 @@ mod tests {
                                                 max_version: 12,
                                                 ..Default::default()
                                             },
+                                            ApiVersion {
+                                                api_key: sasl_handshake_request::API_KEY,
+                                                min_version: 0,
+                                                max_version: 1,
+                                                ..Default::default()
+                                            },
+                                            ApiVersion {
+                                                api_key: sasl_authenticate_request::API_KEY,
+                                                min_version: 0,
+                                                max_version: 2,
+                                                ..Default::default()
+                                            },
                                         ],
                                         ..Default::default()
                                     }

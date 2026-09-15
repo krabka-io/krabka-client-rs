@@ -283,6 +283,9 @@ struct ConnectionInner {
     pending: Pending,
     writer_tx: mpsc::Sender<DispatchItem>,
     shutdown: CancellationToken,
+    /// SASL re-authentication state (KIP-368), for a connection whose broker
+    /// sent a session lifetime.
+    reauth: Option<crate::reauth::Reauth>,
     _reader: JoinHandle<()>,
     _writer: JoinHandle<()>,
 }
@@ -320,7 +323,7 @@ fn tls_handshake_error(addr: SocketAddr, source: std::io::Error) -> ClientError 
 
 /// Classify a failed SASL exchange. Only a rejection is an authentication
 /// failure.
-fn sasl_error(addr: SocketAddr, source: crate::sasl::OutboundSaslError) -> ClientError {
+pub(crate) fn sasl_error(addr: SocketAddr, source: crate::sasl::OutboundSaslError) -> ClientError {
     match source {
         crate::sasl::OutboundSaslError::Authentication(error) => ClientError::Authentication {
             addr,
@@ -469,12 +472,12 @@ impl Connection {
         options: ConnectionOptions,
         security: &crate::security::ClientSecurity,
     ) -> Result<Self, ClientError> {
-        let stream = within_setup_timeout(&options, async {
+        let (stream, reauth) = within_setup_timeout(&options, async {
             let tcp = tcp_connect(addr, &options).await?;
             Self::secure_stream(addr, tcp, &options, security).await
         })
         .await?;
-        Self::from_stream(stream, options).await
+        Self::from_stream_with_reauth(stream, options, reauth).await
     }
 
     /// Run the TLS and SASL handshakes of `security` over `tcp`.
@@ -483,7 +486,7 @@ impl Connection {
         tcp: TcpStream,
         options: &ConnectionOptions,
         security: &crate::security::ClientSecurity,
-    ) -> Result<Box<dyn ClientDuplex>, ClientError> {
+    ) -> Result<(Box<dyn ClientDuplex>, Option<crate::reauth::Reauth>), ClientError> {
         // 1. TLS (if the protocol demands it).
         let mut stream: Box<dyn ClientDuplex> = if security.protocol.requires_tls() {
             let tls = security.tls.as_ref().ok_or_else(|| {
@@ -509,6 +512,7 @@ impl Connection {
         };
 
         // 2. SASL (if the protocol demands it).
+        let mut reauth = None;
         if security.protocol.requires_sasl() {
             let creds = security.sasl.as_ref().ok_or_else(|| {
                 ClientError::Io(std::io::Error::other("SASL protocol without credentials"))
@@ -519,7 +523,7 @@ impl Connection {
             // the principal matches the broker's advertised hostname.
             let target = addr.ip().to_string();
             let server_name = security.sasl_handshake_host(Some(target.as_str()));
-            crate::sasl::outbound_sasl(
+            let session = crate::sasl::outbound_sasl(
                 &mut *stream,
                 creds,
                 server_name,
@@ -528,8 +532,11 @@ impl Connection {
             )
             .await
             .map_err(|source| sasl_error(addr, source))?;
+            reauth = session.needs_reauthentication().then(|| {
+                crate::reauth::Reauth::new(addr, creds.clone(), server_name.to_owned(), session)
+            });
         }
-        Ok(stream)
+        Ok((stream, reauth))
     }
 
     /// Build a `Connection` over a pre-established, optionally
@@ -548,6 +555,16 @@ impl Connection {
     pub async fn from_stream(
         stream: Box<dyn ClientDuplex>,
         options: ConnectionOptions,
+    ) -> Result<Self, ClientError> {
+        Self::from_stream_with_reauth(stream, options, None).await
+    }
+
+    /// [`Self::from_stream`] for a stream that a SASL exchange authenticated,
+    /// with the state to authenticate again before the session ends.
+    pub(crate) async fn from_stream_with_reauth(
+        stream: Box<dyn ClientDuplex>,
+        options: ConnectionOptions,
+        reauth: Option<crate::reauth::Reauth>,
     ) -> Result<Self, ClientError> {
         let (writer_tx, writer_rx) =
             mpsc::channel::<DispatchItem>(options.dispatch_queue_capacity.get());
@@ -575,6 +592,7 @@ impl Connection {
                 pending,
                 writer_tx,
                 shutdown,
+                reauth,
                 _reader: reader_handle,
                 _writer: writer_handle,
             }),
@@ -622,7 +640,7 @@ impl Connection {
         tracing::Span::current().record("version", version);
 
         // 2. Allocate correlation ID.
-        let corr_id = self.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+        let corr_id = self.next_correlation_id();
 
         // 3. Build request header + encoded body into one frame.
         //
@@ -656,9 +674,8 @@ impl Connection {
         //   - Non-flexible messages: ResponseHeader v0 (no bytes after corr_id).
         let mut cursor: &[u8] = &body_bytes;
         let uses_flexible_resp_header = body_flexible && R::API_KEY != API_VERSIONS_KEY;
-        if uses_flexible_resp_header && !cursor.is_empty() {
-            // Consume the tagged-fields byte (always 0x00 in practice).
-            cursor = &cursor[1..];
+        if uses_flexible_resp_header {
+            cursor = skip_tagged_fields(cursor)?;
         }
 
         let resp = <R::Response as krabka_protocol::Decode>::decode(&mut cursor, version)?;
@@ -674,7 +691,7 @@ impl Connection {
     /// connection writer has stopped before accepting the frame.
     pub async fn send_no_response<R: ProtocolRequest>(&self, req: R) -> Result<(), ClientError> {
         let version = self.inner.versions.negotiate::<R>()?;
-        let corr_id = self.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+        let corr_id = self.next_correlation_id();
         let body_flexible = version >= R::FLEXIBLE_MIN;
         let mut frame = build_request_header(
             ApiKey(R::API_KEY),
@@ -684,13 +701,17 @@ impl Connection {
             body_flexible,
         );
         req.encode(&mut frame, version)?;
-        self.inner
+        let guard = self.reauthenticate_if_due().await?;
+        let sent = self
+            .inner
             .writer_tx
             .send(DispatchItem {
                 bytes: frame.freeze(),
             })
             .await
-            .map_err(|_| ClientError::Disconnected)
+            .map_err(|_| ClientError::Disconnected);
+        drop(guard);
+        sent
     }
 
     /// Send a hand-framed request and await the raw response body.
@@ -723,7 +744,7 @@ impl Connection {
         api_version: i16,
         body: Bytes,
     ) -> Result<Bytes, ClientError> {
-        let corr_id = self.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+        let corr_id = self.next_correlation_id();
 
         // RequestHeader v2 (flexible). Krabka-private api keys are always
         // declared flexible so the header shape is predictable.
@@ -738,15 +759,10 @@ impl Connection {
 
         let body_bytes = self.dispatch_request(corr_id, frame).await?;
 
-        // ResponseHeader v1: 1-byte empty-tagged-fields marker after the
-        // already-stripped correlation id. Drop it if present.
-        let slice: &[u8] = &body_bytes;
-        let out = if slice.is_empty() {
-            Bytes::new()
-        } else {
-            body_bytes.slice(1..)
-        };
-        Ok(out)
+        // ResponseHeader v1: the tagged fields after the already-stripped
+        // correlation id.
+        let body = skip_tagged_fields(&body_bytes)?;
+        Ok(body_bytes.slice(body_bytes.len() - body.len()..))
     }
 
     /// Negotiated API versions known to this connection.
@@ -761,6 +777,23 @@ impl Connection {
     #[must_use]
     pub fn in_flight(&self) -> usize {
         self.inner.pending.len()
+    }
+
+    /// The next correlation id of a normal request. As Kafka's
+    /// `NetworkClient.nextCorrelationId` does, the ids wrap to 0 before the
+    /// range that SASL re-authentication reserves.
+    fn next_correlation_id(&self) -> i32 {
+        let last_normal = crate::sasl::MIN_RESERVED_CORRELATION_ID - 1;
+        self.inner
+            .next_corr_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current >= last_normal {
+                    0
+                } else {
+                    current + 1
+                })
+            })
+            .unwrap_or(0)
     }
 
     /// Whether the connection has closed: the peer closed it, an I/O error
@@ -780,9 +813,100 @@ impl Connection {
     }
 
     async fn dispatch_request(&self, corr_id: i32, frame: BytesMut) -> Result<Bytes, ClientError> {
+        let guard = self.reauthenticate_if_due().await?;
+        // A caller that drops this future must not leave its id in `pending`,
+        // where it would keep the connection from its idle close.
+        let _registration = PendingRegistration {
+            pending: &self.inner.pending,
+            corr_id,
+        };
+        let rx = self.enqueue(corr_id, frame).await?;
+        drop(guard);
+        self.await_response(corr_id, rx).await
+    }
+
+    /// Send a frame and wait for its response, with no re-authentication
+    /// check. A re-authentication sends its own frames this way.
+    pub(crate) async fn dispatch_unguarded(
+        &self,
+        corr_id: i32,
+        frame: BytesMut,
+    ) -> Result<Bytes, ClientError> {
+        let _registration = PendingRegistration {
+            pending: &self.inner.pending,
+            corr_id,
+        };
+        let rx = self.enqueue(corr_id, frame).await?;
+        self.await_response(corr_id, rx).await
+    }
+
+    /// The request header of a frame that this connection sends.
+    pub(crate) fn request_header(
+        &self,
+        api_key: ApiKey,
+        version: ApiVersion,
+        corr_id: i32,
+        flexible: bool,
+    ) -> BytesMut {
+        build_request_header(
+            api_key,
+            version,
+            corr_id,
+            &self.inner.options.client_id,
+            flexible,
+        )
+    }
+
+    /// Wait for a due SASL re-authentication to finish, and return a guard
+    /// that keeps a new one from starting until the caller enqueues its frame.
+    ///
+    /// Kafka's `KafkaChannel.maybeBeginClientReauthentication` starts the
+    /// exchange before the first request after the due time. A failed
+    /// exchange closes the connection and fails the request.
+    async fn reauthenticate_if_due(
+        &self,
+    ) -> Result<Option<tokio::sync::RwLockReadGuard<'_, Option<tokio::time::Instant>>>, ClientError>
+    {
+        let Some(reauth) = self.inner.reauth.as_ref() else {
+            return Ok(None);
+        };
+        loop {
+            let next = reauth.next.read().await;
+            if next.is_none_or(|due| tokio::time::Instant::now() < due) {
+                return Ok(Some(next));
+            }
+            drop(next);
+            let mut next = reauth.next.write().await;
+            if next.is_some_and(|due| tokio::time::Instant::now() >= due) {
+                let mut channel = crate::reauth::ConnectionChannel { connection: self };
+                // The exchange nests the whole SASL state machine. Boxing it
+                // keeps every send future small.
+                match Box::pin(reauth.authenticate(
+                    &mut channel,
+                    &self.inner.options.client_id,
+                    self.inner.options.frame_max,
+                ))
+                .await
+                {
+                    Ok(due) => *next = due,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "SASL re-authentication failed");
+                        self.inner.shutdown.cancel();
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Register `corr_id` and queue `frame` for the writer.
+    async fn enqueue(
+        &self,
+        corr_id: i32,
+        frame: BytesMut,
+    ) -> Result<oneshot::Receiver<Result<Bytes, ClientError>>, ClientError> {
         let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
         self.inner.pending.insert(corr_id, tx);
-
         self.inner
             .writer_tx
             .send(DispatchItem {
@@ -790,7 +914,15 @@ impl Connection {
             })
             .await
             .map_err(|_| ClientError::Disconnected)?;
+        Ok(rx)
+    }
 
+    /// Wait for the response of `corr_id` within the request timeout.
+    async fn await_response(
+        &self,
+        corr_id: i32,
+        rx: oneshot::Receiver<Result<Bytes, ClientError>>,
+    ) -> Result<Bytes, ClientError> {
         match tokio::time::timeout(self.inner.options.request_timeout.to_std(), rx).await {
             Ok(Ok(Ok(bytes))) => Ok(bytes),
             Ok(Ok(Err(err))) => Err(err),
@@ -805,6 +937,53 @@ impl Connection {
             }
         }
     }
+}
+
+/// Removes a request from `pending` when its caller stops waiting.
+struct PendingRegistration<'a> {
+    pending: &'a Pending,
+    corr_id: i32,
+}
+
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        self.pending.remove(&self.corr_id);
+    }
+}
+
+/// Skip the tagged fields of a flexible response header: an unsigned varint
+/// count, then for each field a varint tag, a varint size and the data.
+///
+/// # Errors
+/// Returns a codec error for a header that ends early.
+pub(crate) fn skip_tagged_fields(mut bytes: &[u8]) -> Result<&[u8], ClientError> {
+    fn uvarint(bytes: &mut &[u8]) -> Result<u32, ClientError> {
+        let mut value = 0_u32;
+        for shift in (0..35).step_by(7) {
+            let (&byte, rest) = bytes.split_first().ok_or_else(truncated)?;
+            *bytes = rest;
+            value |= u32::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(truncated())
+    }
+    fn truncated() -> ClientError {
+        ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid tagged fields in a response header",
+        ))
+    }
+    if bytes.is_empty() {
+        return Ok(bytes);
+    }
+    for _ in 0..uvarint(&mut bytes)? {
+        uvarint(&mut bytes)?;
+        let size = usize::try_from(uvarint(&mut bytes)?).map_err(|_| truncated())?;
+        bytes = bytes.get(size..).ok_or_else(truncated)?;
+    }
+    Ok(bytes)
 }
 
 /// Spawn independent reader and writer tasks over the split socket.
@@ -1008,64 +1187,135 @@ fn build_request_header(
     buf
 }
 
-/// Send an `ApiVersionsRequest` at version 0 and return the negotiated table.
+/// The client software name that `ApiVersions` v3 and later sends (KIP-511).
+pub const CLIENT_SOFTWARE_NAME: &str = "krabka-client-rs";
+
+/// The client software version that `ApiVersions` v3 and later sends.
+pub const CLIENT_SOFTWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Kafka's `UNSUPPORTED_VERSION` error code.
+const UNSUPPORTED_VERSION: i16 = 35;
+
+/// The `ApiVersions` request of a new connection at `version`, as Kafka's
+/// `ApiVersionsRequest.Builder` fills it.
+pub(crate) fn api_versions_request()
+-> krabka_protocol::owned::api_versions_request::ApiVersionsRequest {
+    krabka_protocol::owned::api_versions_request::ApiVersionsRequest {
+        client_software_name: CLIENT_SOFTWARE_NAME.to_owned(),
+        client_software_version: CLIENT_SOFTWARE_VERSION.to_owned(),
+        ..Default::default()
+    }
+}
+
+/// Decode an `ApiVersions` response body sent for a request at `version`.
+///
+/// Kafka's `ApiVersionsResponse.parse` falls back to version 0: a broker that
+/// does not support `version` answers with a version 0 `UNSUPPORTED_VERSION`
+/// response. A body that does not decode to its end at `version` is read as
+/// version 0.
+pub(crate) fn decode_api_versions_response(
+    body: &[u8],
+    version: i16,
+) -> Result<krabka_protocol::owned::api_versions_response::ApiVersionsResponse, ClientError> {
+    use krabka_protocol::{Decode as _, owned::api_versions_response::ApiVersionsResponse};
+
+    let decode = |version| {
+        let mut cursor = body;
+        let response = ApiVersionsResponse::decode(&mut cursor, version)?;
+        if cursor.is_empty() {
+            Ok(response)
+        } else {
+            Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "ApiVersions response v{version} has {} bytes after its end",
+                    cursor.len()
+                ),
+            )))
+        }
+    };
+    match decode(version) {
+        Err(_) if version != 0 => decode(0),
+        result => result,
+    }
+}
+
+/// The next `ApiVersions` version after a response at `version`, or `None`
+/// when the response ends the negotiation.
+///
+/// Kafka's `NetworkClient.handleApiVersionsResponse` retries an
+/// `UNSUPPORTED_VERSION` answer to a version above 0 at the highest
+/// `ApiVersions` version that the broker lists, or at version 0.
+pub(crate) fn api_versions_retry_version(
+    response: &krabka_protocol::owned::api_versions_response::ApiVersionsResponse,
+    version: i16,
+) -> Option<i16> {
+    use krabka_protocol::owned::api_versions_request::API_KEY;
+
+    (response.error_code == UNSUPPORTED_VERSION && version > 0).then(|| {
+        response
+            .api_keys
+            .iter()
+            .find(|key| key.api_key == API_KEY)
+            .map_or(0, |key| key.max_version)
+            .min(version - 1)
+            .max(0)
+    })
+}
+
+/// Send `ApiVersions` and return the broker's table.
 ///
 /// This is the bootstrap step inside `connect`. No version table exists yet,
-/// so this function cannot use `Connection::send`. Every broker supports
-/// version 0.
+/// so this function cannot use `Connection::send`. The first request uses the
+/// highest version of the client, as Kafka's `NetworkClient` does, and an
+/// `UNSUPPORTED_VERSION` answer makes it retry at the version that the broker
+/// lists.
 #[tracing::instrument(level = "debug", skip_all, err)]
 async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, ClientError> {
-    use krabka_protocol::{
-        Encode,
-        owned::{
-            api_versions_request::ApiVersionsRequest, api_versions_response::ApiVersionsResponse,
-        },
-    };
+    use krabka_protocol::{Encode, owned::api_versions_request::ApiVersionsRequest};
 
-    let req = ApiVersionsRequest::default();
-    let corr_id = conn.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+    let mut version = ApiVersionsRequest::MAX_VERSION;
+    loop {
+        let corr_id = conn.next_correlation_id();
+        let mut frame = build_request_header(
+            ApiKey(ApiVersionsRequest::API_KEY),
+            ApiVersion(version),
+            corr_id,
+            &conn.inner.options.client_id,
+            version >= ApiVersionsRequest::FLEXIBLE_MIN,
+        );
+        api_versions_request().encode(&mut frame, version)?;
 
-    // v0 is non-flexible: header v1, no tagged-fields byte.
-    let mut frame = build_request_header(
-        ApiKey(ApiVersionsRequest::API_KEY),
-        ApiVersion(0),
-        corr_id,
-        &conn.inner.options.client_id,
-        false,
-    );
-    req.encode(&mut frame, 0)?;
+        let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
+        conn.inner.pending.insert(corr_id, tx);
+        conn.inner
+            .writer_tx
+            .send(DispatchItem {
+                bytes: frame.freeze(),
+            })
+            .await
+            .map_err(|_| ClientError::Disconnected)?;
 
-    let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
-    conn.inner.pending.insert(corr_id, tx);
-    conn.inner
-        .writer_tx
-        .send(DispatchItem {
-            bytes: frame.freeze(),
-        })
-        .await
-        .map_err(|_| ClientError::Disconnected)?;
+        let body_bytes = tokio::time::timeout(conn.inner.options.request_timeout.to_std(), rx)
+            .await
+            .map_err(|_| ClientError::Timeout(conn.inner.options.request_timeout))?
+            .map_err(|_| ClientError::Disconnected)??;
 
-    let body_bytes = tokio::time::timeout(conn.inner.options.request_timeout.to_std(), rx)
-        .await
-        .map_err(|_| ClientError::Timeout(conn.inner.options.request_timeout))?
-        .map_err(|_| ClientError::Disconnected)??;
-
-    // ResponseHeader v0: only correlation_id (already stripped by the reader).
-    // No tagged-fields byte — this holds for all ApiVersionsResponse versions,
-    // including flexible ones (the Kafka asymmetry documented in `send`).
-    let mut cursor: &[u8] = &body_bytes;
-    let resp = <ApiVersionsResponse as krabka_protocol::Decode>::decode(&mut cursor, 0)?;
-    if resp.error_code != 0 {
-        return Err(ClientError::Server {
-            error_code: resp.error_code,
-        });
+        // ResponseHeader v0: only correlation_id (already stripped by the
+        // reader), for every ApiVersions version (the Kafka asymmetry
+        // documented in `send`).
+        let response = decode_api_versions_response(&body_bytes, version)?;
+        if let Some(retry) = api_versions_retry_version(&response, version) {
+            version = retry;
+            continue;
+        }
+        if response.error_code != 0 {
+            return Err(ClientError::Server {
+                error_code: response.error_code,
+            });
+        }
+        return Ok(ApiVersionTable::from_response(&response));
     }
-
-    let entries = resp
-        .api_keys
-        .iter()
-        .map(|k| (k.api_key, k.min_version, k.max_version));
-    Ok(ApiVersionTable::from_entries(entries))
 }
 
 #[cfg(test)]
@@ -1162,7 +1412,18 @@ mod secured_tests {
         let server = tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
             // (body, flexible_response_header)
-            let replies: [(BytesMut, bool); 3] = [
+            let replies: [(BytesMut, bool); 4] = [
+                {
+                    // The ApiVersions v0 that starts the SASL exchange lists
+                    // the SASL APIs.
+                    let crate::mock::MockReply::Respond(body) = crate::mock::MockSaslAnswer::Accept
+                        .reply(krabka_protocol::owned::api_versions_request::API_KEY, 0)
+                        .unwrap()
+                    else {
+                        unreachable!("ApiVersions v0 has a reply")
+                    };
+                    (BytesMut::from(&body[..]), false)
+                },
                 {
                     let mut b = BytesMut::new();
                     SaslHandshakeResponse {
@@ -1629,6 +1890,231 @@ mod connection_policy_tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
         // The writer task drops the receiver when it ends.
         check!(connection.inner.writer_tx.is_closed());
+    }
+
+    /// How a scripted broker answers each `ApiVersions` version.
+    #[derive(Clone, Copy, Debug)]
+    enum Broker {
+        /// It supports `ApiVersions` up to this version, and lists it in an
+        /// `UNSUPPORTED_VERSION` answer, as Kafka 2.4 and later do.
+        ListsUpTo(i16),
+        /// It supports only version 0 and lists nothing in its
+        /// `UNSUPPORTED_VERSION` answer.
+        OnlyVersionZero,
+    }
+
+    /// Kafka's `NetworkClient` sends `ApiVersions` at its highest version and
+    /// retries an `UNSUPPORTED_VERSION` answer at the version that the broker
+    /// lists, or at version 0. A version 3 or later answer holds the finalized
+    /// features.
+    #[tokio::test]
+    async fn api_versions_negotiation_follows_the_broker_and_keeps_the_features() {
+        use krabka_protocol::{
+            Decode as _,
+            owned::{
+                api_versions_request::ApiVersionsRequest,
+                api_versions_response::{FinalizedFeatureKey, SupportedFeatureKey},
+            },
+        };
+
+        let features = |version: i16| {
+            if version >= 3 {
+                crate::FinalizedFeatures {
+                    epoch: 7,
+                    levels: std::collections::BTreeMap::from([(
+                        "transaction.version".to_owned(),
+                        2,
+                    )]),
+                }
+            } else {
+                crate::FinalizedFeatures::default()
+            }
+        };
+        let software = |version: i16| {
+            if version >= 3 {
+                (
+                    CLIENT_SOFTWARE_NAME.to_owned(),
+                    CLIENT_SOFTWARE_VERSION.to_owned(),
+                )
+            } else {
+                (String::new(), String::new())
+            }
+        };
+        for (name, broker, expected_versions, expected_features) in [
+            (
+                "a broker at version 5",
+                Broker::ListsUpTo(5),
+                vec![5],
+                features(5),
+            ),
+            (
+                "a broker at version 3",
+                Broker::ListsUpTo(3),
+                vec![5, 3],
+                features(3),
+            ),
+            (
+                "a broker at version 2",
+                Broker::ListsUpTo(2),
+                vec![5, 2],
+                features(2),
+            ),
+            (
+                "an old broker",
+                Broker::OnlyVersionZero,
+                vec![5, 0],
+                features(0),
+            ),
+        ] {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let script = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                loop {
+                    let Ok(len) = server.read_u32().await else {
+                        return seen;
+                    };
+                    let mut request = vec![0_u8; len as usize];
+                    server.read_exact(&mut request).await.unwrap();
+                    let version = i16::from_be_bytes([request[2], request[3]]);
+                    let client_id_len = usize::from(u16::from_be_bytes([request[8], request[9]]));
+                    let mut body = &request[10 + client_id_len + usize::from(version >= 3)..];
+                    let decoded = ApiVersionsRequest::decode(&mut body, version).unwrap();
+                    seen.push((
+                        version,
+                        (
+                            decoded.client_software_name,
+                            decoded.client_software_version,
+                        ),
+                    ));
+                    let max = match broker {
+                        Broker::ListsUpTo(max) => max,
+                        Broker::OnlyVersionZero => 0,
+                    };
+                    let (response, encoded_at) = if version > max {
+                        let api_keys = match broker {
+                            Broker::ListsUpTo(max) => vec![ApiVersion {
+                                api_key: ApiVersionsRequest::API_KEY,
+                                min_version: 0,
+                                max_version: max,
+                                ..Default::default()
+                            }],
+                            Broker::OnlyVersionZero => Vec::new(),
+                        };
+                        (
+                            ApiVersionsResponse {
+                                error_code: UNSUPPORTED_VERSION,
+                                api_keys,
+                                ..Default::default()
+                            },
+                            0,
+                        )
+                    } else {
+                        (
+                            ApiVersionsResponse {
+                                api_keys: vec![ApiVersion {
+                                    api_key: MetadataRequest::API_KEY,
+                                    min_version: 0,
+                                    max_version: 12,
+                                    ..Default::default()
+                                }],
+                                supported_features: vec![SupportedFeatureKey {
+                                    name: "transaction.version".into(),
+                                    min_version: 0,
+                                    max_version: 2,
+                                    ..Default::default()
+                                }],
+                                finalized_features_epoch: 7,
+                                finalized_features: vec![FinalizedFeatureKey {
+                                    name: "transaction.version".into(),
+                                    max_version_level: 2,
+                                    min_version_level: 2,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                            version,
+                        )
+                    };
+                    let mut frame = BytesMut::new();
+                    frame.put_slice(&request[4..8]);
+                    response.encode(&mut frame, encoded_at).unwrap();
+                    server
+                        .write_u32(u32::try_from(frame.len()).unwrap())
+                        .await
+                        .unwrap();
+                    server.write_all(&frame).await.unwrap();
+                }
+            });
+            let connection =
+                Connection::from_stream(Box::new(client), ConnectionOptions::default())
+                    .await
+                    .unwrap();
+            let observed_features = connection.versions().finalized_features().clone();
+            let metadata = connection.advertised_api_range(MetadataRequest::API_KEY);
+            connection.close();
+            let seen = script.await.unwrap();
+            check!(
+                seen == expected_versions
+                    .iter()
+                    .map(|version| (*version, software(*version)))
+                    .collect::<Vec<_>>(),
+                "{name}"
+            );
+            check!(observed_features == expected_features, "{name}");
+            check!(metadata == Some((0, 12)), "{name}");
+        }
+    }
+
+    /// Kafka's `NetworkClient.nextCorrelationId` wraps before the SASL
+    /// reserved range.
+    #[tokio::test]
+    async fn normal_correlation_ids_wrap_before_the_sasl_range() {
+        let (connection, _server) = connection(ConnectionOptions::default()).await;
+        let reserved = crate::sasl::MIN_RESERVED_CORRELATION_ID;
+        connection
+            .inner
+            .next_corr_id
+            .store(reserved - 2, Ordering::Relaxed);
+        let ids = (0..3)
+            .map(|_| connection.next_correlation_id())
+            .collect::<Vec<_>>();
+        check!(ids == vec![reserved - 2, reserved - 1, 0]);
+    }
+
+    #[test]
+    fn flexible_response_headers_skip_every_tagged_field() {
+        for (name, header_and_body, expected) in [
+            ("empty body", vec![], Ok(vec![])),
+            ("no tagged field", vec![0, 7, 8], Ok(vec![7, 8])),
+            (
+                "two tagged fields",
+                vec![2, 1, 2, 0xAA, 0xBB, 5, 0, 7],
+                Ok(vec![7]),
+            ),
+            ("truncated field", vec![1, 1, 4, 0xAA], Err(())),
+        ] {
+            check!(
+                skip_tagged_fields(&header_and_body)
+                    .map(<[u8]>::to_vec)
+                    .map_err(drop)
+                    == expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// A caller that stops waiting leaves nothing in `pending`, so the idle
+    /// close still applies.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_request_leaves_no_pending_entry() {
+        let (connection, _server) = connection(ConnectionOptions::default()).await;
+        let sending = connection.clone();
+        let task = tokio::spawn(async move { sending.send(MetadataRequest::default()).await });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        check!(connection.in_flight() == 1);
+        task.abort();
+        let _ = task.await;
+        check!(connection.in_flight() == 0);
     }
 
     #[test]

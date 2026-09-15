@@ -311,6 +311,9 @@ impl Client {
     #[tracing::instrument(level = "debug", skip_all, fields(bootstrap = %self.bootstrap))]
     pub async fn reconnect_bootstrap(&self) {
         self.pool.evict_bootstrap();
+        // The retry goes to the bootstrap addresses even when the DNS refresh
+        // below fails and the pool keeps the addresses that it has.
+        self.pool.prefer_bootstrap();
         if let Ok(addrs) = bootstrap::resolve_with_server_names(
             &self.bootstrap,
             self.options.dns_timeout,
@@ -385,6 +388,16 @@ impl Client {
         }
 
         empty_response.map_or_else(|| Err(last_error.unwrap_or(ClientError::Disconnected)), Ok)
+    }
+
+    /// The finalized feature levels (KIP-584) with the highest epoch that a
+    /// connection of this client received in `ApiVersions`. Kafka's producer
+    /// reads `transaction.version` from them. The epoch is
+    /// [`UNKNOWN_FINALIZED_FEATURES_EPOCH`](crate::UNKNOWN_FINALIZED_FEATURES_EPOCH)
+    /// before a connection to a broker that sends features.
+    #[must_use]
+    pub fn finalized_features(&self) -> crate::FinalizedFeatures {
+        self.pool.finalized_features()
     }
 
     /// Whether the pool knows a dialable address for `broker_id`.

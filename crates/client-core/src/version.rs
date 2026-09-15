@@ -1,13 +1,51 @@
 //! `ApiVersionTable`: broker-advertised version ranges per API key,
 //! plus client-side negotiation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use krabka_protocol::owned::api_versions_response::ApiVersionsResponse;
 
 use crate::{error::ClientError, request::ProtocolRequest};
+
+/// Kafka's `ApiVersionsResponse.UNKNOWN_FINALIZED_FEATURES_EPOCH`.
+pub const UNKNOWN_FINALIZED_FEATURES_EPOCH: i64 = -1;
+
+/// The finalized feature levels of a broker (KIP-584), from `ApiVersions` v3
+/// and later, as Kafka's `ApiVersions.FinalizedFeaturesInfo` holds them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizedFeatures {
+    /// The epoch of the levels. [`UNKNOWN_FINALIZED_FEATURES_EPOCH`] when the
+    /// broker sent none.
+    pub epoch: i64,
+    /// The finalized maximum version level of each feature, for example
+    /// `transaction.version`.
+    pub levels: BTreeMap<String, i16>,
+}
+
+impl Default for FinalizedFeatures {
+    fn default() -> Self {
+        Self {
+            epoch: UNKNOWN_FINALIZED_FEATURES_EPOCH,
+            levels: BTreeMap::new(),
+        }
+    }
+}
+
+impl FinalizedFeatures {
+    /// The finalized level of `feature`, or `None` when the broker did not
+    /// finalize it.
+    #[must_use]
+    pub fn level(&self, feature: &str) -> Option<i16> {
+        self.levels.get(feature).copied()
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ApiVersionTable {
     by_key: HashMap<i16, (i16, i16)>,
+    /// The supported `(min, max)` version of each feature of the broker.
+    supported_features: BTreeMap<String, (i16, i16)>,
+    finalized_features: FinalizedFeatures,
 }
 
 impl ApiVersionTable {
@@ -19,7 +57,52 @@ impl ApiVersionTable {
         for (k, lo, hi) in entries {
             by_key.insert(k, (lo, hi));
         }
-        Self { by_key }
+        Self {
+            by_key,
+            ..Self::default()
+        }
+    }
+
+    /// Build from a decoded `ApiVersionsResponse`, with its feature data.
+    #[must_use]
+    pub fn from_response(response: &ApiVersionsResponse) -> Self {
+        let mut table = Self::from_entries(
+            response
+                .api_keys
+                .iter()
+                .map(|key| (key.api_key, key.min_version, key.max_version)),
+        );
+        table.supported_features = response
+            .supported_features
+            .iter()
+            .map(|feature| {
+                (
+                    feature.name.clone(),
+                    (feature.min_version, feature.max_version),
+                )
+            })
+            .collect();
+        table.finalized_features = FinalizedFeatures {
+            epoch: response.finalized_features_epoch,
+            levels: response
+                .finalized_features
+                .iter()
+                .map(|feature| (feature.name.clone(), feature.max_version_level))
+                .collect(),
+        };
+        table
+    }
+
+    /// The finalized feature levels that the broker sent.
+    #[must_use]
+    pub const fn finalized_features(&self) -> &FinalizedFeatures {
+        &self.finalized_features
+    }
+
+    /// The supported `(min, max)` version of each feature of the broker.
+    #[must_use]
+    pub const fn supported_features(&self) -> &BTreeMap<String, (i16, i16)> {
+        &self.supported_features
     }
 
     /// Highest version both sides support for `R`, or

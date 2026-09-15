@@ -106,6 +106,14 @@ async fn plaintext_addr() -> SocketAddr {
 /// A SASL listener that offers PLAIN and rejects every password.
 async fn rejecting_broker() -> MockBroker {
     MockBroker::start(|api_key, version, _correlation_id, _body| {
+        if let Some(krabka_client_core::MockReply::Respond(body)) =
+            krabka_client_core::MockSaslAnswer::Accept
+                .reply(api_key, version)
+                .filter(|_| api_key == krabka_protocol::owned::api_versions_request::API_KEY)
+        {
+            // The `ApiVersions` v0 that starts the SASL exchange.
+            return Some(body);
+        }
         let mut bytes = BytesMut::new();
         match api_key {
             sasl_handshake_request::API_KEY => SaslHandshakeResponse {
