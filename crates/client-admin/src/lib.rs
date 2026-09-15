@@ -17,10 +17,11 @@ use krabka_client_core::{
     ClientError, Connection, ConnectionOptions, MetadataRecoveryRebootstrapTrigger,
     MetadataRecoveryStrategy, ProtocolRequest as _, connection_target_host,
 };
-use krabka_units::{Time, convert::TimeExt as _, secs};
+use krabka_units::{Time, convert::TimeExt as _};
 use thiserror::Error;
 
 pub mod brokers;
+mod config;
 pub mod configs;
 pub mod delegation_tokens;
 pub mod features;
@@ -39,6 +40,11 @@ pub struct MetadataVersionUpdate {
     pub level: i16,
 }
 
+pub use config::{
+    AdminClientConfig, DEFAULT_ADMIN_CONNECTIONS_MAX_IDLE, DEFAULT_ADMIN_REQUEST_TIMEOUT,
+    DEFAULT_API_TIMEOUT, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_BACKOFF_MAX,
+    DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT, DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
+};
 pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
 pub use features::{FeatureMetadata, FeatureRange, FeatureUpdate, FeatureUpdateOutcome};
 pub use groups::ConsumerGroupOffsetOutcome;
@@ -520,6 +526,10 @@ pub enum AdminError {
         #[source]
         source: Option<Box<AdminError>>,
     },
+    /// A setting of [`AdminClientConfig`] is invalid, as Kafka raises a
+    /// `ConfigException` when it builds the admin client.
+    #[error("invalid admin client configuration: {0}")]
+    InvalidConfig(String),
     #[error("broker returned error: api={api} code={code} ({name}){detail}",
             detail = .message.as_deref().map(|m| format!(" {m:?}")).unwrap_or_default())]
     Broker {
@@ -603,6 +613,10 @@ pub struct AdminClient {
     /// Full connection template carried forward so reconnects preserve
     /// caller-supplied identity, security, and timeouts.
     options: ConnectionOptions,
+    /// The deadline, backoff and retry count of each call
+    /// (`default.api.timeout.ms`, `retry.backoff.ms`, `retry.backoff.max.ms`,
+    /// `retries`).
+    pub(crate) retry: retry::RetryPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -995,18 +1009,67 @@ where
 }
 
 impl AdminClient {
-    /// Builds the per-connect options for `client_id="krabka-operator"` with
-    /// the supplied security policy.
+    /// The connection options of Kafka's admin client defaults with the
+    /// supplied security policy and a generated `adminclient-<n>` client id.
     fn opts(security: Option<krabka_client_core::security::ClientSecurity>) -> ConnectionOptions {
-        ConnectionOptions {
-            request_timeout: secs(30),
-            // Kafka's admin client closes idle connections after 5 minutes
-            // (`AdminClientConfig` `connections.max.idle.ms`).
-            connections_max_idle: krabka_units::minutes(5),
-            client_id: "krabka-operator".to_string(),
-            security: security.map(Box::new),
-            ..ConnectionOptions::default()
+        AdminClientConfig {
+            security,
+            ..AdminClientConfig::default()
         }
+        .resolve()
+        .expect("the default admin client configuration is valid")
+        .connection
+    }
+
+    /// Connects with Kafka's `AdminClientConfig` settings. Each call of the
+    /// client uses the call deadline, retry backoff and retry count of
+    /// `config`.
+    ///
+    /// # Errors
+    /// Returns [`AdminError::InvalidConfig`] for invalid settings, and
+    /// [`AdminError::Connect`] with the last cause if no bootstrap address
+    /// connects.
+    pub async fn connect_with_config(
+        bootstrap_addrs: &[String],
+        config: AdminClientConfig,
+    ) -> Result<Self, AdminError> {
+        let resolved = config.resolve()?;
+        Self::connect_with_metadata_recovery_target(
+            bootstrap_addrs,
+            resolved.connection,
+            resolved.retry,
+            (
+                resolved.metadata_recovery_strategy,
+                resolved.metadata_recovery_rebootstrap_trigger,
+            ),
+            BootstrapTarget::Brokers,
+        )
+        .await
+    }
+
+    /// Controller-bootstrap variant of [`Self::connect_with_config`]
+    /// (KIP-919).
+    ///
+    /// # Errors
+    /// Returns [`AdminError::InvalidConfig`] for invalid settings, or a
+    /// connection, protocol, or broker error when no controller bootstrap
+    /// endpoint can identify and connect to the active controller.
+    pub async fn connect_controller_with_config(
+        bootstrap_controllers: &[String],
+        config: AdminClientConfig,
+    ) -> Result<Self, AdminError> {
+        let resolved = config.resolve()?;
+        Self::connect_with_metadata_recovery_target(
+            bootstrap_controllers,
+            resolved.connection,
+            resolved.retry,
+            (
+                resolved.metadata_recovery_strategy,
+                resolved.metadata_recovery_rebootstrap_trigger,
+            ),
+            BootstrapTarget::Controllers,
+        )
+        .await
     }
 
     /// Connects and applies optional client security. `None` means plaintext,
@@ -1060,11 +1123,15 @@ impl AdminClient {
         bootstrap_addrs: &[String],
         options: ConnectionOptions,
     ) -> Result<Self, AdminError> {
+        let retry = config::retry_for_connection_options(&options);
         Self::connect_with_metadata_recovery_target(
             bootstrap_addrs,
             options,
-            MetadataRecoveryStrategy::default(),
-            krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
+            retry,
+            (
+                MetadataRecoveryStrategy::default(),
+                krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
+            ),
             BootstrapTarget::Brokers,
         )
         .await
@@ -1101,11 +1168,15 @@ impl AdminClient {
         bootstrap_controllers: &[String],
         options: ConnectionOptions,
     ) -> Result<Self, AdminError> {
+        let retry = config::retry_for_connection_options(&options);
         Self::connect_with_metadata_recovery_target(
             bootstrap_controllers,
             options,
-            MetadataRecoveryStrategy::default(),
-            krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
+            retry,
+            (
+                MetadataRecoveryStrategy::default(),
+                krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
+            ),
             BootstrapTarget::Controllers,
         )
         .await
@@ -1123,11 +1194,12 @@ impl AdminClient {
         strategy: MetadataRecoveryStrategy,
         rebootstrap_trigger: Time,
     ) -> Result<Self, AdminError> {
+        let retry = config::retry_for_connection_options(&options);
         Self::connect_with_metadata_recovery_target(
             bootstrap_addrs,
             options,
-            strategy,
-            rebootstrap_trigger,
+            retry,
+            (strategy, rebootstrap_trigger),
             BootstrapTarget::Brokers,
         )
         .await
@@ -1136,8 +1208,8 @@ impl AdminClient {
     async fn connect_with_metadata_recovery_target(
         bootstrap_addrs: &[String],
         options: ConnectionOptions,
-        strategy: MetadataRecoveryStrategy,
-        rebootstrap_trigger: Time,
+        retry: retry::RetryPolicy,
+        (strategy, rebootstrap_trigger): (MetadataRecoveryStrategy, Time),
         target: BootstrapTarget,
     ) -> Result<Self, AdminError> {
         let trigger = MetadataRecoveryRebootstrapTrigger::new(rebootstrap_trigger)
@@ -1164,6 +1236,7 @@ impl AdminClient {
                         ),
                         bootstrap_addrs: bootstrap_addrs.to_vec(),
                         options,
+                        retry,
                     });
                 }
                 Err(e) if e.is_authentication_failure() => return Err(e),
@@ -1440,6 +1513,7 @@ mod tests {
         },
     };
     use krabka_security::ListenerProtocol;
+    use krabka_units::secs;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -2012,7 +2086,7 @@ mod tests {
             .expect("admin connects");
 
         assert2::assert!(admin.options.dns_timeout == timeout);
-        assert2::assert!(admin.options.client_id == "krabka-operator");
+        assert2::assert!(admin.options.client_id.starts_with("adminclient-"));
         assert2::assert!(admin.options.socket_connection_setup_timeout == secs(10));
         assert2::assert!(admin.options.request_timeout == secs(30));
         live.stop();
@@ -2171,7 +2245,7 @@ mod tests {
 
         assert2::assert!(admin.options.dns_timeout == timeout);
         assert2::assert!(admin.options.security.is_some());
-        assert2::assert!(admin.options.client_id == "krabka-operator");
+        assert2::assert!(admin.options.client_id.starts_with("adminclient-"));
         assert2::assert!(admin.options.socket_connection_setup_timeout == secs(10));
         assert2::assert!(admin.options.request_timeout == secs(30));
         live.stop();
@@ -2236,7 +2310,7 @@ mod tests {
     fn existing_connectors_keep_admin_defaults() {
         let options = AdminClient::opts(None);
 
-        assert2::assert!(options.client_id == "krabka-operator");
+        assert2::assert!(options.client_id.starts_with("adminclient-"));
         assert2::assert!(options.socket_connection_setup_timeout == secs(10));
         assert2::assert!(options.connections_max_idle == krabka_units::minutes(5));
         assert2::assert!(options.request_timeout == secs(30));
