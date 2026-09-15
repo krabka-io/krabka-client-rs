@@ -96,18 +96,33 @@ async fn canonical_addresses(
         .await
         .ok()
         .and_then(Result::ok)
-        .and_then(|mut resolved| resolved.next());
-        if let Some(resolved) = resolved {
-            out.push((resolved, canonical));
-        } else {
+        .map(filter_preferred_addresses)
+        .unwrap_or_default();
+        if resolved.is_empty() {
             tracing::warn!(
                 part,
                 canonical = %canonical,
                 "bootstrap canonical host name did not resolve"
             );
         }
+        add_canonical_addresses(&mut out, &canonical, resolved);
     }
     out
+}
+
+/// Add the addresses of one canonical host name, once each. Kafka resolves the
+/// canonical host again for each connection and tries all its addresses, so
+/// every address of the preferred family stays.
+fn add_canonical_addresses(
+    out: &mut Vec<(SocketAddr, String)>,
+    canonical: &str,
+    resolved: Vec<SocketAddr>,
+) {
+    for address in resolved {
+        if !out.iter().any(|(known, _)| *known == address) {
+            out.push((address, canonical.to_owned()));
+        }
+    }
 }
 
 /// Keep the first address and the later addresses of the same family, as
@@ -201,6 +216,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_canonical_host_keeps_every_address_once() {
+        let a = SocketAddr::from(([10, 0, 0, 1], 9092));
+        let b = SocketAddr::from(([10, 0, 0, 2], 9092));
+        let mut out = Vec::new();
+        // Two bootstrap addresses with the same canonical name that resolves
+        // to both.
+        add_canonical_addresses(&mut out, "broker.example", vec![a, b]);
+        add_canonical_addresses(&mut out, "broker.example", vec![a, b]);
+        assert!(
+            out == vec![
+                (a, "broker.example".to_owned()),
+                (b, "broker.example".to_owned())
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn canonical_lookup_names_each_bootstrap_address_by_its_reverse_lookup() {
         let addresses = resolve_with_server_names(
@@ -212,9 +244,12 @@ mod tests {
         .expect("loopback resolves");
         let expected_name = dns_lookup::lookup_addr(&"127.0.0.1".parse().unwrap())
             .unwrap_or_else(|_| "127.0.0.1".to_owned());
-        assert!(addresses.len() == 1);
-        assert!(addresses[0].0.port() == 9092);
-        assert!(addresses[0].1 == expected_name);
+        assert!(!addresses.is_empty());
+        assert!(
+            addresses
+                .iter()
+                .all(|(address, name)| address.port() == 9092 && *name == expected_name)
+        );
     }
 
     #[tokio::test]

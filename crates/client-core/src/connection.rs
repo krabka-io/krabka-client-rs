@@ -937,7 +937,14 @@ async fn write_loop<W>(
             item = writer_rx.recv() => {
                 let Some(item) = item else { break; };
                 activity.touch();
-                if framed_write.send(item.bytes).await.is_err() {
+                // A peer that stops reading can hold a write for ever. The
+                // write must still end when the connection shuts down, for
+                // example after a request timeout.
+                let written = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    written = framed_write.send(item.bytes) => written,
+                };
+                if written.is_err() {
                     break;
                 }
                 activity.touch();
@@ -1592,6 +1599,33 @@ mod connection_policy_tests {
         check!(matches!(result, Err(ClientError::Timeout(timeout)) if timeout == millis(100)));
         check!(started.elapsed() < Duration::from_secs(5));
         server.abort();
+    }
+
+    /// A request timeout closes the connection, and the writer ends even
+    /// while a peer that does not read holds its write.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_blocked_by_a_peer_that_does_not_read_ends_at_shutdown() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (connection, _server) = tokio::join!(
+            Connection::from_stream(
+                Box::new(client),
+                ConnectionOptions {
+                    request_timeout: secs(30),
+                    ..ConnectionOptions::default()
+                },
+            ),
+            answer_api_versions(server)
+        );
+        let connection = connection.unwrap();
+        // The raw request is larger than the duplex buffer, so its write
+        // blocks.
+        let result = connection
+            .raw_request(3, 0, Bytes::from(vec![0_u8; 256 * 1024]))
+            .await;
+        check!(matches!(result, Err(ClientError::Timeout(_))));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // The writer task drops the receiver when it ends.
+        check!(connection.inner.writer_tx.is_closed());
     }
 
     #[test]

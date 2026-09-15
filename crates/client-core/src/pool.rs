@@ -6,7 +6,10 @@
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use dashmap::DashMap;
@@ -260,6 +263,9 @@ pub struct BrokerPool<C: BrokerConnector = TcpConnector> {
     bootstrap: RwLock<Vec<(SocketAddr, String)>>,
     policy: ConnectPolicy,
     connector: C,
+    /// Set by a bootstrap reconnect: untargeted requests use the bootstrap
+    /// connection until the pool learns brokers again.
+    prefer_bootstrap: AtomicBool,
 }
 
 impl BrokerPool<TcpConnector> {
@@ -312,6 +318,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
             bootstrap: RwLock::new(bootstrap),
             policy,
             connector,
+            prefer_bootstrap: AtomicBool::new(false),
         }
     }
 
@@ -456,12 +463,23 @@ impl<C: BrokerConnector> BrokerPool<C> {
     }
 
     /// Replace bootstrap addresses while retaining their TLS server names.
+    ///
+    /// The bootstrap node keeps its reconnect backoff and failure counts, so
+    /// a retry loop that calls this after each failure still backs off. Until
+    /// the next [`refresh_brokers`](Self::refresh_brokers) with brokers,
+    /// [`least_loaded`](Self::least_loaded) uses the bootstrap connection.
     pub fn replace_bootstrap_with_server_names(&self, bootstrap: Vec<(SocketAddr, String)>) {
         match self.bootstrap.write() {
             Ok(mut guard) => *guard = bootstrap,
             Err(poisoned) => *poisoned.into_inner() = bootstrap,
         }
-        self.nodes.remove(&BOOTSTRAP_ID);
+        if let Some(node) = self.nodes.get(&BOOTSTRAP_ID) {
+            let mut state = node.state();
+            state.connection = None;
+            state.addresses.clear();
+            state.address_index = 0;
+        }
+        self.prefer_bootstrap.store(true, Ordering::Relaxed);
     }
 
     /// Replace bootstrap addresses and discard every connection and advertised
@@ -559,7 +577,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
     /// [`bootstrap_connection`](Self::bootstrap_connection).
     pub async fn least_loaded(&self) -> Result<Arc<C::Conn>, ClientError> {
         let ids = self.broker_ids();
-        if ids.is_empty() {
+        if ids.is_empty() || self.prefer_bootstrap.load(Ordering::Relaxed) {
             return self.bootstrap_connection().await;
         }
         let offset = crate::backoff::random_below(ids.len());
@@ -598,8 +616,11 @@ impl<C: BrokerConnector> BrokerPool<C> {
             return Ok(connection);
         }
         match candidate {
-            Some((_, _, _, id)) => self.get(id).await,
-            None => self.bootstrap_connection().await,
+            // Every known broker is in its reconnect backoff. Kafka's
+            // `leastLoadedNode` then has no node, and the metadata recovery
+            // goes back to the bootstrap servers.
+            Some((true, ..)) | None => self.bootstrap_connection().await,
+            Some((false, _, _, id)) => self.get(id).await,
         }
     }
 
@@ -619,6 +640,9 @@ impl<C: BrokerConnector> BrokerPool<C> {
     /// addresses.
     #[tracing::instrument(level = "debug", skip_all, fields(brokers = brokers.len()))]
     pub async fn refresh_brokers(&self, brokers: &[BrokerInfo]) {
+        if !brokers.is_empty() {
+            self.prefer_bootstrap.store(false, Ordering::Relaxed);
+        }
         for b in brokers {
             let Ok(port) = u16::try_from(b.port) else {
                 continue;

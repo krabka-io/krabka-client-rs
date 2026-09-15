@@ -477,3 +477,74 @@ fn pool_uses_the_kafka_connection_backoffs_of_the_options() {
     check!(policy.reconnect == ExponentialBackoff::kafka(millis(10), millis(80)));
     check!(policy.setup_timeout == ExponentialBackoff::kafka(secs(1), secs(4)));
 }
+
+/// A bootstrap reconnect keeps the backoff of the bootstrap node, so a retry
+/// loop that reconnects after each failure still waits between dials.
+#[tokio::test(start_paused = true)]
+async fn replacing_the_bootstrap_addresses_keeps_the_reconnect_backoff() {
+    let pool = pool(
+        &[addr(1111)],
+        RecordingConnector::new().refuse(&[addr(1111)]),
+    );
+    for _ in 0..3 {
+        let _ = pool.bootstrap_connection().await;
+        pool.evict_bootstrap();
+        pool.replace_bootstrap(vec![addr(1111)]);
+    }
+    let gaps = gaps(&pool.connector.dials());
+    check!(gaps.len() == 2, "{gaps:?}");
+    check!((40..=60).contains(&gaps[0]), "{gaps:?}");
+    check!((80..=120).contains(&gaps[1]), "{gaps:?}");
+}
+
+/// Each row: whether a bootstrap reconnect came after the metadata, and the
+/// state of broker 1. The untargeted request goes to the bootstrap address
+/// after a reconnect and while every known broker backs off.
+#[tokio::test(start_paused = true)]
+async fn least_loaded_goes_back_to_bootstrap_after_a_reconnect_or_when_every_broker_backs_off() {
+    for (name, reconnect, broker_refuses, relearn, expected) in [
+        ("a known broker", false, false, false, addr(9001)),
+        (
+            "after a bootstrap reconnect",
+            true,
+            false,
+            false,
+            addr(1000),
+        ),
+        (
+            "after a reconnect and new metadata",
+            true,
+            false,
+            true,
+            addr(9001),
+        ),
+        (
+            "every known broker backs off",
+            false,
+            true,
+            false,
+            addr(1000),
+        ),
+    ] {
+        let connector = if broker_refuses {
+            RecordingConnector::new().refuse(&[addr(9001)])
+        } else {
+            RecordingConnector::new()
+        };
+        let pool = pool(&[addr(1000)], connector);
+        pool.refresh_brokers(&[broker(1, "127.0.0.1", 9001)]).await;
+        if broker_refuses {
+            check!(pool.get(1).await.is_err(), "{name}");
+        }
+        if reconnect {
+            pool.replace_bootstrap(vec![addr(1000)]);
+        }
+        if relearn {
+            pool.refresh_brokers(&[broker(1, "127.0.0.1", 9001)]).await;
+        }
+        check!(
+            pool.least_loaded().await.unwrap().addr == expected,
+            "{name}"
+        );
+    }
+}
