@@ -99,8 +99,8 @@ pub use consumer::{
     ConsumerRecord, ConsumerRetryPolicy, ConsumerSubscriptionMetadataRefreshInterval,
     DEFAULT_CONSUMER_FETCH_MAX_WAIT, DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT,
     DEFAULT_CONSUMER_MAX_POLL_INTERVAL, DEFAULT_CONSUMER_MAX_POLL_RECORDS,
-    DEFAULT_CONSUMER_SUBSCRIPTION_METADATA_REFRESH_INTERVAL, GroupMembershipOperation, Header,
-    TimestampType,
+    DEFAULT_CONSUMER_METADATA_MAX_AGE, DEFAULT_CONSUMER_SUBSCRIPTION_METADATA_REFRESH_INTERVAL,
+    GroupMembershipOperation, Header, TimestampType,
 };
 pub use error::ConsumerError;
 pub use group_metadata::ConsumerGroupMetadata;

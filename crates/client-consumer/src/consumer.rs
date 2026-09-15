@@ -104,6 +104,10 @@ pub struct Consumer {
     pub(crate) fetch_max_wait: Time,
     /// The in-flight Fetch requests and the fetch session of each broker.
     pub(crate) fetches: crate::poll::Fetches,
+    /// Kafka's `client.rack`, the `rack_id` of each Fetch (KIP-392).
+    pub(crate) client_rack: Option<String>,
+    /// Kafka's `metadata.max.age.ms`. A preferred read replica expires after it.
+    pub(crate) metadata_max_age: Time,
     /// What `poll` does on a missing offset or a detected truncation. `None`
     /// surfaces `ConsumerError::LogTruncation`. Any other value makes `poll`
     /// apply the safe offset, per KIP-320.
@@ -179,6 +183,7 @@ struct StartConfig {
     fetch_max: ByteSize,
     fetch_partition_max: ByteSize,
     fetch_max_wait: Time,
+    metadata_max_age: Time,
     request_timeout: Time,
     dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity,
     frame_max: krabka_client_core::ClientFrameMax,
@@ -761,6 +766,9 @@ fn consumer_client_id(
     }
 }
 
+/// Kafka's default `metadata.max.age.ms`.
+pub const DEFAULT_CONSUMER_METADATA_MAX_AGE: Time = minutes(5);
+
 /// Kafka's default `fetch.max.wait.ms`.
 pub const DEFAULT_CONSUMER_FETCH_MAX_WAIT: Time = millis(500);
 
@@ -908,6 +916,7 @@ impl Consumer {
         #[builder(default = crate::poll::DEFAULT_FETCH_PARTITION_MAX)]
         fetch_partition_max: ByteSize,
         #[builder(default = DEFAULT_CONSUMER_FETCH_MAX_WAIT)] fetch_max_wait: Time,
+        #[builder(default = DEFAULT_CONSUMER_METADATA_MAX_AGE)] metadata_max_age: Time,
         #[builder(default = secs(30))] request_timeout: Time,
         #[builder(default = krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
@@ -985,6 +994,11 @@ impl Consumer {
             validated_max_poll_records(max_poll_records).map_err(ConsumerError::InvalidConfig)?;
         let fetch_max_wait =
             validated_fetch_max_wait(fetch_max_wait).map_err(ConsumerError::InvalidConfig)?;
+        if metadata_max_age.millis_i64() < 0 || !metadata_max_age.secs_f64().is_finite() {
+            return Err(ConsumerError::InvalidConfig(
+                "consumer metadata max age must not be negative".to_owned(),
+            ));
+        }
         let rebalance_protocol = crate::assignor::rebalance_protocol_of(&assignors)
             .map_err(ConsumerError::InvalidConfig)?;
 
@@ -1010,6 +1024,7 @@ impl Consumer {
             fetch_max,
             fetch_partition_max,
             fetch_max_wait,
+            metadata_max_age,
             request_timeout,
             dispatch_queue_capacity,
             frame_max,
@@ -1451,6 +1466,7 @@ async fn spawn_consumer(
         fetch_max,
         fetch_partition_max,
         fetch_max_wait,
+        metadata_max_age,
         request_timeout,
         dispatch_queue_capacity,
         frame_max,
@@ -1615,6 +1631,8 @@ async fn spawn_consumer(
         fetch_partition_max,
         fetch_max_wait,
         fetches: crate::poll::Fetches::default(),
+        client_rack,
+        metadata_max_age,
         auto_offset_reset,
         poll_error,
         auto_commit,
@@ -2521,6 +2539,8 @@ mod security_arg_tests {
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
             fetch_max_wait: DEFAULT_CONSUMER_FETCH_MAX_WAIT,
             fetches: crate::poll::Fetches::default(),
+            client_rack: None,
+            metadata_max_age: DEFAULT_CONSUMER_METADATA_MAX_AGE,
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
@@ -3211,6 +3231,7 @@ mod auto_commit_tests {
             fetch_max: crate::poll::DEFAULT_FETCH_MAX,
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
             fetch_max_wait: DEFAULT_CONSUMER_FETCH_MAX_WAIT,
+            metadata_max_age: DEFAULT_CONSUMER_METADATA_MAX_AGE,
             request_timeout: secs(30),
             dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::new(
                 krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY,

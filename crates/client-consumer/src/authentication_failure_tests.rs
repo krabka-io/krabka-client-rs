@@ -184,6 +184,8 @@ fn consumer(client: Client) -> Consumer {
         fetch_partition_max: DEFAULT_FETCH_PARTITION_MAX,
         fetch_max_wait: crate::consumer::DEFAULT_CONSUMER_FETCH_MAX_WAIT,
         fetches: crate::poll::Fetches::default(),
+        client_rack: None,
+        metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
         auto_offset_reset: AutoOffsetReset::Latest,
         poll_error: PollErrorSlot::default(),
         auto_commit: None,

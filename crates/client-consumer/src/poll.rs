@@ -43,6 +43,8 @@ use crate::{
 const BOOTSTRAP_LEADER: i32 = -1;
 const UNKNOWN_FETCH_OFFSET: i64 = -1;
 const UNKNOWN_LEADER_ID: i32 = -1;
+/// `OFFSET_OUT_OF_RANGE`.
+const OFFSET_OUT_OF_RANGE: i16 = 1;
 /// The offset the wire uses for "the broker did not answer this".
 const UNKNOWN_OFFSET: i64 = -1;
 pub(crate) const DEFAULT_FETCH_PARTITION_MAX: ByteSize = mebibytes(1);
@@ -113,6 +115,11 @@ enum FetchPartitionAction {
 
 /// Map a `Fetch` partition `error_code` to its [`FetchPartitionAction`].
 ///
+/// Kafka's `FetchCollector.handleInitializeErrors` also requests a metadata
+/// update for `REPLICA_NOT_AVAILABLE` (9), `KAFKA_STORAGE_ERROR` (56),
+/// `OFFSET_NOT_AVAILABLE` (78) and `INCONSISTENT_TOPIC_ID` (103), the errors of
+/// a follower that serves a fetch (KIP-392).
+///
 /// Kafka's `FetchCollector.handleInitializeErrors` requests a metadata update
 /// for `UNKNOWN_TOPIC_OR_PARTITION` (3) and for `UNKNOWN_TOPIC_ID` (100), and
 /// does not raise an error to the application. A Fetch v13 or later names the
@@ -126,9 +133,12 @@ fn classify_fetch_partition_error(error_code: i16) -> FetchPartitionAction {
         74 /* FENCED_LEADER_EPOCH */ | 75 /* UNKNOWN_LEADER_EPOCH */ => {
             FetchPartitionAction::RevalidateEpoch
         }
-        3 /* UNKNOWN_TOPIC_OR_PARTITION */ | 100 /* UNKNOWN_TOPIC_ID */ => {
-            FetchPartitionAction::RefreshMetadata
-        }
+        3 /* UNKNOWN_TOPIC_OR_PARTITION */
+        | 9 /* REPLICA_NOT_AVAILABLE */
+        | 56 /* KAFKA_STORAGE_ERROR */
+        | 78 /* OFFSET_NOT_AVAILABLE */
+        | 100 /* UNKNOWN_TOPIC_ID */
+        | 103 /* INCONSISTENT_TOPIC_ID */ => FetchPartitionAction::RefreshMetadata,
         other => FetchPartitionAction::Fail(other),
     }
 }
@@ -190,6 +200,7 @@ fn build_fetch_request(
     isolation_level: IsolationLevel,
     min: ByteSize,
     max: ByteSize,
+    rack_id: &str,
     session: SessionRequest,
 ) -> FetchRequest {
     let mut topics: Vec<FetchTopic> = Vec::new();
@@ -237,6 +248,8 @@ fn build_fetch_request(
         session_epoch: session.session_epoch,
         topics,
         forgotten_topics_data,
+        // KIP-392: `AbstractFetch.createFetchRequest` sends `client.rack`.
+        rack_id: rack_id.to_owned(),
         ..Default::default()
     }
 }
@@ -249,6 +262,8 @@ struct InFlightFetch {
     /// `Fetches::completed`, so a waiter that wakes can always take it.
     result: tokio::sync::oneshot::Receiver<Result<FetchResponse, krabka_client_core::ClientError>>,
     requested: HashMap<(String, i32), i64>,
+    /// The partitions that this Fetch asked from a preferred read replica.
+    from_replica: std::collections::HashSet<(String, i32)>,
 }
 
 /// A Fetch whose task ended: its broker, the fetch offsets it asked for, and
@@ -256,6 +271,7 @@ struct InFlightFetch {
 struct CompletedFetch {
     leader: i32,
     requested: HashMap<(String, i32), i64>,
+    from_replica: std::collections::HashSet<(String, i32)>,
     result: Option<Result<FetchResponse, krabka_client_core::ClientError>>,
 }
 
@@ -273,6 +289,10 @@ pub(crate) struct Fetches {
     /// did not process yet.
     ready: Vec<CompletedFetch>,
     completed: Arc<tokio::sync::Notify>,
+    /// KIP-392: the replica that a broker named in `preferred_read_replica`,
+    /// with the time until which the consumer fetches from it. Kafka's
+    /// `SubscriptionState.TopicPartitionState.preferredReadReplica`.
+    preferred_read_replicas: HashMap<(String, i32), (i32, tokio::time::Instant)>,
 }
 
 impl Fetches {
@@ -292,6 +312,7 @@ impl Fetches {
                 self.ready.push(CompletedFetch {
                     leader,
                     requested: fetch.requested,
+                    from_replica: fetch.from_replica,
                     result,
                 });
             }
@@ -696,6 +717,9 @@ impl Consumer {
         // The fetch positions that this loop resets, for the auto commit
         // before a `JoinGroup`.
         let mut polled_resets: Vec<((String, i32), Option<i64>)> = Vec::new();
+        // KIP-392 preferred read replica changes: `Some(replica)` to fetch from
+        // it, `None` to go back to the leader.
+        let mut replica_updates: Vec<((String, i32), Option<i32>)> = Vec::new();
         let mut offsets = self.next_offsets.lock().await;
         for topic in responses.iter().flat_map(|resp| &resp.responses) {
             let topic_name = if topic.topic.is_empty() {
@@ -724,8 +748,24 @@ impl Consumer {
                     continue;
                 }
                 // Error-first: inspect the partition error_code before decoding.
-                match classify_fetch_partition_error(part.error_code) {
-                    FetchPartitionAction::Records => {}
+                let action = classify_fetch_partition_error(part.error_code);
+                // Kafka's `FetchCollector.handleInitializeErrors` clears the
+                // preferred read replica with each metadata update request.
+                if matches!(
+                    action,
+                    FetchPartitionAction::Reroute
+                        | FetchPartitionAction::RevalidateEpoch
+                        | FetchPartitionAction::RefreshMetadata
+                ) {
+                    replica_updates.push((key.clone(), None));
+                }
+                match action {
+                    FetchPartitionAction::Records => {
+                        // `FetchCollector.updatePartitionState`.
+                        if part.preferred_read_replica >= 0 {
+                            replica_updates.push((key.clone(), Some(part.preferred_read_replica)));
+                        }
+                    }
                     FetchPartitionAction::ResetOffset => {
                         // The response cannot say where the log now starts. Apache
                         // Kafka builds an errored partition with `log_start_offset`,
@@ -839,6 +879,27 @@ impl Consumer {
         // Drop the offsets guard before any `.await`: refreshing metadata is an
         // RPC, and we must never hold a Mutex guard across an await point.
         drop(offsets);
+        let now = tokio::time::Instant::now();
+        for (key, replica) in replica_updates {
+            match replica {
+                // `TopicPartitionState.updatePreferredReadReplica` restarts the
+                // expiry only when the replica changes.
+                Some(replica) => {
+                    let expires = now + self.metadata_max_age.to_std();
+                    let entry = self
+                        .fetches
+                        .preferred_read_replicas
+                        .entry(key)
+                        .or_insert((replica, expires));
+                    if entry.0 != replica {
+                        *entry = (replica, expires);
+                    }
+                }
+                None => {
+                    self.fetches.preferred_read_replicas.remove(&key);
+                }
+            }
+        }
         for partition in fetched {
             self.fetch_buffer.push(partition);
         }
@@ -885,6 +946,16 @@ impl Consumer {
                 .iter()
                 .map(|(key, partition)| (key.clone(), partition.fetch_offset))
                 .collect();
+            let from_replica = wanted
+                .keys()
+                .filter(|key| {
+                    self.fetches
+                        .preferred_read_replicas
+                        .get(*key)
+                        .is_some_and(|(replica, _)| *replica == leader)
+                })
+                .cloned()
+                .collect();
             let session = self
                 .fetches
                 .sessions
@@ -896,6 +967,7 @@ impl Consumer {
                 self.isolation_level,
                 self.fetch_min,
                 self.fetch_max,
+                self.client_rack.as_deref().unwrap_or_default(),
                 session,
             );
             let client = self.client.clone();
@@ -916,6 +988,7 @@ impl Consumer {
                     handle,
                     result,
                     requested,
+                    from_replica,
                 },
             );
         }
@@ -983,6 +1056,7 @@ impl Consumer {
                         );
                         continue;
                     }
+                    let mut replica_out_of_range = Vec::new();
                     for topic in &mut response.responses {
                         let name = if topic.topic.is_empty() {
                             id_to_name.get(&topic.topic_id).cloned().unwrap_or_default()
@@ -991,15 +1065,34 @@ impl Consumer {
                         };
                         topic.partitions.retain(|partition| {
                             let key = (name.clone(), partition.partition_index);
+                            // A preferred replica that answers out of range
+                            // gives no reset: Kafka's `handleInitializeErrors`
+                            // clears the replica and fetches from the leader.
+                            // The request decides this, as the preference can
+                            // change while the Fetch is in flight.
+                            if partition.error_code == OFFSET_OUT_OF_RANGE
+                                && fetch.from_replica.contains(&key)
+                            {
+                                replica_out_of_range.push(key);
+                                return false;
+                            }
                             fetch.requested.get(&key).is_some_and(|requested| {
                                 offsets.get(&key).copied().unwrap_or(0) == *requested
                             })
                         });
                     }
+                    for key in replica_out_of_range {
+                        self.fetches.preferred_read_replicas.remove(&key);
+                    }
                     responses.push(response);
                 }
                 Some(Err(error)) => {
                     session.handle_error();
+                    // `AbstractFetch.handleFetchFailure` clears the preferred read
+                    // replica of each partition of the failed session.
+                    for key in fetch.requested.keys() {
+                        self.fetches.preferred_read_replicas.remove(key);
+                    }
                     if is_transient_transport_error(&error) {
                         if should_use_bootstrap_leader(leader) {
                             self.client.reconnect_bootstrap().await;
@@ -1036,6 +1129,7 @@ impl Consumer {
                     self.isolation_level,
                     self.fetch_min,
                     self.fetch_max,
+                    self.client_rack.as_deref().unwrap_or_default(),
                     SessionRequest {
                         session_id: session.session_id(),
                         session_epoch: FINAL_EPOCH,
@@ -1061,8 +1155,10 @@ impl Consumer {
         .await;
     }
 
-    async fn group_fetches(&self, assigned: &[(String, i32)]) -> FetchByLeader {
+    async fn group_fetches(&mut self, assigned: &[(String, i32)]) -> FetchByLeader {
         let mut grouped: FetchByLeader = HashMap::new();
+        let now = tokio::time::Instant::now();
+        let mut refresh_metadata = false;
         {
             let offsets = self.next_offsets.lock().await;
             let positions = self.positions.lock().await;
@@ -1091,8 +1187,23 @@ impl Consumer {
                 // (e.g. port 0 from an in-process test broker) is treated as
                 // unknown — the bootstrap broker is the leader in that
                 // single-broker case anyway.
-                let leader =
+                let mut leader =
                     fetch_leader_id(pos.leader_id, self.client.knows_broker(pos.leader_id));
+                // KIP-392: Kafka's `AbstractFetch.selectReadReplica` fetches from
+                // the preferred read replica until it expires. A replica that is
+                // not in the metadata clears the preference and refreshes it.
+                let key = (t.clone(), *p);
+                match self.fetches.preferred_read_replicas.get(&key).copied() {
+                    Some((_, expires)) if now > expires => {
+                        self.fetches.preferred_read_replicas.remove(&key);
+                    }
+                    Some((replica, _)) if self.client.knows_broker(replica) => leader = replica,
+                    Some(_) => {
+                        self.fetches.preferred_read_replicas.remove(&key);
+                        refresh_metadata = true;
+                    }
+                    None => {}
+                }
                 // Kafka's `AbstractFetch.prepareFetchRequests` skips a broker
                 // with a pending Fetch.
                 if self.fetches.in_flight.contains_key(&leader) {
@@ -1105,6 +1216,10 @@ impl Consumer {
                     .or_default()
                     .push((*p, next, pos.leader_epoch, pos.offset_epoch));
             }
+        }
+        if refresh_metadata {
+            // Best effort, as the other metadata refreshes of the fetch path.
+            let _ = self.client.refresh_metadata().await;
         }
 
         grouped
@@ -1645,6 +1760,26 @@ mod offset_advance_tests {
                 FetchPartitionAction::RefreshMetadata,
             ),
             (
+                "replica not available",
+                9,
+                FetchPartitionAction::RefreshMetadata,
+            ),
+            (
+                "kafka storage error",
+                56,
+                FetchPartitionAction::RefreshMetadata,
+            ),
+            (
+                "offset not available",
+                78,
+                FetchPartitionAction::RefreshMetadata,
+            ),
+            (
+                "inconsistent topic id",
+                103,
+                FetchPartitionAction::RefreshMetadata,
+            ),
+            (
                 "topic authorization failed",
                 29,
                 FetchPartitionAction::Fail(29),
@@ -1813,6 +1948,7 @@ mod offset_advance_tests {
             IsolationLevel::ReadCommitted,
             krabka_units::bytes(7),
             mebibytes(2),
+            "az-1",
             SessionRequest {
                 session_id: 77,
                 session_epoch: 3,
@@ -1858,7 +1994,7 @@ mod offset_advance_tests {
                     partitions: vec![0, 1],
                     unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
                 }],
-                rack_id: String::new(),
+                rack_id: "az-1".into(),
                 cluster_id: None,
                 replica_state: ReplicaState {
                     replica_id: -1,
@@ -2298,6 +2434,8 @@ pub(crate) mod partition_error_tests {
             fetch_partition_max: DEFAULT_FETCH_PARTITION_MAX,
             fetch_max_wait: crate::consumer::DEFAULT_CONSUMER_FETCH_MAX_WAIT,
             fetches: crate::poll::Fetches::default(),
+            client_rack: None,
+            metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
@@ -3539,6 +3677,11 @@ mod fetch_path_tests {
         /// A response with this top-level error code, session id and no
         /// partition data.
         Respond { error_code: i16, session_id: i32 },
+        /// A response with one `orders-0` row without records.
+        Partition {
+            error_code: i16,
+            preferred_read_replica: i32,
+        },
     }
 
     /// The Fetch requests that the mock brokers received: `(broker id,
@@ -3638,6 +3781,27 @@ mod fetch_path_tests {
                             },
                             version,
                         )),
+                        FetchAnswer::Partition {
+                            error_code,
+                            preferred_read_replica,
+                        } => Some(encode(
+                            &FetchResponse {
+                                responses: vec![FetchableTopicResponse {
+                                    topic: "orders".into(),
+                                    partitions: vec![PartitionData {
+                                        partition_index: 0,
+                                        error_code,
+                                        high_watermark: 5,
+                                        last_stable_offset: 5,
+                                        preferred_read_replica,
+                                        ..Default::default()
+                                    }],
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                            version,
+                        )),
                     };
                 }
                 None
@@ -3732,6 +3896,124 @@ mod fetch_path_tests {
                 leaders
             ) == (0, true, vec![1, 2, 3])
         );
+    }
+
+    /// One step of a read replica case.
+    #[derive(Clone, Copy, Debug)]
+    enum ReplicaStep {
+        Poll,
+        /// Wait longer than the metadata max age of the case.
+        WaitForExpiry,
+    }
+
+    /// KIP-392: Kafka's Fetch carries `client.rack`, and a
+    /// `preferred_read_replica` in a response sends the next Fetch of the
+    /// partition to that replica (`AbstractFetch.selectReadReplica`) until it
+    /// expires after `metadata.max.age.ms` or the replica answers an error
+    /// (`FetchCollector.handleInitializeErrors`).
+    #[tokio::test]
+    async fn fetch_sends_the_rack_and_follows_the_preferred_read_replica() {
+        use FetchAnswer::Partition;
+        use ReplicaStep::{Poll, WaitForExpiry};
+        let records = Partition {
+            error_code: 0,
+            preferred_read_replica: -1,
+        };
+        let prefer_2 = Partition {
+            error_code: 0,
+            preferred_read_replica: 2,
+        };
+        let not_leader = Partition {
+            error_code: 6,
+            preferred_read_replica: -1,
+        };
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, rack, leader, replica, steps, expected) in [
+            (
+                "no rack",
+                None,
+                vec![records],
+                vec![records],
+                vec![Poll],
+                vec![(1, String::new())],
+            ),
+            (
+                "rack",
+                Some("az-1"),
+                vec![records],
+                vec![records],
+                vec![Poll],
+                vec![(1, "az-1".to_owned())],
+            ),
+            (
+                "preferred read replica",
+                Some("az-1"),
+                vec![prefer_2],
+                vec![records],
+                vec![Poll, Poll],
+                vec![(1, "az-1".to_owned()), (2, "az-1".to_owned())],
+            ),
+            (
+                "the replica answers not leader or follower",
+                Some("az-1"),
+                vec![prefer_2, records],
+                vec![not_leader],
+                vec![Poll, Poll, Poll],
+                vec![
+                    (1, "az-1".to_owned()),
+                    (2, "az-1".to_owned()),
+                    (1, "az-1".to_owned()),
+                ],
+            ),
+            (
+                "the preference expires",
+                Some("az-1"),
+                vec![prefer_2, records],
+                vec![records],
+                vec![Poll, Poll, WaitForExpiry, Poll],
+                vec![
+                    (1, "az-1".to_owned()),
+                    (2, "az-1".to_owned()),
+                    (1, "az-1".to_owned()),
+                ],
+            ),
+        ] {
+            let sent = SentFetches::default();
+            let brokers = start_brokers(&[leader, replica], &sent).await;
+            let mut consumer = consumer_on(&brokers).await;
+            *consumer.assigned.lock().await = vec![("orders".to_owned(), 0)];
+            consumer.client_rack = rack.map(str::to_owned);
+            consumer.metadata_max_age = millis(300);
+            for step in steps {
+                match step {
+                    Poll => {
+                        let before = sent.lock().expect("sent lock").len();
+                        consumer.poll(secs(2)).await.expect("poll");
+                        // The fetch sessions of the two brokers are independent;
+                        // wait until the Fetch of this poll is recorded.
+                        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                            while sent.lock().expect("sent lock").len() == before {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                        })
+                        .await;
+                    }
+                    WaitForExpiry => tokio::time::sleep(Duration::from_millis(400)).await,
+                }
+            }
+            let requests: Vec<(i32, String)> = sent
+                .lock()
+                .expect("sent lock")
+                .iter()
+                .map(|(node_id, request)| (*node_id, request.rack_id.clone()))
+                .collect();
+            drop(consumer);
+            stop(brokers);
+            actual.push((name, requests));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
     }
 
     /// One Fetch request of a session case: `(session_id, session_epoch,
@@ -3841,6 +4123,7 @@ mod fetch_path_tests {
                 }),
                 result: rx,
                 requested: HashMap::new(),
+                from_replica: std::collections::HashSet::new(),
             },
         );
         let started = tokio::time::Instant::now();
@@ -3851,6 +4134,54 @@ mod fetch_path_tests {
         drop(consumer);
         stop(brokers);
         assert2::assert!(elapsed < Duration::from_millis(500));
+    }
+
+    /// A preferred read replica that answers `OFFSET_OUT_OF_RANGE` gives no
+    /// offset reset, also when the preference expired while the Fetch was in
+    /// flight: the request decides.
+    #[tokio::test]
+    async fn out_of_range_from_a_replica_request_gives_no_reset() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(&[vec![FetchAnswer::Silent]], &sent).await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer.auto_offset_reset = AutoOffsetReset::Latest;
+        let key = ("orders".to_owned(), 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        consumer.fetches.in_flight.insert(
+            2,
+            InFlightFetch {
+                handle: tokio::spawn(async {}),
+                result: rx,
+                requested: HashMap::from([(key.clone(), 5)]),
+                from_replica: std::collections::HashSet::from([key.clone()]),
+            },
+        );
+        tx.send(Ok(FetchResponse {
+            responses: vec![FetchableTopicResponse {
+                topic: "orders".into(),
+                partitions: vec![PartitionData {
+                    partition_index: 0,
+                    error_code: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))
+        .expect("send response");
+        let topic_ids = consumer.topic_ids.lock().await.clone();
+        let responses = consumer
+            .take_completed_fetches(&topic_ids)
+            .await
+            .expect("take");
+        consumer
+            .process_fetch_responses(responses, &topic_ids)
+            .await
+            .expect("process");
+        let position = consumer.next_offsets.lock().await.get(&key).copied();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!(position == Some(5));
     }
 
     /// Kafka's `FetchCollector` discards the data of a partition whose position
@@ -3867,6 +4198,7 @@ mod fetch_path_tests {
                 handle: tokio::spawn(async {}),
                 result: rx,
                 requested: HashMap::from([(("orders".to_owned(), 0), 5)]),
+                from_replica: std::collections::HashSet::new(),
             },
         );
         // A seek moves the position while the Fetch is in flight.
