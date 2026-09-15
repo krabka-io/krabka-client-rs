@@ -348,6 +348,15 @@ impl CoordinatorRetry {
         }
     }
 
+    /// The retry state of one part of a call whose deadline `deadline`
+    /// already runs, such as the request to one broker of a call to many.
+    pub(crate) const fn from_deadline(deadline: RetryDeadline) -> Self {
+        Self {
+            deadline,
+            find_coordinator: true,
+        }
+    }
+
     /// Whether the next attempt must find the coordinator first.
     pub(crate) const fn find_coordinator(&self) -> bool {
         self.find_coordinator
