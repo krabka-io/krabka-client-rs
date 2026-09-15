@@ -1024,6 +1024,71 @@ mod tests {
         }
     }
 
+    /// The `ApiVersions` answer of the scripted mock coordinator.
+    fn scripted_api_versions(add_partitions_range: (i16, i16), two_phase_commit: bool) -> Vec<u8> {
+        encode_v0(&ApiVersionsResponse {
+            api_keys: vec![
+                ApiVersion {
+                    api_key: add_partitions_to_txn_request::API_KEY,
+                    min_version: add_partitions_range.0,
+                    max_version: add_partitions_range.1,
+                    ..Default::default()
+                },
+                ApiVersion {
+                    api_key: metadata_request::API_KEY,
+                    min_version: 0,
+                    max_version: 12,
+                    ..Default::default()
+                },
+                ApiVersion {
+                    api_key: produce_request::API_KEY,
+                    min_version: 3,
+                    max_version: 13,
+                    ..Default::default()
+                },
+                ApiVersion {
+                    api_key: init_producer_id_request::API_KEY,
+                    min_version: 0,
+                    max_version: if two_phase_commit { 6 } else { 0 },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })
+    }
+
+    /// The `Metadata` answer of the scripted mock coordinator: the topic
+    /// `topic` with one partition that the mock leads.
+    ///
+    /// The producer waits for metadata that holds the topic, so the answer
+    /// must decode at the negotiated version.
+    fn scripted_metadata(port: u16, version: i16) -> Vec<u8> {
+        let response = MetadataResponse {
+            brokers: vec![MetadataResponseBroker {
+                node_id: 1,
+                host: "127.0.0.1".into(),
+                port: i32::from(port),
+                ..Default::default()
+            }],
+            topics: vec![MetadataResponseTopic {
+                name: Some("topic".into()),
+                partitions: vec![MetadataResponsePartition {
+                    partition_index: 0,
+                    leader_id: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        if version >= metadata_response::FLEXIBLE_MIN {
+            buf.extend_from_slice(&[0]);
+        }
+        response.encode(&mut buf, version).expect("encode Metadata");
+        buf.to_vec()
+    }
+
     /// Boot a mock coordinator that answers `EndTxn` and `AddPartitionsToTxn`
     /// from `coordinator`.
     async fn scripted_producer(
@@ -1043,65 +1108,18 @@ mod tests {
         };
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
             if api_key == api_versions_request::API_KEY {
-                return Some(encode_v0(&ApiVersionsResponse {
-                    api_keys: vec![
-                        ApiVersion {
-                            api_key: add_partitions_to_txn_request::API_KEY,
-                            min_version: add_partitions_range.0,
-                            max_version: add_partitions_range.1,
-                            ..Default::default()
-                        },
-                        ApiVersion {
-                            api_key: metadata_request::API_KEY,
-                            min_version: 0,
-                            max_version: 12,
-                            ..Default::default()
-                        },
-                        ApiVersion {
-                            api_key: produce_request::API_KEY,
-                            min_version: 3,
-                            max_version: 13,
-                            ..Default::default()
-                        },
-                        ApiVersion {
-                            api_key: init_producer_id_request::API_KEY,
-                            min_version: 0,
-                            max_version: if two_phase_commit { 6 } else { 0 },
-                            ..Default::default()
-                        },
-                    ],
-                    ..Default::default()
-                }));
+                return Some(scripted_api_versions(
+                    add_partitions_range,
+                    two_phase_commit,
+                ));
             }
             let mut coordinator = handler_shared.lock().expect("scripted coordinator");
             if api_key == metadata_request::API_KEY {
                 coordinator.metadata_requests += 1;
-                // The producer waits for metadata that holds the topic, so the
-                // answer must decode at the negotiated version.
-                let response = MetadataResponse {
-                    brokers: vec![MetadataResponseBroker {
-                        node_id: 1,
-                        host: "127.0.0.1".into(),
-                        port: i32::from(handler_port.load(Ordering::SeqCst)),
-                        ..Default::default()
-                    }],
-                    topics: vec![MetadataResponseTopic {
-                        name: Some("topic".into()),
-                        partitions: vec![MetadataResponsePartition {
-                            partition_index: 0,
-                            leader_id: 1,
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
-                let mut buf = BytesMut::new();
-                if version >= metadata_response::FLEXIBLE_MIN {
-                    buf.extend_from_slice(&[0]);
-                }
-                response.encode(&mut buf, version).expect("encode Metadata");
-                return Some(buf.to_vec());
+                return Some(scripted_metadata(
+                    handler_port.load(Ordering::SeqCst),
+                    version,
+                ));
             }
             if api_key == produce_request::API_KEY {
                 let Reply::Code(error_code) = coordinator.produce.next() else {
@@ -2153,7 +2171,7 @@ mod tests {
             produce: Script::new(&[Reply::Code(42)], Reply::Code(0)),
             two_phase_commit: true,
             // The record stays in the accumulator until the prepare flushes.
-            linger: Some(Duration::from_secs(60)),
+            linger: Some(Duration::from_mins(1)),
             ..Coordinator::default()
         })
         .await;
