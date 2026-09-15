@@ -91,6 +91,8 @@ impl ProtocolRequest for ClientAddPartitionsToTxn {
     const API_KEY: i16 = add_partitions_to_txn_request::API_KEY;
     const MIN_VERSION: i16 = add_partitions_to_txn_request::MIN_VERSION;
     const MAX_VERSION: i16 = ADD_PARTITIONS_LAST_CLIENT_VERSION;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = add_partitions_to_txn_request::FLEXIBLE_MIN;
     type Response = AddPartitionsToTxnResponse;
 }

@@ -75,6 +75,36 @@ impl ProtocolRequest for StableInitProducerId {
     const API_KEY: i16 = init_producer_id_request::API_KEY;
     const MIN_VERSION: i16 = init_producer_id_request::MIN_VERSION;
     const MAX_VERSION: i16 = INIT_PRODUCER_ID_STABLE_MAX_VERSION;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
+    const FLEXIBLE_MIN: i16 = init_producer_id_request::FLEXIBLE_MIN;
+    type Response = InitProducerIdResponse;
+}
+
+/// An `InitProducerId` request with the two-phase commit fields, which only
+/// v6 carries.
+///
+/// Kafka marks v6 `latestVersionUnstable`, so version negotiation leaves it
+/// out of the generated `InitProducerIdRequest`. A two-phase commit request
+/// has no stable version, and this type keeps v6 negotiable for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TwoPhaseCommitInitProducerId(InitProducerIdRequest);
+
+impl Encode for TwoPhaseCommitInitProducerId {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl ProtocolRequest for TwoPhaseCommitInitProducerId {
+    const API_KEY: i16 = init_producer_id_request::API_KEY;
+    const MIN_VERSION: i16 = INIT_PRODUCER_ID_2PC_MIN_VERSION;
+    const MAX_VERSION: i16 = init_producer_id_request::MAX_VERSION;
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = init_producer_id_request::FLEXIBLE_MIN;
     type Response = InitProducerIdResponse;
 }
@@ -569,7 +599,10 @@ pub(crate) async fn send_init_producer_id(
 ) -> Result<InitProducerIdResponse, ClientError> {
     if request.enable2_pc || request.keep_prepared_txn {
         client
-            .send_at_least(request.clone(), INIT_PRODUCER_ID_2PC_MIN_VERSION)
+            .send_at_least(
+                TwoPhaseCommitInitProducerId(request.clone()),
+                INIT_PRODUCER_ID_2PC_MIN_VERSION,
+            )
             .await
     } else {
         client.send(StableInitProducerId(request.clone())).await

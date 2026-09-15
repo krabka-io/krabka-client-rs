@@ -61,6 +61,8 @@ impl ProtocolRequest for TopicNameOffsetFetch {
     const MIN_VERSION: i16 = offset_fetch_request::MIN_VERSION;
     /// The last `OffsetFetch` version that carries topic names.
     const MAX_VERSION: i16 = 9;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = offset_fetch_request::FLEXIBLE_MIN;
     type Response = OffsetFetchResponse;
 }
@@ -322,6 +324,8 @@ impl ProtocolRequest for TopicNameOffsetCommit {
     const MIN_VERSION: i16 = offset_commit_request::MIN_VERSION;
     /// The last `OffsetCommit` version that carries topic names.
     const MAX_VERSION: i16 = 9;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = offset_commit_request::FLEXIBLE_MIN;
     type Response = OffsetCommitResponse;
 }

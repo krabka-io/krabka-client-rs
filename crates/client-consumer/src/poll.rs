@@ -269,6 +269,7 @@ impl ProtocolRequest for ReadCommittedListOffsets {
     /// The first `ListOffsets` version that carries `isolation_level`.
     const MIN_VERSION: i16 = 2;
     const MAX_VERSION: i16 = list_offsets_request::MAX_VERSION;
+    const LATEST_STABLE_VERSION: i16 = list_offsets_request::LATEST_STABLE_VERSION;
     const FLEXIBLE_MIN: i16 = list_offsets_request::FLEXIBLE_MIN;
     type Response = ListOffsetsResponse;
 }
