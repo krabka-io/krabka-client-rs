@@ -56,20 +56,28 @@ impl FetchBuffer {
     /// The call drops the data of a partition that is no longer in `assigned`,
     /// and of a partition whose position changed since the fetch. Kafka's
     /// `SubscriptionState` gives no position to an unassigned partition, and a
-    /// seek clears the buffered data of its partition.
+    /// seek clears the buffered data of its partition. The call keeps the data
+    /// of a `paused` partition and moves it to the end of the buffer, as
+    /// Kafka's `FetchCollector.collectFetch` does.
     pub(crate) fn drain(
         &mut self,
         max_records: usize,
         assigned: &HashSet<(String, i32)>,
+        paused: &HashSet<(String, i32)>,
         offsets: &mut HashMap<(String, i32), i64>,
         positions: &mut HashMap<(String, i32), PartitionPosition>,
     ) -> Vec<ConsumerRecord> {
         let mut out = Vec::new();
+        let mut paused_data = VecDeque::new();
         while let Some(partition) = self.partitions.front_mut() {
             if !assigned.contains(&partition.key)
                 || offsets.get(&partition.key) != Some(&partition.position)
             {
                 self.partitions.pop_front();
+                continue;
+            }
+            if paused.contains(&partition.key) {
+                paused_data.extend(self.partitions.pop_front());
                 continue;
             }
             while out.len() < max_records {
@@ -99,7 +107,16 @@ impl FetchBuffer {
                 break;
             }
         }
+        self.partitions.extend(paused_data);
         out
+    }
+
+    /// The partitions that have buffered data.
+    pub(crate) fn buffered_partitions(&self) -> HashSet<(String, i32)> {
+        self.partitions
+            .iter()
+            .map(|partition| partition.key.clone())
+            .collect()
     }
 }
 
@@ -116,6 +133,7 @@ mod tests {
             offset,
             leader_epoch,
             timestamp: 0,
+            timestamp_type: crate::TimestampType::CreateTime,
             key: None,
             value: Some(Bytes::from(offset.to_string())),
             headers: Vec::new(),
@@ -149,22 +167,27 @@ mod tests {
         let key = |partition: i32| ("orders".to_string(), partition);
         let all = HashSet::from([key(0), key(1)]);
         let only_1 = HashSet::from([key(1)]);
-        for (name, max_records, assigned, seek, expected) in [
+        let none = HashSet::new();
+        let paused_0 = HashSet::from([key(0)]);
+        for (name, max_records, assigned, paused, seek, expected, remaining) in [
             (
                 "partial drain of the first partition",
                 3,
                 &all,
+                &none,
                 None,
                 vec![Drained {
                     offsets: vec![10, 11, 12],
                     next_offsets: vec![(key(0), 13), (key(1), 20)],
                     epochs: vec![(key(0), LeaderEpoch(3))],
                 }],
+                vec![key(0), key(1)],
             ),
             (
                 "two calls cross the partition border and apply the batch end",
                 4,
                 &all,
+                &none,
                 None,
                 vec![
                     Drained {
@@ -178,28 +201,53 @@ mod tests {
                         epochs: vec![(key(0), LeaderEpoch(4)), (key(1), LeaderEpoch(4))],
                     },
                 ],
+                vec![],
             ),
             (
                 "an unassigned partition is dropped",
                 10,
                 &only_1,
+                &none,
                 None,
                 vec![Drained {
                     offsets: vec![20, 21],
                     next_offsets: vec![(key(0), 10), (key(1), 22)],
                     epochs: vec![(key(1), LeaderEpoch(4))],
                 }],
+                vec![],
             ),
             (
                 "a seek drops the data of its partition",
                 10,
                 &all,
+                &none,
                 Some(5),
                 vec![Drained {
                     offsets: vec![20, 21],
                     next_offsets: vec![(key(0), 5), (key(1), 22)],
                     epochs: vec![(key(1), LeaderEpoch(4))],
                 }],
+                vec![],
+            ),
+            (
+                "a paused partition keeps its data at the end of the buffer",
+                10,
+                &all,
+                &paused_0,
+                None,
+                vec![
+                    Drained {
+                        offsets: vec![20, 21],
+                        next_offsets: vec![(key(0), 10), (key(1), 22)],
+                        epochs: vec![(key(1), LeaderEpoch(4))],
+                    },
+                    Drained {
+                        offsets: vec![],
+                        next_offsets: vec![(key(0), 10), (key(1), 22)],
+                        epochs: vec![(key(1), LeaderEpoch(4))],
+                    },
+                ],
+                vec![key(0)],
             ),
         ] {
             let mut buffer = FetchBuffer::default();
@@ -213,7 +261,8 @@ mod tests {
             let mut positions = HashMap::new();
             let mut actual = Vec::new();
             for _ in 0..expected.len() {
-                let records = buffer.drain(max_records, assigned, &mut offsets, &mut positions);
+                let records =
+                    buffer.drain(max_records, assigned, paused, &mut offsets, &mut positions);
                 let mut next_offsets: Vec<_> = offsets.clone().into_iter().collect();
                 next_offsets.sort();
                 let mut epochs: Vec<_> = positions
@@ -227,7 +276,9 @@ mod tests {
                     epochs,
                 });
             }
-            assert2::check!(actual == expected, "case {name}");
+            let mut left: Vec<_> = buffer.buffered_partitions().into_iter().collect();
+            left.sort();
+            assert2::check!((actual, left) == (expected, remaining), "case {name}");
         }
     }
 }

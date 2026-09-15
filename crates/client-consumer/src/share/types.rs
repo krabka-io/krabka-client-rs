@@ -2,18 +2,24 @@
 
 use bytes::Bytes;
 
+use crate::consumer::TimestampType;
+
 /// One record delivered by [`ShareConsumer::poll`](super::ShareConsumer).
 ///
 /// Unlike a classic `ConsumerRecord`, a share record carries a
 /// `delivery_count`. The broker increments it each time it re-acquires the
 /// record after a prior delivery was released or after its acquisition lock
 /// expired, per KIP-932. A first delivery has `delivery_count == 1`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareConsumerRecord {
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
+    /// The create time, or for a `LogAppendTime` batch the broker append
+    /// time (the batch `max_timestamp`).
     pub timestamp: i64,
+    /// The timestamp type from the attributes of the record batch.
+    pub timestamp_type: TimestampType,
     pub key: Option<Bytes>,
     pub value: Option<Bytes>,
     /// Kafka record headers, kept lossless and in wire order.

@@ -283,6 +283,9 @@ struct ConnectionInner {
     pending: Pending,
     writer_tx: mpsc::Sender<DispatchItem>,
     shutdown: CancellationToken,
+    /// SASL re-authentication state (KIP-368), for a connection whose broker
+    /// sent a session lifetime.
+    reauth: Option<crate::reauth::Reauth>,
     _reader: JoinHandle<()>,
     _writer: JoinHandle<()>,
 }
@@ -320,7 +323,7 @@ fn tls_handshake_error(addr: SocketAddr, source: std::io::Error) -> ClientError 
 
 /// Classify a failed SASL exchange. Only a rejection is an authentication
 /// failure.
-fn sasl_error(addr: SocketAddr, source: crate::sasl::OutboundSaslError) -> ClientError {
+pub(crate) fn sasl_error(addr: SocketAddr, source: crate::sasl::OutboundSaslError) -> ClientError {
     match source {
         crate::sasl::OutboundSaslError::Authentication(error) => ClientError::Authentication {
             addr,
@@ -469,12 +472,12 @@ impl Connection {
         options: ConnectionOptions,
         security: &crate::security::ClientSecurity,
     ) -> Result<Self, ClientError> {
-        let stream = within_setup_timeout(&options, async {
+        let (stream, reauth) = within_setup_timeout(&options, async {
             let tcp = tcp_connect(addr, &options).await?;
             Self::secure_stream(addr, tcp, &options, security).await
         })
         .await?;
-        Self::from_stream(stream, options).await
+        Self::from_stream_with_reauth(stream, options, reauth).await
     }
 
     /// Run the TLS and SASL handshakes of `security` over `tcp`.
@@ -483,7 +486,7 @@ impl Connection {
         tcp: TcpStream,
         options: &ConnectionOptions,
         security: &crate::security::ClientSecurity,
-    ) -> Result<Box<dyn ClientDuplex>, ClientError> {
+    ) -> Result<(Box<dyn ClientDuplex>, Option<crate::reauth::Reauth>), ClientError> {
         // 1. TLS (if the protocol demands it).
         let mut stream: Box<dyn ClientDuplex> = if security.protocol.requires_tls() {
             let tls = security.tls.as_ref().ok_or_else(|| {
@@ -509,6 +512,7 @@ impl Connection {
         };
 
         // 2. SASL (if the protocol demands it).
+        let mut reauth = None;
         if security.protocol.requires_sasl() {
             let creds = security.sasl.as_ref().ok_or_else(|| {
                 ClientError::Io(std::io::Error::other("SASL protocol without credentials"))
@@ -519,7 +523,7 @@ impl Connection {
             // the principal matches the broker's advertised hostname.
             let target = addr.ip().to_string();
             let server_name = security.sasl_handshake_host(Some(target.as_str()));
-            crate::sasl::outbound_sasl(
+            let session = crate::sasl::outbound_sasl(
                 &mut *stream,
                 creds,
                 server_name,
@@ -528,8 +532,11 @@ impl Connection {
             )
             .await
             .map_err(|source| sasl_error(addr, source))?;
+            reauth = session.needs_reauthentication().then(|| {
+                crate::reauth::Reauth::new(addr, creds.clone(), server_name.to_owned(), session)
+            });
         }
-        Ok(stream)
+        Ok((stream, reauth))
     }
 
     /// Build a `Connection` over a pre-established, optionally
@@ -548,6 +555,16 @@ impl Connection {
     pub async fn from_stream(
         stream: Box<dyn ClientDuplex>,
         options: ConnectionOptions,
+    ) -> Result<Self, ClientError> {
+        Self::from_stream_with_reauth(stream, options, None).await
+    }
+
+    /// [`Self::from_stream`] for a stream that a SASL exchange authenticated,
+    /// with the state to authenticate again before the session ends.
+    pub(crate) async fn from_stream_with_reauth(
+        stream: Box<dyn ClientDuplex>,
+        options: ConnectionOptions,
+        reauth: Option<crate::reauth::Reauth>,
     ) -> Result<Self, ClientError> {
         let (writer_tx, writer_rx) =
             mpsc::channel::<DispatchItem>(options.dispatch_queue_capacity.get());
@@ -575,6 +592,7 @@ impl Connection {
                 pending,
                 writer_tx,
                 shutdown,
+                reauth,
                 _reader: reader_handle,
                 _writer: writer_handle,
             }),
@@ -683,13 +701,17 @@ impl Connection {
             body_flexible,
         );
         req.encode(&mut frame, version)?;
-        self.inner
+        let guard = self.reauthenticate_if_due().await?;
+        let sent = self
+            .inner
             .writer_tx
             .send(DispatchItem {
                 bytes: frame.freeze(),
             })
             .await
-            .map_err(|_| ClientError::Disconnected)
+            .map_err(|_| ClientError::Disconnected);
+        drop(guard);
+        sent
     }
 
     /// Send a hand-framed request and await the raw response body.
@@ -791,15 +813,100 @@ impl Connection {
     }
 
     async fn dispatch_request(&self, corr_id: i32, frame: BytesMut) -> Result<Bytes, ClientError> {
-        let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
-        self.inner.pending.insert(corr_id, tx);
+        let guard = self.reauthenticate_if_due().await?;
         // A caller that drops this future must not leave its id in `pending`,
         // where it would keep the connection from its idle close.
         let _registration = PendingRegistration {
             pending: &self.inner.pending,
             corr_id,
         };
+        let rx = self.enqueue(corr_id, frame).await?;
+        drop(guard);
+        self.await_response(corr_id, rx).await
+    }
 
+    /// Send a frame and wait for its response, with no re-authentication
+    /// check. A re-authentication sends its own frames this way.
+    pub(crate) async fn dispatch_unguarded(
+        &self,
+        corr_id: i32,
+        frame: BytesMut,
+    ) -> Result<Bytes, ClientError> {
+        let _registration = PendingRegistration {
+            pending: &self.inner.pending,
+            corr_id,
+        };
+        let rx = self.enqueue(corr_id, frame).await?;
+        self.await_response(corr_id, rx).await
+    }
+
+    /// The request header of a frame that this connection sends.
+    pub(crate) fn request_header(
+        &self,
+        api_key: ApiKey,
+        version: ApiVersion,
+        corr_id: i32,
+        flexible: bool,
+    ) -> BytesMut {
+        build_request_header(
+            api_key,
+            version,
+            corr_id,
+            &self.inner.options.client_id,
+            flexible,
+        )
+    }
+
+    /// Wait for a due SASL re-authentication to finish, and return a guard
+    /// that keeps a new one from starting until the caller enqueues its frame.
+    ///
+    /// Kafka's `KafkaChannel.maybeBeginClientReauthentication` starts the
+    /// exchange before the first request after the due time. A failed
+    /// exchange closes the connection and fails the request.
+    async fn reauthenticate_if_due(
+        &self,
+    ) -> Result<Option<tokio::sync::RwLockReadGuard<'_, Option<tokio::time::Instant>>>, ClientError>
+    {
+        let Some(reauth) = self.inner.reauth.as_ref() else {
+            return Ok(None);
+        };
+        loop {
+            let next = reauth.next.read().await;
+            if next.is_none_or(|due| tokio::time::Instant::now() < due) {
+                return Ok(Some(next));
+            }
+            drop(next);
+            let mut next = reauth.next.write().await;
+            if next.is_some_and(|due| tokio::time::Instant::now() >= due) {
+                let mut channel = crate::reauth::ConnectionChannel { connection: self };
+                // The exchange nests the whole SASL state machine. Boxing it
+                // keeps every send future small.
+                match Box::pin(reauth.authenticate(
+                    &mut channel,
+                    &self.inner.options.client_id,
+                    self.inner.options.frame_max,
+                ))
+                .await
+                {
+                    Ok(due) => *next = due,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "SASL re-authentication failed");
+                        self.inner.shutdown.cancel();
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Register `corr_id` and queue `frame` for the writer.
+    async fn enqueue(
+        &self,
+        corr_id: i32,
+        frame: BytesMut,
+    ) -> Result<oneshot::Receiver<Result<Bytes, ClientError>>, ClientError> {
+        let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
+        self.inner.pending.insert(corr_id, tx);
         self.inner
             .writer_tx
             .send(DispatchItem {
@@ -807,7 +914,15 @@ impl Connection {
             })
             .await
             .map_err(|_| ClientError::Disconnected)?;
+        Ok(rx)
+    }
 
+    /// Wait for the response of `corr_id` within the request timeout.
+    async fn await_response(
+        &self,
+        corr_id: i32,
+        rx: oneshot::Receiver<Result<Bytes, ClientError>>,
+    ) -> Result<Bytes, ClientError> {
         match tokio::time::timeout(self.inner.options.request_timeout.to_std(), rx).await {
             Ok(Ok(Ok(bytes))) => Ok(bytes),
             Ok(Ok(Err(err))) => Err(err),

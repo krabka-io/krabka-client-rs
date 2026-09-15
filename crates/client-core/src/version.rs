@@ -107,12 +107,18 @@ impl ApiVersionTable {
 
     /// Highest version both sides support for `R`, or
     /// [`ClientError::IncompatibleVersion`] if the ranges do not overlap.
+    ///
+    /// The client side ends at `R::LATEST_STABLE_VERSION`. Kafka's
+    /// `AbstractRequest.Builder` uses `ApiKeys.latestVersion(false)`, which
+    /// leaves out a `latestVersionUnstable` version, and
+    /// `NodeApiVersions.latestUsableVersion` picks the highest version of that
+    /// range that the broker also supports.
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub fn negotiate<R: ProtocolRequest>(&self) -> Result<i16, ClientError> {
         let api_key = R::API_KEY;
         let client_min = R::MIN_VERSION;
-        let client_max = R::MAX_VERSION;
+        let client_max = R::LATEST_STABLE_VERSION;
         let (broker_min, broker_max) = self.by_key.get(&api_key).copied().unwrap_or((0, 0));
         let chosen = client_max.min(broker_max);
         if chosen < client_min || chosen < broker_min {
@@ -150,6 +156,63 @@ mod tests {
 
     // `ApiVersionsRequest` acts as a sample `ProtocolRequest`. We only
     // need the trait's constants here; the impl comes from codegen.
+
+    /// A request whose latest version is unstable, as Kafka's
+    /// `InitProducerIdRequest.json` marks v6.
+    struct UnstableLatest;
+
+    impl krabka_protocol::Encode for UnstableLatest {
+        fn encode<B: bytes::BufMut>(
+            &self,
+            _buf: &mut B,
+            _version: i16,
+        ) -> Result<(), krabka_protocol::ProtocolError> {
+            Ok(())
+        }
+
+        fn encoded_len(&self, _version: i16) -> usize {
+            0
+        }
+    }
+
+    impl ProtocolRequest for UnstableLatest {
+        const API_KEY: i16 = 22;
+        const MIN_VERSION: i16 = 0;
+        const MAX_VERSION: i16 = 6;
+        const LATEST_STABLE_VERSION: i16 = 5;
+        const FLEXIBLE_MIN: i16 = 2;
+        type Response = krabka_protocol::owned::api_versions_response::ApiVersionsResponse;
+    }
+
+    /// Negotiation stops at the latest stable version, as Kafka's
+    /// `latestVersion(false)` does, and an unstable-only overlap fails.
+    #[test]
+    fn negotiate_leaves_out_an_unstable_latest_version() {
+        let cases = [
+            ("broker supports the unstable version", (0, 6), Ok(5)),
+            ("broker stops at the stable version", (0, 5), Ok(5)),
+            ("broker stops below", (0, 3), Ok(3)),
+            (
+                "broker supports only the unstable version",
+                (6, 6),
+                Err((6, 6)),
+            ),
+        ];
+        for (name, (broker_min, broker_max), expected) in cases {
+            let table = ApiVersionTable::from_entries([(22, broker_min, broker_max)]);
+            let actual = table
+                .negotiate::<UnstableLatest>()
+                .map_err(|error| match error {
+                    ClientError::IncompatibleVersion {
+                        broker_min,
+                        broker_max,
+                        ..
+                    } => (broker_min, broker_max),
+                    other => panic!("{name}: {other}"),
+                });
+            assert!(actual == expected, "{name}");
+        }
+    }
 
     #[test]
     fn negotiate_takes_min_of_max() {

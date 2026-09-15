@@ -277,14 +277,14 @@ impl Client {
         let conn = self.pool.least_loaded().await?;
         let (broker_min, broker_max) = conn.advertised_api_range(R::API_KEY).unwrap_or((0, 0));
         let client_min = R::MIN_VERSION.max(min_version);
-        let chosen = R::MAX_VERSION.min(broker_max);
+        let chosen = R::LATEST_STABLE_VERSION.min(broker_max);
         if chosen < client_min || chosen < broker_min {
             return Err(ClientError::IncompatibleVersion {
                 api_key: R::API_KEY,
                 broker_min,
                 broker_max,
                 client_min,
-                client_max: R::MAX_VERSION,
+                client_max: R::LATEST_STABLE_VERSION,
             });
         }
         conn.send(req).await
@@ -460,8 +460,11 @@ impl Client {
     pub async fn refresh_metadata(
         &self,
     ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
-        self.refresh_metadata_with(self.metadata_topics.request())
-            .await
+        let response = self
+            .refresh_metadata_with(self.metadata_topics.request())
+            .await?;
+        self.metadata_topics.mark_refreshed();
+        Ok(response)
     }
 
     /// Send `request`, parse the broker list from the response, refresh the

@@ -47,15 +47,15 @@ use crate::{
     },
     buffer_pool::BufferPool,
     builder::{ProducerFlushTimeout, send_init_producer_id},
-    compression::Compression,
+    compression::{Compression, CompressionLevels},
     error::{ProducerError, RecordSizeLimit},
     metadata_wait::{MetadataRefresh, MetadataWait, metadata_request},
     partitioner::{BuiltInPartitioner, StickyPartition, TopicPartitions},
     record::{ProducerRecord, RecordMetadata},
     sender::DrainIntent,
     transactional::{
-        AbortableError, AbortableErrorSlot, OwnedTransaction, PreparedTransactionState,
-        Transaction, TxnState,
+        AbortableError, FatalError, OwnedTransaction, PreparedTransactionState, Transaction,
+        TxnErrorSlot, TxnState,
     },
     txn_retry::{
         self, AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision, TxnRequestDecision,
@@ -91,6 +91,8 @@ impl ProtocolRequest for ClientAddPartitionsToTxn {
     const API_KEY: i16 = add_partitions_to_txn_request::API_KEY;
     const MIN_VERSION: i16 = add_partitions_to_txn_request::MIN_VERSION;
     const MAX_VERSION: i16 = ADD_PARTITIONS_LAST_CLIENT_VERSION;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = add_partitions_to_txn_request::FLEXIBLE_MIN;
     type Response = AddPartitionsToTxnResponse;
 }
@@ -129,6 +131,8 @@ impl<R: ProtocolRequest, const MAX: i16> ProtocolRequest for VersionCapped<R, MA
     const API_KEY: i16 = R::API_KEY;
     const MIN_VERSION: i16 = R::MIN_VERSION;
     const MAX_VERSION: i16 = MAX;
+    /// The cap is what the client offers, so the negotiation ends here too.
+    const LATEST_STABLE_VERSION: i16 = MAX;
     const FLEXIBLE_MIN: i16 = R::FLEXIBLE_MIN;
     type Response = R::Response;
 }
@@ -306,6 +310,8 @@ pub struct Producer {
     #[allow(dead_code)]
     pub(crate) acks: Acks,
     pub(crate) compression: Compression,
+    /// The validated `compression.<codec>.level` settings (KIP-390).
+    pub(crate) compression_levels: CompressionLevels,
     pub(crate) batch_size: usize,
     #[allow(dead_code)]
     pub(crate) linger: Time,
@@ -326,7 +332,7 @@ pub struct Producer {
     pub(crate) metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
     /// The metadata refreshes that concurrent sends share while they wait for
     /// a topic. See `MetadataWait`.
-    pub(crate) metadata_refresh: MetadataRefresh,
+    pub(crate) metadata_refresh: Arc<MetadataRefresh>,
     /// Per-`(topic, partition)` leader-id cache. The sender uses it to route
     /// each Produce to the broker that actually leads the partition.
     ///
@@ -379,13 +385,16 @@ pub struct Producer {
     /// flow. `init_transactions` sets it, and the sender reads it when it
     /// builds transactional `ProduceRequest`s.
     pub(crate) txn_pid_epoch: Arc<Mutex<(i64, i16)>>,
-    /// The error code that makes the current transaction abort-only. The
-    /// sender sets it when a transactional batch fails, and a coordinator
-    /// answer of an abortable code sets it too. `commit` and
-    /// `send_offsets_to_transaction` then fail until the application aborts
-    /// the transaction. Kafka's `TransactionManager` keeps the same state in
-    /// `ABORTABLE_ERROR` with `lastError`.
-    pub(crate) txn_abortable_error: Arc<AbortableErrorSlot>,
+    /// The error state of the transaction.
+    ///
+    /// The sender sets the abortable error when a transactional batch fails,
+    /// and a coordinator answer of an abortable code sets it too. `send`,
+    /// `prepare_transaction`, `commit` and `send_offsets_to_transaction` then
+    /// fail until the application aborts the transaction. A fence or a fatal
+    /// coordinator code sets the fatal error, and every later transactional
+    /// operation fails. Kafka's `TransactionManager` keeps the same states in
+    /// `ABORTABLE_ERROR` and `FATAL_ERROR` with `lastError`.
+    pub(crate) txn_error: Arc<TxnErrorSlot>,
     /// The producer follows transaction version 2 (KIP-890 part 2). It skips
     /// `AddPartitionsToTxn` and `AddOffsetsToTxn`, and sends `Produce`,
     /// `EndTxn` and `TxnOffsetCommit` at their latest versions.
@@ -437,6 +446,12 @@ fn add_partitions_error_code(response: &AddPartitionsToTxnResponse) -> i16 {
 }
 
 impl Producer {
+    /// Add `topic`/`partition` to the current transaction with
+    /// `AddPartitionsToTxn`.
+    ///
+    /// A fence or a fatal code sets the fatal error in `txn_error`. It does not
+    /// change `txn_state`: the send path holds that lock during this call, so
+    /// the caller moves the state to [`FatalError::state`].
     pub(crate) async fn register_transaction_partition(
         &self,
         topic: &str,
@@ -492,11 +507,13 @@ impl Producer {
             };
             let rediscover = match txn_retry::decide_add_partitions(attempt) {
                 AddPartitionsDecision::Added => return Ok(()),
-                AddPartitionsDecision::Fenced => return Err(ProducerError::FencedProducer),
+                AddPartitionsDecision::Fenced => return Err(self.fatal_error(FatalError::Fenced)),
                 AddPartitionsDecision::Abortable(code) => {
                     return Err(self.abortable_error(code));
                 }
-                AddPartitionsDecision::Refused(code) => return Err(ProducerError::Server(code)),
+                AddPartitionsDecision::Fatal(code) => {
+                    return Err(self.fatal_error(FatalError::Server(code)));
+                }
                 AddPartitionsDecision::Retry { rediscover } => rediscover,
             };
             if !retry.wait().await {
@@ -606,6 +623,9 @@ impl Producer {
         if self.transactional_id.is_none() {
             return Err(ProducerError::NotTransactional);
         }
+        if let Some(error) = self.fatal_error_state() {
+            return Err(error);
+        }
         if self.transaction_recovery_required() {
             return Err(ProducerError::RecoveryRequired);
         }
@@ -649,6 +669,9 @@ impl Producer {
                 "prepare_transaction requires transaction_two_phase_commit_enable=true",
             ));
         }
+        if let Some(error) = self.fatal_error_state() {
+            return Err(error);
+        }
         if self.transaction_recovery_required() {
             return Err(ProducerError::RecoveryRequired);
         }
@@ -664,6 +687,14 @@ impl Producer {
         }
 
         if let Err(error) = self.flush().await {
+            *self.txn_state.lock().await = TxnState::InTransaction;
+            return Err(error);
+        }
+        // Kafka's `KafkaProducer.prepareTransaction` flushes first, and then
+        // `TransactionManager.prepareTransaction` calls `maybeFailWithError`,
+        // which throws in both error states. A batch that failed during the
+        // flush has set the error by now.
+        if let Some(error) = self.transaction_error_state() {
             *self.txn_state.lock().await = TxnState::InTransaction;
             return Err(error);
         }
@@ -700,6 +731,9 @@ impl Producer {
         &self,
         prepared: PreparedTransactionState,
     ) -> Result<(), ProducerError> {
+        if let Some(error) = self.fatal_error_state() {
+            return Err(error);
+        }
         if *self.txn_state.lock().await != TxnState::Prepared {
             return Err(ProducerError::InvalidTransactionState(
                 "complete_transaction requires a prepared transaction",
@@ -722,9 +756,10 @@ impl Producer {
     ///
     /// - [`ProducerError::NotTransactional`]: `transactional_id` was not set.
     /// - [`ProducerError::InvalidTransactionState`]: not currently in a transaction.
-    /// - [`ProducerError::FencedProducer`]: broker returned `INVALID_PRODUCER_EPOCH (47)` or `PRODUCER_FENCED (90)`.
+    /// - [`ProducerError::FencedProducer`]: broker returned `INVALID_PRODUCER_EPOCH (47)` or `PRODUCER_FENCED (90)`, now or before.
+    /// - [`ProducerError::FatalTransactionError`]: the coordinator answered with a fatal code, now or before. An abort that gets `TRANSACTION_ABORTABLE (120)` is fatal too.
     /// - [`ProducerError::ConcurrentTransactions`]: broker still returned `CONCURRENT_TRANSACTIONS (51)` when the retry deadline ended; caller may retry.
-    /// - [`ProducerError::Server`]: any other broker error code. For a retriable code, the broker still returned it when the retry deadline ended.
+    /// - [`ProducerError::Server`]: an abortable code, or a retriable code that the broker still returned when the retry deadline ended.
     /// - [`ProducerError::RecoveryRequired`]: a request was lost in transport,
     ///   and the retries did not learn the outcome before the deadline.
     ///
@@ -751,6 +786,12 @@ impl Producer {
             .transactional_id
             .clone()
             .ok_or(ProducerError::NotTransactional)?;
+
+        // Kafka's `beginCommit` and `beginAbort` call `maybeFailWithError`,
+        // and a fatal error fails both.
+        if let Some(error) = self.fatal_error_state() {
+            return Err(error);
+        }
 
         // 1. Flush all in-flight records (block until acks).
         self.flush().await?;
@@ -793,7 +834,9 @@ impl Producer {
             committed,
             ..Default::default()
         };
-        let end_txn = self.send_end_txn_until_decided(coord, request).await;
+        let end_txn = self
+            .send_end_txn_until_decided(coord, request, committed)
+            .await;
 
         let mut state = self.txn_state.lock().await;
         let (decision, producer_identity) = match end_txn {
@@ -820,15 +863,20 @@ impl Producer {
                     self.adopt_transactional_identity(identity).await;
                 }
                 *self.prepared_transaction_state.lock().await = None;
-                self.txn_abortable_error.clear();
+                self.txn_error.clear_abortable();
                 *state = TxnState::Ready;
                 self.resolve_transaction_guard();
                 Ok(())
             }
             EndTxnDecision::Fenced => {
                 *state = TxnState::Fenced;
-                self.resolve_transaction_guard();
-                Err(ProducerError::FencedProducer)
+                drop(state);
+                Err(self.fatal_error(FatalError::Fenced))
+            }
+            EndTxnDecision::Fatal(code) => {
+                *state = TxnState::FatalError;
+                drop(state);
+                Err(self.fatal_error(FatalError::Server(code)))
             }
             EndTxnDecision::ConcurrentTransactions => {
                 *state = previous_state; // Caller can retry the same decision.
@@ -839,7 +887,7 @@ impl Producer {
                 drop(state);
                 Err(self.abortable_error(code))
             }
-            EndTxnDecision::Refused(code) => {
+            EndTxnDecision::TimedOut(code) => {
                 *state = previous_state;
                 Err(ProducerError::Server(code))
             }
@@ -893,6 +941,7 @@ impl Producer {
         &self,
         mut coordinator: Client,
         request: EndTxnRequest,
+        committed: bool,
     ) -> Result<(EndTxnDecision, Option<(i64, i16)>), ClientError> {
         let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
         let max_backoff = self.retry_backoff_max.to_std();
@@ -922,7 +971,7 @@ impl Producer {
                     (CoordinatorAttempt::Lost, None)
                 }
             };
-            let decision = txn_retry::decide_end_txn(attempt, earlier_attempt_lost);
+            let decision = txn_retry::decide_end_txn(attempt, earlier_attempt_lost, committed);
             earlier_attempt_lost |= attempt == CoordinatorAttempt::Lost;
             let EndTxnDecision::Retry { rediscover } = decision else {
                 return Ok((decision, identity));
@@ -995,8 +1044,16 @@ impl Producer {
     /// - [`ProducerError::InvalidTransactionState`] — called while a
     ///   transaction is in flight.
     /// - [`ProducerError::FencedProducer`] — the broker returned
-    ///   `INVALID_PRODUCER_EPOCH (47)`.
-    /// - [`ProducerError::Server`] — any other broker error code.
+    ///   `INVALID_PRODUCER_EPOCH (47)` or `PRODUCER_FENCED (90)`, now or in an
+    ///   earlier transactional operation.
+    /// - [`ProducerError::FatalTransactionError`] — the coordinator answered
+    ///   with a fatal code, now or in an earlier transactional operation.
+    ///   Kafka's `initTransactions` does not clear a fatal error either: close
+    ///   the producer.
+    /// - [`ProducerError::Server`] — an abortable code
+    ///   (`TRANSACTIONAL_ID_AUTHORIZATION_FAILED`,
+    ///   `CLUSTER_AUTHORIZATION_FAILED`, `TRANSACTION_ABORTABLE`), or a
+    ///   retriable code at the retry deadline. The call can be made again.
     /// - [`ProducerError::Client`] — transport-level failure.
     #[tracing::instrument(
         level = "info",
@@ -1047,15 +1104,18 @@ impl Producer {
         let Some(tid) = self.transactional_id.as_deref() else {
             return Err(ProducerError::NotTransactional);
         };
+        // Kafka's `TransactionManager.initializeTransactions` calls
+        // `maybeFailWithError`: no transition leaves `FATAL_ERROR`, so a new
+        // `initTransactions` does not clear it.
+        if let Some(error) = self.fatal_error_state() {
+            return Err(error);
+        }
 
         let previous_state = {
             let mut state = self.txn_state.lock().await;
             if !matches!(
                 *state,
-                TxnState::Uninitialized
-                    | TxnState::Ready
-                    | TxnState::Fenced
-                    | TxnState::RecoveryRequired
+                TxnState::Uninitialized | TxnState::Ready | TxnState::RecoveryRequired
             ) && !self.transaction_recovery_required()
             {
                 return Err(ProducerError::InvalidTransactionState(
@@ -1116,7 +1176,7 @@ impl Producer {
                 tracing::Span::current().record("producer_epoch", resp.producer_epoch);
                 self.adopt_transactional_identity((resp.producer_id, resp.producer_epoch))
                     .await;
-                self.txn_abortable_error.clear();
+                self.txn_error.clear_abortable();
                 // Kafka's `KafkaProducer.initTransactions` reads the finalized
                 // features after `InitProducerId`
                 // (`maybeUpdateTransactionV2Enabled(true)`).
@@ -1135,15 +1195,18 @@ impl Producer {
                 self.resolve_transaction_guard();
                 Ok(())
             }
-            47 /* INVALID_PRODUCER_EPOCH */ => {
-                *self.txn_state.lock().await = TxnState::Fenced;
-                self.resolve_transaction_guard();
-                Err(ProducerError::FencedProducer)
-            }
-            other => {
-                *self.txn_state.lock().await = previous_state;
-                Err(ProducerError::Server(other))
-            }
+            code => match txn_retry::decide_init_producer_id(CoordinatorAttempt::Answered(code)) {
+                TxnRequestDecision::Fenced => Err(self.fence_transaction().await),
+                TxnRequestDecision::Fatal(code) => Err(self.fatal_transaction(code).await),
+                // An abortable code, or a retriable code at the retry
+                // deadline, leaves the producer as it was.
+                TxnRequestDecision::Done
+                | TxnRequestDecision::Abortable(_)
+                | TxnRequestDecision::Retry { .. } => {
+                    *self.txn_state.lock().await = previous_state;
+                    Err(ProducerError::Server(code))
+                }
+            },
         }
     }
 
@@ -1282,6 +1345,9 @@ impl Producer {
             .as_deref()
             .ok_or(ProducerError::NotTransactional)?
             .to_string();
+        if let Some(error) = self.fatal_error_state() {
+            return Err(error);
+        }
         if matches!(
             *self.txn_state.lock().await,
             TxnState::Preparing | TxnState::Prepared
@@ -1359,7 +1425,7 @@ impl Producer {
                 TxnRequestDecision::Done => return Ok(()),
                 TxnRequestDecision::Fenced => return Err(self.fence_transaction().await),
                 TxnRequestDecision::Abortable(code) => return Err(self.abortable_error(code)),
-                TxnRequestDecision::Refused(code) => return Err(ProducerError::Server(code)),
+                TxnRequestDecision::Fatal(code) => return Err(self.fatal_transaction(code).await),
                 TxnRequestDecision::Retry { rediscover } => rediscover,
             };
             if !retry.wait().await {
@@ -1428,7 +1494,7 @@ impl Producer {
                 TxnRequestDecision::Done => return Ok(()),
                 TxnRequestDecision::Fenced => return Err(self.fence_transaction().await),
                 TxnRequestDecision::Abortable(code) => return Err(self.abortable_error(code)),
-                TxnRequestDecision::Refused(code) => return Err(ProducerError::Server(code)),
+                TxnRequestDecision::Fatal(code) => return Err(self.fatal_transaction(code).await),
                 TxnRequestDecision::Retry { rediscover } => rediscover,
             };
             if !retry.wait().await {
@@ -1510,15 +1576,53 @@ impl Producer {
     /// the producer in the same place.
     async fn fence_transaction(&self) -> ProducerError {
         *self.txn_state.lock().await = TxnState::Fenced;
+        self.fatal_error(FatalError::Fenced)
+    }
+
+    /// Move the transaction to the fatal error state for `code`, and give the
+    /// error to report. Kafka's `TransactionManager.fatalError` does the same.
+    async fn fatal_transaction(&self, code: i16) -> ProducerError {
+        *self.txn_state.lock().await = TxnState::FatalError;
+        self.fatal_error(FatalError::Server(code))
+    }
+
+    /// Record `error` as the fatal error of the transaction, and give the
+    /// error to report. The caller moves `txn_state`.
+    ///
+    /// The open transaction guard is resolved, because no request of this
+    /// producer can change the transaction again: a dropped guard must not
+    /// ask for recovery. The sender fails every transactional batch that it
+    /// has not sent, as Kafka's `Sender.runOnce` calls `maybeAbortBatches`
+    /// in `FATAL_ERROR`, so the sender is woken.
+    fn fatal_error(&self, error: FatalError) -> ProducerError {
+        self.txn_error.set_fatal(error);
         self.resolve_transaction_guard();
-        ProducerError::FencedProducer
+        tracing::error!(
+            ?error,
+            "the transactional producer is in a fatal error state; close it"
+        );
+        let _ = self.wake_tx.try_send(DrainIntent::Ready);
+        error.error()
+    }
+
+    /// The fatal error of the transaction, as the error that every
+    /// transactional operation reports.
+    fn fatal_error_state(&self) -> Option<ProducerError> {
+        self.txn_error.fatal().map(FatalError::error)
+    }
+
+    /// The error that `maybeFailWithError` throws in Kafka's
+    /// `TransactionManager`: the fatal error, or else the abortable error.
+    fn transaction_error_state(&self) -> Option<ProducerError> {
+        self.fatal_error_state()
+            .or_else(|| self.abortable_error_state())
     }
 
     /// Record `code` as the error that only an abort can clear, and give the
     /// error to report. Kafka's `TransactionManager.abortableError` does the
     /// same.
     fn abortable_error(&self, code: i16) -> ProducerError {
-        self.txn_abortable_error.set(code);
+        self.txn_error.set_abortable(code);
         tracing::warn!(
             error_code = code,
             "the transaction can no longer commit; abort it"
@@ -1528,7 +1632,7 @@ impl Producer {
 
     /// The error that a commit reports while the transaction is abort-only.
     fn abortable_error_state(&self) -> Option<ProducerError> {
-        self.txn_abortable_error.get().map(|error| match error {
+        self.txn_error.abortable().map(|error| match error {
             AbortableError::Server(code) => ProducerError::Server(code),
             AbortableError::Timeout => ProducerError::SendTimeout,
         })
@@ -1603,6 +1707,12 @@ impl Producer {
     /// A record with a negative partition or timestamp fails at once with
     /// [`ProducerError::InvalidPartition`] or
     /// [`ProducerError::InvalidTimestamp`], and the producer sends nothing.
+    ///
+    /// A transactional producer fails the record at once, and sends nothing,
+    /// when its transaction holds an error: the abortable error until the
+    /// application aborts, and the fatal error for good. Kafka's
+    /// `KafkaProducer.doSend` fails the same way in
+    /// `TransactionManager.maybeAddPartition`.
     ///
     /// This returns a `oneshot::Receiver`. The outer call is `async` because
     /// it waits for metadata that holds the topic, for at most `max_block`, as
@@ -1745,7 +1855,7 @@ impl Producer {
                     Some(_) => Some(*self.txn_state.lock().await),
                     None => None,
                 };
-                let expected_generation = match self.transaction_generation(state) {
+                let expected_generation = match self.append_transaction_generation(state) {
                     Ok(generation) => generation,
                     Err(error) => return failed(error),
                 };
@@ -1777,13 +1887,13 @@ impl Producer {
             // `prepare_transaction` takes the same lock before it flushes, so
             // it cannot race past a send that has already joined this
             // transaction.
-            let transaction_state = if self.transactional_id.is_some() {
+            let mut transaction_state = if self.transactional_id.is_some() {
                 Some(self.txn_state.lock().await)
             } else {
                 None
             };
             let transaction_generation =
-                match self.transaction_generation(transaction_state.as_deref().copied()) {
+                match self.append_transaction_generation(transaction_state.as_deref().copied()) {
                     Ok(generation) => generation,
                     Err(error) => return failed(error),
                 };
@@ -1792,6 +1902,12 @@ impl Producer {
                     .register_transaction_partition(&record.topic, partition)
                     .await
             {
+                // The state lock is held here, so the state moves under it.
+                if let (Some(state), Some(fatal)) =
+                    (transaction_state.as_deref_mut(), self.txn_error.fatal())
+                {
+                    *state = fatal.state();
+                }
                 return failed(error);
             }
             let mut a = acc.lock().await;
@@ -1876,6 +1992,30 @@ impl Producer {
         }
     }
 
+    /// The transaction generation that a send appends with in `state`.
+    ///
+    /// This is [`Self::transaction_generation`], after the check that Kafka's
+    /// `TransactionManager.maybeAddPartition` makes with `maybeFailWithError`:
+    /// a transactional producer in the fatal or the abortable error state
+    /// fails the send with the stored error. Kafka makes this check after
+    /// `waitOnMetadata`, so `send` calls this after its metadata wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stored transaction error, or an error of
+    /// [`Self::transaction_generation`].
+    fn append_transaction_generation(
+        &self,
+        state: Option<TxnState>,
+    ) -> Result<Option<u64>, ProducerError> {
+        if state.is_some()
+            && let Some(error) = self.transaction_error_state()
+        {
+            return Err(error);
+        }
+        self.transaction_generation(state)
+    }
+
     /// The transaction generation that a send takes in `state`: the recovery
     /// generation inside a transaction, and `None` otherwise.
     ///
@@ -1919,7 +2059,7 @@ impl Producer {
         skip_all,
         fields(topic = %topic, num_partitions = tracing::field::Empty),
     )]
-    async fn partition_count(
+    pub(crate) async fn partition_count(
         &self,
         topic: &str,
         partition: Option<i32>,
@@ -2007,6 +2147,10 @@ impl std::fmt::Debug for Producer {
             .field("producer_epoch", &self.producer_epoch())
             .field("transactional_id", &self.transactional_id)
             .field("compression", &self.compression)
+            .field(
+                "compression_level",
+                &self.compression_levels.level(self.compression),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -2083,6 +2227,7 @@ mod tests {
     use crate::{
         ProducerRecord,
         accumulator::{Accumulator, AppendResult},
+        compression::Compression,
         error::ProducerError,
         partitioner::partition_for_key,
     };
@@ -2995,6 +3140,42 @@ mod tests {
             drop(producer);
             assert2::assert!(actual == expected, "{name}");
         }
+    }
+
+    /// The `Debug` form of a producer names the level of its codec, and no
+    /// level for a codec without levels.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn debug_names_the_compression_level_of_the_codec() {
+        let (mock, _) = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+        let mut actual = Vec::new();
+        for compression in [Compression::Gzip, Compression::Zstd, Compression::Snappy] {
+            let producer = Producer::builder()
+                .bootstrap(mock.addr.to_string())
+                .client_id(CLIENT_ID)
+                .enable_idempotence(false)
+                .compression(compression)
+                .compression_gzip_level(5)
+                .compression_zstd_level(19)
+                .build()
+                .await
+                .expect("producer connects to mock broker");
+            let debug = format!("{producer:?}");
+            actual.push(
+                debug
+                    .split(", ")
+                    .find(|field| field.starts_with("compression_level"))
+                    .map(str::to_owned),
+            );
+        }
+        mock.stop();
+        assert2::assert!(
+            actual
+                == vec![
+                    Some("compression_level: Some(5)".to_owned()),
+                    Some("compression_level: Some(19)".to_owned()),
+                    Some("compression_level: None".to_owned()),
+                ]
+        );
     }
 
     /// A record that does not fit the current batch closes that batch before

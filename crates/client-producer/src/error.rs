@@ -101,6 +101,17 @@ pub enum ProducerError {
         "transaction outcome is unknown; call init_transactions before sending or beginning another transaction"
     )]
     RecoveryRequired,
+
+    /// A transaction coordinator answered with a fatal code, and the
+    /// transactional producer can do no more transactional work. Every later
+    /// `init_transactions`, `begin_transaction`, `send`,
+    /// `send_offsets_to_transaction`, commit and abort fails with this error.
+    /// Kafka's `TransactionManager` moves to `FATAL_ERROR` for the same codes,
+    /// and the application can only close the producer.
+    #[error(
+        "the transactional producer is in a fatal error state after broker error_code {0}; close the producer"
+    )]
+    FatalTransactionError(i16),
 }
 
 /// The producer limit that a record is larger than.

@@ -1,44 +1,76 @@
 //! KIP-113 admin RPCs: `AlterReplicaLogDirs` (`api_key` 34) and
 //! `DescribeLogDirs` (`api_key` 35).
 //!
-//! Both target the broker that the connection is open against. These are
-//! per-broker calls, so the admin client does NOT do a controller retry on
-//! `NOT_CONTROLLER`. The request does not reach the controller.
+//! Both act only on the broker that receives the request. As Kafka's
+//! `KafkaAdminClient.describeLogDirs` and `alterReplicaLogDirs` do, the admin
+//! client finds each broker by id in the metadata and sends one request to
+//! each broker (`ConstantNodeIdProvider`). A broker that fails gives an error
+//! for that broker only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use krabka_protocol::owned::{
-    alter_replica_log_dirs_request::{
-        AlterReplicaLogDir, AlterReplicaLogDirTopic, AlterReplicaLogDirsRequest,
+use krabka_client_core::{Connection, ConnectionOptions};
+use krabka_protocol::{
+    ProtocolRequest,
+    owned::{
+        alter_replica_log_dirs_request::{
+            AlterReplicaLogDir, AlterReplicaLogDirTopic, AlterReplicaLogDirsRequest,
+        },
+        alter_replica_log_dirs_response::AlterReplicaLogDirsResponse,
+        describe_log_dirs_request::{DescribableLogDirTopic, DescribeLogDirsRequest},
+        describe_log_dirs_response::DescribeLogDirsResponse,
+        metadata_request::MetadataRequest,
     },
-    describe_log_dirs_request::{DescribableLogDirTopic, DescribeLogDirsRequest},
+};
+use krabka_units::{ByteSize, convert::ByteSizeExt as _};
+
+use crate::{
+    AdminClient, AdminError, KafkaError, RecoveringConnection, format_host_port,
+    groups::list_groups_kafka_error,
+    kafka_error_if, kafka_error_name,
+    retry::{CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, is_connection_failure},
 };
 
-use crate::{AdminClient, AdminError, KafkaError, kafka_error_if};
+/// `UNKNOWN_SERVER_ERROR`.
+const UNKNOWN_SERVER_ERROR: i16 = -1;
+/// `REQUEST_TIMED_OUT`: Kafka's `TimeoutException`.
+const REQUEST_TIMED_OUT: i16 = 7;
+/// `CLUSTER_AUTHORIZATION_FAILED`.
+const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
 
-/// One row of an `AlterReplicaLogDirs` result.
-#[derive(Debug, Clone)]
-pub struct AlterReplicaLogDirOutcome {
+/// One replica of a partition on one broker, as Kafka's
+/// `TopicPartitionReplica`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TopicPartitionReplica {
     pub topic: String,
     pub partition: i32,
-    pub error: Option<KafkaError>,
+    pub broker_id: i32,
 }
 
-/// One log dir from a `DescribeLogDirs` response.
-#[derive(Debug, Clone)]
+/// One log dir from a `DescribeLogDirs` response, as Kafka's
+/// `LogDirDescription`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogDirInfo {
     pub log_dir: String,
     pub error: Option<KafkaError>,
     pub topics: Vec<LogDirTopicInfo>,
+    /// The size of the volume. `None` when the broker does not report it
+    /// (`DescribeLogDirs` below v4, or `-1`).
+    pub total: Option<ByteSize>,
+    /// The free space of the volume that the log dir can use. `None` when the
+    /// broker does not report it.
+    pub usable: Option<ByteSize>,
+    /// Whether the log dir takes no new partitions (KIP-1066).
+    pub is_cordoned: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogDirTopicInfo {
     pub name: String,
     pub partitions: Vec<LogDirPartitionInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogDirPartitionInfo {
     pub partition_index: i32,
     pub partition_size: i64,
@@ -46,120 +78,408 @@ pub struct LogDirPartitionInfo {
     pub is_future_key: bool,
 }
 
+/// The result of one broker: its value, or the Kafka error of the broker.
+pub type BrokerResult<T> = Result<T, KafkaError>;
+
 impl AdminClient {
-    /// `AlterReplicaLogDirs` (KIP-113): moves replicas between local
-    /// `log.dirs` on this broker.
+    /// `AlterReplicaLogDirs` (KIP-113): moves replicas between the
+    /// `log.dirs` of their brokers, as Kafka's
+    /// `KafkaAdminClient.alterReplicaLogDirs` does.
     ///
-    /// `assignments` maps each target absolute directory path to the
-    /// `(topic, [partition])` pairs to move into it.
+    /// `assignments` maps each replica to the absolute path of its target log
+    /// dir. The call groups the replicas by broker id and sends one request to
+    /// each broker, all at the same time. The result has one entry for each
+    /// replica:
     ///
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
+    /// - The error code of the broker for that partition, `Ok(())` for 0.
+    /// - `UNKNOWN_SERVER_ERROR` (-1) when the response of the broker has no
+    ///   result for the replica (`completeUnrealizedFutures`).
+    /// - The error of the broker call for every replica of a broker that
+    ///   fails. The call finds each broker by id in fresh metadata for each
+    ///   connection attempt, so a broker that is missing from the metadata or
+    ///   that moved to a new address is found again. A missing broker and a
+    ///   failed or lost connection are tried again with Kafka's backoff until
+    ///   `default.api.timeout.ms` (60 s), and then give `REQUEST_TIMED_OUT`
+    ///   (7). A slow or missing broker does not delay the other brokers.
     pub async fn alter_replica_log_dirs(
         &mut self,
-        assignments: &BTreeMap<String, Vec<(String, Vec<i32>)>>,
-    ) -> Result<Vec<AlterReplicaLogDirOutcome>, AdminError> {
-        let dirs = assignments
-            .iter()
+        assignments: &BTreeMap<TopicPartitionReplica, String>,
+    ) -> BTreeMap<TopicPartitionReplica, BrokerResult<()>> {
+        self.alter_replica_log_dirs_with_retry(assignments, KAFKA_ADMIN_RETRY)
+            .await
+    }
+
+    async fn alter_replica_log_dirs_with_retry(
+        &mut self,
+        assignments: &BTreeMap<TopicPartitionReplica, String>,
+        retry: RetryPolicy,
+    ) -> BTreeMap<TopicPartitionReplica, BrokerResult<()>> {
+        let start = retry.start();
+        let mut by_broker = BTreeMap::<i32, BTreeMap<TopicPartitionReplica, String>>::new();
+        for (replica, path) in assignments {
+            by_broker
+                .entry(replica.broker_id)
+                .or_default()
+                .insert(replica.clone(), path.clone());
+        }
+        let (conn, options) = (&self.conn, &self.options);
+        let answers = futures_util::future::join_all(by_broker.iter().map(|(broker_id, moves)| {
+            call_broker(
+                conn,
+                *broker_id,
+                options,
+                alter_request(moves),
+                CoordinatorRetry::from_deadline(start),
+            )
+        }))
+        .await;
+
+        let mut out = BTreeMap::new();
+        for ((broker_id, moves), answer) in by_broker.into_iter().zip(answers) {
+            match answer {
+                Ok(response) => out.extend(alter_results(broker_id, &moves, response)),
+                Err(error) => {
+                    out.extend(
+                        moves
+                            .into_keys()
+                            .map(|replica| (replica, Err(error.clone()))),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// `DescribeLogDirs` (KIP-113): lists every configured `log.dir` of each
+    /// broker in `brokers`, with the partitions each one holds, as Kafka's
+    /// `KafkaAdminClient.describeLogDirs` does.
+    ///
+    /// Pass `None` to fetch all partitions, as Kafka does. Pass `Some` with a
+    /// topic to partitions filter to narrow the result. An empty inner vec
+    /// means all partitions of that topic.
+    ///
+    /// The result has one entry for each broker id, and the brokers are asked
+    /// at the same time. A broker that answers with no log dir gives its
+    /// top-level error code, or `CLUSTER_AUTHORIZATION_FAILED` (31) when it
+    /// has none, as Kafka does. The call finds each broker by id in fresh
+    /// metadata for each connection attempt. A missing broker and a failed or
+    /// lost connection are tried again with Kafka's backoff until
+    /// `default.api.timeout.ms` (60 s), and then give `REQUEST_TIMED_OUT` (7).
+    pub async fn describe_log_dirs(
+        &mut self,
+        brokers: &[i32],
+        filter: Option<&BTreeMap<String, Vec<i32>>>,
+    ) -> BTreeMap<i32, BrokerResult<Vec<LogDirInfo>>> {
+        self.describe_log_dirs_with_retry(brokers, filter, KAFKA_ADMIN_RETRY)
+            .await
+    }
+
+    async fn describe_log_dirs_with_retry(
+        &mut self,
+        brokers: &[i32],
+        filter: Option<&BTreeMap<String, Vec<i32>>>,
+        retry: RetryPolicy,
+    ) -> BTreeMap<i32, BrokerResult<Vec<LogDirInfo>>> {
+        let start = retry.start();
+        let broker_ids = brokers.iter().copied().collect::<BTreeSet<_>>();
+        let request = describe_request(filter);
+        let (conn, options) = (&self.conn, &self.options);
+        let answers = futures_util::future::join_all(broker_ids.iter().map(|broker_id| {
+            let request = request.clone();
+            async move {
+                let response = call_broker(
+                    conn,
+                    *broker_id,
+                    options,
+                    request,
+                    CoordinatorRetry::from_deadline(start),
+                )
+                .await?;
+                log_dir_infos(response)
+            }
+        }))
+        .await;
+        broker_ids.into_iter().zip(answers).collect()
+    }
+}
+
+/// Send `request` to broker `broker_id` until it answers, the error is
+/// final, or the call deadline passes, as one Kafka `Call` with a
+/// `ConstantNodeIdProvider` does.
+///
+/// Each connection attempt looks the broker up in fresh metadata. A broker
+/// that the metadata does not name, and a failed or lost connection
+/// (including a TLS or SASL handshake with no verdict), are tried again after
+/// the backoff, as Kafka's `Call.fail` retries a `RetriableException`.
+async fn call_broker<R>(
+    conn: &RecoveringConnection,
+    broker_id: i32,
+    options: &ConnectionOptions,
+    request: R,
+    mut retry: CoordinatorRetry,
+) -> BrokerResult<R::Response>
+where
+    R: ProtocolRequest + Clone,
+{
+    let mut connection: Option<Connection> = None;
+    loop {
+        let action = retry
+            .run(broker_attempt(
+                &mut connection,
+                conn,
+                broker_id,
+                options,
+                request.clone(),
+            ))
+            .await;
+        if let Some(result) = retry.next(action).await {
+            return result.map_err(|error| broker_error(broker_id, &error));
+        }
+    }
+}
+
+/// The Kafka error of a failed broker call. A timeout is the error of a call
+/// past its deadline, so it gives `REQUEST_TIMED_OUT` (7), as Kafka's
+/// `Call.handleTimeoutFailure` gives a `TimeoutException`.
+fn broker_error(broker_id: i32, error: &AdminError) -> KafkaError {
+    if is_connection_failure(error) {
+        return KafkaError {
+            code: REQUEST_TIMED_OUT,
+            name: kafka_error_name(REQUEST_TIMED_OUT),
+            message: Some(format!("the call to broker {broker_id} timed out: {error}")),
+        };
+    }
+    list_groups_kafka_error(error)
+}
+
+/// One attempt of [`call_broker`]. Without a connection, the attempt finds
+/// the broker in the metadata and connects to it. A missing broker or a
+/// connection failure empties `connection` and asks for another attempt.
+async fn broker_attempt<R>(
+    connection: &mut Option<Connection>,
+    conn: &RecoveringConnection,
+    broker_id: i32,
+    options: &ConnectionOptions,
+    request: R,
+) -> RetryAction<R::Response>
+where
+    R: ProtocolRequest,
+{
+    if connection.is_none() {
+        let endpoint = match broker_endpoint(conn, broker_id).await {
+            Ok(Some(endpoint)) => endpoint,
+            Ok(None) => {
+                tracing::debug!(broker_id, "the broker is not in the metadata; retrying");
+                return RetryAction::SameCoordinator(Err(AdminError::Broker {
+                    api: "Metadata",
+                    code: REQUEST_TIMED_OUT,
+                    name: kafka_error_name(REQUEST_TIMED_OUT),
+                    message: Some(format!("broker {broker_id} is not in the metadata")),
+                }));
+            }
+            Err(error) if is_connection_failure(&error) => {
+                return RetryAction::SameCoordinator(Err(error));
+            }
+            Err(error) => return RetryAction::Done(Err(error)),
+        };
+        match AdminClient::connect_one(&endpoint, options.clone()).await {
+            Ok(new) => *connection = Some(new),
+            Err(error) if is_connection_failure(&error) => {
+                return RetryAction::SameCoordinator(Err(error));
+            }
+            Err(error) => return RetryAction::Done(Err(error)),
+        }
+    }
+    let Some(current) = connection.as_ref() else {
+        return RetryAction::SameCoordinator(Err(AdminError::Transport(
+            krabka_client_core::ClientError::Disconnected,
+        )));
+    };
+    match current.send(request).await {
+        Ok(response) => RetryAction::Done(Ok(response)),
+        Err(error) => {
+            let error = AdminError::from(error);
+            if is_connection_failure(&error) {
+                *connection = None;
+                RetryAction::SameCoordinator(Err(error))
+            } else {
+                RetryAction::Done(Err(error))
+            }
+        }
+    }
+}
+
+/// The `host:port` of `broker_id` in fresh metadata, or `None` when the
+/// metadata does not name it.
+async fn broker_endpoint(
+    conn: &RecoveringConnection,
+    broker_id: i32,
+) -> Result<Option<String>, AdminError> {
+    let response = conn
+        .send(MetadataRequest {
+            topics: Some(Vec::new()),
+            allow_auto_topic_creation: true,
+            ..Default::default()
+        })
+        .await?;
+    Ok(response
+        .brokers
+        .into_iter()
+        .find(|broker| broker.node_id == broker_id)
+        .map(|broker| format_host_port(&broker.host, broker.port)))
+}
+
+/// The `AlterReplicaLogDirs` request of one broker. It lists each log dir
+/// once, each topic once per log dir, and the partitions in order.
+fn alter_request(moves: &BTreeMap<TopicPartitionReplica, String>) -> AlterReplicaLogDirsRequest {
+    let mut dirs = BTreeMap::<&str, BTreeMap<&str, Vec<i32>>>::new();
+    for (replica, path) in moves {
+        dirs.entry(path.as_str())
+            .or_default()
+            .entry(replica.topic.as_str())
+            .or_default()
+            .push(replica.partition);
+    }
+    AlterReplicaLogDirsRequest {
+        dirs: dirs
+            .into_iter()
             .map(|(path, topics)| AlterReplicaLogDir {
-                path: path.clone(),
+                path: path.to_owned(),
                 topics: topics
-                    .iter()
+                    .into_iter()
                     .map(|(name, partitions)| AlterReplicaLogDirTopic {
-                        name: name.clone(),
-                        partitions: partitions.clone(),
+                        name: name.to_owned(),
+                        partitions,
                         ..Default::default()
                     })
                     .collect(),
                 ..Default::default()
             })
-            .collect();
-        let req = AlterReplicaLogDirsRequest {
-            dirs,
-            ..Default::default()
-        };
-        let resp = self.conn.send(req).await?;
-
-        let mut out = Vec::new();
-        for topic in resp.results {
-            for p in topic.partitions {
-                let error = kafka_error_if(p.error_code, None);
-                out.push(AlterReplicaLogDirOutcome {
-                    topic: topic.topic_name.clone(),
-                    partition: p.partition_index,
-                    error,
-                });
-            }
-        }
-        Ok(out)
+            .collect(),
+        ..Default::default()
     }
+}
 
-    /// `DescribeLogDirs` (KIP-113): lists every configured `log.dir` on this
-    /// broker, with the partitions each one holds. The list covers current
-    /// logs and in-progress future logs.
-    ///
-    /// Pass `None` to fetch all partitions. Pass `Some` with a topic →
-    /// partitions filter to narrow the result. An empty inner vec means all
-    /// partitions of that topic.
-    ///
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
-    pub async fn describe_log_dirs(
-        &mut self,
-        filter: Option<&BTreeMap<String, Vec<i32>>>,
-    ) -> Result<Vec<LogDirInfo>, AdminError> {
-        let topics = filter.map(|f| {
-            f.iter()
+/// The result of each replica that `broker_id` moves. A result for a
+/// partition that is not in the request is skipped, and a replica with no
+/// result gets `UNKNOWN_SERVER_ERROR`, as Kafka does.
+fn alter_results(
+    broker_id: i32,
+    moves: &BTreeMap<TopicPartitionReplica, String>,
+    response: AlterReplicaLogDirsResponse,
+) -> BTreeMap<TopicPartitionReplica, BrokerResult<()>> {
+    let mut out = BTreeMap::new();
+    for topic in response.results {
+        for partition in topic.partitions {
+            let replica = TopicPartitionReplica {
+                topic: topic.topic_name.clone(),
+                partition: partition.partition_index,
+                broker_id,
+            };
+            if !moves.contains_key(&replica) {
+                tracing::warn!(
+                    broker_id,
+                    topic = %replica.topic,
+                    partition = replica.partition,
+                    "the AlterReplicaLogDirs response names a partition that is not in the request"
+                );
+                continue;
+            }
+            let result = kafka_error_if(partition.error_code, None).map_or(Ok(()), Err);
+            out.insert(replica, result);
+        }
+    }
+    for replica in moves.keys() {
+        out.entry(replica.clone()).or_insert_with(|| {
+            Err(KafkaError {
+                code: UNKNOWN_SERVER_ERROR,
+                name: kafka_error_name(UNKNOWN_SERVER_ERROR),
+                message: Some(format!(
+                    "the response from broker {broker_id} did not contain a result for replica \
+                     {}-{}",
+                    replica.topic, replica.partition
+                )),
+            })
+        });
+    }
+    out
+}
+
+fn describe_request(filter: Option<&BTreeMap<String, Vec<i32>>>) -> DescribeLogDirsRequest {
+    DescribeLogDirsRequest {
+        topics: filter.map(|filter| {
+            filter
+                .iter()
                 .map(|(name, partitions)| DescribableLogDirTopic {
                     topic: name.clone(),
                     partitions: partitions.clone(),
                     ..Default::default()
                 })
                 .collect()
-        });
-        let req = DescribeLogDirsRequest {
-            topics,
-            ..Default::default()
-        };
-        let resp = self.conn.send(req).await?;
+        }),
+        ..Default::default()
+    }
+}
 
-        let mut out = Vec::new();
-        for result in resp.results {
-            let error = kafka_error_if(result.error_code, None);
-            let topics = result
+/// A volume size of the response, `None` for `-1`.
+fn volume_bytes(bytes: i64) -> Option<ByteSize> {
+    u64::try_from(bytes).ok().map(ByteSize::from_bytes)
+}
+
+/// The log dirs of one response. No log dir is an error of the broker, as
+/// Kafka's `describeLogDirs` `handleResponse` makes it.
+fn log_dir_infos(response: DescribeLogDirsResponse) -> BrokerResult<Vec<LogDirInfo>> {
+    if response.results.is_empty() {
+        let code = if response.error_code == 0 {
+            CLUSTER_AUTHORIZATION_FAILED
+        } else {
+            response.error_code
+        };
+        return Err(KafkaError {
+            code,
+            name: kafka_error_name(code),
+            message: None,
+        });
+    }
+    Ok(response
+        .results
+        .into_iter()
+        .map(|result| LogDirInfo {
+            log_dir: result.log_dir,
+            error: kafka_error_if(result.error_code, None),
+            topics: result
                 .topics
                 .into_iter()
-                .map(|t| LogDirTopicInfo {
-                    name: t.name,
-                    partitions: t
+                .map(|topic| LogDirTopicInfo {
+                    name: topic.name,
+                    partitions: topic
                         .partitions
                         .into_iter()
-                        .map(|p| LogDirPartitionInfo {
-                            partition_index: p.partition_index,
-                            partition_size: p.partition_size,
-                            offset_lag: p.offset_lag,
-                            is_future_key: p.is_future_key,
+                        .map(|partition| LogDirPartitionInfo {
+                            partition_index: partition.partition_index,
+                            partition_size: partition.partition_size,
+                            offset_lag: partition.offset_lag,
+                            is_future_key: partition.is_future_key,
                         })
                         .collect(),
                 })
-                .collect();
-            out.push(LogDirInfo {
-                log_dir: result.log_dir,
-                error,
-                topics,
-            });
-        }
-        Ok(out)
-    }
+                .collect(),
+            total: volume_bytes(result.total_bytes),
+            usable: volume_bytes(result.usable_bytes),
+            is_cordoned: result.is_cordoned,
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        net::SocketAddr,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
+    use assert2::assert;
     use bytes::{Buf, BytesMut};
     use krabka_client_core::MockBroker;
     use krabka_protocol::{
@@ -168,230 +488,597 @@ mod tests {
             alter_replica_log_dirs_request,
             alter_replica_log_dirs_response::{
                 AlterReplicaLogDirPartitionResult, AlterReplicaLogDirTopicResult,
-                AlterReplicaLogDirsResponse,
             },
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             describe_log_dirs_request,
             describe_log_dirs_response::{
-                DescribeLogDirsPartition, DescribeLogDirsResponse, DescribeLogDirsResult,
-                DescribeLogDirsTopic,
+                DescribeLogDirsPartition, DescribeLogDirsResult, DescribeLogDirsTopic,
             },
+            metadata_request,
+            metadata_response::{MetadataResponse, MetadataResponseBroker},
         },
     };
 
     use super::*;
 
-    fn encode_v0(resp: &impl Encode) -> Vec<u8> {
-        encode_at(resp, 0)
+    /// `KAFKA_STORAGE_ERROR`: a broker answers it for a replica it does not
+    /// host.
+    const KAFKA_STORAGE_ERROR: i16 = 56;
+    const LONG: Duration = Duration::from_secs(5);
+    const SHORT: Duration = Duration::from_millis(300);
+
+    /// What each mock broker received: the broker id, and the request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Received {
+        Describe(i32, DescribeLogDirsRequest),
+        Alter(i32, AlterReplicaLogDirsRequest),
     }
 
-    fn encode_at(resp: &impl Encode, version: i16) -> Vec<u8> {
+    /// How one mock broker of the cluster behaves.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Behavior {
+        /// It answers for its own log dir and replicas.
+        Normal,
+        /// It answers `DescribeLogDirs` with no log dir and error code 0.
+        NoLogDirs,
+        /// The metadata names it at an address that refuses connections.
+        Down,
+        /// The first metadata response names it at an address that refuses
+        /// connections, and later responses name its real address, as after
+        /// a restart with a new advertised address.
+        Moved,
+    }
+
+    fn encode(response: &impl Encode, version: i16, flexible: bool) -> Vec<u8> {
         let mut buf = BytesMut::new();
-        resp.encode(&mut buf, version).unwrap();
+        if flexible {
+            buf.extend_from_slice(&[0]);
+        }
+        response.encode(&mut buf, version).unwrap();
         buf.to_vec()
     }
 
-    fn api_versions_response(api_key: i16, version: i16) -> Vec<u8> {
-        encode_v0(&ApiVersionsResponse {
-            api_keys: vec![
-                ApiVersion {
-                    api_key: api_versions_request::API_KEY,
-                    min_version: 0,
-                    max_version: 0,
-                    ..Default::default()
-                },
-                ApiVersion {
-                    api_key,
-                    min_version: version,
-                    max_version: version,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        })
-    }
-
-    fn request_body_after_header(mut body: &[u8], flexible_header: bool) -> &[u8] {
+    fn decode<R: for<'de> Decode<'de>>(mut body: &[u8], version: i16, flexible: bool) -> R {
         let client_id_len = body.get_i16();
-        assert2::assert!(client_id_len >= 0);
-        body.advance(usize::try_from(client_id_len).expect("client id length is non-negative"));
-        if flexible_header {
-            assert2::assert!(body.get_u8() == 0);
+        body.advance(usize::try_from(client_id_len).expect("client id length"));
+        if flexible {
+            body.advance(1);
         }
-        body
+        R::decode(&mut body, version).expect("request decodes")
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn alter_replica_log_dirs_maps_non_empty_partition_results() {
-        let seen_request = Arc::new(Mutex::new(None));
-        let captured_request = Arc::clone(&seen_request);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            if api_key == api_versions_request::API_KEY {
-                return Some(api_versions_response(
-                    alter_replica_log_dirs_request::API_KEY,
-                    1,
-                ));
-            }
-            if api_key == alter_replica_log_dirs_request::API_KEY {
-                let mut body = request_body_after_header(
-                    body,
-                    version >= alter_replica_log_dirs_request::FLEXIBLE_MIN,
-                );
-                let request = AlterReplicaLogDirsRequest::decode(&mut body, version)
-                    .expect("alter log dirs request decodes");
-                assert2::assert!(body.is_empty());
-                *captured_request.lock().expect("request capture lock") = Some(request);
-                return Some(encode_at(
-                    &AlterReplicaLogDirsResponse {
-                        results: vec![AlterReplicaLogDirTopicResult {
-                            topic_name: "orders".into(),
-                            partitions: vec![AlterReplicaLogDirPartitionResult {
-                                partition_index: 2,
-                                error_code: 56,
+    fn api_versions() -> Vec<u8> {
+        let api = |api_key, max_version| ApiVersion {
+            api_key,
+            min_version: 0,
+            max_version,
+            ..Default::default()
+        };
+        encode(
+            &ApiVersionsResponse {
+                api_keys: vec![
+                    api(api_versions_request::API_KEY, 0),
+                    api(metadata_request::API_KEY, 12),
+                    api(describe_log_dirs_request::API_KEY, 4),
+                    api(alter_replica_log_dirs_request::API_KEY, 2),
+                ],
+                ..Default::default()
+            },
+            0,
+            false,
+        )
+    }
+
+    fn log_dir(broker_id: i32) -> String {
+        format!("/data/broker-{broker_id}")
+    }
+
+    /// The log dir that broker `broker_id` describes: partition
+    /// `broker_id - 1` of `orders`, and a 1 GiB volume.
+    fn described(broker_id: i32) -> Vec<LogDirInfo> {
+        vec![LogDirInfo {
+            log_dir: log_dir(broker_id),
+            error: None,
+            topics: vec![LogDirTopicInfo {
+                name: "orders".into(),
+                partitions: vec![LogDirPartitionInfo {
+                    partition_index: broker_id - 1,
+                    partition_size: 100,
+                    offset_lag: 0,
+                    is_future_key: false,
+                }],
+            }],
+            total: Some(krabka_units::gibibytes(1)),
+            usable: None,
+            is_cordoned: false,
+        }]
+    }
+
+    /// Start one broker of a two-broker cluster. Broker `broker_id` hosts
+    /// partition `broker_id - 1` of `orders`, and `addresses` holds the
+    /// address of each broker id that the metadata names.
+    async fn cluster_broker(
+        broker_id: i32,
+        behavior: Behavior,
+        addresses: Arc<Mutex<Addresses>>,
+        received: Arc<Mutex<Vec<Received>>>,
+    ) -> MockBroker {
+        MockBroker::start(move |api_key, version, _, body| match api_key {
+            api_versions_request::API_KEY => Some(api_versions()),
+            metadata_request::API_KEY => Some(encode(
+                &MetadataResponse {
+                    brokers: addresses
+                        .lock()
+                        .expect("addresses lock")
+                        .next()
+                        .iter()
+                        .map(|(node_id, addr)| MetadataResponseBroker {
+                            node_id: *node_id,
+                            host: addr.ip().to_string(),
+                            port: i32::from(addr.port()),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                version,
+                version >= metadata_request::FLEXIBLE_MIN,
+            )),
+            describe_log_dirs_request::API_KEY => {
+                let flexible = version >= describe_log_dirs_request::FLEXIBLE_MIN;
+                let request: DescribeLogDirsRequest = decode(body, version, flexible);
+                received
+                    .lock()
+                    .expect("received lock")
+                    .push(Received::Describe(broker_id, request));
+                let results = if behavior == Behavior::NoLogDirs {
+                    Vec::new()
+                } else {
+                    vec![DescribeLogDirsResult {
+                        log_dir: log_dir(broker_id),
+                        topics: vec![DescribeLogDirsTopic {
+                            name: "orders".into(),
+                            partitions: vec![DescribeLogDirsPartition {
+                                partition_index: broker_id - 1,
+                                partition_size: 100,
                                 ..Default::default()
                             }],
                             ..Default::default()
                         }],
+                        total_bytes: 1 << 30,
+                        usable_bytes: -1,
+                        ..Default::default()
+                    }]
+                };
+                Some(encode(
+                    &DescribeLogDirsResponse {
+                        results,
                         ..Default::default()
                     },
-                    1,
-                ));
+                    version,
+                    flexible,
+                ))
             }
-            None
+            alter_replica_log_dirs_request::API_KEY => {
+                let flexible = version >= alter_replica_log_dirs_request::FLEXIBLE_MIN;
+                let request: AlterReplicaLogDirsRequest = decode(body, version, flexible);
+                let results = request
+                    .dirs
+                    .iter()
+                    .flat_map(|dir| dir.topics.iter())
+                    .map(|topic| AlterReplicaLogDirTopicResult {
+                        topic_name: topic.name.clone(),
+                        partitions: topic
+                            .partitions
+                            .iter()
+                            .map(|partition| AlterReplicaLogDirPartitionResult {
+                                partition_index: *partition,
+                                error_code: if *partition == broker_id - 1 {
+                                    0
+                                } else {
+                                    KAFKA_STORAGE_ERROR
+                                },
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    })
+                    .collect();
+                received
+                    .lock()
+                    .expect("received lock")
+                    .push(Received::Alter(broker_id, request));
+                Some(encode(
+                    &AlterReplicaLogDirsResponse {
+                        results,
+                        ..Default::default()
+                    },
+                    version,
+                    flexible,
+                ))
+            }
+            _ => None,
         })
-        .await;
-        let mut admin = AdminClient::connect(&[mock.addr.to_string()])
-            .await
-            .expect("admin connects to mock broker");
-        let assignments = BTreeMap::from([(
-            "/var/lib/kafka-a".to_string(),
-            vec![("orders".to_string(), vec![2])],
-        )]);
+        .await
+    }
 
-        let outcomes = admin
-            .alter_replica_log_dirs(&assignments)
-            .await
-            .expect("alter log dirs response maps");
+    /// The broker addresses that the metadata names. `first` is used for the
+    /// first metadata response only.
+    #[derive(Default)]
+    struct Addresses {
+        first: Option<Vec<(i32, SocketAddr)>>,
+        later: Vec<(i32, SocketAddr)>,
+    }
 
-        let error = outcomes[0]
-            .error
-            .as_ref()
-            .expect("broker error is surfaced");
-        assert2::assert!(
+    impl Addresses {
+        fn next(&mut self) -> Vec<(i32, SocketAddr)> {
+            self.first.take().unwrap_or_else(|| self.later.clone())
+        }
+    }
+
+    /// A running two-broker cluster.
+    struct Cluster {
+        brokers: Vec<MockBroker>,
+        received: Arc<Mutex<Vec<Received>>>,
+        admin: AdminClient,
+    }
+
+    impl Cluster {
+        /// Start brokers 1 and 2. Broker 1 is the bootstrap broker.
+        async fn start(broker_2: Behavior) -> Self {
+            let addresses = Arc::new(Mutex::new(Addresses::default()));
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let one = cluster_broker(
+                1,
+                Behavior::Normal,
+                Arc::clone(&addresses),
+                Arc::clone(&received),
+            )
+            .await;
+            let two =
+                cluster_broker(2, broker_2, Arc::clone(&addresses), Arc::clone(&received)).await;
+            let refused = {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind a port");
+                listener.local_addr().expect("local address")
+            };
+            *addresses.lock().expect("addresses lock") = match broker_2 {
+                Behavior::Down => Addresses {
+                    first: None,
+                    later: vec![(1, one.addr), (2, refused)],
+                },
+                Behavior::Moved => Addresses {
+                    first: Some(vec![(1, one.addr), (2, refused)]),
+                    later: vec![(1, one.addr), (2, two.addr)],
+                },
+                Behavior::Normal | Behavior::NoLogDirs => Addresses {
+                    first: None,
+                    later: vec![(1, one.addr), (2, two.addr)],
+                },
+            };
+            let admin = AdminClient::connect(&[one.addr.to_string()])
+                .await
+                .expect("admin connects");
+            Self {
+                brokers: vec![one, two],
+                received,
+                admin,
+            }
+        }
+
+        fn stop(self) -> Vec<Received> {
+            for broker in self.brokers {
+                broker.stop();
+            }
+            let mut received = self.received.lock().expect("received lock").clone();
+            received.sort_by_key(|entry| match entry {
+                Received::Describe(id, _) | Received::Alter(id, _) => *id,
+            });
+            received
+        }
+    }
+
+    fn policy(timeout: Duration) -> RetryPolicy {
+        let backoff = if timeout == LONG {
+            Duration::from_millis(1)
+        } else {
+            timeout
+        };
+        RetryPolicy {
+            timeout,
+            initial_backoff: backoff,
+            max_backoff: backoff,
+            jitter: 0.0,
+        }
+    }
+
+    /// The Kafka error code of each broker result.
+    fn codes<T>(results: BTreeMap<i32, BrokerResult<T>>) -> BTreeMap<i32, Result<T, i16>> {
+        results
+            .into_iter()
+            .map(|(broker_id, result)| (broker_id, result.map_err(|error| error.code)))
+            .collect()
+    }
+
+    /// Kafka's `describeLogDirs` sends one `DescribeLogDirs` to each named
+    /// broker (`ConstantNodeIdProvider`), waits for an unknown broker until
+    /// the deadline, fails a broker that answers with no log dir with its
+    /// error code or `CLUSTER_AUTHORIZATION_FAILED`, and times out a broker
+    /// that it cannot reach.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn describe_log_dirs_asks_each_broker_by_id() {
+        let all = describe_request(None);
+        for (name, broker_2, brokers, timeout, expected_requests, expected) in [
             (
-                outcomes.len(),
-                &outcomes[0].topic,
-                outcomes[0].partition,
-                error.code,
-                &error.message
-            ) == (1, &"orders".to_string(), 2, 56, &None)
-        );
-        let request = seen_request
-            .lock()
-            .expect("request capture lock")
-            .take()
-            .expect("alter log dirs request was captured");
-        assert2::assert!(
-            request
-                == AlterReplicaLogDirsRequest {
-                    dirs: vec![AlterReplicaLogDir {
-                        path: "/var/lib/kafka-a".into(),
-                        topics: vec![AlterReplicaLogDirTopic {
-                            name: "orders".into(),
-                            partitions: vec![2],
+                "both brokers",
+                Behavior::Normal,
+                vec![1, 2],
+                LONG,
+                vec![
+                    Received::Describe(1, all.clone()),
+                    Received::Describe(2, all.clone()),
+                ],
+                BTreeMap::from([(1, Ok(described(1))), (2, Ok(described(2)))]),
+            ),
+            (
+                "one broker",
+                Behavior::Normal,
+                vec![2],
+                LONG,
+                vec![Received::Describe(2, all.clone())],
+                BTreeMap::from([(2, Ok(described(2)))]),
+            ),
+            (
+                "an unknown broker times out",
+                Behavior::Normal,
+                vec![3],
+                SHORT,
+                vec![],
+                BTreeMap::from([(3, Err(REQUEST_TIMED_OUT))]),
+            ),
+            (
+                "a known broker is asked while an unknown broker waits",
+                Behavior::Normal,
+                vec![1, 3],
+                SHORT,
+                vec![Received::Describe(1, all.clone())],
+                BTreeMap::from([(1, Ok(described(1))), (3, Err(REQUEST_TIMED_OUT))]),
+            ),
+            (
+                "a broker at a new address is found again",
+                Behavior::Moved,
+                vec![2],
+                LONG,
+                vec![Received::Describe(2, all.clone())],
+                BTreeMap::from([(2, Ok(described(2)))]),
+            ),
+            (
+                "a broker with no log dir",
+                Behavior::NoLogDirs,
+                vec![1, 2],
+                LONG,
+                vec![
+                    Received::Describe(1, all.clone()),
+                    Received::Describe(2, all.clone()),
+                ],
+                BTreeMap::from([
+                    (1, Ok(described(1))),
+                    (2, Err(CLUSTER_AUTHORIZATION_FAILED)),
+                ]),
+            ),
+            (
+                "an unreachable broker times out",
+                Behavior::Down,
+                vec![1, 2],
+                SHORT,
+                vec![Received::Describe(1, all.clone())],
+                BTreeMap::from([(1, Ok(described(1))), (2, Err(REQUEST_TIMED_OUT))]),
+            ),
+        ] {
+            let mut cluster = Cluster::start(broker_2).await;
+            let result = cluster
+                .admin
+                .describe_log_dirs_with_retry(&brokers, None, policy(timeout))
+                .await;
+            let received = cluster.stop();
+            assert!(
+                (codes(result), received) == (expected, expected_requests),
+                "case {name}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn describe_log_dirs_sends_the_topic_filter() {
+        let mut cluster = Cluster::start(Behavior::Normal).await;
+        let filter = BTreeMap::from([("orders".to_string(), vec![0])]);
+        cluster.admin.describe_log_dirs(&[1], Some(&filter)).await;
+        let received = cluster.stop();
+        assert!(
+            received
+                == vec![Received::Describe(
+                    1,
+                    DescribeLogDirsRequest {
+                        topics: Some(vec![DescribableLogDirTopic {
+                            topic: "orders".into(),
+                            partitions: vec![0],
                             ..Default::default()
-                        }],
+                        }]),
+                        ..Default::default()
+                    }
+                )]
+        );
+    }
+
+    fn replica(partition: i32, broker_id: i32) -> TopicPartitionReplica {
+        TopicPartitionReplica {
+            topic: "orders".into(),
+            partition,
+            broker_id,
+        }
+    }
+
+    fn alter(dirs: &[(&str, &[i32])]) -> AlterReplicaLogDirsRequest {
+        AlterReplicaLogDirsRequest {
+            dirs: dirs
+                .iter()
+                .map(|(path, partitions)| AlterReplicaLogDir {
+                    path: (*path).to_owned(),
+                    topics: vec![AlterReplicaLogDirTopic {
+                        name: "orders".into(),
+                        partitions: partitions.to_vec(),
                         ..Default::default()
                     }],
                     ..Default::default()
-                }
-        );
-        mock.stop();
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 
+    /// Kafka's `alterReplicaLogDirs` groups the moves by
+    /// `TopicPartitionReplica.brokerId` and sends each group to its broker.
+    /// A replica with no result in the response fails with
+    /// `UNKNOWN_SERVER_ERROR`, and a broker that fails fails only its own
+    /// replicas.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn describe_log_dirs_maps_non_empty_directory_tree() {
-        let seen_request = Arc::new(Mutex::new(None));
-        let captured_request = Arc::clone(&seen_request);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            if api_key == api_versions_request::API_KEY {
-                return Some(api_versions_response(describe_log_dirs_request::API_KEY, 1));
-            }
-            if api_key == describe_log_dirs_request::API_KEY {
-                let mut body = request_body_after_header(
-                    body,
-                    version >= describe_log_dirs_request::FLEXIBLE_MIN,
-                );
-                let request = DescribeLogDirsRequest::decode(&mut body, version)
-                    .expect("describe log dirs request decodes");
-                assert2::assert!(body.is_empty());
-                *captured_request.lock().expect("request capture lock") = Some(request);
-                return Some(encode_at(
-                    &DescribeLogDirsResponse {
-                        results: vec![DescribeLogDirsResult {
-                            log_dir: "/data/kafka".into(),
-                            topics: vec![DescribeLogDirsTopic {
-                                name: "orders".into(),
-                                partitions: vec![DescribeLogDirsPartition {
-                                    partition_index: 4,
-                                    partition_size: 123,
-                                    offset_lag: 7,
-                                    is_future_key: true,
-                                    ..Default::default()
-                                }],
-                                ..Default::default()
-                            }],
-                            ..Default::default()
-                        }],
+    async fn alter_replica_log_dirs_sends_each_move_to_its_broker() {
+        for (name, broker_2, moves, timeout, expected_requests, expected) in [
+            (
+                "each move goes to the broker of its replica",
+                Behavior::Normal,
+                vec![(replica(0, 1), "/a"), (replica(1, 2), "/b")],
+                LONG,
+                vec![
+                    Received::Alter(1, alter(&[("/a", &[0])])),
+                    Received::Alter(2, alter(&[("/b", &[1])])),
+                ],
+                BTreeMap::from([(replica(0, 1), Ok(())), (replica(1, 2), Ok(()))]),
+            ),
+            (
+                "a broker groups its moves by log dir",
+                Behavior::Normal,
+                vec![
+                    (replica(0, 1), "/a"),
+                    (replica(5, 1), "/a"),
+                    (replica(6, 1), "/b"),
+                ],
+                LONG,
+                vec![Received::Alter(1, alter(&[("/a", &[0, 5]), ("/b", &[6])]))],
+                BTreeMap::from([
+                    (replica(0, 1), Ok(())),
+                    (replica(5, 1), Err(KAFKA_STORAGE_ERROR)),
+                    (replica(6, 1), Err(KAFKA_STORAGE_ERROR)),
+                ]),
+            ),
+            (
+                "an unreachable broker fails only its replicas",
+                Behavior::Down,
+                vec![(replica(0, 1), "/a"), (replica(1, 2), "/b")],
+                SHORT,
+                vec![Received::Alter(1, alter(&[("/a", &[0])]))],
+                BTreeMap::from([
+                    (replica(0, 1), Ok(())),
+                    (replica(1, 2), Err(REQUEST_TIMED_OUT)),
+                ]),
+            ),
+            (
+                "an unknown broker times out",
+                Behavior::Normal,
+                vec![(replica(0, 9), "/a")],
+                SHORT,
+                vec![],
+                BTreeMap::from([(replica(0, 9), Err(REQUEST_TIMED_OUT))]),
+            ),
+        ] {
+            let mut cluster = Cluster::start(broker_2).await;
+            let assignments = moves
+                .into_iter()
+                .map(|(replica, path)| (replica, path.to_owned()))
+                .collect();
+            let result = cluster
+                .admin
+                .alter_replica_log_dirs_with_retry(&assignments, policy(timeout))
+                .await
+                .into_iter()
+                .map(|(replica, result)| (replica, result.map_err(|error| error.code)))
+                .collect::<BTreeMap<_, _>>();
+            let received = cluster.stop();
+            assert!(
+                (result, received) == (expected, expected_requests),
+                "case {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_replica_without_a_result_fails_with_unknown_server_error() {
+        let moves = BTreeMap::from([
+            (replica(0, 1), "/a".to_owned()),
+            (replica(1, 1), "/a".to_owned()),
+        ]);
+        let response = AlterReplicaLogDirsResponse {
+            results: vec![AlterReplicaLogDirTopicResult {
+                topic_name: "orders".into(),
+                partitions: vec![
+                    AlterReplicaLogDirPartitionResult {
+                        partition_index: 0,
                         ..Default::default()
                     },
-                    1,
-                ));
-            }
-            None
-        })
-        .await;
-        let mut admin = AdminClient::connect(&[mock.addr.to_string()])
-            .await
-            .expect("admin connects to mock broker");
-        let filter = BTreeMap::from([("orders".to_string(), vec![4])]);
-
-        let dirs = admin
-            .describe_log_dirs(Some(&filter))
-            .await
-            .expect("describe log dirs response maps");
-
-        let partition = &dirs[0].topics[0].partitions[0];
-        assert2::assert!(
-            (
-                dirs.len(),
-                dirs[0].log_dir.as_str(),
-                dirs[0].error.as_ref(),
-                dirs[0].topics.len(),
-                dirs[0].topics[0].name.as_str(),
-                partition.partition_index,
-                partition.partition_size,
-                partition.offset_lag,
-                partition.is_future_key,
-            ) == (1, "/data/kafka", None, 1, "orders", 4, 123, 7, true)
-        );
-        let request = seen_request
-            .lock()
-            .expect("request capture lock")
-            .take()
-            .expect("describe log dirs request was captured");
-        assert2::assert!(
-            request
-                == DescribeLogDirsRequest {
-                    topics: Some(vec![DescribableLogDirTopic {
-                        topic: "orders".into(),
-                        partitions: vec![4],
+                    AlterReplicaLogDirPartitionResult {
+                        partition_index: 7,
                         ..Default::default()
-                    }]),
-                    ..Default::default()
-                }
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            alter_results(1, &moves, response)
+                == BTreeMap::from([
+                    (replica(0, 1), Ok(())),
+                    (
+                        replica(1, 1),
+                        Err(KafkaError {
+                            code: UNKNOWN_SERVER_ERROR,
+                            name: "UNKNOWN_SERVER_ERROR",
+                            message: Some(
+                                "the response from broker 1 did not contain a result for replica \
+                                 orders-1"
+                                    .into()
+                            ),
+                        })
+                    ),
+                ])
         );
-        mock.stop();
+    }
+
+    #[test]
+    fn a_log_dir_reports_its_volume_sizes() {
+        let response = DescribeLogDirsResponse {
+            results: vec![DescribeLogDirsResult {
+                log_dir: "/d".into(),
+                error_code: 57,
+                total_bytes: 4096,
+                usable_bytes: 1024,
+                is_cordoned: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            log_dir_infos(response)
+                == Ok(vec![LogDirInfo {
+                    log_dir: "/d".into(),
+                    error: kafka_error_if(57, None),
+                    topics: vec![],
+                    total: Some(krabka_units::kibibytes(4)),
+                    usable: Some(krabka_units::kibibytes(1)),
+                    is_cordoned: true,
+                }])
+        );
     }
 }
