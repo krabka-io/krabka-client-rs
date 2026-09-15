@@ -100,6 +100,10 @@ pub struct Consumer {
     pub(crate) fetch_min: ByteSize,
     pub(crate) fetch_max: ByteSize,
     pub(crate) fetch_partition_max: ByteSize,
+    /// Kafka's `fetch.max.wait.ms`, the `max_wait_ms` of each Fetch.
+    pub(crate) fetch_max_wait: Time,
+    /// The in-flight Fetch requests and the fetch session of each broker.
+    pub(crate) fetches: crate::poll::Fetches,
     /// What `poll` does on a missing offset or a detected truncation. `None`
     /// surfaces `ConsumerError::LogTruncation`. Any other value makes `poll`
     /// apply the safe offset, per KIP-320.
@@ -174,6 +178,7 @@ struct StartConfig {
     fetch_min: ByteSize,
     fetch_max: ByteSize,
     fetch_partition_max: ByteSize,
+    fetch_max_wait: Time,
     request_timeout: Time,
     dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity,
     frame_max: krabka_client_core::ClientFrameMax,
@@ -756,6 +761,23 @@ fn consumer_client_id(
     }
 }
 
+/// Kafka's default `fetch.max.wait.ms`.
+pub const DEFAULT_CONSUMER_FETCH_MAX_WAIT: Time = millis(500);
+
+/// The validated `fetch_max_wait`.
+///
+/// Kafka's `ConsumerConfig` defines `fetch.max.wait.ms` as an `int` of at least
+/// 0.
+fn validated_fetch_max_wait(wait: Time) -> Result<Time, String> {
+    let milliseconds = MinMaxI64::<0, { i32::MAX as i64 }>::new(wait.millis_i64())
+        .map_err(|error| format!("consumer fetch max wait: {error}"))?
+        .into_value();
+    if !wait.secs_f64().is_finite() || Time::from_millis(milliseconds) != wait {
+        return Err("consumer fetch max wait must be a whole number of milliseconds".to_owned());
+    }
+    Ok(wait)
+}
+
 /// Kafka's default `max.poll.records`.
 pub const DEFAULT_CONSUMER_MAX_POLL_RECORDS: usize = 500;
 
@@ -885,6 +907,7 @@ impl Consumer {
         #[builder(default = crate::poll::DEFAULT_FETCH_MAX)] fetch_max: ByteSize,
         #[builder(default = crate::poll::DEFAULT_FETCH_PARTITION_MAX)]
         fetch_partition_max: ByteSize,
+        #[builder(default = DEFAULT_CONSUMER_FETCH_MAX_WAIT)] fetch_max_wait: Time,
         #[builder(default = secs(30))] request_timeout: Time,
         #[builder(default = krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
@@ -960,6 +983,8 @@ impl Consumer {
             validated_max_poll_interval(max_poll_interval).map_err(ConsumerError::InvalidConfig)?;
         let max_poll_records =
             validated_max_poll_records(max_poll_records).map_err(ConsumerError::InvalidConfig)?;
+        let fetch_max_wait =
+            validated_fetch_max_wait(fetch_max_wait).map_err(ConsumerError::InvalidConfig)?;
         let rebalance_protocol = crate::assignor::rebalance_protocol_of(&assignors)
             .map_err(ConsumerError::InvalidConfig)?;
 
@@ -984,6 +1009,7 @@ impl Consumer {
             fetch_min,
             fetch_max,
             fetch_partition_max,
+            fetch_max_wait,
             request_timeout,
             dispatch_queue_capacity,
             frame_max,
@@ -1424,6 +1450,7 @@ async fn spawn_consumer(
         fetch_min,
         fetch_max,
         fetch_partition_max,
+        fetch_max_wait,
         request_timeout,
         dispatch_queue_capacity,
         frame_max,
@@ -1586,6 +1613,8 @@ async fn spawn_consumer(
         fetch_min,
         fetch_max,
         fetch_partition_max,
+        fetch_max_wait,
+        fetches: crate::poll::Fetches::default(),
         auto_offset_reset,
         poll_error,
         auto_commit,
@@ -1735,6 +1764,8 @@ impl Consumer {
         if let Some(h) = self.coordinator_handle.take() {
             let _ = h.await;
         }
+        // Kafka's `AbstractFetch.close` closes the fetch session of each broker.
+        self.close_fetch_sessions().await;
         Ok(())
     }
 }
@@ -2488,6 +2519,8 @@ mod security_arg_tests {
             fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
             fetch_max: crate::poll::DEFAULT_FETCH_MAX,
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
+            fetch_max_wait: DEFAULT_CONSUMER_FETCH_MAX_WAIT,
+            fetches: crate::poll::Fetches::default(),
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
@@ -3177,6 +3210,7 @@ mod auto_commit_tests {
             fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
             fetch_max: crate::poll::DEFAULT_FETCH_MAX,
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
+            fetch_max_wait: DEFAULT_CONSUMER_FETCH_MAX_WAIT,
             request_timeout: secs(30),
             dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::new(
                 krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY,

@@ -1519,6 +1519,8 @@ mod tests {
             fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
             fetch_max: crate::poll::DEFAULT_FETCH_MAX,
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
+            fetch_max_wait: crate::consumer::DEFAULT_CONSUMER_FETCH_MAX_WAIT,
+            fetches: crate::poll::Fetches::default(),
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,

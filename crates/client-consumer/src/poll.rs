@@ -1,14 +1,18 @@
 //! `Consumer::poll` issues one `Fetch` that covers every assigned partition,
 //! advances next-offsets, and returns the decoded records.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use bytes::BufMut;
 use krabka_ids::LeaderEpoch;
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
     owned::{
-        fetch_request::{FetchPartition, FetchRequest, FetchTopic},
+        fetch_request::{FetchPartition, FetchRequest, FetchTopic, ForgottenTopic},
+        fetch_response::FetchResponse,
         list_offsets_request::{self, ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
         list_offsets_response::ListOffsetsResponse,
     },
@@ -25,6 +29,9 @@ use crate::{
     consumer::{Consumer, ConsumerRecord, Header, TimestampType},
     error::ConsumerError,
     fetch_buffer::BufferedPartition,
+    fetch_session::{
+        FINAL_EPOCH, FetchSession, INVALID_SESSION_ID, SessionPartition, SessionRequest,
+    },
     position::PartitionPosition,
 };
 
@@ -156,50 +163,114 @@ pub(crate) fn record_timestamp(batch: &RecordBatch, record: &Record) -> (i64, Ti
     (timestamp, timestamp_type)
 }
 
-fn build_fetch_topic(
-    name: String,
+/// The `max_bytes` of one partition in a Fetch request.
+fn session_partition(
     topic_id: krabka_protocol::primitives::uuid::Uuid,
-    partitions: Vec<FetchSpec>,
+    (_, fetch_offset, leader_epoch, last_fetched_epoch): FetchSpec,
     partition_max: ByteSize,
-) -> FetchTopic {
-    FetchTopic {
-        topic: name,
+) -> SessionPartition {
+    SessionPartition {
         topic_id,
-        partitions: partitions
-            .into_iter()
-            .map(
-                |(p, off, leader_epoch, last_fetched_epoch)| FetchPartition {
-                    partition: p,
-                    fetch_offset: off,
-                    // Unwrap the leader epochs to raw wire `int32` at the
-                    // FetchRequest encode boundary.
-                    current_leader_epoch: leader_epoch.get(),
-                    last_fetched_epoch: last_fetched_epoch.get(),
-                    partition_max_bytes: partition_max.bytes_i32(),
-                    ..Default::default()
-                },
-            )
-            .collect(),
+        fetch_offset,
+        // Unwrap the leader epochs to raw wire `int32` at the FetchRequest
+        // encode boundary.
+        current_leader_epoch: leader_epoch.get(),
+        last_fetched_epoch: last_fetched_epoch.get(),
+        partition_max_bytes: partition_max.bytes_i32(),
+    }
+}
+
+/// Build the Fetch request of one broker from its session request.
+///
+/// Kafka's `AbstractFetch.createFetchRequest`: `max_wait_ms` is
+/// `fetch.max.wait.ms`, and the session id, epoch, partitions and forgotten
+/// partitions come from the fetch session (KIP-227).
+fn build_fetch_request(
+    max_wait_ms: i32,
+    isolation_level: IsolationLevel,
+    min: ByteSize,
+    max: ByteSize,
+    session: SessionRequest,
+) -> FetchRequest {
+    let mut topics: Vec<FetchTopic> = Vec::new();
+    for ((topic, partition), data) in session.partitions {
+        if topics.last().is_none_or(|last| last.topic != topic) {
+            topics.push(FetchTopic {
+                topic: topic.clone(),
+                topic_id: data.topic_id,
+                ..Default::default()
+            });
+        }
+        if let Some(last) = topics.last_mut() {
+            last.partitions.push(FetchPartition {
+                partition,
+                fetch_offset: data.fetch_offset,
+                current_leader_epoch: data.current_leader_epoch,
+                last_fetched_epoch: data.last_fetched_epoch,
+                partition_max_bytes: data.partition_max_bytes,
+                ..Default::default()
+            });
+        }
+    }
+    let mut forgotten_topics_data: Vec<ForgottenTopic> = Vec::new();
+    for ((topic, partition), topic_id) in session.forgotten {
+        if forgotten_topics_data
+            .last()
+            .is_none_or(|last| last.topic != topic)
+        {
+            forgotten_topics_data.push(ForgottenTopic {
+                topic: topic.clone(),
+                topic_id,
+                ..Default::default()
+            });
+        }
+        if let Some(last) = forgotten_topics_data.last_mut() {
+            last.partitions.push(partition);
+        }
+    }
+    FetchRequest {
+        max_wait_ms,
+        min_bytes: min.bytes_i32(),
+        max_bytes: max.bytes_i32(),
+        isolation_level: isolation_level.wire(),
+        session_id: session.session_id,
+        session_epoch: session.session_epoch,
+        topics,
+        forgotten_topics_data,
         ..Default::default()
     }
 }
 
-fn build_fetch_request(
-    timeout_ms: i32,
-    isolation_level: IsolationLevel,
-    min: ByteSize,
-    max: ByteSize,
-    topics: Vec<FetchTopic>,
-) -> FetchRequest {
-    FetchRequest {
-        max_wait_ms: timeout_ms,
-        min_bytes: min.bytes_i32(),
-        max_bytes: max.bytes_i32(),
-        isolation_level: isolation_level.wire(),
-        topics,
-        ..Default::default()
+/// A Fetch that runs in a task, with the fetch offset of each partition that
+/// it asked for.
+struct InFlightFetch {
+    handle: tokio::task::JoinHandle<Result<FetchResponse, krabka_client_core::ClientError>>,
+    requested: HashMap<(String, i32), i64>,
+}
+
+/// The Fetch requests of a consumer: at most one in flight per broker, and the
+/// fetch session of each broker.
+///
+/// Kafka's `AbstractFetch` sends a Fetch to every broker that has no pending
+/// Fetch, and keeps a `FetchSessionHandler` per broker. A response that arrives
+/// after `poll` returned waits here for the next `poll`.
+#[derive(Default)]
+pub(crate) struct Fetches {
+    sessions: HashMap<i32, FetchSession>,
+    in_flight: HashMap<i32, InFlightFetch>,
+    completed: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for Fetches {
+    fn drop(&mut self) {
+        for fetch in self.in_flight.values() {
+            fetch.handle.abort();
+        }
     }
 }
+
+/// The time to wait for the fetch sessions to close in `close`.
+const FETCH_SESSION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `ListOffsets` timestamp that asks for the log end offset.
 const LATEST_TIMESTAMP: i64 = -1;
@@ -487,9 +558,9 @@ impl Consumer {
         let by_leader = self.group_fetches(&assigned).await;
         tracing::Span::current().record("leaders", by_leader.len());
         let topic_ids = self.topic_ids.lock().await.clone();
-        let remaining =
-            Time::from_std(deadline.saturating_duration_since(tokio::time::Instant::now()));
-        let responses = self.send_fetches(remaining, by_leader, &topic_ids).await?;
+        self.send_fetches(by_leader, &topic_ids);
+        self.wait_for_fetches(deadline).await;
+        let responses = self.take_completed_fetches(&topic_ids).await?;
 
         self.process_fetch_responses(responses, &topic_ids).await?;
         let records = self.drain_fetch_buffer().await;
@@ -747,65 +818,215 @@ impl Consumer {
         Ok(())
     }
 
-    async fn send_fetches(
-        &self,
-        timeout: Time,
+    /// Send a Fetch to each leader in `by_leader` that has no Fetch in flight.
+    /// Each request runs in its own task, so the leaders answer in parallel.
+    fn send_fetches(
+        &mut self,
         by_leader: FetchByLeader,
         topic_ids: &HashMap<String, krabka_protocol::primitives::uuid::Uuid>,
-    ) -> Result<Vec<krabka_protocol::owned::fetch_response::FetchResponse>, ConsumerError> {
-        // Truncate rather than round: `max_wait_ms` is a wire field, and a
-        // fractional millisecond rounded up would ask the broker to hold the
-        // Fetch open past the caller's budget. A negative budget — a deadline
-        // already passed — means "do not wait", as `Duration` did before.
-        let timeout_ms = i32::try_from(timeout.millis_i64_trunc().max(0)).unwrap_or(i32::MAX);
-
-        // Issue one Fetch per leader. All guards are released; we collect every
-        // response before re-locking to process them. Sent sequentially so a
-        // single parked leader can't starve the others' deadlines beyond the
-        // per-request timeout (and to keep the borrow on `self.client` simple).
-        let mut responses = Vec::with_capacity(by_leader.len());
+    ) {
+        let max_wait_ms = crate::consumer::protocol_millis_i32(self.fetch_max_wait);
         for (leader, by_topic) in by_leader {
-            let topics: Vec<FetchTopic> = by_topic
+            if self.fetches.in_flight.contains_key(&leader) {
+                continue;
+            }
+            let wanted: BTreeMap<(String, i32), SessionPartition> = by_topic
                 .into_iter()
-                .map(|(name, plist)| {
-                    let topic_id = topic_ids.get(&name).copied().unwrap_or_default();
-                    build_fetch_topic(name, topic_id, plist, self.fetch_partition_max)
+                .flat_map(|(topic, specs)| {
+                    let topic_id = topic_ids.get(&topic).copied().unwrap_or_default();
+                    let partition_max = self.fetch_partition_max;
+                    specs.into_iter().map(move |spec| {
+                        (
+                            (topic.clone(), spec.0),
+                            session_partition(topic_id, spec, partition_max),
+                        )
+                    })
                 })
                 .collect();
-            let req = build_fetch_request(
-                timeout_ms,
+            let requested = wanted
+                .iter()
+                .map(|(key, partition)| (key.clone(), partition.fetch_offset))
+                .collect();
+            let session = self
+                .fetches
+                .sessions
+                .entry(leader)
+                .or_default()
+                .build(wanted);
+            let request = build_fetch_request(
+                max_wait_ms,
                 self.isolation_level,
                 self.fetch_min,
                 self.fetch_max,
-                topics,
+                session,
             );
-            let resp = if should_use_bootstrap_leader(leader) {
-                match self.client.send(req).await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        if is_transient_transport_error(&e) {
-                            self.client.reconnect_bootstrap().await;
-                            continue;
-                        }
-                        return Err(e.into());
-                    }
-                }
-            } else {
-                match self.client.broker(leader).send(req).await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        if is_transient_transport_error(&e) {
-                            self.client.evict_broker(leader);
-                            continue;
-                        }
-                        return Err(e.into());
-                    }
-                }
-            };
-            responses.push(resp);
+            let client = self.client.clone();
+            let completed = Arc::clone(&self.fetches.completed);
+            let handle = tokio::spawn(async move {
+                let result = if should_use_bootstrap_leader(leader) {
+                    client.send(request).await
+                } else {
+                    client.broker(leader).send(request).await
+                };
+                completed.notify_one();
+                result
+            });
+            self.fetches
+                .in_flight
+                .insert(leader, InFlightFetch { handle, requested });
         }
+    }
 
-        Ok(responses)
+    /// Wait until a Fetch in flight completes, or until `deadline`. Kafka's
+    /// `ClassicKafkaConsumer.pollForFetches` bounds the network wait with the
+    /// poll timer and returns as soon as a fetch is available.
+    async fn wait_for_fetches(&self, deadline: tokio::time::Instant) {
+        loop {
+            if self.fetches.in_flight.is_empty()
+                || self
+                    .fetches
+                    .in_flight
+                    .values()
+                    .any(|fetch| fetch.handle.is_finished())
+            {
+                return;
+            }
+            tokio::select! {
+                () = self.fetches.completed.notified() => {}
+                () = tokio::time::sleep_until(deadline) => return,
+            }
+        }
+    }
+
+    /// Take the responses of the completed Fetch requests, and update the
+    /// fetch session of each broker.
+    ///
+    /// The function drops the data of a partition whose fetch position changed
+    /// after the request, as Kafka's `FetchCollector.initialize` discards a
+    /// stale fetch. A response that the fetch session rejects gives no data, as
+    /// in `AbstractFetch.handleFetchSuccess`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error that is not transient.
+    async fn take_completed_fetches(
+        &mut self,
+        topic_ids: &HashMap<String, krabka_protocol::primitives::uuid::Uuid>,
+    ) -> Result<Vec<FetchResponse>, ConsumerError> {
+        let finished: Vec<i32> = self
+            .fetches
+            .in_flight
+            .iter()
+            .filter(|(_, fetch)| fetch.handle.is_finished())
+            .map(|(leader, _)| *leader)
+            .collect();
+        if finished.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_to_name = crate::offset_wire::id_to_name(topic_ids);
+        let offsets = self.next_offsets.lock().await.clone();
+        let mut responses = Vec::new();
+        let mut failure = None;
+        for leader in finished {
+            let Some(fetch) = self.fetches.in_flight.remove(&leader) else {
+                continue;
+            };
+            let session = self.fetches.sessions.entry(leader).or_default();
+            match fetch.handle.await {
+                Ok(Ok(mut response)) => {
+                    let partitions = response
+                        .responses
+                        .iter()
+                        .map(|topic| topic.partitions.len())
+                        .sum();
+                    if !session.handle_response(
+                        response.error_code,
+                        response.session_id,
+                        partitions,
+                        response.throttle_time_ms,
+                    ) {
+                        tracing::debug!(
+                            leader,
+                            error_code = response.error_code,
+                            "fetch session answered with an error; the next fetch is a full fetch"
+                        );
+                        continue;
+                    }
+                    for topic in &mut response.responses {
+                        let name = if topic.topic.is_empty() {
+                            id_to_name.get(&topic.topic_id).cloned().unwrap_or_default()
+                        } else {
+                            topic.topic.clone()
+                        };
+                        topic.partitions.retain(|partition| {
+                            let key = (name.clone(), partition.partition_index);
+                            fetch.requested.get(&key).is_some_and(|requested| {
+                                offsets.get(&key).copied().unwrap_or(0) == *requested
+                            })
+                        });
+                    }
+                    responses.push(response);
+                }
+                Ok(Err(error)) => {
+                    session.handle_error();
+                    if is_transient_transport_error(&error) {
+                        if should_use_bootstrap_leader(leader) {
+                            self.client.reconnect_bootstrap().await;
+                        } else {
+                            self.client.evict_broker(leader);
+                        }
+                    } else if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+                Err(_join_error) => session.handle_error(),
+            }
+        }
+        match failure {
+            Some(error) => Err(error.into()),
+            None => Ok(responses),
+        }
+    }
+
+    /// Close the fetch session of each broker. Kafka's `AbstractFetch.close`
+    /// sends a Fetch with the session id, epoch `-1` and no partitions to each
+    /// broker that holds a session.
+    pub(crate) async fn close_fetch_sessions(&mut self) {
+        let max_wait_ms = crate::consumer::protocol_millis_i32(self.fetch_max_wait);
+        let closes: Vec<_> = self
+            .fetches
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.session_id() != INVALID_SESSION_ID)
+            .map(|(leader, session)| {
+                let request = build_fetch_request(
+                    max_wait_ms,
+                    self.isolation_level,
+                    self.fetch_min,
+                    self.fetch_max,
+                    SessionRequest {
+                        session_id: session.session_id(),
+                        session_epoch: FINAL_EPOCH,
+                        partitions: BTreeMap::new(),
+                        forgotten: Vec::new(),
+                    },
+                );
+                let client = self.client.clone();
+                let leader = *leader;
+                async move {
+                    let _ = if should_use_bootstrap_leader(leader) {
+                        client.send(request).await
+                    } else {
+                        client.broker(leader).send(request).await
+                    };
+                }
+            })
+            .collect();
+        let _ = tokio::time::timeout(
+            FETCH_SESSION_CLOSE_TIMEOUT,
+            futures_util::future::join_all(closes),
+        )
+        .await;
     }
 
     async fn group_fetches(&self, assigned: &[(String, i32)]) -> FetchByLeader {
@@ -840,6 +1061,11 @@ impl Consumer {
                 // single-broker case anyway.
                 let leader =
                     fetch_leader_id(pos.leader_id, self.client.knows_broker(pos.leader_id));
+                // Kafka's `AbstractFetch.prepareFetchRequests` skips a broker
+                // with a pending Fetch.
+                if self.fetches.in_flight.contains_key(&leader) {
+                    continue;
+                }
                 grouped
                     .entry(leader)
                     .or_default()
@@ -1351,7 +1577,6 @@ mod offset_advance_tests {
         records::{RecordBatch, RecordsPayload},
         tagged_fields::UnknownTaggedFields,
     };
-    use krabka_units::kibibytes;
 
     use super::*;
 
@@ -1539,52 +1764,68 @@ mod offset_advance_tests {
         }
     }
 
+    /// Kafka's `AbstractFetch.createFetchRequest` and `FetchRequest.Builder`:
+    /// the limits, the isolation level, the session fields, the partitions by
+    /// topic, and the forgotten partitions by topic.
     #[test]
-    fn build_fetch_request_preserves_topic_partition_and_limits() {
-        let topic = build_fetch_topic(
-            "topic-a".into(),
-            id(7),
-            vec![(2, 42, LeaderEpoch(5), LeaderEpoch(4))],
-            kibibytes(128),
-        );
-        assert2::assert!(
-            topic
-                == FetchTopic {
-                    topic: "topic-a".into(),
-                    topic_id: id(7),
-                    partitions: vec![FetchPartition {
-                        partition: 2,
-                        current_leader_epoch: 5,
-                        fetch_offset: 42,
-                        last_fetched_epoch: 4,
-                        log_start_offset: -1,
-                        partition_max_bytes: 128 * 1024,
-                        replica_directory_id: WireUuid::default(),
-                        high_watermark: i64::MAX,
-                        unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
-                    }],
-                    unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
-                }
-        );
-
+    fn build_fetch_request_carries_limits_session_partitions_and_forgotten_topics() {
+        let partition = |fetch_offset| crate::fetch_session::SessionPartition {
+            topic_id: id(7),
+            fetch_offset,
+            current_leader_epoch: 5,
+            last_fetched_epoch: 4,
+            partition_max_bytes: 128 * 1024,
+        };
         let req = build_fetch_request(
-            123,
+            500,
             IsolationLevel::ReadCommitted,
             krabka_units::bytes(7),
             mebibytes(2),
-            vec![topic.clone()],
+            SessionRequest {
+                session_id: 77,
+                session_epoch: 3,
+                partitions: BTreeMap::from([
+                    (("topic-a".to_owned(), 2), partition(42)),
+                    (("topic-a".to_owned(), 3), partition(43)),
+                ]),
+                forgotten: vec![
+                    (("topic-b".to_owned(), 0), id(8)),
+                    (("topic-b".to_owned(), 1), id(8)),
+                ],
+            },
         );
+        let fetch_partition = |partition, fetch_offset| FetchPartition {
+            partition,
+            current_leader_epoch: 5,
+            fetch_offset,
+            last_fetched_epoch: 4,
+            log_start_offset: -1,
+            partition_max_bytes: 128 * 1024,
+            replica_directory_id: WireUuid::default(),
+            high_watermark: i64::MAX,
+            unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
+        };
         assert2::assert!(
             req == FetchRequest {
                 replica_id: -1,
-                max_wait_ms: 123,
+                max_wait_ms: 500,
                 min_bytes: 7,
                 max_bytes: 2 * 1024 * 1024,
                 isolation_level: 1, // read_committed wire value
-                session_id: 0,
-                session_epoch: -1,
-                topics: vec![topic],
-                forgotten_topics_data: Vec::new(),
+                session_id: 77,
+                session_epoch: 3,
+                topics: vec![FetchTopic {
+                    topic: "topic-a".into(),
+                    topic_id: id(7),
+                    partitions: vec![fetch_partition(2, 42), fetch_partition(3, 43)],
+                    unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
+                }],
+                forgotten_topics_data: vec![ForgottenTopic {
+                    topic: "topic-b".into(),
+                    topic_id: id(8),
+                    partitions: vec![0, 1],
+                    unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
+                }],
                 rack_id: String::new(),
                 cluster_id: None,
                 replica_state: ReplicaState {
@@ -1902,7 +2143,7 @@ mod offset_advance_tests {
 }
 
 #[cfg(test)]
-mod partition_error_tests {
+pub(crate) mod partition_error_tests {
     use std::{
         sync::{
             Arc,
@@ -1985,6 +2226,11 @@ mod partition_error_tests {
             .build()
             .await
             .unwrap();
+        consumer_with_client(client)
+    }
+
+    /// A consumer of `group-a` on `client` that owns `orders-0` at offset 5.
+    pub(super) fn consumer_with_client(client: Client) -> Consumer {
         Consumer {
             client,
             group_id: "group-a".into(),
@@ -2018,6 +2264,8 @@ mod partition_error_tests {
             fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
             fetch_max: DEFAULT_FETCH_MAX,
             fetch_partition_max: DEFAULT_FETCH_PARTITION_MAX,
+            fetch_max_wait: crate::consumer::DEFAULT_CONSUMER_FETCH_MAX_WAIT,
+            fetches: crate::poll::Fetches::default(),
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
@@ -3215,5 +3463,403 @@ pub(crate) mod timestamp_cases {
                 .collect(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod fetch_path_tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU16, Ordering},
+        },
+        time::Duration,
+    };
+
+    use bytes::Buf as _;
+    use krabka_client_core::{Client, MockBroker};
+    use krabka_protocol::{
+        Decode as _, Encode,
+        owned::{
+            api_versions_request,
+            api_versions_response::{ApiVersion, ApiVersionsResponse},
+            fetch_request,
+            fetch_response::{FetchableTopicResponse, PartitionData},
+            metadata_request,
+            metadata_response::{
+                MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
+                MetadataResponseTopic,
+            },
+        },
+        primitives::uuid::Uuid as WireUuid,
+    };
+    use krabka_units::{millis, secs};
+
+    use super::*;
+
+    const TOPIC_ID: WireUuid = WireUuid([7; 16]);
+
+    /// What a mock broker does with a Fetch request.
+    #[derive(Clone, Copy, Debug)]
+    enum FetchAnswer {
+        /// No response.
+        Silent,
+        /// A response with this top-level error code, session id and no
+        /// partition data.
+        Respond { error_code: i16, session_id: i32 },
+    }
+
+    /// The Fetch requests that the mock brokers received: `(broker id,
+    /// request)`.
+    type SentFetches = Arc<std::sync::Mutex<Vec<(i32, FetchRequest)>>>;
+
+    fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
+        let mut buf = bytes::BytesMut::new();
+        response.encode(&mut buf, version).expect("encode");
+        buf.to_vec()
+    }
+
+    /// Start one mock broker per entry of `answers`, with node ids from 1.
+    /// Metadata names broker `i + 1` as the leader of `orders-i`. Each broker
+    /// answers Fetch v4 to v11 with its entry of `answers`.
+    async fn start_brokers(answers: &[Vec<FetchAnswer>], sent: &SentFetches) -> Vec<MockBroker> {
+        let ports: Arc<Vec<AtomicU16>> =
+            Arc::new(answers.iter().map(|_| AtomicU16::new(0)).collect());
+        let mut brokers = Vec::new();
+        for (index, answers) in answers.iter().enumerate() {
+            let node_id = i32::try_from(index).expect("index") + 1;
+            let ports_in_mock = Arc::clone(&ports);
+            let sent = Arc::clone(sent);
+            let answers = std::sync::Mutex::new(answers.clone().into_iter());
+            let last = std::sync::Mutex::new(FetchAnswer::Silent);
+            let broker = MockBroker::start(move |api_key, version, _corr_id, mut body| {
+                if api_key == api_versions_request::API_KEY {
+                    let versions = ApiVersionsResponse {
+                        api_keys: [
+                            (api_versions_request::API_KEY, 0, 3),
+                            (metadata_request::API_KEY, 0, 8),
+                            (fetch_request::API_KEY, 4, 11),
+                        ]
+                        .into_iter()
+                        .map(|(api_key, min_version, max_version)| ApiVersion {
+                            api_key,
+                            min_version,
+                            max_version,
+                            ..Default::default()
+                        })
+                        .collect(),
+                        ..Default::default()
+                    };
+                    return Some(encode(&versions, 0));
+                }
+                if api_key == metadata_request::API_KEY {
+                    let ports = &ports_in_mock;
+                    let count = ports.len();
+                    let metadata = MetadataResponse {
+                        brokers: (0..count)
+                            .map(|index| MetadataResponseBroker {
+                                node_id: i32::try_from(index).expect("index") + 1,
+                                host: "127.0.0.1".into(),
+                                port: i32::from(ports[index].load(Ordering::SeqCst)),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        topics: vec![MetadataResponseTopic {
+                            name: Some("orders".into()),
+                            topic_id: TOPIC_ID,
+                            partitions: (0..count)
+                                .map(|index| {
+                                    let index = i32::try_from(index).expect("index");
+                                    MetadataResponsePartition {
+                                        partition_index: index,
+                                        leader_id: index + 1,
+                                        leader_epoch: 1,
+                                        ..Default::default()
+                                    }
+                                })
+                                .collect(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    };
+                    return Some(encode(&metadata, version));
+                }
+                if api_key == fetch_request::API_KEY {
+                    let client_id_len = usize::try_from(body.get_i16()).expect("client id");
+                    body.advance(client_id_len);
+                    let request = FetchRequest::decode(&mut body, version).expect("decode fetch");
+                    sent.lock().expect("sent lock").push((node_id, request));
+                    let mut last = last.lock().expect("last lock");
+                    if let Some(answer) = answers.lock().expect("answers lock").next() {
+                        *last = answer;
+                    }
+                    return match *last {
+                        FetchAnswer::Silent => None,
+                        FetchAnswer::Respond {
+                            error_code,
+                            session_id,
+                        } => Some(encode(
+                            &FetchResponse {
+                                error_code,
+                                session_id,
+                                ..Default::default()
+                            },
+                            version,
+                        )),
+                    };
+                }
+                None
+            })
+            .await;
+            ports[index].store(broker.addr.port(), Ordering::SeqCst);
+            brokers.push(broker);
+        }
+        brokers
+    }
+
+    /// A consumer that bootstraps from the first broker and owns one partition
+    /// of `orders` per broker, each at offset 5.
+    async fn consumer_on(brokers: &[MockBroker]) -> Consumer {
+        let client = Client::builder()
+            .bootstrap(brokers[0].addr.to_string())
+            .request_timeout(secs(30))
+            .build()
+            .await
+            .expect("client");
+        let partitions: Vec<(String, i32)> = (0..brokers.len())
+            .map(|index| ("orders".to_owned(), i32::try_from(index).expect("index")))
+            .collect();
+        let consumer = crate::poll::partition_error_tests::consumer_with_client(client);
+        *consumer.assigned.lock().await = partitions.clone();
+        *consumer.next_offsets.lock().await =
+            partitions.iter().map(|key| (key.clone(), 5)).collect();
+        consumer.commit_identity.lock().await.ownership_ids =
+            partitions.into_iter().zip(1..).collect();
+        consumer
+    }
+
+    fn stop(brokers: Vec<MockBroker>) {
+        for broker in brokers {
+            broker.stop();
+        }
+    }
+
+    /// Kafka's `FetchRequest.max_wait_ms` is `fetch.max.wait.ms` (default
+    /// 500), whatever the poll timeout.
+    #[tokio::test]
+    async fn fetch_waits_fetch_max_wait_and_not_the_poll_timeout() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(
+            &[vec![FetchAnswer::Respond {
+                error_code: 0,
+                session_id: 0,
+            }]],
+            &sent,
+        )
+        .await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer.poll(secs(30)).await.expect("poll");
+        let max_waits: Vec<i32> = sent
+            .lock()
+            .expect("sent lock")
+            .iter()
+            .map(|(_, request)| request.max_wait_ms)
+            .collect();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!(max_waits == vec![500]);
+    }
+
+    /// Kafka sends the Fetch of every leader at once, and `poll` returns by its
+    /// timeout, also when no leader answers.
+    #[tokio::test]
+    async fn fetches_go_to_all_leaders_at_once_and_poll_returns_by_its_timeout() {
+        let sent = SentFetches::default();
+        let silent = vec![FetchAnswer::Silent];
+        let brokers = start_brokers(&[silent.clone(), silent.clone(), silent], &sent).await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer.refresh_leader_epochs().await.expect("metadata");
+        let started = tokio::time::Instant::now();
+        let records = consumer.poll(millis(300)).await.expect("poll");
+        let elapsed = started.elapsed();
+        // Let the requests reach the brokers.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut leaders: Vec<i32> = sent
+            .lock()
+            .expect("sent lock")
+            .iter()
+            .map(|(node_id, _)| *node_id)
+            .collect();
+        leaders.sort_unstable();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!(
+            (
+                records.len(),
+                elapsed < Duration::from_millis(1500),
+                leaders
+            ) == (0, true, vec![1, 2, 3])
+        );
+    }
+
+    /// One Fetch request of a session case: `(session_id, session_epoch,
+    /// fetched partitions, forgotten partitions)`.
+    type SessionFields = (i32, i32, Vec<i32>, Vec<i32>);
+
+    fn session_fields(request: &FetchRequest) -> SessionFields {
+        (
+            request.session_id,
+            request.session_epoch,
+            request
+                .topics
+                .iter()
+                .flat_map(|topic| topic.partitions.iter().map(|p| p.partition))
+                .collect(),
+            request
+                .forgotten_topics_data
+                .iter()
+                .flat_map(|topic| topic.partitions.iter().copied())
+                .collect(),
+        )
+    }
+
+    /// Kafka's `FetchSessionHandler`: the first Fetch is full and creates a
+    /// session, the next one is incremental and names no unchanged partition.
+    /// `FETCH_SESSION_ID_NOT_FOUND` starts a new session with a full Fetch.
+    #[tokio::test]
+    async fn fetch_sessions_send_incremental_requests_and_recover_a_lost_session() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, answers, expected) in [
+            (
+                "session",
+                vec![
+                    FetchAnswer::Respond {
+                        error_code: 0,
+                        session_id: 77,
+                    },
+                    FetchAnswer::Respond {
+                        error_code: 0,
+                        session_id: 77,
+                    },
+                ],
+                vec![(0, 0, vec![0], vec![]), (77, 1, vec![], vec![])],
+            ),
+            (
+                "session lost",
+                vec![
+                    FetchAnswer::Respond {
+                        error_code: 0,
+                        session_id: 77,
+                    },
+                    FetchAnswer::Respond {
+                        error_code: 70,
+                        session_id: 0,
+                    },
+                    FetchAnswer::Respond {
+                        error_code: 0,
+                        session_id: 78,
+                    },
+                ],
+                vec![
+                    (0, 0, vec![0], vec![]),
+                    (77, 1, vec![], vec![]),
+                    (0, 0, vec![0], vec![]),
+                ],
+            ),
+        ] {
+            let sent = SentFetches::default();
+            let rounds = answers.len();
+            let brokers = start_brokers(&[answers], &sent).await;
+            let mut consumer = consumer_on(&brokers).await;
+            for _ in 0..rounds {
+                consumer.poll(secs(5)).await.expect("poll");
+            }
+            let requests: Vec<SessionFields> = sent
+                .lock()
+                .expect("sent lock")
+                .iter()
+                .map(|(_, request)| session_fields(request))
+                .collect();
+            drop(consumer);
+            stop(brokers);
+            actual.push((name, requests));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `FetchCollector` discards the data of a partition whose position
+    /// changed after the Fetch went out, for example after a seek.
+    #[tokio::test]
+    async fn a_fetch_response_for_a_moved_position_gives_no_records() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(&[vec![FetchAnswer::Silent]], &sent).await;
+        let mut consumer = consumer_on(&brokers).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let completed = Arc::clone(&consumer.fetches.completed);
+        consumer.fetches.in_flight.insert(
+            -1,
+            InFlightFetch {
+                handle: tokio::spawn(async move {
+                    let response = rx.await.expect("response");
+                    completed.notify_one();
+                    Ok(response)
+                }),
+                requested: HashMap::from([(("orders".to_owned(), 0), 5)]),
+            },
+        );
+        // A seek moves the position while the Fetch is in flight.
+        consumer
+            .next_offsets
+            .lock()
+            .await
+            .insert(("orders".to_owned(), 0), 40);
+        let record = krabka_protocol::records::RecordBatch {
+            base_offset: 5,
+            last_offset_delta: 0,
+            records: vec![krabka_protocol::records::Record {
+                offset_delta: 0,
+                value: Some(bytes::Bytes::from_static(b"old")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        tx.send(FetchResponse {
+            responses: vec![FetchableTopicResponse {
+                topic: "orders".into(),
+                partitions: vec![PartitionData {
+                    partition_index: 0,
+                    high_watermark: 6,
+                    records: Some(krabka_protocol::records::RecordsPayload::V2(vec![record])),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .expect("send response");
+        consumer
+            .wait_for_fetches(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        let topic_ids = consumer.topic_ids.lock().await.clone();
+        let responses = consumer
+            .take_completed_fetches(&topic_ids)
+            .await
+            .expect("take");
+        consumer
+            .process_fetch_responses(responses, &topic_ids)
+            .await
+            .expect("process");
+        let records = consumer.drain_fetch_buffer().await;
+        let position = consumer
+            .next_offsets
+            .lock()
+            .await
+            .get(&("orders".to_owned(), 0))
+            .copied();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!((records.len(), position) == (0, Some(40)));
     }
 }
