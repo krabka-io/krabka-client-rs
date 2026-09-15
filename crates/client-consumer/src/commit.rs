@@ -424,16 +424,26 @@ impl PartitionCommitError {
     }
 }
 
-/// Whether a partition of `response` makes Kafka's
-/// `OffsetCommitResponseHandler` call `markCoordinatorUnknown`. The consumer
-/// then finds the coordinator again.
+impl PartitionCommitError {
+    /// The class of `response` in [`auto_commit_outcome`]: the largest class of
+    /// its partitions.
+    fn of_response(response: &OffsetCommitResponse) -> Self {
+        response
+            .topics
+            .iter()
+            .flat_map(|topic| topic.partitions.iter())
+            .map(|partition| Self::of(partition.error_code))
+            .max()
+            .unwrap_or(Self::None)
+    }
+}
+
+/// Whether `response` makes Kafka's `OffsetCommitResponseHandler` call
+/// `markCoordinatorUnknown`, so the consumer finds the coordinator again and
+/// the commit is retriable. A partition with a final error or a rebalance
+/// error takes precedence, as in [`auto_commit_outcome`].
 pub(crate) fn names_moved_coordinator(response: &OffsetCommitResponse) -> bool {
-    response.topics.iter().any(|topic| {
-        topic.partitions.iter().any(|partition| {
-            PartitionCommitError::of(partition.error_code)
-                == PartitionCommitError::CoordinatorUnknown
-        })
-    })
+    PartitionCommitError::of_response(response) == PartitionCommitError::CoordinatorUnknown
 }
 
 /// Classify the result of one automatic `OffsetCommit`, as Kafka's
@@ -451,26 +461,17 @@ pub(crate) fn auto_commit_outcome(
     result: &Result<OffsetCommitResponse, ConsumerError>,
 ) -> AutoCommitOutcome {
     match result {
-        Ok(response) => {
-            let error = response
-                .topics
-                .iter()
-                .flat_map(|topic| topic.partitions.iter())
-                .map(|partition| PartitionCommitError::of(partition.error_code))
-                .max()
-                .unwrap_or(PartitionCommitError::None);
-            match error {
-                PartitionCommitError::None => AutoCommitOutcome::Committed,
-                PartitionCommitError::Retriable | PartitionCommitError::CoordinatorUnknown => {
-                    AutoCommitOutcome::Retriable
-                }
-                PartitionCommitError::TopicAuthorization
-                | PartitionCommitError::Rebalance
-                | PartitionCommitError::FencedInstanceId
-                | PartitionCommitError::GroupAuthorization
-                | PartitionCommitError::Fatal => AutoCommitOutcome::Failed,
+        Ok(response) => match PartitionCommitError::of_response(response) {
+            PartitionCommitError::None => AutoCommitOutcome::Committed,
+            PartitionCommitError::Retriable | PartitionCommitError::CoordinatorUnknown => {
+                AutoCommitOutcome::Retriable
             }
-        }
+            PartitionCommitError::TopicAuthorization
+            | PartitionCommitError::Rebalance
+            | PartitionCommitError::FencedInstanceId
+            | PartitionCommitError::GroupAuthorization
+            | PartitionCommitError::Fatal => AutoCommitOutcome::Failed,
+        },
         Err(ConsumerError::Client(error))
             if is_retriable_transport_error(error)
                 || matches!(error, krabka_client_core::ClientError::Timeout(_)) =>
@@ -958,7 +959,9 @@ impl Consumer {
                     self.client
                         .evict_broker(self.coordinator_id.load(Ordering::Relaxed));
                     self.find_coordinator_again(retry_start).await;
-                    tokio::time::sleep(retry_backoff).await;
+                    if !self.sleep_before_retry(retry_start, retry_backoff).await {
+                        return Err(ConsumerError::CoordinatorUnavailable);
+                    }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
                     continue;
                 }
@@ -1021,11 +1024,31 @@ impl Consumer {
                     if find_coordinator {
                         self.find_coordinator_again(retry_start).await;
                     }
-                    tokio::time::sleep(retry_backoff).await;
+                    if !self.sleep_before_retry(retry_start, retry_backoff).await {
+                        return Err(ConsumerError::Server(code));
+                    }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
                 }
             }
         }
+    }
+
+    /// Wait `backoff` before the next attempt of a synchronous commit that
+    /// started at `retry_start`, but not past the retry timeout. Return whether
+    /// time is left for the next attempt. Kafka's `commitOffsetsSync` does
+    /// `timer.sleep(backoff)` and then sends again only while
+    /// `timer.notExpired()`.
+    async fn sleep_before_retry(
+        &self,
+        retry_start: tokio::time::Instant,
+        backoff: Duration,
+    ) -> bool {
+        let remaining = self
+            .retry_policy
+            .timeout
+            .saturating_sub(retry_start.elapsed());
+        tokio::time::sleep(backoff.min(remaining)).await;
+        !retry_deadline_elapsed(retry_start, self.retry_policy.timeout)
     }
 
     /// Find the group coordinator again, within the time that is left of a
@@ -1174,9 +1197,13 @@ impl Consumer {
                         auto_commit.as_ref(),
                     )
                     .await
-                        && let Err(error) = route.send(topics, generation, &member_id).await
                     {
-                        tracing::warn!(%error, "commit_async failed");
+                        // Kafka's `DefaultOffsetCommitCallback` logs a failed
+                        // asynchronous commit, also one with a retriable error.
+                        let result = route.send(topics, generation, &member_id).await;
+                        if auto_commit_outcome(&result) != AutoCommitOutcome::Committed {
+                            tracing::warn!(?result, "commit_async failed");
+                        }
                     }
                 }
 
@@ -1717,6 +1744,45 @@ mod tests {
         assert2::assert!(actual == wanted);
     }
 
+    /// The automatic commit route finds the coordinator again and resends only
+    /// when the response is retriable because of `7`, `15` or `16`, the codes
+    /// where Kafka's `OffsetCommitResponseHandler` calls
+    /// `markCoordinatorUnknown`. A final error or a rebalance error on another
+    /// partition takes precedence.
+    #[test]
+    fn names_moved_coordinator_only_for_a_retriable_coordinator_response() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, errors, expected) in [
+            ("success", &[0, 0][..], false),
+            ("request timed out", &[0, 7][..], true),
+            ("coordinator not available", &[15][..], true),
+            ("not coordinator with a retriable code", &[3, 16][..], true),
+            ("coordinator load in progress", &[14][..], false),
+            ("unknown topic or partition", &[3][..], false),
+            (
+                "request timed out and metadata too large",
+                &[7, 12][..],
+                false,
+            ),
+            (
+                "not coordinator and group authorization",
+                &[30, 16][..],
+                false,
+            ),
+            ("not coordinator and a rebalance", &[16, 27][..], false),
+            (
+                "not coordinator and topic authorization",
+                &[29, 16][..],
+                true,
+            ),
+        ] {
+            actual.push((name, names_moved_coordinator(&response(errors))));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
     /// `poll` does not wait for a commit that holds the commit lock. The
     /// interval commit stays due, and the next `poll` sends it.
     #[tokio::test(start_paused = true)]
@@ -2195,11 +2261,25 @@ mod tests {
     async fn commit_sync_handles_each_offset_commit_error_code_as_kafka_does() {
         use CommitAnswer::{Close, Codes, Silent};
 
-        const RETRY: Duration = Duration::from_secs(2);
+        const RETRY: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
+            timeout: Duration::from_secs(2),
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        };
+        const EXPIRED: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
+            timeout: Duration::ZERO,
+            ..RETRY
+        };
+        /// The backoff is longer than the time that is left.
+        const LONG_BACKOFF: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
+            timeout: Duration::from_millis(100),
+            initial_backoff: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(5),
+        };
         let fenced = ConsumerError::FencedInstanceId("instance-a".into()).to_string();
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
-        for (name, answers, rejoin, timeout, expected) in [
+        for (name, answers, rejoin, retry_policy, expected) in [
             ("success", vec![Codes(&[])], false, RETRY, (Ok(()), 1, 0)),
             (
                 "unknown topic or partition retries",
@@ -2240,8 +2320,15 @@ mod tests {
                 "unknown topic or partition past the timeout",
                 vec![Codes(&[("orders", 3)])],
                 false,
-                Duration::ZERO,
+                EXPIRED,
                 (Err(ConsumerError::Server(3).to_string()), 1, 0),
+            ),
+            (
+                "not coordinator with a backoff past the timeout",
+                vec![Codes(&[("orders", 16)]), Codes(&[])],
+                false,
+                LONG_BACKOFF,
+                (Err(ConsumerError::Server(16).to_string()), 1, 1),
             ),
             (
                 "disconnect finds the coordinator and retries",
@@ -2261,7 +2348,7 @@ mod tests {
                 "disconnect past the timeout",
                 vec![Close],
                 false,
-                Duration::ZERO,
+                EXPIRED,
                 (Err(ConsumerError::CoordinatorUnavailable.to_string()), 1, 0),
             ),
             (
@@ -2353,7 +2440,10 @@ mod tests {
                 (Ok(()), 2, 0),
             ),
         ] {
-            actual.push((name, scripted_commit_sync(answers, rejoin, timeout).await));
+            actual.push((
+                name,
+                scripted_commit_sync(answers, rejoin, retry_policy).await,
+            ));
             wanted.push((name, expected));
         }
         let wanted: Vec<(&str, CommitCodeResult)> = wanted;
@@ -2367,7 +2457,7 @@ mod tests {
     async fn scripted_commit_sync(
         answers: Vec<CommitAnswer>,
         rejoin: bool,
-        timeout: Duration,
+        retry_policy: CoordinatorRetryPolicy,
     ) -> CommitCodeResult {
         use CommitAnswer::{Close, Codes, Silent};
         use krabka_protocol::owned::{
@@ -2466,11 +2556,7 @@ mod tests {
             .await
             .unwrap();
         consumer.group_instance_id = Some("instance-a".into());
-        consumer.retry_policy = CoordinatorRetryPolicy {
-            timeout,
-            initial_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(1),
-        };
+        consumer.retry_policy = retry_policy;
 
         let result = tokio::time::timeout(Duration::from_secs(10), consumer.commit_sync())
             .await
