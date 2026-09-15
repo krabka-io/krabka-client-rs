@@ -125,19 +125,19 @@ fn lookup(response: &MetadataResponse, topic: &str) -> TopicLookup {
 /// Kafka's `NetworkClient` gives `Metadata.fatalError` an authentication
 /// failure and an unsupported version, and `KafkaProducer.waitOnMetadata`
 /// throws them at once. A disconnect or a timeout only counts as a failed
-/// update, and the wait goes on. A TLS handshake that the peer rejects is an
-/// `SslAuthenticationException` in Kafka. Rustls reports it as
-/// `InvalidData`, and a reset during the handshake has another kind.
+/// update, and the wait goes on.
+///
+/// Client-core decides which handshake failures are rejections. A TLS engine
+/// error and a SASL rejection are [`ClientError::Authentication`]. A
+/// [`ClientError::Tls`] or [`ClientError::Sasl`] failed with no verdict from
+/// the peer, for example on EOF or a reset. Kafka's `NetworkClient` keeps such
+/// a disconnect in the `AUTHENTICATE` state retriable, so the wait goes on.
 fn stops_the_wait(error: &ClientError) -> bool {
-    match error {
-        ClientError::Sasl { .. }
-        | ClientError::IncompatibleVersion { .. }
-        | ClientError::InvalidConfig(_) => true,
-        ClientError::Tls { source, .. } => source.kind() == std::io::ErrorKind::InvalidData,
-        // A disconnect, a timeout, an I/O failure, a connect failure, and any
-        // other failure keep the wait going until `max_block` ends.
-        _ => false,
-    }
+    error.is_authentication_failure()
+        || matches!(
+            error,
+            ClientError::IncompatibleVersion { .. } | ClientError::InvalidConfig(_)
+        )
 }
 
 /// Run `future` until `deadline`. No deadline means no limit.
@@ -269,6 +269,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
+    use krabka_client_core::{AuthenticationError, OutboundSaslError, SaslAuthenticationError};
     use krabka_protocol::{
         owned::metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
         primitives::uuid::Uuid,
@@ -280,6 +281,8 @@ mod tests {
     const TOPIC: &str = "orders";
     const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
     const LEADER_NOT_AVAILABLE: i16 = 5;
+    const UNKNOWN_SERVER_ERROR: i16 = -1;
+    const ADDR: &str = "127.0.0.1:9093";
     const RETRY_BACKOFF: Duration = Duration::from_millis(100);
     const MAX_BACKOFF: Duration = Duration::from_secs(1);
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
@@ -511,6 +514,48 @@ mod tests {
                 },
             ),
             (
+                "a SASL stream failure, then the topic",
+                vec![
+                    Answer::Fails(|| ClientError::Sasl {
+                        addr: ADDR.parse().expect("address"),
+                        source: OutboundSaslError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "eof",
+                        )),
+                    }),
+                    topic(0, 3),
+                ],
+                minute,
+                None,
+                WaitOutcome {
+                    result: Ok(3),
+                    waited: ms(100),
+                    refreshes: 2,
+                    cached: Some(known(3)),
+                },
+            ),
+            (
+                "a SaslAuthenticate code that is not a rejection, then the topic",
+                vec![
+                    Answer::Fails(|| ClientError::Sasl {
+                        addr: ADDR.parse().expect("address"),
+                        source: OutboundSaslError::Server {
+                            error_code: UNKNOWN_SERVER_ERROR,
+                            error_message: None,
+                        },
+                    }),
+                    topic(0, 3),
+                ],
+                minute,
+                None,
+                WaitOutcome {
+                    result: Ok(3),
+                    waited: ms(100),
+                    refreshes: 2,
+                    cached: Some(known(3)),
+                },
+            ),
+            (
                 "leader not available, then the topic",
                 vec![topic(LEADER_NOT_AVAILABLE, 0), topic(0, 12)],
                 minute,
@@ -616,15 +661,35 @@ mod tests {
                 },
             ),
             (
-                "a rejected TLS handshake stops the wait",
-                vec![Answer::Fails(|| ClientError::Tls {
-                    addr: "127.0.0.1:9093".parse().expect("address"),
-                    source: std::io::Error::new(std::io::ErrorKind::InvalidData, "bad certificate"),
+                "a TLS rejection stops the wait",
+                vec![Answer::Fails(|| ClientError::Authentication {
+                    addr: ADDR.parse().expect("address"),
+                    source: AuthenticationError::Tls(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bad certificate",
+                    )),
                 })],
                 minute,
                 None,
                 WaitOutcome {
-                    result: Err("client: TLS handshake with 127.0.0.1:9093: bad certificate".into()),
+                    result: Err("client: authentication with 127.0.0.1:9093 failed: TLS handshake failed: bad certificate".into()),
+                    waited: Duration::ZERO,
+                    refreshes: 1,
+                    cached: None,
+                },
+            ),
+            (
+                "a SASL rejection stops the wait",
+                vec![Answer::Fails(|| ClientError::Authentication {
+                    addr: ADDR.parse().expect("address"),
+                    source: AuthenticationError::Sasl(SaslAuthenticationError::Failed(
+                        "bad password".into(),
+                    )),
+                })],
+                minute,
+                None,
+                WaitOutcome {
+                    result: Err("client: authentication with 127.0.0.1:9093 failed: SASL authentication failed: bad password".into()),
                     waited: Duration::ZERO,
                     refreshes: 1,
                     cached: None,
@@ -634,7 +699,7 @@ mod tests {
                 "a reset TLS handshake is retried",
                 vec![
                     Answer::Fails(|| ClientError::Tls {
-                        addr: "127.0.0.1:9093".parse().expect("address"),
+                        addr: ADDR.parse().expect("address"),
                         source: std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
                     }),
                     topic(0, 1),
