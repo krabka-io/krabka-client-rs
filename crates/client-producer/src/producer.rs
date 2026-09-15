@@ -95,6 +95,71 @@ impl ProtocolRequest for ClientAddPartitionsToTxn {
     type Response = AddPartitionsToTxnResponse;
 }
 
+/// The last `EndTxn` version before transaction version 2. Kafka's
+/// `EndTxnRequest.LAST_STABLE_VERSION_BEFORE_TRANSACTION_V2`.
+const END_TXN_TRANSACTION_V1_MAX_VERSION: i16 = 4;
+
+/// The last `TxnOffsetCommit` version before transaction version 2. Kafka's
+/// `TxnOffsetCommitRequest.LAST_STABLE_VERSION_BEFORE_TRANSACTION_V2`.
+const TXN_OFFSET_COMMIT_TRANSACTION_V1_MAX_VERSION: i16 = 4;
+
+/// The finalized feature that names the transaction protocol of the cluster.
+const TRANSACTION_VERSION_FEATURE: &str = "transaction.version";
+
+/// A request that negotiates `MAX` at most.
+///
+/// The version of `EndTxn`, `TxnOffsetCommit` and `Produce` tells a broker
+/// which transaction protocol the producer follows. A producer on transaction
+/// version 1 caps each of them at the last version before transaction version
+/// 2, as Kafka's request builders do when `isTransactionV2Enabled` is false.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VersionCapped<R, const MAX: i16>(R);
+
+impl<R: Encode, const MAX: i16> Encode for VersionCapped<R, MAX> {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl<R: ProtocolRequest, const MAX: i16> ProtocolRequest for VersionCapped<R, MAX> {
+    const API_KEY: i16 = R::API_KEY;
+    const MIN_VERSION: i16 = R::MIN_VERSION;
+    const MAX_VERSION: i16 = MAX;
+    const FLEXIBLE_MIN: i16 = R::FLEXIBLE_MIN;
+    type Response = R::Response;
+}
+
+/// Send `request` on `client` in the transaction protocol that
+/// `transaction_v2` names: at the latest version for transaction version 2,
+/// and at `V1_MAX` at most for transaction version 1.
+async fn send_in_transaction_version<R, const V1_MAX: i16>(
+    client: &Client,
+    request: R,
+    transaction_v2: bool,
+) -> Result<R::Response, ClientError>
+where
+    R: ProtocolRequest + Send + Sync,
+{
+    if transaction_v2 {
+        client.send(request).await
+    } else {
+        client.send(VersionCapped::<R, V1_MAX>(request)).await
+    }
+}
+
+/// Tell if the finalized features of a broker turn on transaction version 2.
+/// Kafka's `TransactionManager.maybeUpdateTransactionV2Enabled`:
+/// `transactionVersion != null && transactionVersion >= 2`.
+fn transaction_v2_enabled(features: &krabka_client_core::FinalizedFeatures) -> bool {
+    features
+        .level(TRANSACTION_VERSION_FEATURE)
+        .is_some_and(|level| level >= 2)
+}
+
 /// The deadline and the backoff of the retries of one coordinator request.
 struct CoordinatorRetry {
     deadline: tokio::time::Instant,
@@ -321,6 +386,13 @@ pub struct Producer {
     /// the transaction. Kafka's `TransactionManager` keeps the same state in
     /// `ABORTABLE_ERROR` with `lastError`.
     pub(crate) txn_abortable_error: Arc<AbortableErrorSlot>,
+    /// The producer follows transaction version 2 (KIP-890 part 2). It skips
+    /// `AddPartitionsToTxn` and `AddOffsetsToTxn`, and sends `Produce`,
+    /// `EndTxn` and `TxnOffsetCommit` at their latest versions.
+    /// `init_transactions` sets it from the finalized feature
+    /// `transaction.version` of the transaction coordinator. The transport of
+    /// the sender shares it.
+    pub(crate) transaction_v2: Arc<AtomicBool>,
     /// Identity of the transaction that was prepared locally or recovered via
     /// `InitProducerId(keepPreparedTxn=true)`. Recovery deliberately keeps this
     /// separate from `txn_pid_epoch`, which is the newly staged identity used
@@ -373,6 +445,12 @@ impl Producer {
         let Some(transactional_id) = &self.transactional_id else {
             return Ok(());
         };
+        // Kafka's `TransactionManager.maybeAddPartition`: with transaction
+        // version 2 the broker adds the partition when it gets the first
+        // transactional Produce, so no `AddPartitionsToTxn` goes out.
+        if self.transaction_v2() {
+            return Ok(());
+        }
         let mut coordinator = self.txn_coord_client.lock().await.clone().ok_or(
             ProducerError::InvalidTransactionState(
                 "no txn coordinator cached — did init_transactions succeed?",
@@ -821,7 +899,13 @@ impl Producer {
         let mut backoff = self.init_retry_backoff.to_std();
         let mut earlier_attempt_lost = false;
         loop {
-            let (attempt, identity) = match coordinator.send(request.clone()).await {
+            let sent = send_in_transaction_version::<_, END_TXN_TRANSACTION_V1_MAX_VERSION>(
+                &coordinator,
+                request.clone(),
+                self.transaction_v2(),
+            )
+            .await;
+            let (attempt, identity) = match sent {
                 Ok(response) => {
                     tracing::Span::current().record("error_code", response.error_code);
                     let identity = (response.producer_id >= 0)
@@ -1033,6 +1117,13 @@ impl Producer {
                 self.adopt_transactional_identity((resp.producer_id, resp.producer_epoch))
                     .await;
                 self.txn_abortable_error.clear();
+                // Kafka's `KafkaProducer.initTransactions` reads the finalized
+                // features after `InitProducerId`
+                // (`maybeUpdateTransactionV2Enabled(true)`).
+                self.transaction_v2.store(
+                    transaction_v2_enabled(&coord.finalized_features()),
+                    Ordering::Release,
+                );
                 *self.txn_coord_client.lock().await = Some(coord);
                 *self.prepared_transaction_state.lock().await = recovered;
                 *self.txn_state.lock().await = if recovered.is_some() {
@@ -1207,9 +1298,14 @@ impl Producer {
 
         let (pid, epoch) = *self.txn_pid_epoch.lock().await;
 
-        // 1. AddOffsetsToTxn → transaction coordinator.
-        self.add_offsets_to_txn(&tid, pid, epoch, &group_meta.group_id)
-            .await?;
+        // 1. AddOffsetsToTxn → transaction coordinator. Kafka's
+        //    `TransactionManager.sendOffsetsToTransaction` skips it with
+        //    transaction version 2: the group coordinator adds the offsets
+        //    partition when it gets `TxnOffsetCommit` v5 or later.
+        if !self.transaction_v2() {
+            self.add_offsets_to_txn(&tid, pid, epoch, &group_meta.group_id)
+                .await?;
+        }
 
         // 2. FindCoordinator(group_id, key_type=0 GROUP), then TxnOffsetCommit
         //    → group coordinator, carrying the consumer group metadata
@@ -1308,7 +1404,14 @@ impl Producer {
         let mut group_client = self.connect_group_coordinator(&group_meta.group_id).await?;
         let mut retry = self.coordinator_retry();
         loop {
-            let (attempt, last_error) = match group_client.send(request.clone()).await {
+            let sent =
+                send_in_transaction_version::<_, TXN_OFFSET_COMMIT_TRANSACTION_V1_MAX_VERSION>(
+                    &group_client,
+                    request.clone(),
+                    self.transaction_v2(),
+                )
+                .await;
+            let (attempt, last_error) = match sent {
                 Ok(response) => {
                     let code = txn_offset_commit_error_code(&response);
                     (
@@ -1429,6 +1532,11 @@ impl Producer {
             AbortableError::Server(code) => ProducerError::Server(code),
             AbortableError::Timeout => ProducerError::SendTimeout,
         })
+    }
+
+    /// Tell if the producer follows transaction version 2.
+    fn transaction_v2(&self) -> bool {
+        self.transaction_v2.load(Ordering::Acquire)
     }
 
     pub(crate) fn is_active(&self) -> Result<(), ProducerError> {

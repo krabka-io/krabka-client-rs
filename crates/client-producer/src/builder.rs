@@ -882,9 +882,13 @@ impl Producer {
         let txn_pid_epoch = Arc::new(Mutex::new(initial_txn_pid_epoch()));
         let prepared_transaction_state = Arc::new(Mutex::new(None));
         let txn_abortable_error = Arc::new(AbortableErrorSlot::default());
+        let transaction_v2 = Arc::new(AtomicBool::new(false));
 
         let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
-            transport: Box::new(ClientTransport::new(client.clone())),
+            transport: Box::new(ClientTransport::new(
+                client.clone(),
+                Arc::clone(&transaction_v2),
+            )),
             producer_id,
             producer_epoch: Arc::clone(&producer_epoch),
             acks,
@@ -958,6 +962,7 @@ impl Producer {
             txn_coord_client: Mutex::new(None),
             txn_pid_epoch,
             txn_abortable_error,
+            transaction_v2,
             prepared_transaction_state,
         })
     }
