@@ -72,6 +72,10 @@ pub(crate) const NOT_COORDINATOR: i16 = 16;
 
 const UNKNOWN_EPOCH: i32 = -1;
 
+/// `FENCED_INSTANCE_ID`: another consumer joined the group with the same
+/// `group.instance.id` (KIP-345).
+const FENCED_INSTANCE_ID: i16 = 82;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CoordinatorRetryPolicy {
     pub timeout: Duration,
@@ -509,6 +513,12 @@ enum HeartbeatOutcome {
     NeedRejoin,
     /// `UNKNOWN_MEMBER_ID (25)`. Clear `member_id` and rejoin from scratch.
     RejoinFromScratch,
+    /// `FENCED_INSTANCE_ID (82)`. Another consumer joined with the same
+    /// `group.instance.id`. The member stops. Kafka's
+    /// `AbstractCoordinator.HeartbeatResponseHandler` resets the member and
+    /// raises `FencedInstanceIdException`, and the heartbeat thread keeps it as
+    /// its failure cause.
+    Fenced,
     /// Transport error or unexpected non-fatal broker code. Retry on the next tick.
     Transient,
 }
@@ -518,6 +528,7 @@ fn heartbeat_outcome(error_code: i16) -> HeartbeatOutcome {
         0 => HeartbeatOutcome::Ok,
         27 | 22 => HeartbeatOutcome::NeedRejoin,
         25 => HeartbeatOutcome::RejoinFromScratch,
+        FENCED_INSTANCE_ID => HeartbeatOutcome::Fenced,
         _ => HeartbeatOutcome::Transient,
     }
 }
@@ -677,6 +688,10 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                         // difference. Monotonic max-merge: only ever advance.
                         merge_counts(&mut known_counts, &snapshot);
                     }
+                    Err(ConsumerError::FencedInstanceId(group_instance_id)) => {
+                        stop_fenced_member(&mut state, &shutdown, group_instance_id).await;
+                        break;
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "rejoin failed; will retry on next tick");
                         report_rejoin_error(&state.poll_error, e);
@@ -700,6 +715,11 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                         state.assignment_changed.notify_waiters();
                         needs_rejoin = true;
                     }
+                    HeartbeatOutcome::Fenced => {
+                        let group_instance_id = state.group_instance_id.clone().unwrap_or_default();
+                        stop_fenced_member(&mut state, &shutdown, group_instance_id).await;
+                        break;
+                    }
                 },
             }
         }
@@ -713,6 +733,46 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
     // its session expires, stalling the rest of the group's rebalance.
     // Best-effort and bounded: a hung broker must not block `close()`.
     leave_group(&state).await;
+}
+
+/// Stop the member after the coordinator fenced its `group.instance.id`.
+///
+/// This function cancels `shutdown`, so a commit fails from now on. It then
+/// clears the assignment, the member id and the generation, so `poll()` fetches
+/// nothing. It then keeps the fenced error for the next `poll()`. The caller stops the task. The shutdown
+/// path sends no `LeaveGroup`, because the member id is empty. Kafka resets the
+/// generation to `NO_GENERATION`, so `AbstractCoordinator.maybeLeaveGroup`
+/// sends no `LeaveGroup` either.
+async fn stop_fenced_member(
+    state: &mut CoordinatorState,
+    shutdown: &CancellationToken,
+    group_instance_id: String,
+) {
+    tracing::error!(
+        group = %state.group_id,
+        group_instance_id = %group_instance_id,
+        "another consumer joined with the same group.instance.id; the member stops"
+    );
+    shutdown.cancel();
+    state.member_id.clear();
+    publish_assignment(state, &[], false, -1).await;
+    *state
+        .poll_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(ConsumerError::FencedInstanceId(group_instance_id));
+}
+
+/// The error for a non-zero `JoinGroup` or `SyncGroup` `error_code`.
+///
+/// Kafka's `JoinGroupResponseHandler` and `SyncGroupResponseHandler` raise
+/// `FENCED_INSTANCE_ID` as a fatal error.
+fn group_response_error(error_code: i16, group_instance_id: Option<&str>) -> ConsumerError {
+    if error_code == FENCED_INSTANCE_ID {
+        ConsumerError::FencedInstanceId(group_instance_id.unwrap_or_default().to_string())
+    } else {
+        ConsumerError::Server(error_code)
+    }
 }
 
 /// Best-effort `LeaveGroup` for the coordinator's *current* member id.
@@ -1217,11 +1277,17 @@ async fn perform_join(
         )
         .await?;
         if r2.error_code != 0 {
-            return Err(ConsumerError::Server(r2.error_code));
+            return Err(group_response_error(
+                r2.error_code,
+                group_instance_id.as_deref(),
+            ));
         }
         r2
     } else {
-        return Err(ConsumerError::Server(r1.error_code));
+        return Err(group_response_error(
+            r1.error_code,
+            group_instance_id.as_deref(),
+        ));
     };
 
     Ok(join_resp)
@@ -1397,7 +1463,10 @@ async fn sync_assignment(
     )
     .await?;
     if response.error_code != 0 {
-        return Err(ConsumerError::Server(response.error_code));
+        return Err(group_response_error(
+            response.error_code,
+            state.group_instance_id.as_deref(),
+        ));
     }
     Ok(decode_assignment(&response.assignment))
 }
@@ -1571,8 +1640,10 @@ mod retry_tests {
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
-            find_coordinator_request, leave_group_request, metadata_request,
-            metadata_response::MetadataResponse,
+            find_coordinator_request, heartbeat_request,
+            heartbeat_response::HeartbeatResponse,
+            join_group_request, leave_group_request, metadata_request,
+            metadata_response::{MetadataResponse, MetadataResponseBroker},
             offset_fetch_request::{
                 self, OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic,
                 OffsetFetchRequestTopics,
@@ -1581,6 +1652,7 @@ mod retry_tests {
                 OffsetFetchResponseGroup, OffsetFetchResponsePartition,
                 OffsetFetchResponsePartitions, OffsetFetchResponseTopic, OffsetFetchResponseTopics,
             },
+            sync_group_request,
         },
     };
     use krabka_units::{millis, minutes, secs};
@@ -2559,10 +2631,381 @@ mod retry_tests {
             ("rebalance in progress", 27, HeartbeatOutcome::NeedRejoin),
             ("illegal generation", 22, HeartbeatOutcome::NeedRejoin),
             ("unknown member", 25, HeartbeatOutcome::RejoinFromScratch),
+            ("fenced instance id", 82, HeartbeatOutcome::Fenced),
             ("loading coordinator", 14, HeartbeatOutcome::Transient),
             ("unknown transient", 99, HeartbeatOutcome::Transient),
         ] {
             assert2::assert!(heartbeat_outcome(error_code) == expected);
+        }
+    }
+
+    /// Encode `response` at `version` behind the flexible response header's
+    /// empty tagged fields when `version` is flexible.
+    fn group_response(response: &impl Encode, version: i16, flexible_min: i16) -> Vec<u8> {
+        let mut buffer = bytes::BytesMut::new();
+        if version >= flexible_min {
+            buffer.extend_from_slice(&[0]);
+        }
+        response
+            .encode(&mut buffer, version)
+            .expect("encode response");
+        buffer.to_vec()
+    }
+
+    /// An `ApiVersions` response that advertises the lowest client version of
+    /// each group API that the coordinator task sends.
+    fn api_versions_for_coordinator_task() -> Vec<u8> {
+        let version = |api_key: i16, version: i16| ApiVersion {
+            api_key,
+            min_version: version,
+            max_version: version,
+            ..Default::default()
+        };
+        let response = ApiVersionsResponse {
+            error_code: 0,
+            api_keys: vec![
+                ApiVersion {
+                    api_key: api_versions_request::API_KEY,
+                    min_version: 0,
+                    max_version: 3,
+                    ..Default::default()
+                },
+                version(metadata_request::API_KEY, metadata_request::MIN_VERSION),
+                version(
+                    find_coordinator_request::API_KEY,
+                    find_coordinator_request::MIN_VERSION,
+                ),
+                version(heartbeat_request::API_KEY, heartbeat_request::MIN_VERSION),
+                version(join_group_request::API_KEY, join_group_request::MIN_VERSION),
+                version(sync_group_request::API_KEY, sync_group_request::MIN_VERSION),
+                version(
+                    leave_group_request::API_KEY,
+                    leave_group_request::MIN_VERSION,
+                ),
+            ],
+            ..Default::default()
+        };
+        let mut buffer = bytes::BytesMut::new();
+        response
+            .encode(&mut buffer, 0)
+            .expect("encode API versions");
+        buffer.to_vec()
+    }
+
+    /// The broker answers for one coordinator task case. `None` leaves the
+    /// request without a response.
+    #[derive(Clone, Copy)]
+    struct GroupAnswers {
+        heartbeat: i16,
+        join_group: Option<i16>,
+        sync_group: Option<i16>,
+    }
+
+    /// What the coordinator task did after the heartbeat answer.
+    #[derive(Debug, PartialEq, Eq)]
+    struct TaskObservation {
+        task_exited: bool,
+        shutdown_cancelled: bool,
+        poll_error: Option<String>,
+        assigned: Vec<(String, i32)>,
+        generation: i32,
+        commit_member_id: String,
+        group_requests: BTreeSet<&'static str>,
+    }
+
+    fn group_request_name(api_key: i16) -> Option<&'static str> {
+        match api_key {
+            find_coordinator_request::API_KEY => Some("FindCoordinator"),
+            heartbeat_request::API_KEY => Some("Heartbeat"),
+            join_group_request::API_KEY => Some("JoinGroup"),
+            sync_group_request::API_KEY => Some("SyncGroup"),
+            leave_group_request::API_KEY => Some("LeaveGroup"),
+            _ => None,
+        }
+    }
+
+    /// Start a mock coordinator that answers with `answers`, run the
+    /// coordinator task of a static member that owns `orders-0` against it,
+    /// and return what the task did once the observation equals `expected`
+    /// or two seconds elapse.
+    async fn run_coordinator_task(
+        answers: GroupAnswers,
+        expected: &TaskObservation,
+    ) -> TaskObservation {
+        let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let port_in_mock = Arc::clone(&port);
+        let group_requests = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+        let group_requests_in_mock = Arc::clone(&group_requests);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+            if let Some(name) = group_request_name(api_key) {
+                group_requests_in_mock
+                    .lock()
+                    .expect("requests lock")
+                    .insert(name);
+            }
+            let port = i32::from(port_in_mock.load(Ordering::SeqCst));
+            match api_key {
+                api_versions_request::API_KEY => Some(api_versions_for_coordinator_task()),
+                metadata_request::API_KEY => Some(group_response(
+                    &MetadataResponse {
+                        brokers: vec![MetadataResponseBroker {
+                            node_id: 0,
+                            host: "127.0.0.1".into(),
+                            port,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    version,
+                    metadata_request::FLEXIBLE_MIN,
+                )),
+                find_coordinator_request::API_KEY => Some(group_response(
+                    &FindCoordinatorResponse {
+                        node_id: 0,
+                        host: "127.0.0.1".into(),
+                        port,
+                        ..Default::default()
+                    },
+                    version,
+                    find_coordinator_request::FLEXIBLE_MIN,
+                )),
+                heartbeat_request::API_KEY => Some(group_response(
+                    &HeartbeatResponse {
+                        error_code: answers.heartbeat,
+                        ..Default::default()
+                    },
+                    version,
+                    heartbeat_request::FLEXIBLE_MIN,
+                )),
+                join_group_request::API_KEY => answers.join_group.map(|error_code| {
+                    group_response(
+                        &JoinGroupResponse {
+                            error_code,
+                            generation_id: 2,
+                            protocol_name: Some("range".into()),
+                            leader: "member-b".into(),
+                            member_id: "member-a".into(),
+                            ..Default::default()
+                        },
+                        version,
+                        join_group_request::FLEXIBLE_MIN,
+                    )
+                }),
+                sync_group_request::API_KEY => answers.sync_group.map(|error_code| {
+                    group_response(
+                        &SyncGroupResponse {
+                            error_code,
+                            ..Default::default()
+                        },
+                        version,
+                        sync_group_request::FLEXIBLE_MIN,
+                    )
+                }),
+                _ => None,
+            }
+        })
+        .await;
+        port.store(mock.addr.port(), Ordering::SeqCst);
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("client");
+        let orders_0 = (ORDERS.to_string(), 0);
+        let state = CoordinatorState {
+            client,
+            group_id: "group-a".into(),
+            coordinator_id: Arc::new(AtomicI32::new(0)),
+            member_id: "member-a".into(),
+            commit_identity: Arc::new(Mutex::new(CommitIdentity {
+                generation: 1,
+                member_id: "member-a".into(),
+                ownership_ids: HashMap::from([(orders_0.clone(), 1)]),
+            })),
+            group_instance_id: Some("instance-a".into()),
+            generation_id: 1,
+            current_generation: Arc::new(AtomicI32::new(1)),
+            assignor: Assignor::Range,
+            subscribed_topics: vec![ORDERS.into()],
+            assigned: Arc::new(Mutex::new(vec![orders_0.clone()])),
+            assignment_changed: Arc::new(Notify::new()),
+            next_ownership_id: 2,
+            next_offsets: Arc::new(Mutex::new(HashMap::from([(orders_0, 5)]))),
+            end_offsets: Arc::new(Mutex::new(HashMap::new())),
+            positions: Arc::new(Mutex::new(HashMap::new())),
+            topic_ids: Arc::new(Mutex::new(HashMap::new())),
+            session_timeout: secs(45),
+            rebalance_timeout: minutes(1),
+            heartbeat_interval: millis(20),
+            subscription_metadata_refresh_interval: minutes(10),
+            leave_group_timeout: millis(200),
+            auto_offset_reset: AutoOffsetReset::Latest,
+            client_rack: None,
+            initial_subscribed_counts: HashMap::new(),
+            retry_policy: CoordinatorRetryPolicy {
+                timeout: Duration::from_secs(1),
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            },
+            poll_error: PollErrorSlot::default(),
+        };
+        let poll_error = Arc::clone(&state.poll_error);
+        let assigned = Arc::clone(&state.assigned);
+        let generation = Arc::clone(&state.current_generation);
+        let commit_identity = Arc::clone(&state.commit_identity);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run(state, shutdown.clone()));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let observation = loop {
+            let poll_error = poll_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(ToString::to_string);
+            let observation = TaskObservation {
+                task_exited: task.is_finished(),
+                shutdown_cancelled: shutdown.is_cancelled(),
+                poll_error,
+                assigned: assigned.lock().await.clone(),
+                generation: generation.load(Ordering::SeqCst),
+                commit_member_id: commit_identity.lock().await.member_id.clone(),
+                group_requests: group_requests.lock().expect("requests lock").clone(),
+            };
+            if observation == *expected || tokio::time::Instant::now() >= deadline {
+                break observation;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("coordinator task stops on shutdown")
+            .expect("coordinator task does not panic");
+        mock.stop();
+        observation
+    }
+
+    /// A heartbeat, `JoinGroup` or `SyncGroup` answer of
+    /// `FENCED_INSTANCE_ID (82)` stops the coordinator task, clears the
+    /// assignment and the member, and leaves the fenced error for the next
+    /// `poll()`. The task sends no `LeaveGroup`. Kafka's
+    /// `AbstractCoordinator.HeartbeatResponseHandler` resets the member and
+    /// raises `FencedInstanceIdException`, which the heartbeat thread keeps as
+    /// its failure cause. Other heartbeat answers keep the assignment.
+    #[tokio::test]
+    async fn coordinator_task_stops_a_fenced_static_member() {
+        let fenced = "fenced group.instance.id instance-a: another consumer with the same group.instance.id joined the group";
+        let owned = vec![(ORDERS.to_string(), 0)];
+        let requests = |names: &[&'static str]| names.iter().copied().collect::<BTreeSet<_>>();
+        for (name, answers, expected) in [
+            (
+                "success",
+                GroupAnswers {
+                    heartbeat: 0,
+                    join_group: None,
+                    sync_group: None,
+                },
+                TaskObservation {
+                    task_exited: false,
+                    shutdown_cancelled: false,
+                    poll_error: None,
+                    assigned: owned.clone(),
+                    generation: 1,
+                    commit_member_id: "member-a".into(),
+                    group_requests: requests(&["Heartbeat"]),
+                },
+            ),
+            (
+                "heartbeat fenced instance id",
+                GroupAnswers {
+                    heartbeat: 82,
+                    join_group: None,
+                    sync_group: None,
+                },
+                TaskObservation {
+                    task_exited: true,
+                    shutdown_cancelled: true,
+                    poll_error: Some(fenced.into()),
+                    assigned: Vec::new(),
+                    generation: -1,
+                    commit_member_id: String::new(),
+                    group_requests: requests(&["Heartbeat"]),
+                },
+            ),
+            (
+                "rebalance in progress",
+                GroupAnswers {
+                    heartbeat: 27,
+                    join_group: None,
+                    sync_group: None,
+                },
+                TaskObservation {
+                    task_exited: false,
+                    shutdown_cancelled: false,
+                    poll_error: None,
+                    assigned: owned.clone(),
+                    generation: 1,
+                    commit_member_id: "member-a".into(),
+                    group_requests: requests(&["Heartbeat", "JoinGroup"]),
+                },
+            ),
+            (
+                "coordinator not available",
+                GroupAnswers {
+                    heartbeat: 15,
+                    join_group: None,
+                    sync_group: None,
+                },
+                TaskObservation {
+                    task_exited: false,
+                    shutdown_cancelled: false,
+                    poll_error: None,
+                    assigned: owned.clone(),
+                    generation: 1,
+                    commit_member_id: "member-a".into(),
+                    group_requests: requests(&["FindCoordinator", "Heartbeat"]),
+                },
+            ),
+            (
+                "join group fenced instance id",
+                GroupAnswers {
+                    heartbeat: 27,
+                    join_group: Some(82),
+                    sync_group: None,
+                },
+                TaskObservation {
+                    task_exited: true,
+                    shutdown_cancelled: true,
+                    poll_error: Some(fenced.into()),
+                    assigned: Vec::new(),
+                    generation: -1,
+                    commit_member_id: String::new(),
+                    group_requests: requests(&["Heartbeat", "JoinGroup"]),
+                },
+            ),
+            (
+                "sync group fenced instance id",
+                GroupAnswers {
+                    heartbeat: 27,
+                    join_group: Some(0),
+                    sync_group: Some(82),
+                },
+                TaskObservation {
+                    task_exited: true,
+                    shutdown_cancelled: true,
+                    poll_error: Some(fenced.into()),
+                    assigned: Vec::new(),
+                    generation: -1,
+                    commit_member_id: String::new(),
+                    group_requests: requests(&["Heartbeat", "JoinGroup", "SyncGroup"]),
+                },
+            ),
+        ] {
+            let observation = run_coordinator_task(answers, &expected).await;
+            check!(observation == expected, "case {name}");
         }
     }
 
