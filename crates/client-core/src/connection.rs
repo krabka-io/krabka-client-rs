@@ -879,13 +879,14 @@ impl Connection {
             let mut next = reauth.next.write().await;
             if next.is_some_and(|due| tokio::time::Instant::now() >= due) {
                 let mut channel = crate::reauth::ConnectionChannel { connection: self };
-                match reauth
-                    .authenticate(
-                        &mut channel,
-                        &self.inner.options.client_id,
-                        self.inner.options.frame_max,
-                    )
-                    .await
+                // The exchange nests the whole SASL state machine. Boxing it
+                // keeps every send future small.
+                match Box::pin(reauth.authenticate(
+                    &mut channel,
+                    &self.inner.options.client_id,
+                    self.inner.options.frame_max,
+                ))
+                .await
                 {
                     Ok(due) => *next = due,
                     Err(error) => {
