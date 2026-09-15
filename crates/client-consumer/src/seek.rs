@@ -11,6 +11,9 @@
 //! overwrite the seek. The seek holds the `assigned` lock while it writes the
 //! position, so a rebalance cannot remove the partition during the write.
 //!
+//! `seek_to_beginning` and `seek_to_end` plant a reset sentinel in
+//! `next_offsets`. The next position update resolves it with `ListOffsets`.
+//!
 //! Records that `poll` fetched from the earlier position stay in the fetch
 //! buffer, but `poll` drops them because their position is not the current
 //! one. Kafka's `FetchCollector` does the same check.
@@ -80,6 +83,79 @@ impl Consumer {
     ) -> Result<(), ConsumerError> {
         self.seek_to_position(topic.into(), partition, offset, Some(leader_epoch))
             .await
+    }
+
+    /// Reset the position of `partitions` to the log start. Kafka's
+    /// `KafkaConsumer.seekToBeginning`.
+    ///
+    /// An empty slice resets every assigned partition. The next `poll` or
+    /// [`position`](Self::position) sends `ListOffsets` with timestamp `-2`
+    /// and fetches from the offset that it returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::NoCurrentAssignment`] if the consumer does not
+    /// own a partition. The call then resets no partition.
+    pub async fn seek_to_beginning(
+        &self,
+        partitions: &[(String, i32)],
+    ) -> Result<(), ConsumerError> {
+        self.request_offset_reset(partitions, crate::poll::BEGINNING_SENTINEL)
+            .await
+    }
+
+    /// Reset the position of `partitions` to the log end. Kafka's
+    /// `KafkaConsumer.seekToEnd`.
+    ///
+    /// An empty slice resets every assigned partition. The next `poll` or
+    /// [`position`](Self::position) sends `ListOffsets` with timestamp `-1`.
+    /// With `read_committed`, that is the last stable offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::NoCurrentAssignment`] if the consumer does not
+    /// own a partition. The call then resets no partition.
+    pub async fn seek_to_end(&self, partitions: &[(String, i32)]) -> Result<(), ConsumerError> {
+        self.request_offset_reset(partitions, crate::poll::END_SENTINEL)
+            .await
+    }
+
+    /// Kafka's `SubscriptionState.requestOffsetReset`: plant `sentinel` for each
+    /// partition, so that the next position update resolves it.
+    async fn request_offset_reset(
+        &self,
+        partitions: &[(String, i32)],
+        sentinel: i64,
+    ) -> Result<(), ConsumerError> {
+        let assigned = self.assigned.lock().await;
+        let targets = if partitions.is_empty() {
+            assigned.clone()
+        } else {
+            if let Some((topic, partition)) = partitions
+                .iter()
+                .find(|partition| !assigned.contains(*partition))
+            {
+                return Err(ConsumerError::NoCurrentAssignment {
+                    topic: topic.clone(),
+                    partition: *partition,
+                });
+            }
+            partitions.to_vec()
+        };
+        let mut offsets = self.next_offsets.lock().await;
+        let mut positions = self.positions.lock().await;
+        for key in &targets {
+            offsets.insert(key.clone(), sentinel);
+            seek_position(positions.entry(key.clone()).or_default(), None);
+        }
+        drop(positions);
+        drop(offsets);
+        drop(assigned);
+        let mut ends = self.end_offsets.lock().await;
+        for key in &targets {
+            ends.remove(key);
+        }
+        Ok(())
     }
 
     async fn seek_to_position(

@@ -86,6 +86,7 @@ mod group_metadata;
 #[cfg(test)]
 mod lock_order_model;
 mod offset_wire;
+mod partition_state;
 mod poll;
 mod position;
 mod rebalance_listener;
@@ -99,10 +100,11 @@ pub use commit::{OffsetAndMetadata, OffsetCommitCallback};
 pub use consumer::{
     Consumer, ConsumerFetchMaxBytes, ConsumerFetchPartitionMaxBytes, ConsumerLeaveGroupTimeout,
     ConsumerRecord, ConsumerRetryPolicy, ConsumerSubscriptionMetadataRefreshInterval,
-    DEFAULT_CONSUMER_FETCH_MAX_WAIT, DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT,
-    DEFAULT_CONSUMER_MAX_POLL_INTERVAL, DEFAULT_CONSUMER_MAX_POLL_RECORDS,
-    DEFAULT_CONSUMER_METADATA_MAX_AGE, DEFAULT_CONSUMER_SUBSCRIPTION_METADATA_REFRESH_INTERVAL,
-    GroupMembershipOperation, Header, TimestampType,
+    DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT, DEFAULT_CONSUMER_FETCH_MAX_WAIT,
+    DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT, DEFAULT_CONSUMER_MAX_POLL_INTERVAL,
+    DEFAULT_CONSUMER_MAX_POLL_RECORDS, DEFAULT_CONSUMER_METADATA_MAX_AGE,
+    DEFAULT_CONSUMER_SUBSCRIPTION_METADATA_REFRESH_INTERVAL, GroupMembershipOperation, Header,
+    TimestampType,
 };
 pub use error::ConsumerError;
 pub use group_metadata::ConsumerGroupMetadata;

@@ -104,6 +104,11 @@ pub struct Consumer {
     pub(crate) client_rack: Option<String>,
     /// Kafka's `metadata.max.age.ms`. A preferred read replica expires after it.
     pub(crate) metadata_max_age: Time,
+    /// Kafka's `default.api.timeout.ms`, the timeout of `position` and
+    /// `committed`.
+    pub(crate) default_api_timeout: Time,
+    /// The partitions that the application paused.
+    pub(crate) paused: crate::partition_state::PausedPartitions,
     /// What `poll` does on a missing offset or a detected truncation. `None`
     /// surfaces `ConsumerError::LogTruncation`. Any other value makes `poll`
     /// apply the safe offset, per KIP-320.
@@ -188,6 +193,7 @@ struct StartConfig {
     fetch_partition_max: ByteSize,
     fetch_max_wait: Time,
     metadata_max_age: Time,
+    default_api_timeout: Time,
     request_timeout: Time,
     dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity,
     frame_max: krabka_client_core::ClientFrameMax,
@@ -744,6 +750,9 @@ pub(crate) fn reset_starting_offset(auto_offset_reset: AutoOffsetReset) -> i64 {
     }
 }
 
+/// Kafka's default `default.api.timeout.ms`.
+pub const DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT: Time = secs(60);
+
 /// Kafka's default `max.poll.interval.ms`.
 pub const DEFAULT_CONSUMER_MAX_POLL_INTERVAL: Time = minutes(5);
 
@@ -923,6 +932,10 @@ impl Consumer {
         fetch_partition_max: ByteSize,
         #[builder(default = DEFAULT_CONSUMER_FETCH_MAX_WAIT)] fetch_max_wait: Time,
         #[builder(default = DEFAULT_CONSUMER_METADATA_MAX_AGE)] metadata_max_age: Time,
+        /// Kafka's `default.api.timeout.ms`: the timeout of
+        /// [`position`](Self::position) and [`committed`](Self::committed).
+        #[builder(default = DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT)]
+        default_api_timeout: Time,
         #[builder(default = secs(30))] request_timeout: Time,
         #[builder(default = krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
@@ -1006,6 +1019,11 @@ impl Consumer {
                 "consumer metadata max age must not be negative".to_owned(),
             ));
         }
+        if default_api_timeout.millis_i64() < 0 || !default_api_timeout.secs_f64().is_finite() {
+            return Err(ConsumerError::InvalidConfig(
+                "consumer default api timeout must not be negative".to_owned(),
+            ));
+        }
         let rebalance_protocol = crate::assignor::rebalance_protocol_of(&assignors)
             .map_err(ConsumerError::InvalidConfig)?;
 
@@ -1032,6 +1050,7 @@ impl Consumer {
             fetch_partition_max,
             fetch_max_wait,
             metadata_max_age,
+            default_api_timeout,
             request_timeout,
             dispatch_queue_capacity,
             frame_max,
@@ -1479,6 +1498,7 @@ async fn spawn_consumer(
         fetch_partition_max,
         fetch_max_wait,
         metadata_max_age,
+        default_api_timeout,
         request_timeout,
         dispatch_queue_capacity,
         frame_max,
@@ -1664,6 +1684,8 @@ async fn spawn_consumer(
         fetches: crate::poll::Fetches::default(),
         client_rack,
         metadata_max_age,
+        default_api_timeout,
+        paused: std::sync::Mutex::default(),
         auto_offset_reset,
         poll_error,
         auto_commit,
@@ -2599,6 +2621,8 @@ mod security_arg_tests {
             fetches: crate::poll::Fetches::default(),
             client_rack: None,
             metadata_max_age: DEFAULT_CONSUMER_METADATA_MAX_AGE,
+            default_api_timeout: DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
+            paused: std::sync::Mutex::default(),
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
@@ -3301,6 +3325,7 @@ mod auto_commit_tests {
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
             fetch_max_wait: DEFAULT_CONSUMER_FETCH_MAX_WAIT,
             metadata_max_age: DEFAULT_CONSUMER_METADATA_MAX_AGE,
+            default_api_timeout: DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
             request_timeout: secs(30),
             dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::new(
                 krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY,

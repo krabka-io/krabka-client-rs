@@ -186,6 +186,8 @@ fn consumer(client: Client) -> Consumer {
         fetches: crate::poll::Fetches::default(),
         client_rack: None,
         metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
+        default_api_timeout: crate::consumer::DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
+        paused: std::sync::Mutex::default(),
         auto_offset_reset: AutoOffsetReset::Latest,
         poll_error: PollErrorSlot::default(),
         auto_commit: None,

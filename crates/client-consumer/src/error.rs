@@ -35,6 +35,11 @@ pub enum ConsumerError {
     #[error("illegal state: {0}")]
     IllegalState(String),
 
+    /// A call did not complete before its timeout. Kafka's
+    /// `TimeoutException`.
+    #[error("timeout: {0}")]
+    Timeout(String),
+
     #[error("invalid seek offset {0}: must be non-negative")]
     InvalidOffset(i64),
 
