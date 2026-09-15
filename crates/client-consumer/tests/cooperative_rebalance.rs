@@ -8,8 +8,8 @@
 //!   with no partition held by two members and no member left empty.
 //! - A rebalance stays transparent to `poll()`. The method never reports a
 //!   rebalance-specific error, the member that sheds partitions loses no
-//!   record, and the member that gains them replays none, because the
-//!   revoke-time commit moved the committed position first.
+//!   record, and the member that gains them replays none, because the auto
+//!   commit before `JoinGroup` moved the committed position first.
 //!
 //! Every case needs the Docker container from [`support`], so every case
 //! carries `#[ignore]`.
@@ -96,12 +96,18 @@ async fn cooperative_transparent_to_poll() {
     assert2::assert!(first_wave.len() == 4);
 
     // Second wave. m1 still owns all four partitions and reads the whole wave
-    // before any rebalance. This is the case the revoke-time commit protects:
-    // m1 moves past `b0..b3`, so the committed position must stop a replay
-    // when a partition later moves to m2.
+    // before any rebalance. This is the case the auto commit before `JoinGroup`
+    // protects: m1 moves past `b0..b3`, so the committed position must stop a
+    // replay when a partition later moves to m2.
     produce_wave(&producer, &topic, 'b').await;
     let m1_second_wave = poll_until_values(&mut m1, 4, |v| v.starts_with('b')).await;
     assert2::assert!(m1_second_wave.len() == 4);
+    // As in Kafka, the records of a poll count as processed when the
+    // application polls again. The pre-rebalance commit therefore includes the
+    // second wave only after this poll.
+    m1.poll(millis(200))
+        .await
+        .expect("poll after the second wave");
 
     // m2 starts and triggers a cooperative rebalance that takes two partitions
     // from m1. m1 keeps polling so its coordinator can complete the rejoin.
@@ -321,16 +327,14 @@ async fn wait_for_settled_split(
 /// makes the rebalance transparent to `poll()`, so a rebalance-specific error
 /// from `poll()` fails the case at once. Other errors are transient and the
 /// loop ignores them. Once m2 owns its partitions the leader has completed
-/// phase 2, which runs after the revoke-time commit of m1.
+/// phase 2, which runs after the pre-rebalance auto commit of m1.
 async fn wait_for_even_split(m1: &mut Consumer, m2: &Consumer, each: usize) {
     tokio::time::timeout(SETTLE_TIMEOUT, async {
         loop {
-            match m1.poll(millis(200)).await {
-                Ok(_) => {}
-                Err(ConsumerError::CommitInvalid | ConsumerError::RebalanceFailed(_)) => {
-                    panic!("m1.poll reported a rebalance-specific error, which KIP-429 forbids")
-                }
-                Err(_) => {}
+            if let Err(ConsumerError::CommitInvalid | ConsumerError::RebalanceFailed(_)) =
+                m1.poll(millis(200)).await
+            {
+                panic!("m1.poll reported a rebalance-specific error, which KIP-429 forbids")
             }
             if m1.assignment().await.len() == each && m2.assignment().await.len() == each {
                 return;

@@ -35,7 +35,6 @@ use krabka_protocol::{
         join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol},
         join_group_response::JoinGroupResponse,
         leave_group_request::{LeaveGroupRequest, MemberIdentity},
-        offset_commit_request::OffsetCommitRequest,
         offset_fetch_response::OffsetFetchResponse,
         sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment},
         sync_group_response::SyncGroupResponse,
@@ -46,7 +45,7 @@ use krabka_units::{
     Time,
     convert::{StdDurationExt as _, TimeExt as _},
 };
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -55,11 +54,14 @@ use crate::{
         AutoOffsetReset, decode_assignment, decode_subscription, encode_assignment,
         encode_subscription,
     },
+    commit::{
+        AutoCommitOutcome, auto_commit_outcome, build_commit_request, names_moved_coordinator,
+    },
     consumer::{CommitIdentity, ConsumerRetryPolicy, reset_starting_offset, starting_offset},
     error::ConsumerError,
     offset_wire::{
-        OffsetFetchAction, TopicNameOffsetCommit, TopicNameOffsetFetch, build_commit_topics,
-        build_offset_fetch, classify_offset_fetch, parse_offset_fetch,
+        OffsetFetchAction, TopicNameOffsetFetch, build_commit_topics, build_offset_fetch,
+        classify_offset_fetch, parse_offset_fetch,
     },
 };
 
@@ -69,8 +71,6 @@ use crate::{
 pub(crate) const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
 pub(crate) const COORDINATOR_NOT_AVAILABLE: i16 = 15;
 pub(crate) const NOT_COORDINATOR: i16 = 16;
-
-const UNKNOWN_EPOCH: i32 = -1;
 
 /// `FENCED_INSTANCE_ID`: another consumer joined the group with the same
 /// `group.instance.id` (KIP-345).
@@ -410,6 +410,17 @@ pub(crate) struct CoordinatorState {
     /// shared with the parent `Consumer`. Kafka's consumer raises such an
     /// `OffsetFetch` error from `poll()`.
     pub poll_error: PollErrorSlot,
+    /// Kafka's `enable.auto.commit` state, shared with the parent `Consumer`.
+    /// `None` when auto commit is off.
+    pub auto_commit: Option<crate::commit::AutoCommit>,
+    /// The commit lock of the parent `Consumer`. The commit before a
+    /// `JoinGroup` takes it, so the commits of the consumer reach the
+    /// coordinator in order.
+    pub commit_serialization: Arc<Mutex<()>>,
+    /// `true` after the pre-join auto commit ran and before the join completes.
+    /// Kafka's `AbstractCoordinator.needsJoinPrepare` is the inverse flag: a
+    /// retry of a failed `JoinGroup` does not commit again.
+    pub join_prepared: bool,
 }
 
 /// A fatal coordinator error that waits for the next `poll()`.
@@ -711,14 +722,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     HeartbeatOutcome::Ok | HeartbeatOutcome::Transient => {}
                     HeartbeatOutcome::NeedRejoin => needs_rejoin = true,
                     HeartbeatOutcome::RejoinFromScratch => {
-                        state.member_id.clear();
-                        let mut identity = state.commit_identity.lock().await;
-                        identity.member_id.clear();
-                        identity.ownership_ids.clear();
-                        identity.generation = -1;
-                        drop(identity);
-                        set_generation(&mut state, -1);
-                        state.assignment_changed.notify_waiters();
+                        forget_member(&mut state).await;
                         needs_rejoin = true;
                     }
                     HeartbeatOutcome::Fenced => {
@@ -739,6 +743,19 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
     // its session expires, stalling the rest of the group's rebalance.
     // Best-effort and bounded: a hung broker must not block `close()`.
     leave_group(&state).await;
+}
+
+/// Forget the member id, the generation and the partition ownership after
+/// `UNKNOWN_MEMBER_ID`, so the next join starts from scratch.
+async fn forget_member(state: &mut CoordinatorState) {
+    state.member_id.clear();
+    let mut identity = state.commit_identity.lock().await;
+    identity.member_id.clear();
+    identity.ownership_ids.clear();
+    identity.generation = -1;
+    drop(identity);
+    set_generation(state, -1);
+    state.assignment_changed.notify_waiters();
 }
 
 /// Stop the member after the coordinator fenced its `group.instance.id`.
@@ -835,16 +852,41 @@ async fn leave_group(state: &CoordinatorState) {
     )
 )]
 pub(crate) async fn heartbeat_once(state: &CoordinatorState) -> HeartbeatOutcome {
-    let result = state
-        .client
-        .broker(state.coordinator_id.load(Ordering::Relaxed))
-        .send(build_heartbeat_request(
-            state.group_id.clone(),
-            state.generation_id,
-            state.member_id.clone(),
-            state.group_instance_id.clone(),
-        ))
-        .await;
+    let result = send_heartbeat(state).await;
+    heartbeat_result_outcome(state, result).await
+}
+
+/// The `Heartbeat` RPC of the current member. The future owns its inputs, so
+/// a task can run it to its end.
+fn send_heartbeat(
+    state: &CoordinatorState,
+) -> impl std::future::Future<
+    Output = Result<
+        krabka_protocol::owned::heartbeat_response::HeartbeatResponse,
+        krabka_client_core::ClientError,
+    >,
+> + Send
++ 'static {
+    let client = state.client.clone();
+    let coordinator = state.coordinator_id.load(Ordering::Relaxed);
+    let request = build_heartbeat_request(
+        state.group_id.clone(),
+        state.generation_id,
+        state.member_id.clone(),
+        state.group_instance_id.clone(),
+    );
+    async move { client.broker(coordinator).send(request).await }
+}
+
+/// Classify a `Heartbeat` result, and find the coordinator again after a
+/// coordinator or transport error.
+async fn heartbeat_result_outcome(
+    state: &CoordinatorState,
+    result: Result<
+        krabka_protocol::owned::heartbeat_response::HeartbeatResponse,
+        krabka_client_core::ClientError,
+    >,
+) -> HeartbeatOutcome {
     match result {
         Ok(r) => {
             let outcome = heartbeat_outcome(r.error_code);
@@ -980,15 +1022,10 @@ async fn rejoin(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, Co
                     .cloned()
                     .collect();
                 publish_assignment(state, &kept, true, new_generation).await;
-                // Adopt the generation from round 1 *before* committing: the
-                // broker advanced the group epoch when we rejoined above, so
-                // an OffsetCommit carrying the pre-rebalance generation is
-                // rejected with ILLEGAL_GENERATION. Commit the revoked
-                // partitions' positions under the current generation so the
-                // member that picks them up in phase 2 primes from the offset
-                // we'd consumed to, rather than re-delivering records we
-                // already saw (KIP-429 onPartitionsRevoked semantics).
-                commit_revoked(state, &revoked).await;
+                // With auto commit on, `commit_before_join` committed the
+                // positions of the revoked partitions before round 1. With
+                // auto commit off, the application commits. The consumer does
+                // not commit a position that the application did not ask for.
                 {
                     let mut off = state.next_offsets.lock().await;
                     let mut pos = state.positions.lock().await;
@@ -1027,90 +1064,6 @@ async fn rejoin(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, Co
         }
     };
     Ok(final_counts)
-}
-
-/// Best-effort `OffsetCommit` for the partitions that a cooperative rebalance
-/// revokes. It uses the current, pre-rebalance generation.
-///
-/// This function logs and swallows failures. A revoke-time commit that races
-/// the generation bump can return `ILLEGAL_GENERATION`, and surfacing that into
-/// `poll()` would break the KIP-429 transparency guarantee. In the worst case
-/// the new owner re-delivers a few records, which is at-least-once.
-#[cfg_attr(test, mutants::skip)] // cargo-mutants: best-effort revoke-time commit I/O, exercised by integration tests
-#[tracing::instrument(
-    name = "consumer.commit_revoked",
-    level = "debug",
-    skip_all,
-    fields(
-        group_id = %state.group_id,
-        generation = state.generation_id,
-        revoked = revoked.len(),
-    )
-)]
-async fn commit_revoked(state: &CoordinatorState, revoked: &[(String, i32)]) {
-    let revoked_set: HashSet<&(String, i32)> = revoked.iter().collect();
-    let offsets: HashMap<(String, i32), (i64, i32)> = {
-        let off = state.next_offsets.lock().await;
-        let pos = state.positions.lock().await;
-        off.iter()
-            // Only commit partitions where we actually consumed something. A
-            // next_offset still at its reset baseline (0 = Earliest, i64::MAX =
-            // Latest) means no records were polled, so there is no progress to
-            // preserve — committing it just adds a blocking round-trip that
-            // widens the mid-rebalance generation-race window.
-            .filter(|(k, v)| should_commit_revoked_offset(revoked_set.contains(k), **v))
-            .map(|(k, v)| {
-                // Unwrap the position's leader epoch to raw wire `int32` for the
-                // revoke-time OffsetCommit `committed_leader_epoch` field.
-                let epoch = pos.get(k).map_or(UNKNOWN_EPOCH, |p| p.offset_epoch.get());
-                (k.clone(), (*v, epoch))
-            })
-            .collect()
-    };
-    if offsets.is_empty() {
-        return;
-    }
-    let topics = build_commit_topics(offsets);
-    let res = state
-        .client
-        .broker(state.coordinator_id.load(Ordering::Relaxed))
-        .send(build_revoked_commit_request(
-            state.group_id.clone(),
-            state.generation_id,
-            state.member_id.clone(),
-            state.group_instance_id.clone(),
-            topics,
-        ))
-        .await;
-    match res {
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "revoke-time offset commit failed; partitions may re-deliver");
-        }
-    }
-}
-
-fn should_commit_revoked_offset(is_revoked: bool, next_offset: i64) -> bool {
-    is_revoked && next_offset > 0 && next_offset != i64::MAX
-}
-
-/// Build the revoke-time `OffsetCommit` request. The request names each
-/// topic, so the version is v9 or lower. See [`TopicNameOffsetCommit`].
-fn build_revoked_commit_request(
-    group_id: String,
-    generation_id: i32,
-    member_id: String,
-    group_instance_id: Option<String>,
-    topics: Vec<krabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic>,
-) -> TopicNameOffsetCommit {
-    TopicNameOffsetCommit(OffsetCommitRequest {
-        group_id,
-        generation_id_or_member_epoch: generation_id,
-        member_id,
-        group_instance_id,
-        topics,
-        ..Default::default()
-    })
 }
 
 fn build_join_group_request(
@@ -1166,6 +1119,219 @@ fn build_sync_group_request(
         protocol_name: Some(chosen_protocol),
         assignments,
         ..Default::default()
+    }
+}
+
+/// The auto commit before a `JoinGroup`: Kafka's
+/// `ConsumerCoordinator.onJoinPrepare` with `enable.auto.commit` on.
+///
+/// Kafka commits the consumed positions of every owned partition before each
+/// `JoinGroup`, for the eager and the cooperative protocol. It retries a
+/// retriable failure until the rebalance timeout expires. After a non-retriable
+/// failure or at the timeout, it writes an error to the log and joins the
+/// group. This function commits the positions of the latest `poll`; see
+/// [`crate::commit::AutoCommit`]. It runs once per join: a retry of a failed
+/// `JoinGroup` does not commit again.
+///
+/// Kafka's heartbeat thread keeps the session alive while `onJoinPrepare`
+/// waits. This function sends a heartbeat each heartbeat interval while the
+/// commit runs. When a heartbeat says that the coordinator does not know the
+/// member, the function stops the commit, forgets the member and joins from
+/// scratch.
+///
+/// # Errors
+///
+/// Returns `FencedInstanceId` when a heartbeat says that another consumer
+/// joined with the same `group.instance.id`.
+#[tracing::instrument(
+    name = "consumer.commit_before_join",
+    level = "debug",
+    skip_all,
+    fields(group_id = %state.group_id, generation = state.generation_id)
+)]
+async fn commit_before_join(state: &mut CoordinatorState) -> Result<(), ConsumerError> {
+    let Some(auto_commit) = state.auto_commit.clone() else {
+        return Ok(());
+    };
+    if state.join_prepared {
+        return Ok(());
+    }
+    state.join_prepared = true;
+    let heartbeat = {
+        let state = &*state;
+        let commit_done = CancellationToken::new();
+        let stop_commit = CancellationToken::new();
+        let commit = async {
+            tokio::select! {
+                () = commit_consumed_before_join(state, &auto_commit) => {}
+                () = stop_commit.cancelled() => {}
+            }
+            commit_done.cancel();
+        };
+        let heartbeats = async {
+            let outcome = heartbeat_during_join_prepare(state, &commit_done).await;
+            stop_commit.cancel();
+            outcome
+        };
+        tokio::join!(commit, heartbeats).1
+    };
+    match heartbeat {
+        Some(HeartbeatOutcome::Fenced) => Err(ConsumerError::FencedInstanceId(
+            state.group_instance_id.clone().unwrap_or_default(),
+        )),
+        Some(HeartbeatOutcome::RejoinFromScratch) => {
+            tracing::warn!(
+                "the coordinator does not know the member; joining the group from scratch"
+            );
+            forget_member(state).await;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Send a heartbeat each heartbeat interval until `commit_done` is cancelled,
+/// or until a heartbeat says that the member is fenced or unknown. Return that
+/// outcome.
+///
+/// The function returns as soon as `commit_done` is cancelled, also while a
+/// heartbeat is in flight, so the heartbeat does not delay the `JoinGroup`, as
+/// in Kafka, where the heartbeat thread and the `JoinGroup` do not wait for
+/// each other. A task runs the `Heartbeat` RPC, so the request runs to its end
+/// on the connection.
+async fn heartbeat_during_join_prepare(
+    state: &CoordinatorState,
+    commit_done: &CancellationToken,
+) -> Option<HeartbeatOutcome> {
+    let interval = state.heartbeat_interval.to_std();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            () = commit_done.cancelled() => return None,
+            _ = ticker.tick() => {}
+        }
+        let mut request = tokio::spawn(send_heartbeat(state));
+        let result = tokio::select! {
+            biased;
+            () = commit_done.cancelled() => return None,
+            result = &mut request => result,
+        };
+        let Ok(result) = result else {
+            // The heartbeat task panicked. The next tick sends a new heartbeat.
+            continue;
+        };
+        let outcome = tokio::select! {
+            biased;
+            () = commit_done.cancelled() => return None,
+            outcome = heartbeat_result_outcome(state, result) => outcome,
+        };
+        match outcome {
+            HeartbeatOutcome::Ok | HeartbeatOutcome::NeedRejoin | HeartbeatOutcome::Transient => {}
+            outcome @ (HeartbeatOutcome::RejoinFromScratch | HeartbeatOutcome::Fenced) => {
+                return Some(outcome);
+            }
+        }
+    }
+}
+
+/// Commit the positions of the latest `poll` before a `JoinGroup`.
+///
+/// The commit takes `commit_serialization` before it reads the positions, so
+/// it cannot reach the coordinator after a newer commit of the consumer. The
+/// rebalance timeout bounds the wait for that lock, each `OffsetCommit` and
+/// each coordinator lookup.
+async fn commit_consumed_before_join(
+    state: &CoordinatorState,
+    auto_commit: &crate::commit::AutoCommit,
+) {
+    let deadline = tokio::time::Instant::now() + state.rebalance_timeout.to_std();
+    let Some(_turn) = commit_turn(&state.commit_serialization, auto_commit, deadline).await else {
+        tracing::error!(
+            "auto commit before the rebalance timed out waiting for another commit; joining the group"
+        );
+        return;
+    };
+    loop {
+        let identity = state.commit_identity.lock().await.clone();
+        let offsets = auto_commit.polled_offsets(&identity.ownership_ids).await;
+        if offsets.is_empty() {
+            return;
+        }
+        let coordinator = state.coordinator_id.load(Ordering::Relaxed);
+        let broker = state.client.broker(coordinator);
+        let send = broker.send(build_commit_request(
+            state.group_id.clone(),
+            identity.generation,
+            identity.member_id,
+            state.group_instance_id.clone(),
+            build_commit_topics(offsets),
+        ));
+        let Ok(result) = tokio::time::timeout_at(deadline, send).await else {
+            tracing::error!("auto commit before the rebalance timed out; joining the group");
+            return;
+        };
+        let result = result.map_err(ConsumerError::from);
+        match auto_commit_outcome(&result) {
+            AutoCommitOutcome::Committed => return,
+            AutoCommitOutcome::Failed => {
+                tracing::error!(
+                    ?result,
+                    "auto commit before the rebalance failed; joining the group"
+                );
+                return;
+            }
+            AutoCommitOutcome::Retriable => {
+                let moved = match &result {
+                    Ok(response) => names_moved_coordinator(response),
+                    Err(_) => true,
+                };
+                if moved {
+                    state.client.evict_broker(coordinator);
+                    if tokio::time::timeout_at(deadline, refind_after(state, "auto commit"))
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(
+                            ?result,
+                            "auto commit before the rebalance timed out; joining the group"
+                        );
+                        return;
+                    }
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    tracing::error!(
+                        ?result,
+                        "auto commit before the rebalance timed out; joining the group"
+                    );
+                    return;
+                }
+                tokio::time::sleep(state.retry_policy.initial_backoff.min(deadline - now)).await;
+            }
+        }
+    }
+}
+
+/// Wait for the turn of the commit before a `JoinGroup` in the commit order.
+///
+/// The function returns `Some(Some(guard))` when the commit holds
+/// `commit_serialization`. It returns `Some(None)` when the commit that holds
+/// the lock waits for this rebalance. That commit sends nothing before the
+/// rebalance publishes the next assignment, so the commit before the
+/// `JoinGroup` goes first. The function returns `None` at `deadline`.
+async fn commit_turn(
+    commit_serialization: &Arc<Mutex<()>>,
+    auto_commit: &crate::commit::AutoCommit,
+    deadline: tokio::time::Instant,
+) -> Option<Option<OwnedMutexGuard<()>>> {
+    let mut parked_commits = auto_commit.parked_commits();
+    tokio::select! {
+        biased;
+        guard = Arc::clone(commit_serialization).lock_owned() => Some(Some(guard)),
+        parked = parked_commits.wait_for(|parked| *parked) => parked.is_ok().then_some(None),
+        () = tokio::time::sleep_until(deadline) => None,
     }
 }
 
@@ -1325,6 +1491,7 @@ async fn join_and_sync(
     state: &mut CoordinatorState,
     owned: &[(String, i32)],
 ) -> Result<JoinOutcome, ConsumerError> {
+    commit_before_join(state).await?;
     let join_resp = perform_join(state, owned).await?;
     // The broker may have refreshed our member_id on this join too.
     if !join_resp.member_id.is_empty() {
@@ -1353,6 +1520,10 @@ async fn join_and_sync(
     let my_assignment =
         sync_assignment(state, generation_id, &chosen_protocol, leader.assignments).await?;
     tracing::Span::current().record("assigned_partitions", my_assignment.len());
+    state.join_prepared = false;
+    if let Some(auto_commit) = &state.auto_commit {
+        auto_commit.restart_interval().await;
+    }
     Ok(JoinOutcome {
         assignment: my_assignment,
         generation: generation_id,
@@ -2339,6 +2510,9 @@ mod retry_tests {
             initial_subscribed_counts: HashMap::new(),
             retry_policy: retry(Duration::from_secs(30)),
             poll_error: PollErrorSlot::default(),
+            auto_commit: None,
+            commit_serialization: Arc::new(Mutex::new(())),
+            join_prepared: false,
         };
 
         tokio::time::timeout(Duration::from_secs(1), leave_group(&state))
@@ -2476,41 +2650,6 @@ mod retry_tests {
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
             }
         );
-    }
-
-    #[test]
-    fn revoked_commit_helpers_preserve_filter_boundaries_and_request_fields() {
-        for (_name, is_revoked, next_offset, expected) in [
-            ("revoked positive", true, 1, true),
-            ("not revoked", false, 1, false),
-            ("zero offset", true, 0, false),
-            ("negative offset", true, -1, false),
-            ("latest sentinel", true, i64::MAX, false),
-        ] {
-            assert2::assert!(should_commit_revoked_offset(is_revoked, next_offset) == expected);
-        }
-
-        let topics = build_commit_topics(HashMap::from([(("topic-a".to_string(), 2), (42, 7))]));
-        let req = build_revoked_commit_request(
-            "group-a".into(),
-            3,
-            "member-a".into(),
-            Some("instance-a".into()),
-            topics.clone(),
-        );
-
-        assert2::assert!(
-            req == TopicNameOffsetCommit(OffsetCommitRequest {
-                group_id: "group-a".into(),
-                generation_id_or_member_epoch: 3,
-                member_id: "member-a".into(),
-                group_instance_id: Some("instance-a".into()),
-                retention_time_ms: -1,
-                topics,
-                unknown_tagged_fields: UnknownTaggedFields(vec![]),
-            })
-        );
-        assert2::assert!(UNKNOWN_EPOCH == -1);
     }
 
     #[test]
@@ -2856,6 +2995,9 @@ mod retry_tests {
                 max_backoff: Duration::from_millis(1),
             },
             poll_error: PollErrorSlot::default(),
+            auto_commit: None,
+            commit_serialization: Arc::new(Mutex::new(())),
+            join_prepared: false,
         };
         let poll_error = Arc::clone(&state.poll_error);
         let assigned = Arc::clone(&state.assigned);

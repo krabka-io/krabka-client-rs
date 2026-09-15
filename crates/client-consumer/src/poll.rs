@@ -463,6 +463,9 @@ impl Consumer {
         // the broker's real log start, and reading that is an RPC, so the loop
         // records them and the code below the guard resolves them.
         let mut out_of_range: Vec<((String, i32), i64)> = Vec::new();
+        // The fetch positions that this loop resets, for the auto commit
+        // before a `JoinGroup`.
+        let mut polled_resets: Vec<((String, i32), Option<i64>)> = Vec::new();
         let mut offsets = self.next_offsets.lock().await;
         for topic in responses.iter().flat_map(|resp| &resp.responses) {
             let topic_name = if topic.topic.is_empty() {
@@ -487,6 +490,7 @@ impl Consumer {
                         &key,
                         part.diverging_epoch.end_offset,
                     )?;
+                    polled_resets.push((key.clone(), Some(part.diverging_epoch.end_offset)));
                     continue;
                 }
                 // Error-first: inspect the partition error_code before decoding.
@@ -511,6 +515,7 @@ impl Consumer {
                         match self.auto_offset_reset {
                             AutoOffsetReset::Latest => {
                                 offsets.insert(key.clone(), LATEST_SENTINEL);
+                                polled_resets.push((key.clone(), None));
                             }
                             AutoOffsetReset::Earliest | AutoOffsetReset::None => {
                                 let fetch_offset = fetch_offset_or_unknown(&offsets, &key);
@@ -594,6 +599,9 @@ impl Consumer {
                 self.process_partition_records(&mut offsets, &key, &topic_name, part, &mut out)
                     .await?;
             }
+        }
+        if let Some(auto_commit) = &self.auto_commit {
+            auto_commit.reset_polled(polled_resets).await;
         }
         // Drop the offsets guard before any `.await`: refreshing metadata is an
         // RPC, and we must never hold a Mutex guard across an await point.
@@ -725,6 +733,9 @@ impl Consumer {
             return Err(error);
         }
         self.apply_pending_seeks().await;
+        // Kafka's `ConsumerCoordinator.poll` sends the interval auto commit
+        // before `updateFetchPositions`.
+        self.maybe_auto_commit_async().await;
         // Metadata comes first. A partition that has no position yet (a new
         // assignment without a committed offset) gets its leader id and
         // epoch here, so its first `ListOffsets` goes to the leader and not
@@ -1064,8 +1075,18 @@ impl Consumer {
         }
 
         let mut offsets = self.next_offsets.lock().await;
-        for (key, log_start) in out_of_range_positions(out_of_range, &result.offsets) {
-            offsets.insert(key, log_start);
+        let log_starts = out_of_range_positions(out_of_range, &result.offsets);
+        for (key, log_start) in &log_starts {
+            offsets.insert(key.clone(), *log_start);
+        }
+        if let Some(auto_commit) = &self.auto_commit {
+            auto_commit
+                .reset_polled(
+                    log_starts
+                        .into_iter()
+                        .map(|(key, log_start)| (key, Some(log_start))),
+                )
+                .await;
         }
         Ok(result.retry)
     }
@@ -1145,6 +1166,15 @@ impl Consumer {
                 });
             }
             offsets.insert(key.clone(), *safe_offset);
+        }
+        if let Some(auto_commit) = &self.auto_commit {
+            auto_commit
+                .reset_polled(
+                    truncated
+                        .iter()
+                        .map(|(key, safe_offset)| (key.clone(), Some(*safe_offset))),
+                )
+                .await;
         }
         Ok(())
     }
@@ -1851,6 +1881,7 @@ mod partition_error_tests {
             fetch_partition_max: DEFAULT_FETCH_PARTITION_MAX,
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
+            auto_commit: None,
         }
     }
 
@@ -1992,6 +2023,133 @@ mod partition_error_tests {
             broker.stop();
             check!(outcome == expected, "case {name}");
         }
+    }
+
+    /// How the test resets the fetch position of `orders-0` after the start of
+    /// `poll`.
+    #[derive(Clone, Copy, Debug)]
+    enum PollReset {
+        /// A Fetch row without an error and without records.
+        None,
+        /// A Fetch row with `OFFSET_OUT_OF_RANGE` under `auto.offset.reset=latest`.
+        LatestOutOfRange,
+        /// A Fetch row with `OFFSET_OUT_OF_RANGE` under
+        /// `auto.offset.reset=earliest`. The leader answers `ListOffsets` with
+        /// log start 2.
+        EarliestOutOfRange,
+        /// A Fetch row with a diverging epoch that ends at offset 3.
+        FetchTruncation,
+        /// The validation pass finds a truncation to offset 3.
+        ValidationTruncation,
+    }
+
+    /// Kafka's `onJoinPrepare` commits `SubscriptionState.allConsumed`, which
+    /// reads the current fetch positions. A reset in `poll` therefore changes
+    /// what the commit before a `JoinGroup` sends. A position that waits for
+    /// `ListOffsets` is not valid, and `allConsumed` skips it.
+    #[tokio::test]
+    async fn a_reset_in_poll_moves_the_position_of_the_commit_before_join() {
+        let orders_0 = ("orders".to_string(), 0);
+        let cases = [
+            (
+                "no reset: the position at the start of poll",
+                PollReset::None,
+                HashMap::from([(orders_0.clone(), (5, -1))]),
+            ),
+            (
+                "out of range under latest: no position until ListOffsets",
+                PollReset::LatestOutOfRange,
+                HashMap::new(),
+            ),
+            (
+                "out of range under earliest: the log start",
+                PollReset::EarliestOutOfRange,
+                HashMap::from([(orders_0.clone(), (2, -1))]),
+            ),
+            (
+                "truncation in a Fetch response: the end offset of the diverging epoch",
+                PollReset::FetchTruncation,
+                HashMap::from([(orders_0.clone(), (3, -1))]),
+            ),
+            (
+                "truncation from validation: the safe offset",
+                PollReset::ValidationTruncation,
+                HashMap::from([(orders_0.clone(), (3, -1))]),
+            ),
+        ];
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, reset, expected) in cases {
+            let leader_port = Arc::new(AtomicU16::new(0));
+            let broker = list_offsets_broker(
+                "leader",
+                Arc::clone(&leader_port),
+                (0, 2),
+                list_offsets_request::MAX_VERSION,
+                Arc::default(),
+                Arc::default(),
+            )
+            .await;
+            leader_port.store(broker.addr.port(), Ordering::SeqCst);
+            let mut consumer = consumer_on(&broker).await;
+            let auto_commit = crate::commit::AutoCommit::new(std::time::Duration::from_secs(5));
+            consumer.auto_commit = Some(auto_commit.clone());
+            // The start of `poll` records the positions. The interval has not
+            // passed, so it sends no commit.
+            consumer.maybe_auto_commit_async().await;
+            let topic_ids = consumer.topic_ids.lock().await.clone();
+
+            let result = match reset {
+                PollReset::None => consumer
+                    .process_fetch_responses(vec![fetch_response(0)], &topic_ids)
+                    .await
+                    .map(|_| ()),
+                PollReset::LatestOutOfRange => {
+                    consumer.auto_offset_reset = AutoOffsetReset::Latest;
+                    consumer
+                        .process_fetch_responses(vec![fetch_response(1)], &topic_ids)
+                        .await
+                        .map(|_| ())
+                }
+                PollReset::EarliestOutOfRange => {
+                    consumer.auto_offset_reset = AutoOffsetReset::Earliest;
+                    consumer
+                        .refresh_leader_epochs()
+                        .await
+                        .expect("metadata for the leader route");
+                    consumer
+                        .process_fetch_responses(vec![fetch_response(1)], &topic_ids)
+                        .await
+                        .map(|_| ())
+                }
+                PollReset::FetchTruncation => {
+                    let mut response = fetch_response(0);
+                    response.responses[0].partitions[0].diverging_epoch = EpochEndOffset {
+                        epoch: 2,
+                        end_offset: 3,
+                        ..Default::default()
+                    };
+                    consumer
+                        .process_fetch_responses(vec![response], &topic_ids)
+                        .await
+                        .map(|_| ())
+                }
+                PollReset::ValidationTruncation => {
+                    consumer
+                        .apply_truncation(&HashMap::from([(orders_0.clone(), 3)]))
+                        .await
+                }
+            };
+            result.expect("the reset succeeds");
+            let offsets = auto_commit
+                .polled_offsets(&HashMap::from([(orders_0.clone(), 1)]))
+                .await;
+
+            broker.stop();
+            actual.push((name, offsets));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
     }
 
     /// The broker id that the metadata names as the leader of `orders-0`.

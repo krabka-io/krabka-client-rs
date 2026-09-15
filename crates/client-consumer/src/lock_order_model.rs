@@ -23,7 +23,7 @@
 //! It keeps only what a deadlock can depend on: **which task holds which
 //! `tokio::sync::Mutex` and where each task is suspended.**
 //!
-//! ## The eight shared `tokio::sync::Mutex`es
+//! ## The ten shared `tokio::sync::Mutex`es
 //!
 //! `Consumer` declares them in `consumer.rs`, in the `Consumer` mutex fields,
 //! and shares them into `CoordinatorState` with `Arc::clone`:
@@ -38,19 +38,34 @@
 //! | 5  | `commit_identity` | CI  |
 //! | 6  | `commit_serialization` | CS |
 //! | 7  | `end_offsets`  | E      |
+//! | 8  | `AutoCommit::polled` | AP |
+//! | 9  | `AutoCommit::next_due` | ND |
 //!
 //! ## Modeled lock-holding regions (sequences where >1 guard is alive at once,
 //! plus single-lock regions for completeness). Citations are to the real code.
 //!
 //! `commit_serialization` is intentionally held across commit RPCs and rebalance
-//! waits, but no coordinator path needs that lock. All other guards are dropped
-//! before RPCs. The model abstracts network waits and keeps every nested mutex
-//! acquisition, because only those acquisitions can form lock-order cycles.
+//! waits. The coordinator takes it only in `commit_before_join`, while it holds
+//! no other lock. All other guards are dropped before RPCs. The model abstracts
+//! network waits and keeps every nested mutex acquisition, because only those
+//! acquisitions can form lock-order cycles.
 //!
-//! ### poll task (`poll.rs`, `seek.rs`, `validate.rs`)
+//! A commit that holds `commit_serialization` can wait for a rebalance
+//! (`commit_pending_offsets`, the deferred response). That is a wait for a
+//! notification, not for a lock, so this model does not show it. The commit
+//! marks that wait with `AutoCommit::park`, and `commit_before_join` then stops
+//! its wait for the lock (`commit_turn`). The rebalance timeout also bounds that
+//! wait.
+//!
+//! ### poll task (`poll.rs`, `seek.rs`, `validate.rs`, `commit.rs`)
 //! - `apply_pending_seeks` (seek.rs): PS fast-path probe (released) → A
 //!   `assigned.clone()` (released) → **PS → N → P** held together, all released
 //!   at scope end. Region edges: PS→N, N→P.
+//! - `maybe_auto_commit_async` (commit.rs): CI, N and P each alone
+//!   (`consumed_positions`), then AP alone, then ND. While it holds ND it tries
+//!   CS with `try_lock_owned`, which never waits, so the model has no ND → CS
+//!   acquire. It hands the CS guard to the spawned auto commit task, which
+//!   takes **CS → ND** after a retriable failure.
 //! - `refresh_leader_epochs` (validate.rs): **P alone** (after the metadata
 //!   `.await`), released; then **T alone** (the tracked `topic_ids` update).
 //! - `resolve_latest_sentinels` (poll.rs): **N alone** for the sentinel
@@ -59,6 +74,8 @@
 //!   apply the offsets. No region takes a second lock.
 //! - `validate_positions` (validate.rs): **N→P** snapshot held together,
 //!   released before the RPC; then **P alone** in the post-RPC apply.
+//!   `apply_truncation` (poll.rs) then holds N and takes AP
+//!   (`AutoCommit::reset_polled`): **N→AP**.
 //! - `poll` fetch-build (poll.rs, the `by_leader` snapshot): **N→P** held
 //!   together, released before the Fetch `.await`.
 //! - `poll` post-fetch loop (poll.rs): A `assigned.clone()` (released) → **N
@@ -67,8 +84,9 @@
 //!   is already locked, positions acquired second"). VERIFIED: there is **no
 //!   P→N inversion** on the post-fetch path. N released before the metadata
 //!   refresh `.await`. Updating the fetched high watermark adds **N→E**.
+//!   Before N is released, `AutoCommit::reset_polled` adds **N→AP**.
 //!   After N is released, `recover_out_of_range` takes **P alone** for the
-//!   leader routes, and then **N alone** to apply the log starts.
+//!   leader routes, and then **N→AP** to apply the log starts.
 //! - `at_log_end` (consumer.rs): **A→N→E**.
 //!
 //! ### coordinator task (`coordinator.rs`)
@@ -78,8 +96,9 @@
 //!   cooperative `next_offsets`→`positions` prunes). A is never held while N or
 //!   P is acquired.
 //! - `run` after `UNKNOWN_MEMBER_ID`: **CI alone** while clearing identity.
-//! - `commit_revoked`: **N→P** (the commit snapshot); then T alone
-//!   (`topic_ids.clone()`).
+//! - `commit_before_join` (at the start of `join_and_sync`): **CS**, and under
+//!   it CI alone, then AP alone. At the end of `join_and_sync`,
+//!   `restart_interval` takes ND alone.
 //! - `prime_offsets`: T alone (`topic_ids.clone()`), then **N→P**
 //!   (`next_offsets`→`positions`).
 //! - `join_and_sync` (leader branch): **T alone** (`topic_ids` merge).
@@ -88,15 +107,21 @@
 //! - Every commit holds **CS** for its complete operation. Synchronous commits
 //!   initially nest **CI→N** under CS. The asynchronous snapshot takes CI and N
 //!   separately under CS. Retry snapshots take CI alone under CS, followed by
-//!   P and T alone under CS. This serializes concurrent commits without blocking
-//!   coordinator publication, because the coordinator never takes CS.
+//!   P, AP (`AutoCommit::record_sent`) and T alone under CS. The asynchronous
+//!   snapshot also takes AP alone under CS. This serializes concurrent commits
+//!   without blocking coordinator publication, because the coordinator takes
+//!   CS only in `commit_before_join`, before it publishes anything.
+//! - `auto_commit_on_close` holds CS, takes CI, N and P each alone under it,
+//!   and then runs the synchronous commit regions.
 //!
 //! ## The lock hierarchy these regions imply
 //!
 //! Collecting every "hold L1 while acquiring L2" edge actually observed:
-//!   PS → N, N → P, N → E, A → N, A → CI, CS → CI, CI → N, CS → P, CS → T.
+//!   PS → N, N → P, N → E, A → N, A → CI, CS → CI, CI → N, CS → N, CS → P,
+//!   CS → T, CS → ND, CS → AP, N → AP.
 //! The resulting partial order is acyclic: `A < CI < N < P`,
-//! `CS < CI < N < P`, `PS < N < P`, and `CS < T`.
+//! `CS < CI < N < P`, `PS < N < P`, `CS < T`, `CS < ND`, `CS < AP`, and
+//! `N < AP`. No region takes a lock while it holds AP.
 //! This is acyclic ⇒ the prediction is **deadlock-free**, and the model proves
 //! it exhaustively across all task interleavings.
 
@@ -114,7 +139,9 @@ const T: u8 = 4; // topic_ids
 const CI: u8 = 5; // commit_identity
 const CS: u8 = 6; // commit_serialization
 const E: u8 = 7; // end_offsets
-const NUM_LOCKS: usize = 8;
+const AP: u8 = 8; // AutoCommit::polled
+const ND: u8 = 9; // AutoCommit::next_due
+const NUM_LOCKS: usize = 10;
 
 /// A single lock operation in a task's program. `Acquire` is a suspension
 /// point, a `.lock().await`. `Release` drops a guard at the end of a scope or
@@ -185,6 +212,7 @@ struct Step {
 /// function. So are the RPC `.await`s between them, where all guards are
 /// already dropped:
 ///   1. `apply_pending_seeks` (seek.rs)   : PS, N, P  (PS→N→P held)
+///      `maybe_auto_commit_async` (commit.rs): CI, N, P, AP, ND (each alone)
 ///   2. `refresh_leader_epochs` (validate.rs): P  then  T  (each alone)
 ///   3. `resolve_latest_sentinels` (poll.rs): N, P, N  (each alone)
 ///   4. `validate_positions` (validate.rs): N, P  then  P  (N→P snapshot, then P alone)
@@ -206,6 +234,21 @@ fn poll_program() -> Vec<Op> {
         Release(P),
         Release(N),
         Release(PS),
+        // --- maybe_auto_commit_async (commit.rs): identity, offsets and
+        //     positions snapshots, each alone. ---
+        Acquire(CI),
+        Release(CI),
+        Acquire(N),
+        Release(N),
+        Acquire(P),
+        Release(P),
+        // polled positions, then the interval deadline, each alone.
+        Acquire(AP),
+        Release(AP),
+        // ND. The `try_lock_owned` on CS under it never waits. The CS guard
+        // moves to the spawned task, which `auto_commit_task_program` models.
+        Acquire(ND),
+        Release(ND),
         // --- refresh_leader_epochs (validate.rs): P alone, then T alone
         //     (`topic_ids` update after `positions` is dropped). ---
         Acquire(P),
@@ -228,6 +271,12 @@ fn poll_program() -> Vec<Op> {
         // … then P alone post-RPC (validate_positions apply).
         Acquire(P),
         Release(P),
+        // apply_truncation (poll.rs): N, and under it AP
+        // (AutoCommit::reset_polled).
+        Acquire(N),
+        Acquire(AP),
+        Release(AP),
+        Release(N),
         // --- poll fetch-build (poll.rs `by_leader` snapshot): N→P, dropped
         //     before the Fetch. ---
         Acquire(N),
@@ -246,12 +295,18 @@ fn poll_program() -> Vec<Op> {
         Release(P),
         Acquire(E),
         Release(E),
+        // AutoCommit::reset_polled before the offsets guard drops.
+        Acquire(AP),
+        Release(AP),
         Release(N),
         // recover_out_of_range (poll.rs), after N is released: P alone
-        // (`list_offsets` routes), then N alone (apply the log starts).
+        // (`list_offsets` routes), then N and under it AP (apply the log
+        // starts, AutoCommit::reset_polled).
         Acquire(P),
         Release(P),
         Acquire(N),
+        Acquire(AP),
+        Release(AP),
         Release(N),
     ]
 }
@@ -274,9 +329,9 @@ fn at_log_end_program() -> Vec<Op> {
 ///
 /// Sequence (coordinator.rs `rejoin`, cooperative-revoke path):
 ///   A alone (`rejoin`: `assigned.clone()` owned snapshot)
-///   [`join_and_sync` → T alone (`topic_ids` merge)]
+///   [`commit_before_join` → CI alone ; AP alone]
+///   [`join_and_sync` → T alone (`topic_ids` merge) ; ND alone (`restart_interval`)]
 ///   A→CI (`publish_assignment`: phase-1 assignment + commit identity)
-///   [`commit_revoked` → N,P (`next_offsets`→`positions`) ; T alone (`topic_ids.clone()`)]
 ///   N,P prune (`rejoin`: phase-1 `next_offsets`→`positions` remove)
 ///   A alone (`rejoin`: `owned_after_revoke` `assigned.clone()` snapshot)
 ///   [`prime_offsets` → T alone (`topic_ids.clone()`) ; N,P (`next_offsets`→`positions`)]
@@ -286,22 +341,25 @@ fn coordinator_program() -> Vec<Op> {
         // rejoin: owned snapshot (`assigned.clone()`)
         Acquire(A),
         Release(A),
+        // commit_before_join: the commit lock, and under it the identity
+        // snapshot, then the polled positions.
+        Acquire(CS),
+        Acquire(CI),
+        Release(CI),
+        Acquire(AP),
+        Release(AP),
+        Release(CS),
         // join_and_sync → topic_ids merge (leader branch, T alone)
         Acquire(T),
         Release(T),
+        // join_and_sync: restart_interval (ND alone)
+        Acquire(ND),
+        Release(ND),
         // publish_assignment: assigned → commit_identity
         Acquire(A),
         Acquire(CI),
         Release(CI),
         Release(A),
-        // commit_revoked: N→P (`next_offsets`→`positions`)
-        Acquire(N),
-        Acquire(P),
-        Release(P),
-        Release(N),
-        // commit_revoked: topic_ids snapshot (`topic_ids.clone()`)
-        Acquire(T),
-        Release(T),
         // rejoin: phase-1 prune next_offsets + positions, N→P
         Acquire(N),
         Acquire(P),
@@ -346,6 +404,9 @@ fn commit_program() -> Vec<Op> {
         // positions snapshot.
         Acquire(P),
         Release(P),
+        // AutoCommit::record_sent raises the polled positions.
+        Acquire(AP),
+        Release(AP),
         // topic_ids snapshot.
         Acquire(T),
         Release(T),
@@ -368,8 +429,40 @@ fn async_commit_program() -> Vec<Op> {
         Release(N),
         Acquire(P),
         Release(P),
+        // snapshot_commit_topics: AutoCommit::record_sent.
+        Acquire(AP),
+        Release(AP),
         Acquire(T),
         Release(T),
+        Release(CS),
+    ]
+}
+
+/// The task that `maybe_auto_commit_async` spawns. It holds CS for the RPC and
+/// sets ND after a retriable failure.
+fn auto_commit_task_program() -> Vec<Op> {
+    vec![Acquire(CS), Acquire(ND), Release(ND), Release(CS)]
+}
+
+/// `auto_commit_on_close`. CS spans the snapshot and the synchronous commit.
+fn close_auto_commit_program() -> Vec<Op> {
+    vec![
+        Acquire(CS),
+        // consumed_positions: CI, N and P each alone.
+        Acquire(CI),
+        Release(CI),
+        Acquire(N),
+        Release(N),
+        Acquire(P),
+        Release(P),
+        // commit_pending_offsets identity and positions snapshots, then
+        // AutoCommit::record_sent.
+        Acquire(CI),
+        Release(CI),
+        Acquire(P),
+        Release(P),
+        Acquire(AP),
+        Release(AP),
         Release(CS),
     ]
 }
@@ -519,6 +612,32 @@ mod tests {
         );
         // The bound must NOT have been hit, or "deadlock-free" would be a
         // statement about a truncated space, not the whole one.
+        assert2::assert!(checker.state_count() < MAX_STATES);
+        assert2::assert!(checker.max_depth() < MAX_DEPTH);
+        checker.assert_properties();
+    }
+
+    /// The auto commit tasks race the poll task, the coordinator task and an
+    /// asynchronous commit. The spawned auto commit and the auto commit of
+    /// `close` hold `commit_serialization`, and the coordinator reads the
+    /// polled positions. The protocol is still deadlock-free.
+    #[test]
+    fn auto_commit_tasks_are_deadlock_free() {
+        let checker = run_model(vec![
+            ("poll", poll_program()),
+            ("coordinator", coordinator_program()),
+            ("commit-async", async_commit_program()),
+            ("auto-commit", auto_commit_task_program()),
+            ("close-auto-commit", close_auto_commit_program()),
+        ])
+        .spawn_bfs()
+        .join();
+        eprintln!(
+            "[lock_order/auto-commit] unique={} generated={} depth={}",
+            checker.unique_state_count(),
+            checker.state_count(),
+            checker.max_depth(),
+        );
         assert2::assert!(checker.state_count() < MAX_STATES);
         assert2::assert!(checker.max_depth() < MAX_DEPTH);
         checker.assert_properties();

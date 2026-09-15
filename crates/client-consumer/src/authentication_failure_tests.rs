@@ -183,6 +183,7 @@ fn consumer(client: Client) -> Consumer {
         fetch_partition_max: DEFAULT_FETCH_PARTITION_MAX,
         auto_offset_reset: AutoOffsetReset::Latest,
         poll_error: PollErrorSlot::default(),
+        auto_commit: None,
     }
 }
 
@@ -223,6 +224,9 @@ fn coordinator_state(client: Client) -> CoordinatorState {
             max_backoff: Duration::from_millis(50),
         },
         poll_error: PollErrorSlot::default(),
+        auto_commit: None,
+        commit_serialization: Arc::new(Mutex::new(())),
+        join_prepared: false,
     }
 }
 

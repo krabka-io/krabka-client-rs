@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
 
 use krabka_protocol::owned::{
@@ -14,8 +15,8 @@ use tokio::sync::Mutex;
 use crate::{
     consumer::{CommitIdentity, Consumer},
     coordinator::{
-        find_coordinator, is_retriable_transport_error, next_backoff, retry_deadline_elapsed,
-        with_coordinator_refind,
+        find_coordinator, is_retriable_coordinator_code, is_retriable_transport_error,
+        next_backoff, retry_deadline_elapsed, with_coordinator_refind,
     },
     error::ConsumerError,
     offset_wire::{TopicNameOffsetCommit, build_commit_topics},
@@ -88,14 +89,21 @@ fn validate_selected_offsets(
     Ok(())
 }
 
+/// Take the offsets of an asynchronous commit.
+///
+/// With `auto_commit`, the function also raises the positions for the commit
+/// before a `JoinGroup` to these offsets. See [`AutoCommit::record_sent`].
 async fn snapshot_commit_topics(
     commit_identity: &Arc<Mutex<CommitIdentity>>,
     offsets: &Arc<Mutex<HashMap<(String, i32), i64>>>,
     positions: &Arc<Mutex<HashMap<(String, i32), PartitionPosition>>>,
+    auto_commit: Option<&AutoCommit>,
 ) -> Option<(usize, Vec<OffsetCommitRequestTopic>, (i32, String))> {
     let identity = commit_identity.lock().await.clone();
     let mut raw_offsets = offsets.lock().await.clone();
-    raw_offsets.retain(|partition, _| identity.ownership_ids.contains_key(partition));
+    raw_offsets.retain(|partition, offset| {
+        identity.ownership_ids.contains_key(partition) && has_valid_position(*offset)
+    });
     if raw_offsets.is_empty() {
         return None;
     }
@@ -103,6 +111,11 @@ async fn snapshot_commit_topics(
     let pos = positions.lock().await;
     let offsets = commit_offsets(raw_offsets, &pos);
     drop(pos);
+    if let Some(auto_commit) = auto_commit {
+        auto_commit
+            .record_sent(sent_positions(&offsets, &identity.ownership_ids))
+            .await;
+    }
     Some((
         partitions,
         build_commit_topics(offsets),
@@ -112,7 +125,7 @@ async fn snapshot_commit_topics(
 
 /// Build the `OffsetCommit` request of a commit. The request names each
 /// topic, so the version is v9 or lower. See [`TopicNameOffsetCommit`].
-fn build_commit_request(
+pub(crate) fn build_commit_request(
     group_id: String,
     generation_id_or_member_epoch: i32,
     member_id: String,
@@ -209,6 +222,501 @@ fn retain_continuously_owned(
     pending.retain(|partition, (_, ownership_id)| current.get(partition) == Some(ownership_id));
 }
 
+/// Kafka's `ConsumerUtils.DEFAULT_CLOSE_TIMEOUT_MS`. It bounds the synchronous
+/// auto commit in [`Consumer::close`].
+const AUTO_COMMIT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `REQUEST_TIMED_OUT`. Kafka's `OffsetCommitResponseHandler` retries it.
+const REQUEST_TIMED_OUT: i16 = 7;
+
+/// The committable position of one owned partition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConsumedPosition {
+    pub offset: i64,
+    pub leader_epoch: i32,
+    /// The ownership that the position belongs to. A commit sends the position
+    /// only while the consumer still holds this ownership.
+    pub ownership_id: u64,
+}
+
+/// Committable positions, keyed like `Consumer::next_offsets`.
+pub(crate) type ConsumedPositions = HashMap<(String, i32), ConsumedPosition>;
+
+/// Whether `next_offset` is a fetch position that Kafka can commit.
+///
+/// `i64::MAX` is the `Latest` sentinel that `poll` has not resolved yet. Kafka's
+/// `SubscriptionState.allConsumed` skips a partition without a valid position.
+fn has_valid_position(next_offset: i64) -> bool {
+    next_offset >= 0 && next_offset != i64::MAX
+}
+
+/// Kafka's `SubscriptionState.allConsumed`: the position and leader epoch of
+/// each owned partition that has a valid position.
+pub(crate) fn all_consumed(
+    ownership_ids: &HashMap<(String, i32), u64>,
+    next_offsets: &HashMap<(String, i32), i64>,
+    positions: &HashMap<(String, i32), PartitionPosition>,
+) -> ConsumedPositions {
+    next_offsets
+        .iter()
+        .filter(|(_, offset)| has_valid_position(**offset))
+        .filter_map(|(partition, offset)| {
+            ownership_ids.get(partition).map(|ownership_id| {
+                let leader_epoch = positions
+                    .get(partition)
+                    .map_or(-1, |position| position.offset_epoch.get());
+                (
+                    partition.clone(),
+                    ConsumedPosition {
+                        offset: *offset,
+                        leader_epoch,
+                        ownership_id: *ownership_id,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// The `(offset, leader_epoch)` of each position whose ownership is still
+/// current.
+fn owned_offsets(
+    consumed: &ConsumedPositions,
+    ownership_ids: &HashMap<(String, i32), u64>,
+) -> HashMap<(String, i32), (i64, i32)> {
+    consumed
+        .iter()
+        .filter(|(partition, position)| {
+            ownership_ids.get(*partition) == Some(&position.ownership_id)
+        })
+        .map(|(partition, position)| (partition.clone(), (position.offset, position.leader_epoch)))
+        .collect()
+}
+
+/// The committable positions of the `(offset, leader_epoch)` pairs that a
+/// commit sends, with the ownership of each partition.
+fn sent_positions(
+    offsets: &HashMap<(String, i32), (i64, i32)>,
+    ownership_ids: &HashMap<(String, i32), u64>,
+) -> Vec<((String, i32), ConsumedPosition)> {
+    offsets
+        .iter()
+        .filter_map(|(partition, (offset, leader_epoch))| {
+            ownership_ids.get(partition).map(|ownership_id| {
+                (
+                    partition.clone(),
+                    ConsumedPosition {
+                        offset: *offset,
+                        leader_epoch: *leader_epoch,
+                        ownership_id: *ownership_id,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// How an automatic commit ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AutoCommitOutcome {
+    Committed,
+    /// Kafka's `RetriableCommitFailedException`: the coordinator is loading,
+    /// moved or timed out, the topic is unknown, or the connection failed.
+    Retriable,
+    Failed,
+}
+
+/// `TOPIC_AUTHORIZATION_FAILED`.
+const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+
+/// The error class of one partition in an `OffsetCommitResponse`. A larger
+/// class takes precedence when a response has errors of more than one class.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PartitionCommitError {
+    None,
+    /// Kafka's `OffsetCommitResponseHandler` collects the unauthorized topics
+    /// and raises `TopicAuthorizationException` only when no other partition
+    /// has an error. Any other error takes precedence.
+    TopicAuthorization,
+    Retriable,
+    Fatal,
+}
+
+impl PartitionCommitError {
+    fn of(code: i16) -> Self {
+        match code {
+            0 => Self::None,
+            TOPIC_AUTHORIZATION_FAILED => Self::TopicAuthorization,
+            UNKNOWN_TOPIC_OR_PARTITION | REQUEST_TIMED_OUT => Self::Retriable,
+            code if is_retriable_coordinator_code(code) => Self::Retriable,
+            _ => Self::Fatal,
+        }
+    }
+}
+
+/// Whether a partition of `response` says that the coordinator is loading or
+/// moved. The consumer then finds the coordinator again.
+pub(crate) fn names_moved_coordinator(response: &OffsetCommitResponse) -> bool {
+    response.topics.iter().any(|topic| {
+        topic
+            .partitions
+            .iter()
+            .any(|partition| is_retriable_coordinator_code(partition.error_code))
+    })
+}
+
+/// Classify the result of one automatic `OffsetCommit`, as Kafka's
+/// `ConsumerCoordinator.OffsetCommitResponseHandler` does.
+///
+/// The function reads the error of every partition. Kafka's handler stops at
+/// the first partition error other than `TOPIC_AUTHORIZATION_FAILED`, so its
+/// result for a response with a retriable and a fatal partition error depends
+/// on the partition order. That order comes from hash maps, here and in Kafka
+/// (`ConsumerCoordinator.sendOffsetCommitRequest`). This function gives the
+/// fatal error precedence, so the result does not depend on that order. The
+/// commit before a `JoinGroup` then does not retry until the rebalance timeout
+/// when a partition can never commit.
+pub(crate) fn auto_commit_outcome(
+    result: &Result<OffsetCommitResponse, ConsumerError>,
+) -> AutoCommitOutcome {
+    match result {
+        Ok(response) => {
+            let error = response
+                .topics
+                .iter()
+                .flat_map(|topic| topic.partitions.iter())
+                .map(|partition| PartitionCommitError::of(partition.error_code))
+                .max()
+                .unwrap_or(PartitionCommitError::None);
+            match error {
+                PartitionCommitError::None => AutoCommitOutcome::Committed,
+                PartitionCommitError::Retriable => AutoCommitOutcome::Retriable,
+                PartitionCommitError::TopicAuthorization | PartitionCommitError::Fatal => {
+                    AutoCommitOutcome::Failed
+                }
+            }
+        }
+        Err(ConsumerError::Client(error))
+            if is_retriable_transport_error(error)
+                || matches!(error, krabka_client_core::ClientError::Timeout(_)) =>
+        {
+            AutoCommitOutcome::Retriable
+        }
+        Err(ConsumerError::Server(code)) if is_retriable_coordinator_code(*code) => {
+            AutoCommitOutcome::Retriable
+        }
+        Err(_) => AutoCommitOutcome::Failed,
+    }
+}
+
+/// Kafka's `enable.auto.commit` state for one consumer. The consumer and its
+/// coordinator task share it.
+#[derive(Clone, Debug)]
+pub(crate) struct AutoCommit {
+    /// Kafka's `auto.commit.interval.ms`.
+    interval: Duration,
+    /// When the next interval commit from `poll` is due. Kafka's
+    /// `ConsumerCoordinator.nextAutoCommitTimer`.
+    next_due: Arc<Mutex<tokio::time::Instant>>,
+    /// The positions at the start of the latest `poll`, raised to each offset
+    /// that a commit sent after that `poll` for the same ownership.
+    ///
+    /// Kafka runs `onJoinPrepare` inside `poll`, so its pre-rebalance commit
+    /// includes only records that the application received before that `poll`.
+    /// The krabka coordinator task rebalances between two polls, while the
+    /// application can still process the records of the last `poll`. The task
+    /// therefore commits these positions and not the live ones.
+    ///
+    /// A commit of the application can send a newer offset than the positions
+    /// of the latest `poll`. The pre-rebalance commit must not move the
+    /// committed offset back behind it. Kafka's `allConsumed` is never behind a
+    /// `commitSync()` of the same ownership, because both read the positions.
+    polled: Arc<Mutex<ConsumedPositions>>,
+    /// `true` while a commit that holds `commit_serialization` waits for the
+    /// coordinator task to finish a rebalance. See [`AutoCommit::park`].
+    commit_parked: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+/// A commit that holds `commit_serialization` and waits for a rebalance.
+///
+/// The commit before a `JoinGroup` waits for `commit_serialization`. A commit
+/// that holds the lock and waits for the rebalance would block that rebalance
+/// until its deadline. While this guard lives, the commit before a `JoinGroup`
+/// does not wait for the lock. The waiting commit sends nothing until the
+/// coordinator task publishes the next assignment, so the order of the commits
+/// stays the same.
+pub(crate) struct ParkedCommit {
+    commit_parked: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Drop for ParkedCommit {
+    fn drop(&mut self) {
+        self.commit_parked.send_replace(false);
+    }
+}
+
+impl AutoCommit {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next_due: Arc::new(Mutex::new(tokio::time::Instant::now() + interval)),
+            polled: Arc::new(Mutex::new(HashMap::new())),
+            commit_parked: Arc::new(tokio::sync::watch::Sender::new(false)),
+        }
+    }
+
+    /// Mark that the commit that holds `commit_serialization` waits for a
+    /// rebalance, until the returned guard drops.
+    pub(crate) fn park(&self) -> ParkedCommit {
+        self.commit_parked.send_replace(true);
+        ParkedCommit {
+            commit_parked: Arc::clone(&self.commit_parked),
+        }
+    }
+
+    /// A receiver that sees when a commit that holds `commit_serialization`
+    /// waits for a rebalance.
+    pub(crate) fn parked_commits(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.commit_parked.subscribe()
+    }
+
+    /// Move the positions for the commit before a `JoinGroup` after `poll`
+    /// resets fetch positions.
+    ///
+    /// Kafka's `allConsumed` reads the current position, so a reset in `poll`
+    /// changes what `onJoinPrepare` commits. `Some(offset)` is a truncation or
+    /// an out-of-range reset: the commit sends that offset. The position of a
+    /// reset has no known leader epoch here, so the commit sends none (`-1`).
+    /// `None` is a reset that waits for `ListOffsets`: the partition has no
+    /// valid position, and the commit skips it, as `allConsumed` does. A
+    /// partition without a position of the latest `poll` stays without one.
+    pub(crate) async fn reset_polled(
+        &self,
+        resets: impl IntoIterator<Item = ((String, i32), Option<i64>)>,
+    ) {
+        let mut polled = self.polled.lock().await;
+        for (partition, offset) in resets {
+            match offset {
+                Some(offset) => {
+                    if let Some(position) = polled.get_mut(&partition) {
+                        position.offset = offset;
+                        position.leader_epoch = -1;
+                    }
+                }
+                None => {
+                    polled.remove(&partition);
+                }
+            }
+        }
+    }
+
+    /// Raise the positions for the commit before a `JoinGroup` to the offsets
+    /// that a commit sends. Call it while you hold `commit_serialization`,
+    /// before the commit sends its request.
+    pub(crate) async fn record_sent(
+        &self,
+        sent: impl IntoIterator<Item = ((String, i32), ConsumedPosition)>,
+    ) {
+        let mut polled = self.polled.lock().await;
+        for (partition, position) in sent {
+            let known = polled.entry(partition).or_insert(position);
+            if known.ownership_id != position.ownership_id || known.offset < position.offset {
+                *known = position;
+            }
+        }
+    }
+
+    /// Start the interval again. Kafka's `onJoinComplete` resets
+    /// `nextAutoCommitTimer` after each assignment.
+    pub(crate) async fn restart_interval(&self) {
+        *self.next_due.lock().await = tokio::time::Instant::now() + self.interval;
+    }
+
+    /// The `(offset, leader_epoch)` of each position of the latest `poll`
+    /// whose ownership is still current.
+    pub(crate) async fn polled_offsets(
+        &self,
+        ownership_ids: &HashMap<(String, i32), u64>,
+    ) -> HashMap<(String, i32), (i64, i32)> {
+        owned_offsets(&*self.polled.lock().await, ownership_ids)
+    }
+}
+
+/// The route of a background commit to the group coordinator.
+#[derive(Clone)]
+struct CommitRoute {
+    client: krabka_client_core::Client,
+    group_id: String,
+    group_instance_id: Option<String>,
+    coordinator_id: Arc<std::sync::atomic::AtomicI32>,
+    retry_policy: crate::coordinator::CoordinatorRetryPolicy,
+}
+
+impl CommitRoute {
+    /// Send one `OffsetCommit` to the coordinator.
+    ///
+    /// If the coordinator moved or the connection failed, find the coordinator
+    /// again and send once more. A background commit does not wait through the
+    /// full retry loop.
+    async fn send(
+        &self,
+        topics: Vec<OffsetCommitRequestTopic>,
+        generation: i32,
+        member_id: &str,
+    ) -> Result<OffsetCommitResponse, ConsumerError> {
+        let request = |topics| {
+            build_commit_request(
+                self.group_id.clone(),
+                generation,
+                member_id.to_owned(),
+                self.group_instance_id.clone(),
+                topics,
+            )
+        };
+        let target = self.coordinator_id.load(Ordering::Relaxed);
+        let result = self
+            .client
+            .broker(target)
+            .send(request(topics.clone()))
+            .await;
+        let moved = match &result {
+            Ok(response) => names_moved_coordinator(response),
+            Err(error) => is_retriable_transport_error(error),
+        };
+        if !moved {
+            return result.map_err(ConsumerError::from);
+        }
+        let id = find_coordinator(&self.client, &self.group_id, self.retry_policy).await?;
+        self.coordinator_id.store(id, Ordering::Relaxed);
+        self.client
+            .broker(id)
+            .send(request(topics))
+            .await
+            .map_err(ConsumerError::from)
+    }
+}
+
+impl Consumer {
+    fn commit_route(&self) -> CommitRoute {
+        CommitRoute {
+            client: self.client.clone(),
+            group_id: self.group_id.clone(),
+            group_instance_id: self.group_instance_id.clone(),
+            coordinator_id: Arc::clone(&self.coordinator_id),
+            retry_policy: self.retry_policy,
+        }
+    }
+
+    /// The identity and the committable positions of this consumer now.
+    async fn consumed_positions(&self) -> (CommitIdentity, ConsumedPositions) {
+        let identity = self.commit_identity.lock().await.clone();
+        let next_offsets = self.next_offsets.lock().await.clone();
+        let positions = self.positions.lock().await.clone();
+        let consumed = all_consumed(&identity.ownership_ids, &next_offsets, &positions);
+        (identity, consumed)
+    }
+
+    /// The auto commit of `poll`: Kafka's
+    /// `ConsumerCoordinator.maybeAutoCommitOffsetsAsync(now)`.
+    ///
+    /// This method records the positions for a later pre-rebalance commit. When
+    /// the interval has passed, it sends an asynchronous commit of the
+    /// positions. A failure goes to the log. A retriable failure makes the next
+    /// commit due after the retry backoff, as Kafka's `autoCommitOffsetsAsync`
+    /// does.
+    pub(crate) async fn maybe_auto_commit_async(&self) {
+        let Some(auto_commit) = &self.auto_commit else {
+            return;
+        };
+        let (identity, consumed) = self.consumed_positions().await;
+        auto_commit.polled.lock().await.clone_from(&consumed);
+        let mut next_due = auto_commit.next_due.lock().await;
+        let now = tokio::time::Instant::now();
+        if now < *next_due {
+            return;
+        }
+        // Take the commit lock before `poll` continues, so a later
+        // `commit_sync` cannot commit newer offsets before this older commit.
+        // If another commit holds the lock, `poll` does not wait for it: the
+        // commit stays due and the next `poll` tries again.
+        let Ok(commit_guard) = Arc::clone(&self.commit_serialization).try_lock_owned() else {
+            return;
+        };
+        *next_due = now + auto_commit.interval;
+        drop(next_due);
+        let offsets = owned_offsets(&consumed, &identity.ownership_ids);
+        if offsets.is_empty() {
+            return;
+        }
+        let route = self.commit_route();
+        let next_due = Arc::clone(&auto_commit.next_due);
+        let retry_backoff = self.retry_policy.initial_backoff;
+        tokio::spawn(async move {
+            let _commit_guard = commit_guard;
+            let result = route
+                .send(
+                    build_commit_topics(offsets),
+                    identity.generation,
+                    &identity.member_id,
+                )
+                .await;
+            match auto_commit_outcome(&result) {
+                AutoCommitOutcome::Committed => {}
+                AutoCommitOutcome::Retriable => {
+                    tracing::debug!(
+                        group = %route.group_id,
+                        ?result,
+                        "asynchronous auto commit failed with a retriable error"
+                    );
+                    *next_due.lock().await = tokio::time::Instant::now() + retry_backoff;
+                }
+                AutoCommitOutcome::Failed => {
+                    tracing::warn!(
+                        group = %route.group_id,
+                        ?result,
+                        "asynchronous auto commit failed"
+                    );
+                }
+            }
+        });
+    }
+
+    /// The auto commit of `close`: Kafka's
+    /// `ConsumerCoordinator.maybeAutoCommitOffsetsSync(timer)`.
+    ///
+    /// This method commits the current positions and waits for the result, up
+    /// to Kafka's default close timeout. A failure goes to the log, and `close`
+    /// continues.
+    pub(crate) async fn auto_commit_on_close(&self) {
+        if self.auto_commit.is_none() {
+            return;
+        }
+        // The close timeout also bounds the wait for another commit that holds
+        // the commit lock.
+        let commit = async {
+            let _commit_guard = self.commit_serialization.lock().await;
+            let (_, consumed) = self.consumed_positions().await;
+            let pending = consumed
+                .into_iter()
+                .map(|(partition, position)| (partition, (position.offset, position.ownership_id)))
+                .collect::<HashMap<_, _>>();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            self.commit_pending_offsets(pending).await
+        };
+        match tokio::time::timeout(AUTO_COMMIT_CLOSE_TIMEOUT, commit).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(group = %self.group_id, %error, "synchronous auto commit on close failed");
+            }
+            Err(_) => {
+                tracing::warn!(group = %self.group_id, "synchronous auto commit on close timed out");
+            }
+        }
+    }
+}
+
 impl Consumer {
     /// Commit the current next-offsets for every assigned partition.
     ///
@@ -236,6 +744,7 @@ impl Consumer {
             let offsets = self.next_offsets.lock().await;
             offsets
                 .iter()
+                .filter(|(_, offset)| has_valid_position(**offset))
                 .filter_map(|(partition, offset)| {
                     identity
                         .ownership_ids
@@ -340,6 +849,15 @@ impl Consumer {
                     .collect(),
                 &position_epochs,
             );
+            if let Some(auto_commit) = &self.auto_commit {
+                let ownership_ids = pending
+                    .iter()
+                    .map(|(partition, (_, ownership_id))| (partition.clone(), *ownership_id))
+                    .collect();
+                auto_commit
+                    .record_sent(sent_positions(&offsets, &ownership_ids))
+                    .await;
+            }
             let topics = build_commit_topics(offsets);
             match self
                 .commit_topics_once(topics, (identity.generation, identity.member_id.clone()))
@@ -369,6 +887,7 @@ impl Consumer {
                     if current_identity.generation == identity.generation
                         && current_identity.member_id == identity.member_id
                     {
+                        let _parked = self.auto_commit.as_ref().map(AutoCommit::park);
                         tokio::select! {
                             () = &mut assignment_changed => {}
                             () = self.coordinator_shutdown.cancelled() => {
@@ -515,16 +1034,13 @@ impl Consumer {
             }
         }
 
-        let client = self.client.clone();
-        let group_id = self.group_id.clone();
+        let route = self.commit_route();
         let commit_identity = Arc::clone(&self.commit_identity);
         let commit_serialization = Arc::clone(&self.commit_serialization);
-        let group_instance_id = self.group_instance_id.clone();
         let offsets = Arc::clone(&self.next_offsets);
         let positions = Arc::clone(&self.positions);
-        let coordinator_id = Arc::clone(&self.coordinator_id);
         let commit_async_state = Arc::clone(&self.commit_async_state);
-        let retry_policy = self.retry_policy;
+        let auto_commit = self.auto_commit.clone();
         tokio::spawn(async move {
             loop {
                 {
@@ -532,46 +1048,16 @@ impl Consumer {
                     // Calls queued before this snapshot are represented by the
                     // current offsets, so collapse them into this request.
                     commit_async_state.store(ASYNC_COMMIT_RUNNING, Ordering::Release);
-                    if let Some((_, topics, (generation, member_id))) =
-                        snapshot_commit_topics(&commit_identity, &offsets, &positions).await
+                    if let Some((_, topics, (generation, member_id))) = snapshot_commit_topics(
+                        &commit_identity,
+                        &offsets,
+                        &positions,
+                        auto_commit.as_ref(),
+                    )
+                    .await
+                        && let Err(error) = route.send(topics, generation, &member_id).await
                     {
-                        // Route to the coordinator broker. If it returns a moved/cold
-                        // coordinator code (or the socket is gone), re-discover once and
-                        // retry — but don't block a background commit on the full retry
-                        // loop; one re-find recovers a coordinator move at-least-once.
-                        let make_req = |topics: Vec<_>| {
-                            build_commit_request(
-                                group_id.clone(),
-                                generation,
-                                member_id.clone(),
-                                group_instance_id.clone(),
-                                topics,
-                            )
-                        };
-                        let target = coordinator_id.load(Ordering::Relaxed);
-                        let res = client.broker(target).send(make_req(topics.clone())).await;
-                        let moved = match &res {
-                            Ok(resp) => crate::coordinator::is_retriable_coordinator_code(
-                                first_commit_error(resp),
-                            ),
-                            Err(e) if is_retriable_transport_error(e) => true,
-                            Err(_) => false,
-                        };
-                        if moved {
-                            match find_coordinator(&client, &group_id, retry_policy).await {
-                                Ok(id) => {
-                                    coordinator_id.store(id, Ordering::Relaxed);
-                                    if let Err(e) = client.broker(id).send(make_req(topics)).await {
-                                        tracing::warn!(error = %e, "commit_async retry after re-find failed");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "commit_async coordinator re-discovery failed");
-                                }
-                            }
-                        } else if let Err(e) = res {
-                            tracing::warn!(error = %e, "commit_async failed");
-                        }
+                        tracing::warn!(%error, "commit_async failed");
                     }
                 }
 
@@ -875,6 +1361,7 @@ mod tests {
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
+            auto_commit: None,
         }
     }
 
@@ -940,13 +1427,276 @@ mod tests {
         );
     }
 
+    /// Kafka's `SubscriptionState.allConsumed` commits each owned partition
+    /// that has a valid position, with its leader epoch. A later commit sends a
+    /// position only while its ownership is still current.
+    #[test]
+    fn consumed_positions_keep_owned_valid_positions_of_the_current_ownership() {
+        let ownership_ids = HashMap::from([
+            (("orders".into(), 0), 1),
+            (("orders".into(), 1), 2),
+            (("orders".into(), 2), 3),
+            (("orders".into(), 3), 4),
+        ]);
+        let next_offsets = HashMap::from([
+            (("orders".into(), 0), 12),
+            (("orders".into(), 1), 0),
+            (("orders".into(), 2), i64::MAX),
+            (("orders".into(), 3), -1),
+            (("unowned".into(), 0), 5),
+        ]);
+        let positions = HashMap::from([(
+            ("orders".into(), 0),
+            PartitionPosition {
+                offset_epoch: krabka_ids::LeaderEpoch(4),
+                ..Default::default()
+            },
+        )]);
+
+        let consumed = all_consumed(&ownership_ids, &next_offsets, &positions);
+        assert2::assert!(
+            consumed
+                == HashMap::from([
+                    (
+                        ("orders".into(), 0),
+                        ConsumedPosition {
+                            offset: 12,
+                            leader_epoch: 4,
+                            ownership_id: 1,
+                        },
+                    ),
+                    (
+                        ("orders".into(), 1),
+                        ConsumedPosition {
+                            offset: 0,
+                            leader_epoch: -1,
+                            ownership_id: 2,
+                        },
+                    ),
+                ])
+        );
+
+        let reassigned = HashMap::from([(("orders".into(), 0), 9), (("orders".into(), 1), 2)]);
+        assert2::assert!(
+            owned_offsets(&consumed, &reassigned)
+                == HashMap::from([(("orders".into(), 1), (0, -1))])
+        );
+    }
+
+    /// Kafka's `OffsetCommitResponseHandler` raises a retriable error for 3, 7,
+    /// 14, 15 and 16, and for a failed connection. Every other error is final.
+    #[test]
+    fn auto_commit_outcome_follows_kafka_commit_error_classes() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, result, expected) in [
+            (
+                "success",
+                Ok(response(&[0, 0])),
+                AutoCommitOutcome::Committed,
+            ),
+            (
+                "unknown topic or partition",
+                Ok(response(&[0, 3])),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "request timed out",
+                Ok(response(&[7])),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "coordinator loading",
+                Ok(response(&[14])),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "coordinator not available",
+                Ok(response(&[15])),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "not coordinator",
+                Ok(response(&[16])),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "illegal generation",
+                Ok(response(&[22])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "rebalance in progress",
+                Ok(response(&[27])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "group authorization failed",
+                Ok(response(&[30])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "disconnected",
+                Err(ConsumerError::Client(
+                    krabka_client_core::ClientError::Disconnected,
+                )),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "client timeout",
+                Err(ConsumerError::Client(
+                    krabka_client_core::ClientError::Timeout(secs(30)),
+                )),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "coordinator lookup not available",
+                Err(ConsumerError::Server(15)),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "coordinator lookup refused",
+                Err(ConsumerError::Server(30)),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "topic authorization failed",
+                Ok(response(&[0, 29])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "retriable partition, then a fatal partition",
+                Ok(response(&[3, 30])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "fatal partition, then a retriable partition",
+                Ok(response(&[30, 3])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "retriable coordinator partition, then a fatal partition",
+                Ok(response(&[16, 22])),
+                AutoCommitOutcome::Failed,
+            ),
+            (
+                "topic authorization failure, then a retriable partition",
+                Ok(response(&[29, 3])),
+                AutoCommitOutcome::Retriable,
+            ),
+            (
+                "retriable partition, then a topic authorization failure",
+                Ok(response(&[3, 29])),
+                AutoCommitOutcome::Retriable,
+            ),
+        ] {
+            actual.push((name, auto_commit_outcome(&result)));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// `poll` does not wait for a commit that holds the commit lock. The
+    /// interval commit stays due, and the next `poll` sends it.
+    #[tokio::test(start_paused = true)]
+    async fn busy_commit_lock_moves_the_interval_commit_to_the_next_poll() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_in_mock = Arc::clone(&requests);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions_for_offset_commit((2, 2)));
+            }
+            if api_key != offset_commit_request::API_KEY {
+                return None;
+            }
+            requests_in_mock.fetch_add(1, Ordering::SeqCst);
+            Some(encode_response(&response(&[0]), version))
+        })
+        .await;
+        let mut consumer = commit_consumer(
+            &mock,
+            commit_identity(7, "member-a"),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicI32::new(7)),
+        )
+        .await;
+        let interval = Duration::from_hours(1);
+        consumer.auto_commit = Some(AutoCommit::new(interval));
+        tokio::time::advance(interval).await;
+
+        let busy = consumer.commit_serialization.lock().await;
+        consumer.maybe_auto_commit_async().await;
+        let while_busy = requests.load(Ordering::SeqCst);
+        drop(busy);
+        consumer.maybe_auto_commit_async().await;
+        drop(consumer.commit_serialization.lock().await);
+        let after = requests.load(Ordering::SeqCst);
+
+        mock.stop();
+        assert2::assert!((while_busy, after) == (0, 1));
+    }
+
+    /// After a retriable failure, Kafka's `autoCommitOffsetsAsync` makes the
+    /// next auto commit due after `retry.backoff.ms`, and not after a full
+    /// `auto.commit.interval.ms`.
+    #[tokio::test(start_paused = true)]
+    async fn retriable_auto_commit_failure_commits_again_after_the_retry_backoff() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_in_mock = Arc::clone(&requests);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions_for_offset_commit((2, 2)));
+            }
+            if api_key != offset_commit_request::API_KEY {
+                return None;
+            }
+            let error = if requests_in_mock.fetch_add(1, Ordering::SeqCst) == 0 {
+                7
+            } else {
+                0
+            };
+            Some(encode_response(&response(&[error]), version))
+        })
+        .await;
+        let mut consumer = commit_consumer(
+            &mock,
+            commit_identity(7, "member-a"),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicI32::new(7)),
+        )
+        .await;
+        let interval = Duration::from_hours(1);
+        consumer.auto_commit = Some(AutoCommit::new(interval));
+        let backoff = consumer.retry_policy.initial_backoff;
+        // The paused clock jumps to the next timer while a response is on the
+        // loopback socket. A short timer keeps each jump far below the request
+        // timeout.
+        let ticker = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        let mut sent = Vec::new();
+        for advance in [interval, Duration::ZERO, backoff, Duration::ZERO] {
+            tokio::time::advance(advance).await;
+            consumer.maybe_auto_commit_async().await;
+            drop(consumer.commit_serialization.lock().await);
+            sent.push(requests.load(Ordering::SeqCst));
+        }
+
+        ticker.abort();
+        mock.stop();
+        assert2::assert!(sent == vec![1, 1, 2, 2]);
+    }
+
     #[tokio::test]
     async fn snapshot_commit_topics_returns_none_for_empty_offsets() {
         let identity = commit_identity(7, "member-a");
         let offsets = Arc::new(Mutex::new(HashMap::new()));
         let positions = Arc::new(Mutex::new(HashMap::new()));
 
-        let snapshot = snapshot_commit_topics(&identity, &offsets, &positions).await;
+        let snapshot = snapshot_commit_topics(&identity, &offsets, &positions, None).await;
 
         assert2::assert!(snapshot.is_none());
     }
@@ -970,7 +1720,7 @@ mod tests {
             },
         )])));
         let (partition_count, topics, seen_identity) =
-            snapshot_commit_topics(&identity, &offsets, &positions)
+            snapshot_commit_topics(&identity, &offsets, &positions, None)
                 .await
                 .expect("non-empty offsets are snapshotted");
         let mut topics = topics;
