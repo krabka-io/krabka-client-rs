@@ -48,7 +48,7 @@ use crate::{
     compression::Compression,
     error::ProducerError,
     metadata_wait::{MetadataRefresh, MetadataWait, metadata_request},
-    partitioner::UniformStickyPartitioner,
+    partitioner::{BuiltInPartitioner, StickyPartition, TopicPartitions},
     record::{ProducerRecord, RecordMetadata},
     sender::DrainIntent,
     transactional::{
@@ -267,7 +267,7 @@ pub struct Producer {
     pub(crate) partition_leaders: Arc<DashMap<(String, i32), i32>>,
     pub(crate) accumulators: AccumulatorMap,
     pub(crate) next_seq: Arc<DashMap<(String, i32), i32>>,
-    pub(crate) partitioner: Arc<UniformStickyPartitioner>,
+    pub(crate) partitioner: Arc<BuiltInPartitioner>,
     pub(crate) state: Arc<AtomicU8>,
     pub(crate) wake_tx: tokio::sync::mpsc::Sender<DrainIntent>,
     pub(crate) flush_notify: Arc<Notify>,
@@ -1539,14 +1539,26 @@ impl Producer {
         // Produce v13 carries only the `topic_id` on the wire, so the cache
         // must hold the topic also when the caller names the partition.
         let metadata_started = tokio::time::Instant::now();
-        let partition = match self.partition_count(&record.topic, record.partition).await {
-            Ok(count) => record.partition.unwrap_or_else(|| {
-                self.partitioner
-                    .pick(&record.topic, record.key.as_deref(), count)
-            }),
+        let partition_count = match self.partition_count(&record.topic, record.partition).await {
+            Ok(count) => count,
             Err(error) => return failed(error),
         };
-        tracing::Span::current().record("partition", partition);
+        // A record that names no partition and has no key that picks one goes
+        // to the sticky partition. Kafka's `KafkaProducer.partition` and
+        // `RecordAccumulator.append`.
+        let fixed_partition = record.partition.or_else(|| {
+            self.partitioner
+                .keyed_partition(record.key.as_deref(), partition_count)
+        });
+        let has_leader = |partition: i32| {
+            self.partition_leaders
+                .get(&(record.topic.clone(), partition))
+                .is_some_and(|leader| *leader >= 0)
+        };
+        let partitions = TopicPartitions {
+            count: partition_count,
+            has_leader: &has_leader,
+        };
         // Kafka's `KafkaProducer.doSend` gives the buffer the part of
         // `max.block.ms` that the metadata wait left, in whole milliseconds.
         let waited_on_metadata = Duration::from_millis(
@@ -1564,17 +1576,27 @@ impl Producer {
             return failed(ProducerError::RecordTooLarge { record_size });
         }
 
-        let key = (record.topic.clone(), partition);
-        let acc = Arc::clone(
-            self.accumulators
-                .entry(key)
-                .or_insert_with(|| Arc::new(Mutex::new(Accumulator::new(self.batch_size))))
-                .value(),
-        );
-
         let timestamp = record.timestamp_ms.unwrap_or_else(current_millis);
         let mut memory = None;
         loop {
+            // Kafka's `RecordAccumulator.append` peeks the sticky partition
+            // before it takes the partition lock, and checks under the lock
+            // that no other send switched it. A switch starts the loop again.
+            // Memory is not bound to a partition, so it serves the new one.
+            let sticky = fixed_partition
+                .is_none()
+                .then(|| self.partitioner.peek(&record.topic, &partitions));
+            let partition = fixed_partition
+                .or(sticky.map(StickyPartition::partition))
+                .unwrap_or_default();
+            tracing::Span::current().record("partition", partition);
+            let acc = Arc::clone(
+                self.accumulators
+                    .entry((record.topic.clone(), partition))
+                    .or_insert_with(|| Arc::new(Mutex::new(Accumulator::new(self.batch_size))))
+                    .value(),
+            );
+
             // A record that starts a new batch needs buffer memory. The wait
             // holds no lock, so the sender can complete batches and free
             // memory. Kafka's `RecordAccumulator.append` also allocates
@@ -1595,6 +1617,9 @@ impl Producer {
                 };
                 let needs_memory = {
                     let mut a = acc.lock().await;
+                    if self.sticky_partition_changed(&record.topic, sticky, &a, &partitions) {
+                        continue;
+                    }
                     let needs_memory = a.needs_new_batch(record_size, expected_generation);
                     // Kafka closes a batch that the record does not fit, so
                     // the sender can send it and free its memory during the
@@ -1636,6 +1661,12 @@ impl Producer {
                 return failed(error);
             }
             let mut a = acc.lock().await;
+            if self.sticky_partition_changed(&record.topic, sticky, &a, &partitions) {
+                // Another send switched the sticky partition. Adding this
+                // partition to the transaction has no effect on the outcome:
+                // the transaction ends with no record on it.
+                continue;
+            }
             if memory.is_none() && a.needs_new_batch(record_size, transaction_generation) {
                 // Another send filled the batch since the check above. Wait
                 // for memory again, with no lock held. Adding the partition to
@@ -1656,11 +1687,47 @@ impl Producer {
                 transaction_generation,
                 memory,
             );
+            if let Some(sticky) = sticky {
+                // Kafka's `RecordAccumulator.updatePartitionInfoOnAppend`.
+                self.partitioner.update(
+                    &record.topic,
+                    sticky,
+                    record_size,
+                    &partitions,
+                    a.all_batches_full(),
+                );
+            }
             drop(a);
             drop(transaction_state);
             wake_sender_after_append(&self.wake_tx, self.linger, wakes_sender);
             return rx;
         }
+    }
+
+    /// Tell if the append must pick its partition again. Kafka's
+    /// `RecordAccumulator.partitionChanged`.
+    ///
+    /// Another send can have switched the sticky partition. When no batch of
+    /// the partition is open, a switch that an open batch deferred happens
+    /// now. The caller holds the lock of the accumulator `accumulator`.
+    fn sticky_partition_changed(
+        &self,
+        topic: &str,
+        sticky: Option<StickyPartition>,
+        accumulator: &Accumulator,
+        partitions: &TopicPartitions<'_>,
+    ) -> bool {
+        let Some(sticky) = sticky else {
+            return false;
+        };
+        if self.partitioner.is_changed(topic, sticky) {
+            return true;
+        }
+        if accumulator.all_batches_full() {
+            self.partitioner.update(topic, sticky, 0, partitions, true);
+            return self.partitioner.is_changed(topic, sticky);
+        }
+        false
     }
 
     /// The transaction generation that a send takes in `state`: the recovery
@@ -2817,5 +2884,187 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Start a broker with the topic `orders`, whose partition `p` has the
+    /// leader `leaders[p]`. A leader of -1 means no leader. It answers every
+    /// Produce with success, and logs the partition of each Produce.
+    async fn leader_broker(leaders: &'static [i32]) -> (MockBroker, Arc<Mutex<Vec<i32>>>) {
+        let port = Arc::new(AtomicU16::new(0));
+        let handler_port = Arc::clone(&port);
+        let produce_log = Arc::new(Mutex::new(Vec::new()));
+        let handler_produce_log = Arc::clone(&produce_log);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(encode_v0(&ApiVersionsResponse {
+                    api_keys: vec![
+                        ApiVersion {
+                            api_key: metadata_request::API_KEY,
+                            min_version: 0,
+                            max_version: 12,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: produce_request::API_KEY,
+                            min_version: PRODUCE_VERSION,
+                            max_version: PRODUCE_VERSION,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }));
+            }
+            if api_key == metadata_request::API_KEY {
+                let response = MetadataResponse {
+                    brokers: vec![MetadataResponseBroker {
+                        node_id: 1,
+                        host: "127.0.0.1".into(),
+                        port: i32::from(handler_port.load(Ordering::SeqCst)),
+                        ..Default::default()
+                    }],
+                    topics: vec![MetadataResponseTopic {
+                        name: Some(METADATA_TOPIC.into()),
+                        partitions: (0..)
+                            .zip(leaders)
+                            .map(|(partition_index, &leader_id)| MetadataResponsePartition {
+                                partition_index,
+                                leader_id,
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                if version >= metadata_response::FLEXIBLE_MIN {
+                    buf.extend_from_slice(&[0]);
+                }
+                response.encode(&mut buf, version).expect("encode Metadata");
+                return Some(buf.to_vec());
+            }
+            if api_key == produce_request::API_KEY {
+                let mut request_body = &body[2 + CLIENT_ID.len()..];
+                let request =
+                    ProduceRequest::decode(&mut request_body, version).expect("decode Produce");
+                handler_produce_log.lock().unwrap().extend(
+                    request
+                        .topic_data
+                        .iter()
+                        .flat_map(|topic| topic.partition_data.iter().map(|p| p.index)),
+                );
+                return Some(produce_answer(&request));
+            }
+            None
+        })
+        .await;
+        port.store(mock.addr.port(), Ordering::SeqCst);
+        (mock, produce_log)
+    }
+
+    /// Where the keyless records of one row went.
+    #[derive(Debug, PartialEq, Eq)]
+    struct KeylessSpread {
+        /// The number of distinct partitions of the keyless records.
+        keyless_partitions: usize,
+        /// A keyless record went to a partition with no leader.
+        keyless_on_a_partition_without_leader: bool,
+        /// The partition of the keyed record of the row, if it has one.
+        keyed_partition: Option<i32>,
+        /// Each Produce carried one record.
+        produce_requests: usize,
+    }
+
+    /// Kafka's `BuiltInPartitioner` (KIP-480, KIP-794) keeps keyless records
+    /// on one partition until about `batch.size` bytes go there. A drain does
+    /// not move it, a keyed record does not move it, and it picks only
+    /// partitions with a leader. Each record here waits for its ack, so each
+    /// drain sends one record, and the records are much smaller than
+    /// `batch.size`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keyless_records_stay_on_one_partition_with_a_leader() {
+        const KEYED: &[u8] = b"kafka";
+        let mut actual_rows = Vec::new();
+        let mut expected_rows = Vec::new();
+        for (name, leaders, keyed_at, expected) in [
+            (
+                "drains do not move the sticky partition",
+                &[1, 1, 1, 1][..],
+                None,
+                KeylessSpread {
+                    keyless_partitions: 1,
+                    keyless_on_a_partition_without_leader: false,
+                    keyed_partition: None,
+                    produce_requests: 6,
+                },
+            ),
+            (
+                "partitions without a leader are skipped",
+                &[1, -1, -1, 1][..],
+                None,
+                KeylessSpread {
+                    keyless_partitions: 1,
+                    keyless_on_a_partition_without_leader: false,
+                    keyed_partition: None,
+                    produce_requests: 6,
+                },
+            ),
+            (
+                "a keyed record does not move the sticky partition",
+                &[1, 1, 1, 1][..],
+                Some(2),
+                KeylessSpread {
+                    keyless_partitions: 1,
+                    keyless_on_a_partition_without_leader: false,
+                    keyed_partition: Some(partition_for_key(KEYED, 4)),
+                    produce_requests: 6,
+                },
+            ),
+        ] {
+            let (mock, produce_log) = leader_broker(leaders).await;
+            let producer = Producer::builder()
+                .bootstrap(mock.addr.to_string())
+                .client_id(CLIENT_ID)
+                .enable_idempotence(false)
+                .linger(Duration::ZERO)
+                .build()
+                .await
+                .expect("producer connects to mock broker");
+            let mut keyless = BTreeSet::new();
+            let mut keyed_partition = None;
+            for index in 0..6 {
+                let key = (keyed_at == Some(index)).then_some(Bytes::from_static(KEYED));
+                let partition = producer
+                    .send(ProducerRecord {
+                        topic: METADATA_TOPIC.into(),
+                        key: key.clone(),
+                        value: Some(Bytes::from_static(b"value")),
+                        ..Default::default()
+                    })
+                    .await
+                    .await
+                    .expect("the producer answers the send")
+                    .expect("the record is delivered")
+                    .partition;
+                if key.is_some() {
+                    keyed_partition = Some(partition);
+                } else {
+                    keyless.insert(partition);
+                }
+            }
+            let actual = KeylessSpread {
+                keyless_partitions: keyless.len(),
+                keyless_on_a_partition_without_leader: keyless.iter().any(|&partition| {
+                    usize::try_from(partition).is_ok_and(|index| leaders[index] < 0)
+                }),
+                keyed_partition,
+                produce_requests: produce_log.lock().unwrap().len(),
+            };
+            producer.close().await.expect("close producer");
+            mock.stop();
+            actual_rows.push((name, actual));
+            expected_rows.push((name, expected));
+        }
+        assert2::assert!(actual_rows == expected_rows);
     }
 }

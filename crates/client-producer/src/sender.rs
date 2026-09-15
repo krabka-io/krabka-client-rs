@@ -75,12 +75,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    accumulator::{AccumulatorMap, InProgressBatch, PendingRecord},
+    accumulator::{Accumulator, AccumulatorMap, InProgressBatch, PendingRecord},
     buffer_pool::MemoryReservation,
     compression::Compression,
     error::ProducerError,
     error_class::{self, ErrorClass},
-    partitioner::UniformStickyPartitioner,
+    partitioner::{BuiltInPartitioner, QueueSizes},
     producer::{Acks, STATE_ACTIVE, STATE_FENCED, TopicMetadata},
     record::RecordMetadata,
     transactional::{AbortableErrorSlot, TxnState},
@@ -220,9 +220,9 @@ pub(crate) struct SenderConfig {
     /// to route each Produce to the partition leader, and refreshes it on
     /// `NOT_LEADER_OR_FOLLOWER` and on `UNKNOWN_TOPIC_OR_PARTITION`.
     pub partition_leaders: Arc<DashMap<(String, i32), i32>>,
-    /// Shared null-key sticky partitioner. The sender rotates it when it seals
-    /// a topic batch, so later keyless records fan out across partitions.
-    pub partitioner: Arc<UniformStickyPartitioner>,
+    /// The built-in partitioner, shared with `Producer`. The sender gives it
+    /// the queue size of each partition for the adaptive pick.
+    pub partitioner: Arc<BuiltInPartitioner>,
     pub accumulators: AccumulatorMap,
     pub next_seq: Arc<DashMap<(String, i32), i32>>,
     pub state: Arc<AtomicU8>,
@@ -274,6 +274,126 @@ struct PipelineState {
     /// Kafka's `TxnPartitionEntry.lastAckedOffset` holds the same value, and
     /// `UNKNOWN_PRODUCER_ID` compares it with the log start offset.
     last_acked_offset: HashMap<(String, i32), i64>,
+    /// Per-broker drain times for `partitioner.availability.timeout.ms`.
+    /// Kafka's `RecordAccumulator.nodeStats`.
+    node_latency: HashMap<i32, NodeLatency>,
+}
+
+/// When the sender last found ready records for a broker, and when it last
+/// sent records to it. Kafka's `RecordAccumulator.NodeLatencyStats`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NodeLatency {
+    ready_at: Instant,
+    drained_at: Instant,
+}
+
+impl NodeLatency {
+    /// Tell if records waited longer than `timeout` for the broker. Kafka's
+    /// `RecordAccumulator.partitionReady` then leaves the partitions of the
+    /// broker out of the adaptive pick.
+    fn unavailable(self, timeout: Duration) -> bool {
+        self.ready_at.saturating_duration_since(self.drained_at) > timeout
+    }
+}
+
+/// Note that `key` had ready records at `now`, and whether this cycle sent
+/// them. Kafka's `RecordAccumulator.updateNodeLatencyStats`. It does nothing
+/// when the availability timeout is zero, or when the partition has no leader.
+fn note_node_latency(
+    cfg: &SenderConfig,
+    state: &mut PipelineState,
+    key: &(String, i32),
+    now: Instant,
+    drained: bool,
+) {
+    if cfg.partitioner.config().availability_timeout.is_zero() {
+        return;
+    }
+    let Some(leader) = cfg
+        .partition_leaders
+        .get(key)
+        .map(|leader| *leader)
+        .filter(|leader| *leader >= 0)
+    else {
+        return;
+    };
+    let latency = state.node_latency.entry(leader).or_insert(NodeLatency {
+        ready_at: now,
+        drained_at: now,
+    });
+    if drained {
+        latency.drained_at = now;
+    }
+    latency.ready_at = now;
+}
+
+/// A partition of a topic and its accumulator.
+type PartitionAccumulator = (i32, Arc<Mutex<Accumulator>>);
+
+/// Give the partitioner the queue size of each partition, for the adaptive
+/// pick of a new sticky partition. Kafka's `RecordAccumulator.partitionReady`.
+///
+/// A topic gets queue sizes only when every partition has an accumulator, so
+/// the pick can see each partition. A partition without a leader has no queue
+/// size. With `partitioner.availability.timeout.ms`, a partition whose leader
+/// had ready records and no send for longer than the timeout has none either.
+/// A parked resend counts in the queue, as Kafka puts a retried batch back in
+/// the partition queue.
+async fn update_partition_load_stats(cfg: &SenderConfig, state: &PipelineState) {
+    let config = cfg.partitioner.config();
+    if !config.adaptive_partitioning {
+        return;
+    }
+    let mut topics: HashMap<String, Vec<PartitionAccumulator>> = HashMap::new();
+    for entry in cfg.accumulators.iter() {
+        let (topic, partition) = entry.key();
+        topics
+            .entry(topic.clone())
+            .or_default()
+            .push((*partition, Arc::clone(entry.value())));
+    }
+    for (topic, mut partitions) in topics {
+        let complete = topic_partition_count(cfg, &topic)
+            .await
+            .and_then(|count| usize::try_from(count).ok())
+            .is_some_and(|count| partitions.len() >= count);
+        if !complete {
+            cfg.partitioner.update_load_stats(&topic, None);
+            continue;
+        }
+        partitions.sort_unstable_by_key(|(partition, _)| *partition);
+        let mut queues = QueueSizes {
+            sizes: Vec::with_capacity(partitions.len()),
+            partition_ids: Vec::with_capacity(partitions.len()),
+            all: partitions.len(),
+        };
+        for (partition, accumulator) in partitions {
+            let key = (topic.clone(), partition);
+            let Some(leader) = cfg
+                .partition_leaders
+                .get(&key)
+                .map(|leader| *leader)
+                .filter(|leader| *leader >= 0)
+            else {
+                continue;
+            };
+            let queue_size =
+                accumulator.lock().await.queue_size() + usize::from(state.retry.contains_key(&key));
+            if !config.availability_timeout.is_zero()
+                && state
+                    .node_latency
+                    .get(&leader)
+                    .is_some_and(|latency| latency.unavailable(config.availability_timeout))
+            {
+                continue;
+            }
+            queues
+                .sizes
+                .push(u32::try_from(queue_size).unwrap_or(u32::MAX));
+            queues.partition_ids.push(partition);
+        }
+        cfg.partitioner.update_load_stats(&topic, Some(queues));
+    }
 }
 
 #[derive(Debug)]
@@ -625,6 +745,7 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
     //    and returns batches that reached the delivery timeout, which we fail here
     //    (their in-flight slot was counted at first drain, so `finish_in_flight`
     //    once).
+    update_partition_load_stats(cfg, state).await;
     fail_recovered_accumulator_batches(cfg).await;
     fail_recovered_retry_slots(cfg, &mut state.retry);
     fail_expired_accumulator_batches(cfg, now).await;
@@ -660,18 +781,29 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
     //    accumulator lock is held, so a concurrent `flush` never sees a batch
     //    that is neither in the accumulator nor counted in flight.
     let keys: Vec<(String, i32)> = cfg.accumulators.iter().map(|e| e.key().clone()).collect();
+    let track_latency = !cfg.partitioner.config().availability_timeout.is_zero();
+    for pb in &to_send {
+        note_node_latency(cfg, state, &(pb.topic.clone(), pb.partition), now, true);
+    }
     for key in keys {
-        if to_send.len() >= cfg.max_in_flight {
+        let capped = to_send.len() >= cfg.max_in_flight;
+        if capped && !track_latency {
             break;
-        }
-        // A partition with a resend in flight keeps its one slot; skip it.
-        if occupied.contains(&key) {
-            continue;
         }
         let acc = match cfg.accumulators.get(&key) {
             Some(a) => Arc::clone(a.value()),
             None => continue,
         };
+        // A partition with a resend in flight keeps its one slot; skip it.
+        if capped || occupied.contains(&key) {
+            // Records wait for a broker that this cycle cannot send to.
+            // Kafka's `Sender.sendProducerData` notes the same case when
+            // `NetworkClient.ready` refuses a node with ready data.
+            if track_latency && acc.lock().await.queue_size() > 0 {
+                note_node_latency(cfg, state, &key, now, false);
+            }
+            continue;
+        }
         // Seal only when this drain's cause permits it, then take a single
         // ready batch. A rollover wake must not pull an unrelated young
         // partition into the same send.
@@ -700,9 +832,7 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
             b
         };
         let Some(batch) = batch else { continue };
-        if let Some(num_partitions) = topic_partition_count(cfg, &key.0).await {
-            cfg.partitioner.rotate(&key.0, num_partitions);
-        }
+        note_node_latency(cfg, state, &key, now, true);
         if batch_crosses_recovery_barrier(cfg, batch.transaction_generation) {
             fail_batch(batch.records, ProducerError::RecoveryRequired);
             finish_in_flight(cfg);
@@ -2596,6 +2726,7 @@ mod tests {
 #[cfg(test)]
 mod harness {
     use std::{
+        collections::VecDeque,
         sync::{
             Mutex as StdMutex,
             atomic::{AtomicBool, AtomicI64, AtomicU64},
@@ -2623,6 +2754,7 @@ mod harness {
     use super::*;
     use crate::{
         accumulator::Accumulator,
+        partitioner::{PartitionerConfig, TopicPartitions},
         producer::{STATE_ACTIVE, STATE_FENCED, TopicMetadata},
         transactional::{AbortableError, TxnState},
     };
@@ -3161,7 +3293,7 @@ mod harness {
         flush_notify: Arc<Notify>,
         in_flight: Arc<AtomicUsize>,
         shutdown: CancellationToken,
-        partitioner: Arc<UniformStickyPartitioner>,
+        partitioner: Arc<BuiltInPartitioner>,
         transport: Arc<MockTransport>,
         recovery_required: Arc<AtomicBool>,
         recovery_generation: Arc<AtomicU64>,
@@ -3329,7 +3461,7 @@ mod harness {
         let metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let partition_leaders: Arc<DashMap<(String, i32), i32>> = Arc::new(DashMap::new());
-        let partitioner = Arc::new(UniformStickyPartitioner::new());
+        let partitioner = Arc::new(BuiltInPartitioner::new(PartitionerConfig::default()));
         let state = Arc::new(AtomicU8::new(STATE_ACTIVE));
         let recovery_required = Arc::new(AtomicBool::new(false));
         let recovery_generation = Arc::new(AtomicU64::new(0));
@@ -3929,8 +4061,10 @@ mod harness {
         shutdown(h).await;
     }
 
+    /// A drain does not move the sticky partition. Kafka's `BuiltInPartitioner`
+    /// switches only after `batch.size` bytes went to the partition.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sealing_batch_rotates_null_key_sticky_partition() {
+    async fn a_drained_batch_does_not_move_the_sticky_partition() {
         let transport = MockTransport::new(Duration::ZERO);
         let h = spawn_sender(transport.clone(), 5);
         h.metadata_cache.lock().await.insert(
@@ -3940,19 +4074,333 @@ mod harness {
                 topic_id: Uuid::ZERO,
             },
         );
+        let has_leader = |_: i32| true;
+        let partitions = TopicPartitions {
+            count: 3,
+            has_leader: &has_leader,
+        };
+        let before = h.partitioner.peek("t", &partitions);
 
-        assert2::assert!(h.partitioner.pick("t", None, 3) == 0);
-
-        let mut rxs = produce_single_batch(&h, "t", 0, 1).await;
+        let mut rxs = produce_single_batch(&h, "t", before.partition(), 1).await;
         tokio::time::timeout(Duration::from_secs(5), rxs.remove(0))
             .await
             .expect("record ack should resolve")
             .expect("oneshot sender should stay alive")
             .expect("record should ack");
 
-        assert2::assert!(h.partitioner.pick("t", None, 3) == 1);
-
+        let after = h.partitioner.peek("t", &partitions);
         shutdown(h).await;
+        assert2::assert!(after == before);
+    }
+
+    /// A sender configuration with `partitioner`, for a direct call into one
+    /// sender function.
+    fn direct_config(
+        partitioner: Arc<BuiltInPartitioner>,
+        max_in_flight: usize,
+    ) -> (SenderConfig, Arc<MockTransport>) {
+        let transport = MockTransport::new(Duration::ZERO);
+        let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
+        let cfg = SenderConfig {
+            transport: Box::new(ArcTransport(Arc::clone(&transport))),
+            producer_id: -1,
+            producer_epoch: Arc::new(AtomicI16::new(-1)),
+            acks: Acks::All,
+            compression: Compression::None,
+            linger: millis(1),
+            request_timeout_ms: 5_000,
+            retries: i32::MAX,
+            retry_backoff: RetryBackoff::new(Duration::from_millis(1), Duration::from_secs(1)),
+            delivery_timeout: secs(30),
+            max_in_flight,
+            metadata_cache: Arc::new(Mutex::new(HashMap::new())),
+            partition_leaders: Arc::new(DashMap::new()),
+            partitioner,
+            accumulators: Arc::new(DashMap::new()),
+            next_seq: Arc::new(DashMap::new()),
+            state: Arc::new(AtomicU8::new(STATE_ACTIVE)),
+            wake_rx,
+            flush_notify: Arc::new(Notify::new()),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            shutdown: CancellationToken::new(),
+            transactional_id: None,
+            txn_state: Arc::new(Mutex::new(TxnState::Uninitialized)),
+            txn_pid_epoch: Arc::new(Mutex::new((-1, -1))),
+            txn_recovery_required: Arc::new(AtomicBool::new(false)),
+            txn_recovery_generation: Arc::new(AtomicU64::new(0)),
+            txn_abortable_error: Arc::new(AbortableErrorSlot::default()),
+        };
+        (cfg, transport)
+    }
+
+    /// A partitioner that takes its random values from `values` in order.
+    fn scripted_partitioner(
+        config: PartitionerConfig,
+        values: Vec<u32>,
+    ) -> Arc<BuiltInPartitioner> {
+        let values = Arc::new(StdMutex::new(VecDeque::from(values)));
+        Arc::new(BuiltInPartitioner::with_random(
+            config,
+            Arc::new(move || {
+                values
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("the test scripts enough random values")
+            }),
+        ))
+    }
+
+    /// Put `batches` sealed batches of one record each in the accumulator of
+    /// `(topic, partition)`.
+    async fn queue_batches(cfg: &SenderConfig, topic: &str, partition: i32, batches: usize) {
+        let accumulator = Arc::clone(
+            cfg.accumulators
+                .entry((topic.to_owned(), partition))
+                .or_insert_with(|| Arc::new(Mutex::new(Accumulator::new(16 * 1024))))
+                .value(),
+        );
+        let mut accumulator = accumulator.lock().await;
+        for _ in 0..batches {
+            let _ = accumulator.try_append(
+                None,
+                Some(bytes::Bytes::from_static(b"v")),
+                vec![],
+                0,
+                None,
+            );
+            accumulator.seal_current();
+        }
+    }
+
+    /// The sender gives the partitioner the queue size of each partition, as
+    /// Kafka's `RecordAccumulator.partitionReady` does, and the new sticky
+    /// partition follows the weights of `BuiltInPartitioner.nextPartition`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn queue_sizes_weight_the_adaptive_pick() {
+        struct Row {
+            name: &'static str,
+            /// The leader of each partition of the topic `t`.
+            leaders: &'static [i32],
+            /// The sealed batches of each partition. A partition past the end
+            /// has no accumulator.
+            batches: &'static [usize],
+            /// A partition with a parked resend.
+            parked: Option<i32>,
+            /// A broker whose records waited this long with no send.
+            waited: Option<(i32, Duration)>,
+            adaptive: bool,
+            randoms: &'static [u32],
+            picks: &'static [i32],
+        }
+        let rows = [
+            Row {
+                // Sizes 2, 0, 1 give the table 1, 4, 6.
+                name: "queue sizes weight the pick",
+                leaders: &[1, 1, 1],
+                batches: &[2, 0, 1],
+                parked: None,
+                waited: None,
+                adaptive: true,
+                randoms: &[0, 1, 3, 4, 5, 6],
+                picks: &[0, 1, 1, 2, 2, 0],
+            },
+            Row {
+                // Sizes 2, 1, 1 give the table 1, 3, 5.
+                name: "a parked resend counts in the queue",
+                leaders: &[1, 1, 1],
+                batches: &[2, 0, 1],
+                parked: Some(1),
+                waited: None,
+                adaptive: true,
+                randoms: &[0, 1, 2, 3, 4],
+                picks: &[0, 1, 1, 2, 2],
+            },
+            Row {
+                // Sizes 2 and 1 on partitions 0 and 2 give the table 1, 3.
+                name: "a partition without a leader is left out",
+                leaders: &[1, -1, 1],
+                batches: &[2, 0, 1],
+                parked: None,
+                waited: None,
+                adaptive: true,
+                randoms: &[0, 1, 2, 3],
+                picks: &[0, 2, 2, 0],
+            },
+            Row {
+                name: "a broker past the availability timeout is left out",
+                leaders: &[1, 2, 1],
+                batches: &[2, 0, 1],
+                parked: None,
+                waited: Some((2, Duration::from_millis(101))),
+                adaptive: true,
+                randoms: &[0, 1, 2, 3],
+                picks: &[0, 2, 2, 0],
+            },
+            Row {
+                // Sizes 2, 0, 1 give the table 1, 4, 6.
+                name: "a broker inside the availability timeout stays in",
+                leaders: &[1, 2, 1],
+                batches: &[2, 0, 1],
+                parked: None,
+                waited: Some((2, Duration::from_millis(100))),
+                adaptive: true,
+                randoms: &[0, 1, 3, 4],
+                picks: &[0, 1, 1, 2],
+            },
+            Row {
+                name: "a partition with no queue gives a uniform pick",
+                leaders: &[1, 1, 1],
+                batches: &[2, 0],
+                parked: None,
+                waited: None,
+                adaptive: true,
+                randoms: &[0, 1, 2, 3],
+                picks: &[0, 1, 2, 0],
+            },
+            Row {
+                name: "equal queues give a uniform pick",
+                leaders: &[1, 1, 1],
+                batches: &[1, 1, 1],
+                parked: None,
+                waited: None,
+                adaptive: true,
+                randoms: &[0, 1, 2, 3],
+                picks: &[0, 1, 2, 0],
+            },
+            Row {
+                name: "adaptive partitioning off gives a uniform pick",
+                leaders: &[1, 1, 1],
+                batches: &[2, 0, 1],
+                parked: None,
+                waited: None,
+                adaptive: false,
+                randoms: &[0, 1, 2, 3],
+                picks: &[0, 1, 2, 0],
+            },
+        ];
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for row in rows {
+            let mut randoms = row.randoms.to_vec();
+            randoms.push(0);
+            let partitioner = scripted_partitioner(
+                PartitionerConfig {
+                    sticky_batch_size: 1,
+                    ignore_keys: false,
+                    adaptive_partitioning: row.adaptive,
+                    availability_timeout: Duration::from_millis(100),
+                },
+                randoms,
+            );
+            let (cfg, _transport) = direct_config(partitioner, 5);
+            cfg.metadata_cache.lock().await.insert(
+                "t".to_owned(),
+                TopicMetadata {
+                    num_partitions: 3,
+                    topic_id: Uuid::ZERO,
+                },
+            );
+            for (partition, &leader) in (0..).zip(row.leaders) {
+                cfg.partition_leaders
+                    .insert(("t".to_owned(), partition), leader);
+            }
+            for (partition, &batches) in (0..).zip(row.batches) {
+                queue_batches(&cfg, "t", partition, batches).await;
+            }
+            let mut state = PipelineState::default();
+            if let Some(partition) = row.parked {
+                let (pb, _rx) = idempotent_batch("t", partition, 0, 0);
+                state.retry.insert(("t".to_owned(), partition), pb);
+            }
+            if let Some((broker, waited)) = row.waited {
+                let now = Instant::now();
+                state.node_latency.insert(
+                    broker,
+                    NodeLatency {
+                        ready_at: now,
+                        drained_at: now.checked_sub(waited).expect("instant in range"),
+                    },
+                );
+            }
+
+            update_partition_load_stats(&cfg, &state).await;
+
+            let leaders = row.leaders;
+            let has_leader =
+                |partition: i32| usize::try_from(partition).is_ok_and(|index| leaders[index] >= 0);
+            let partitions = TopicPartitions {
+                count: 3,
+                has_leader: &has_leader,
+            };
+            let picks: Vec<i32> = row
+                .randoms
+                .iter()
+                .map(|_| {
+                    let sticky = cfg.partitioner.peek("t", &partitions);
+                    cfg.partitioner.update("t", sticky, 1, &partitions, true);
+                    sticky.partition()
+                })
+                .collect();
+            actual.push((row.name, picks));
+            expected.push((row.name, row.picks.to_vec()));
+        }
+        assert2::assert!(actual == expected);
+    }
+
+    /// With `partitioner.availability.timeout.ms`, a drain cycle notes for
+    /// each leader when records were ready and when the cycle sent them.
+    /// Kafka's `Sender.sendProducerData` calls
+    /// `RecordAccumulator.updateNodeLatencyStats` in the same way.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_drain_notes_ready_and_drained_times_per_leader() {
+        let partitioner = Arc::new(BuiltInPartitioner::new(PartitionerConfig {
+            sticky_batch_size: 16 * 1024,
+            ignore_keys: false,
+            adaptive_partitioning: true,
+            availability_timeout: Duration::from_millis(100),
+        }));
+        let (mut cfg, _transport) = direct_config(partitioner, 5);
+        for (partition, leader) in [(0, 1), (1, 2), (2, 3)] {
+            cfg.partition_leaders
+                .insert(("t".to_owned(), partition), leader);
+            queue_batches(&cfg, "t", partition, 1).await;
+        }
+        let earlier = Instant::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let now = Instant::now();
+        let mut state = PipelineState::default();
+        // Partition 1 waits for a resend, so its new batch cannot go out.
+        let (mut parked, _rx) = idempotent_batch("t", 1, 0, 0);
+        parked.backoff_until = Some(now + Duration::from_secs(10));
+        state.retry.insert(("t".to_owned(), 1), parked);
+        let seen = NodeLatency {
+            ready_at: earlier,
+            drained_at: earlier,
+        };
+        state.node_latency.insert(2, seen);
+        state.node_latency.insert(3, seen);
+
+        drain_once(&mut cfg, &mut state, DrainIntent::Force).await;
+
+        let drained = NodeLatency {
+            ready_at: now,
+            drained_at: now,
+        };
+        assert2::assert!(
+            state.node_latency
+                == HashMap::from([
+                    (1, drained),
+                    (
+                        2,
+                        NodeLatency {
+                            ready_at: now,
+                            drained_at: earlier,
+                        },
+                    ),
+                    (3, drained),
+                ])
+        );
     }
 
     /// A one-shot transport error mid-stream must NOT drop or reorder. The
@@ -5087,7 +5535,7 @@ mod harness {
             max_in_flight: 5,
             metadata_cache: Arc::new(Mutex::new(HashMap::new())),
             partition_leaders: Arc::new(DashMap::new()),
-            partitioner: Arc::new(UniformStickyPartitioner::new()),
+            partitioner: Arc::new(BuiltInPartitioner::new(PartitionerConfig::default())),
             accumulators: Arc::new(DashMap::new()),
             next_seq: Arc::new(DashMap::new()),
             state: Arc::new(AtomicU8::new(STATE_ACTIVE)),

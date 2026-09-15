@@ -23,7 +23,7 @@ consume-process-produce transactions.
 ## Capabilities
 
 - Async producer builder with bootstrap, linger, compression, and ack settings.
-- Per-topic/partition batching with sticky/hash partitioning.
+- Per-topic/partition batching. Keyed records hash to a partition, and keyless records use the adaptive sticky partitioner of Kafka (KIP-480, KIP-794).
 - Idempotent producer identity and sequence stamping through `InitProducerId`.
 - Retries that preserve producer identity and batch sequence numbers.
 - Per-record partition override with `ProducerRecord::partition`.
