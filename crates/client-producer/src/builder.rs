@@ -362,7 +362,7 @@ fn validated_duration(value: Duration, name: &str) -> Result<Duration, String> {
 ///
 /// The delivery timeout must be at least `linger + request_timeout`. When the
 /// application set it, a smaller value is an error. When it did not, a default
-/// smaller than that sum becomes the sum.
+/// smaller than that sum becomes the sum, with a warning.
 ///
 /// # Errors
 ///
@@ -387,7 +387,15 @@ fn resolve_delivery_timeout(
             }
             Ok(configured)
         }
-        None => Ok(DEFAULT_PRODUCER_DELIVERY_TIMEOUT.max(smallest)),
+        None if DEFAULT_PRODUCER_DELIVERY_TIMEOUT < smallest => {
+            tracing::warn!(
+                delivery_timeout = ?smallest,
+                "delivery_timeout should be equal to or larger than linger + request_timeout. \
+                 Setting it to linger + request_timeout."
+            );
+            Ok(smallest)
+        }
+        None => Ok(DEFAULT_PRODUCER_DELIVERY_TIMEOUT),
     }
 }
 
@@ -1188,20 +1196,33 @@ mod security_arg_tests {
         assert2::assert!(actual == expected);
     }
 
+    /// A configured delivery timeout below `linger + request_timeout` fails
+    /// `build()`. The default linger of 5 ms counts in the sum, as in Kafka.
     #[tokio::test]
     async fn producer_builder_rejects_delivery_timeout_below_linger_and_request_timeout() {
-        let error = Producer::builder()
-            .bootstrap("127.0.0.1:1")
-            .linger(Duration::from_millis(5))
-            .request_timeout(Duration::from_secs(1))
-            .delivery_timeout(Duration::from_millis(1_004))
-            .build()
-            .await
-            .expect_err("delivery timeout below linger + request timeout");
-        assert2::assert!(
-            error.to_string()
-                == "invalid config: delivery_timeout should be equal to or larger than linger + request_timeout"
-        );
+        let rule = "invalid config: delivery_timeout should be equal to or larger than linger \
+                    + request_timeout";
+        let cases = [
+            ("configured linger", Some(Duration::from_millis(5)), 1_004),
+            ("default linger", None, 1_004),
+            ("default linger, delivery equal to request", None, 1_000),
+        ];
+        let mut actual = Vec::with_capacity(cases.len());
+        let mut expected = Vec::with_capacity(cases.len());
+        for (name, linger, delivery_timeout_ms) in cases {
+            let error = Producer::builder()
+                .bootstrap("127.0.0.1:1")
+                .maybe_linger(linger)
+                .request_timeout(Duration::from_secs(1))
+                .delivery_timeout(Duration::from_millis(delivery_timeout_ms))
+                .build()
+                .await
+                .err()
+                .map(|error| error.to_string());
+            actual.push((name, error));
+            expected.push((name, Some(rule.to_owned())));
+        }
+        assert2::assert!(actual == expected);
     }
 
     #[test]
