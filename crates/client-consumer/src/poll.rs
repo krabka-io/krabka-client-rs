@@ -2116,6 +2116,7 @@ mod partition_error_tests {
                     offset: 5,
                     leader_epoch: 0,
                     timestamp: 0,
+                    timestamp_type: crate::TimestampType::CreateTime,
                     key: None,
                     value: None,
                     headers: Vec::new(),
