@@ -226,111 +226,117 @@ fn prepopulate_current_assignments(
     out
 }
 
-/// `ConstrainedAssignmentBuilder`, for when all members share the same
-/// subscription.
+/// Kafka's `AbstractStickyAssignor.ConstrainedAssignmentBuilder`, for when all
+/// members share the same subscription.
 ///
-/// This is the faster path. In that special case it produces the same final
-/// assignment as the general algorithm.
+/// Each member keeps up to `min_quota` of its owned partitions, and up to
+/// `max_quota` while fewer than `total % members` members hold more than
+/// `min_quota`. The other partitions go round robin to the members below
+/// `min_quota`, then to the members that may still take one more.
 fn constrained_assign(
     member_ids: &[String],
     subs: &BTreeMap<String, BTreeSet<String>>,
     current_assignment: &BTreeMap<String, Vec<(String, i32)>>,
     topic_partitions: &HashMap<String, i32>,
 ) -> HashMap<String, Vec<(String, i32)>> {
-    // Determine the shared subscription (all members have the same).
-    let shared: BTreeSet<String> = member_ids
-        .first()
-        .and_then(|m| subs.get(m).cloned())
-        .unwrap_or_default();
-
-    // Enumerate all partitions of subscribed topics (sorted topic, then partition).
-    let mut all_partitions: Vec<(String, i32)> = Vec::new();
-    let mut topics_sorted: Vec<&String> = shared.iter().collect();
-    topics_sorted.sort();
-    for t in topics_sorted {
-        let Some(&n) = topic_partitions.get(t) else {
-            continue;
-        };
-        for p in 0..n {
-            all_partitions.push((t.clone(), p));
-        }
-    }
-
     let num_members = member_ids.len();
     if num_members == 0 {
         return HashMap::new();
     }
+    let shared: BTreeSet<String> = member_ids
+        .first()
+        .and_then(|m| subs.get(m).cloned())
+        .unwrap_or_default();
+    // `getAllTopicPartitions`: sorted topics, then partitions.
+    let all_partitions: Vec<(String, i32)> = shared
+        .iter()
+        .filter_map(|topic| topic_partitions.get(topic).map(|count| (topic, *count)))
+        .flat_map(|(topic, count)| (0..count.max(0)).map(move |p| (topic.clone(), p)))
+        .collect();
     let total = all_partitions.len();
-    let base = total / num_members;
-    let remainder = total % num_members;
+    let min_quota = total / num_members;
+    let max_quota = total.div_ceil(num_members);
+    let expected_over_min = total % num_members;
+    let mut current_over_min = 0;
 
-    // Per-member target_size. JVM gives the +1 to the first `remainder` members
-    // in iteration order; since our member_ids are sorted, that's lex order.
-    let mut targets: BTreeMap<String, usize> = BTreeMap::new();
-    for (i, id) in member_ids.iter().enumerate() {
-        let extra = usize::from(i < remainder);
-        targets.insert(id.clone(), base + extra);
-    }
+    let mut assignment: HashMap<String, Vec<(String, i32)>> = member_ids
+        .iter()
+        .map(|id| (id.clone(), Vec::new()))
+        .collect();
+    let mut assigned: HashSet<(String, i32)> = HashSet::new();
+    let mut under_min: Vec<String> = Vec::new();
+    let mut exactly_min: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
-    // Step A: each member keeps a prefix of their owned (lex-sorted),
-    // up to target_size.
-    let mut out: HashMap<String, Vec<(String, i32)>> = HashMap::new();
-    let mut taken: HashSet<(String, i32)> = HashSet::new();
+    // `assignOwnedPartitions`.
     for id in member_ids {
         let mut owned: Vec<(String, i32)> = current_assignment.get(id).cloned().unwrap_or_default();
-        owned.sort();
-        let target = *targets.get(id).unwrap_or(&0);
-        let kept: Vec<(String, i32)> = owned.into_iter().take(target).collect();
-        for tp in &kept {
-            taken.insert(tp.clone());
-        }
-        out.insert(id.clone(), kept);
-    }
-
-    // Step B: distribute the remaining (unowned-or-released) partitions
-    // round-robin to members still below their target. Iterate partitions
-    // in (topic, partition) order; member queue in lex order.
-    let mut unassigned: Vec<(String, i32)> = all_partitions
-        .into_iter()
-        .filter(|tp| !taken.contains(tp))
-        .collect();
-    unassigned.sort();
-
-    let mut member_cursor = 0usize;
-    for tp in unassigned {
-        // Find the next member with capacity, starting from cursor (round-robin).
-        let mut placed = false;
-        for _ in 0..num_members {
-            let id = &member_ids[member_cursor % num_members];
-            member_cursor += 1;
-            let target = *targets.get(id).unwrap_or(&0);
-            let slot = out.entry(id.clone()).or_default();
-            if slot.len() < target {
-                slot.push(tp);
-                placed = true;
-                break;
+        owned.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let slot = assignment.get_mut(id).expect("member slot");
+        if owned.len() < min_quota {
+            assigned.extend(owned.iter().cloned());
+            slot.extend(owned);
+            under_min.push(id.clone());
+        } else if owned.len() >= max_quota && current_over_min < expected_over_min {
+            current_over_min += 1;
+            if current_over_min == expected_over_min {
+                exactly_min.clear();
+            }
+            owned.truncate(max_quota);
+            assigned.extend(owned.iter().cloned());
+            slot.extend(owned);
+        } else {
+            owned.truncate(min_quota);
+            assigned.extend(owned.iter().cloned());
+            slot.extend(owned);
+            if current_over_min < expected_over_min {
+                exactly_min.push_back(id.clone());
             }
         }
-        // Invariant: per-member targets sum to `total`, and Step A only ever
-        // marks partitions of `all_partitions` as `taken` (each at most once,
-        // since `prepopulate_current_assignments` filters stale ownership and
-        // resolves conflicts). So the remaining capacity Σ(target − kept)
-        // equals |unassigned|, and because the inner loop scans every member,
-        // any leftover capacity is always found. A failure to place means the
-        // target arithmetic or Step-A bookkeeping has regressed.
-        debug_assert!(
-            placed,
-            "constrained_assign: unassigned partition found no slot despite Σtargets == total"
-        );
-        if !placed {
-            break;
+    }
+
+    let unassigned: Vec<(String, i32)> = all_partitions
+        .into_iter()
+        .filter(|partition| !assigned.contains(partition))
+        .collect();
+    under_min.sort();
+    exactly_min.make_contiguous().sort();
+
+    // `assignRoundRobin`.
+    let mut cursor = 0;
+    for partition in unassigned {
+        let member = if cursor < under_min.len() {
+            under_min[cursor].clone()
+        } else if under_min.is_empty() {
+            let Some(member) = exactly_min.pop_front() else {
+                // Kafka throws `IllegalStateException`; the quotas make this
+                // unreachable.
+                break;
+            };
+            member
+        } else {
+            cursor = 0;
+            under_min[0].clone()
+        };
+        let slot = assignment.get_mut(&member).expect("member slot");
+        slot.push(partition);
+        let count = slot.len();
+        // A member from the exactly-min queue now holds `max_quota` and leaves
+        // the queue. A member below `min_quota` moves to that queue when it
+        // reaches `min_quota`.
+        if cursor < under_min.len() && under_min[cursor] == member {
+            if count == min_quota {
+                under_min.remove(cursor);
+                exactly_min.push_back(member);
+            } else {
+                cursor += 1;
+            }
         }
     }
 
-    for v in out.values_mut() {
-        v.sort();
+    for partitions in assignment.values_mut() {
+        partitions.sort();
     }
-    out
+    assignment
 }
 
 /// `AbstractStickyAssignor.generalAssign`, the four-pass general algorithm for
@@ -486,6 +492,15 @@ fn max_balance_iters(partitions: usize, members: usize) -> usize {
     partitions.saturating_mul(members) + 16
 }
 
+/// Kafka's `GeneralAssignmentBuilder.performReassignments`: move partitions
+/// until no partition can move to a less loaded subscriber.
+///
+/// For each partition in `(topic, partition)` order, the owner gives it back to
+/// its previous owner when the owner holds more than one partition more than
+/// that previous owner. Otherwise the owner gives it to the least loaded
+/// subscriber (then the lowest member id) when that subscriber holds more than
+/// one partition less. The pass repeats while it moved a partition, at most
+/// `max_iters` moves.
 fn balance_assignment(
     member_ids: &[String],
     subs: &BTreeMap<String, BTreeSet<String>>,
@@ -493,64 +508,65 @@ fn balance_assignment(
     new_assignment: &mut BTreeMap<String, Vec<(String, i32)>>,
     max_iters: usize,
 ) {
-    for _ in 0..max_iters {
-        // Find heaviest and lightest among ALL members (lex tiebreak on id).
-        let mut heaviest: Option<(usize, String)> = None;
-        let mut lightest: Option<(usize, String)> = None;
-        for id in member_ids {
-            let load = new_assignment.get(id).map_or(0, Vec::len);
-            match &heaviest {
-                None => heaviest = Some((load, id.clone())),
-                Some((hl, _)) if load > *hl => heaviest = Some((load, id.clone())),
-                _ => {}
-            }
-            match &lightest {
-                None => lightest = Some((load, id.clone())),
-                Some((ll, _)) if load < *ll => lightest = Some((load, id.clone())),
-                _ => {}
-            }
-        }
-        let Some((hload, hid)) = heaviest else {
-            break;
-        };
-        let Some((lload, lid)) = lightest else {
-            break;
-        };
-        if hload <= lload + 1 {
-            break;
-        }
-
-        // Need to find a partition on hid whose topic lid subscribes to.
-        let l_subs = subs.get(&lid).cloned().unwrap_or_default();
-        let h_parts = new_assignment.get(&hid).cloned().unwrap_or_default();
-        let mut candidates: Vec<(String, i32)> = h_parts
-            .into_iter()
-            .filter(|tp| l_subs.contains(&tp.0))
+    let load = |assignment: &BTreeMap<String, Vec<(String, i32)>>, id: &str| {
+        assignment.get(id).map_or(0, Vec::len)
+    };
+    let mut moves = 0;
+    loop {
+        let mut modified = false;
+        let mut partitions: Vec<((String, i32), String)> = new_assignment
+            .iter()
+            .flat_map(|(id, parts)| parts.iter().map(move |tp| (tp.clone(), id.clone())))
             .collect();
-        if candidates.is_empty() {
-            // Can't fix this imbalance with these two endpoints; we'd need
-            // multi-hop, which JVM also doesn't do. The JVM scans the full pair
-            // matrix per iteration; the cases covered here (assignor tests +
-            // steady state) produce the same result.
-            break;
+        partitions.sort();
+        for (partition, owner) in partitions {
+            if moves >= max_iters {
+                return;
+            }
+            let owner_load = load(new_assignment, &owner);
+            let subscribers: Vec<&String> = member_ids
+                .iter()
+                .filter(|id| {
+                    subs.get(*id)
+                        .is_some_and(|topics| topics.contains(&partition.0))
+                })
+                .collect();
+            if subscribers.len() <= 1 {
+                continue;
+            }
+            let target = match prev_owner.get(&partition) {
+                Some(previous)
+                    if previous != &owner
+                        && subscribers.contains(&previous)
+                        && owner_load > load(new_assignment, previous) + 1 =>
+                {
+                    Some(previous.clone())
+                }
+                _ => subscribers
+                    .iter()
+                    .filter(|id| owner_load > load(new_assignment, id) + 1)
+                    .min_by(|a, b| {
+                        load(new_assignment, a)
+                            .cmp(&load(new_assignment, b))
+                            .then_with(|| a.cmp(b))
+                    })
+                    .map(|id| (*id).clone()),
+            };
+            let Some(target) = target else {
+                continue;
+            };
+            if let Some(parts) = new_assignment.get_mut(&owner)
+                && let Some(position) = parts.iter().position(|tp| tp == &partition)
+            {
+                parts.remove(position);
+            }
+            new_assignment.entry(target).or_default().push(partition);
+            moves += 1;
+            modified = true;
         }
-        // Sort candidates: partitions lid didn't previously own first
-        // (sticky), then (topic, partition).
-        candidates.sort_by(|a, b| {
-            let a_was_lids = prev_owner.get(a) == Some(&lid);
-            let b_was_lids = prev_owner.get(b) == Some(&lid);
-            a_was_lids
-                .cmp(&b_was_lids)
-                .then_with(|| a.0.cmp(&b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        let moved = candidates.into_iter().next().expect("non-empty");
-
-        let h_vec = new_assignment.get_mut(&hid).unwrap();
-        if let Some(pos) = h_vec.iter().position(|x| x == &moved) {
-            h_vec.remove(pos);
+        if !modified {
+            return;
         }
-        new_assignment.get_mut(&lid).unwrap().push(moved);
     }
 }
 
@@ -617,6 +633,73 @@ mod tests {
             &topic_parts,
         );
         assert2::assert!(a["m1"] == tp(&[("t", 0), ("t", 1), ("t", 2), ("t", 3)]));
+    }
+
+    /// Kafka's `ConstrainedAssignmentBuilder` keeps every owned partition that
+    /// fits the quotas: a member that owns `max_quota` keeps them while fewer
+    /// than `total % members` members are over `min_quota`.
+    #[test]
+    fn constrained_assignment_keeps_owned_partitions_within_the_quotas() {
+        let one = topic_parts(&[("t", 1)]);
+        let three = topic_parts(&[("t", 3)]);
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, members, counts, expected) in [
+            (
+                "a new member does not take the only partition from its owner",
+                vec![
+                    ("a".to_string(), topics(&["t"]), vec![], 1),
+                    ("z".to_string(), topics(&["t"]), tp(&[("t", 0)]), 1),
+                ],
+                one.clone(),
+                assigned(&[("a", &[]), ("z", &[("t", 0)])]),
+            ),
+            (
+                "the owner of two keeps both when one member may be over the min quota",
+                vec![
+                    ("a".to_string(), topics(&["t"]), vec![], 1),
+                    (
+                        "z".to_string(),
+                        topics(&["t"]),
+                        tp(&[("t", 0), ("t", 2)]),
+                        1,
+                    ),
+                ],
+                three.clone(),
+                assigned(&[("a", &[("t", 1)]), ("z", &[("t", 0), ("t", 2)])]),
+            ),
+        ] {
+            actual.push((name, assign_eager(&members, &counts)));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `performReassignments` scans every partition, so a move between
+    /// two members that are not the heaviest and the lightest also balances the
+    /// group.
+    #[test]
+    fn general_assignment_moves_between_any_compatible_pair() {
+        let counts = topic_parts(&[("x", 2), ("y", 5), ("z", 1)]);
+        let members = vec![
+            ("a".to_string(), topics(&["x"]), vec![], -1),
+            ("b".to_string(), topics(&["y"]), vec![], -1),
+            ("c".to_string(), topics(&["z"]), vec![], -1),
+            ("d".to_string(), topics(&["x", "y"]), vec![], -1),
+        ];
+        let loads: BTreeMap<String, usize> = assign_eager(&members, &counts)
+            .into_iter()
+            .map(|(id, partitions)| (id, partitions.len()))
+            .collect();
+        assert2::assert!(
+            loads
+                == BTreeMap::from([
+                    ("a".to_string(), 2),
+                    ("b".to_string(), 3),
+                    ("c".to_string(), 1),
+                    ("d".to_string(), 2),
+                ])
+        );
     }
 
     #[test]
@@ -825,12 +908,14 @@ mod tests {
 
         balance_assignment(&ids, &subs, &prev_owner, &mut assignment, 8);
 
+        // t0 goes to the least loaded member, t1 back to its previous owner,
+        // and t2 to the member that is still two partitions behind.
         assert2::assert!(
             assignment
                 == current(&[
-                    ("m1", &[("t", 2), ("t", 3)]),
-                    ("m2", &[("t", 0)]),
-                    ("m3", &[("t", 1)]),
+                    ("m1", &[("t", 3)]),
+                    ("m2", &[("t", 0), ("t", 1)]),
+                    ("m3", &[("t", 2)]),
                 ])
         );
     }
@@ -881,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn balance_assignment_moves_partition_lightest_did_not_previously_own() {
+    fn balance_assignment_moves_a_partition_back_to_its_previous_owner() {
         let ids = member_ids(&["m1", "m2"]);
         let subs = subs(&[("m1", &["t"]), ("m2", &["t"])]);
         let prev_owner = HashMap::from([(("t".to_string(), 0), "m1".to_string())]);
@@ -890,7 +975,7 @@ mod tests {
         balance_assignment(&ids, &subs, &prev_owner, &mut assignment, 1);
 
         assert2::assert!(
-            assignment == current(&[("m1", &[("t", 1)]), ("m2", &[("t", 0), ("t", 2)]),])
+            assignment == current(&[("m1", &[("t", 0)]), ("m2", &[("t", 1), ("t", 2)]),])
         );
     }
 
