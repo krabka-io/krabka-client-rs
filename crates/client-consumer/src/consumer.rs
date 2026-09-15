@@ -136,6 +136,9 @@ pub struct Consumer {
     /// The listener calls that the coordinator task asks `poll` to run.
     pub(crate) listener_calls:
         tokio::sync::mpsc::UnboundedReceiver<crate::rebalance_listener::ListenerCall>,
+    /// The added partitions that wait for `on_partitions_assigned`. The
+    /// coordinator task writes it and `poll` does not fetch them.
+    pub(crate) assigned_callback_pending: crate::rebalance_listener::AssignedCallbackPending,
 }
 
 /// What a closing consumer does with its group membership. Kafka's
@@ -1563,6 +1566,7 @@ async fn spawn_consumer(
     let rebalance_pending_receiver = rebalance_pending.subscribe();
     let close_operation = tokio::sync::watch::Sender::new(GroupMembershipOperation::Default);
     let (listener_sender, listener_calls) = tokio::sync::mpsc::unbounded_channel();
+    let assigned_callback_pending = crate::rebalance_listener::AssignedCallbackPending::default();
     if has_rebalance_listener {
         // Kafka's first `poll` completes the first join and calls
         // `on_partitions_assigned`. Here the build joined, so the first `poll`
@@ -1623,6 +1627,9 @@ async fn spawn_consumer(
         rejoin_reason: String::new(),
         listener_calls: has_rebalance_listener.then_some(listener_sender),
         lost_partitions: Vec::new(),
+        assigned_callback_pending: Arc::clone(&assigned_callback_pending),
+        poll_timer: crate::coordinator::PollTimer::new(max_poll_interval),
+        poll_timeout_in_callback: false,
     };
     // IMPORTANT: `tokio::spawn` is the very last operation — no `.await`
     // follows it.  Dropping a timed-out `start_once` future before this
@@ -1671,6 +1678,7 @@ async fn spawn_consumer(
         close_operation,
         rebalance_listener: None,
         listener_calls,
+        assigned_callback_pending,
     })
 }
 
@@ -2605,6 +2613,7 @@ mod security_arg_tests {
             close_operation: tokio::sync::watch::Sender::new(GroupMembershipOperation::Default),
             rebalance_listener: None,
             listener_calls: tokio::sync::mpsc::unbounded_channel().1,
+            assigned_callback_pending: Arc::default(),
         }
     }
 
@@ -4818,11 +4827,20 @@ mod rebalance_listener_tests {
         Assigned(Vec<(String, i32)>),
         Lost(Vec<(String, i32)>),
         CommitInRevoke(Result<(), String>),
+        /// The partitions that `poll` did not fetch while the assign callback
+        /// ran.
+        AwaitingCallback(Vec<(String, i32)>),
+        /// A `poll` returned this error.
+        PollError(String),
+        /// The position of partition 0 after the first `poll`.
+        Position(Option<i64>),
     }
 
     struct Recorder {
         calls: Arc<std::sync::Mutex<Vec<Call>>>,
         commit_on_revoke: bool,
+        fail_revoke: bool,
+        seek_on_assign: Option<i64>,
     }
 
     impl Recorder {
@@ -4846,15 +4864,35 @@ mod rebalance_listener_tests {
                     .map_err(|error| error.to_string());
                 self.record(Call::CommitInRevoke(result));
             }
+            if self.fail_revoke {
+                return Err("revoke failed".into());
+            }
             Ok(())
         }
 
         async fn on_partitions_assigned(
             &mut self,
-            _consumer: &Consumer,
+            consumer: &Consumer,
             partitions: &[(String, i32)],
         ) -> Result<(), RebalanceListenerError> {
             self.record(Call::Assigned(partitions.to_vec()));
+            let mut awaiting: Vec<_> = consumer
+                .assigned_callback_pending
+                .lock()
+                .expect("pending lock")
+                .iter()
+                .cloned()
+                .collect();
+            awaiting.sort();
+            if !partitions.is_empty() {
+                self.record(Call::AwaitingCallback(awaiting));
+            }
+            if let (Some(offset), Some(partition)) = (self.seek_on_assign, partitions.first()) {
+                consumer
+                    .seek(partition.0.clone(), partition.1, offset)
+                    .await
+                    .expect("seek");
+            }
             Ok(())
         }
 
@@ -4884,11 +4922,17 @@ mod rebalance_listener_tests {
         assignments: Vec<Vec<(String, i32)>>,
         event: Event,
         commit_on_revoke: bool,
+        fail_revoke: bool,
+        seek_on_assign: Option<i64>,
         /// The number of calls after which the case stops polling.
         calls: usize,
     }
 
-    async fn run_case(case: Case) -> (Vec<Call>, Vec<GroupRequest>) {
+    /// The listener calls of a case, and the generation of each
+    /// `OffsetCommit`.
+    type CaseResult = (Vec<Call>, Vec<i32>);
+
+    async fn run_case(case: Case) -> CaseResult {
         let coordinator = MockCoordinator::new(case.assignor, case.assignments);
         let in_mock = Arc::clone(&coordinator);
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
@@ -4923,10 +4967,24 @@ mod rebalance_listener_tests {
         consumer.rebalance_listener = Some(Box::new(Recorder {
             calls: Arc::clone(&calls),
             commit_on_revoke: case.commit_on_revoke,
+            fail_revoke: case.fail_revoke,
+            seek_on_assign: case.seek_on_assign,
         }));
 
         // The first poll runs the assign callback of the build.
         consumer.poll(millis(20)).await.expect("first poll");
+        if case.seek_on_assign.is_some() {
+            let position = consumer
+                .next_offsets
+                .lock()
+                .await
+                .get(&partition(0))
+                .copied();
+            calls
+                .lock()
+                .expect("calls lock")
+                .push(Call::Position(position));
+        }
         match case.event {
             Event::Heartbeat(error_code) => {
                 coordinator
@@ -4936,128 +4994,336 @@ mod rebalance_listener_tests {
                 while calls.lock().expect("calls lock").len() < case.calls
                     && tokio::time::Instant::now() < deadline
                 {
-                    consumer.poll(millis(20)).await.expect("poll");
+                    poll_recording(&mut consumer, &calls).await;
                 }
                 // Polls after the last expected call show any extra call.
                 for _ in 0..10 {
-                    consumer.poll(millis(20)).await.expect("poll");
+                    poll_recording(&mut consumer, &calls).await;
                 }
                 drop(consumer);
             }
             Event::Close => consumer.close().await.expect("close"),
         }
-        let requests = coordinator
+        let generations = coordinator
             .requests()
             .into_iter()
-            .filter(|request| matches!(request, GroupRequest::OffsetCommit(_)))
+            .filter_map(|request| match request {
+                GroupRequest::OffsetCommit(commit) => Some(commit.generation_id_or_member_epoch),
+                _ => None,
+            })
             .collect();
         mock.stop();
         let calls = calls.lock().expect("calls lock").clone();
-        (calls, requests)
+        (calls, generations)
+    }
+
+    /// Poll once, and record an error of the `poll`.
+    async fn poll_recording(consumer: &mut Consumer, calls: &std::sync::Mutex<Vec<Call>>) {
+        if let Err(error) = consumer.poll(millis(20)).await {
+            calls
+                .lock()
+                .expect("calls lock")
+                .push(Call::PollError(error.to_string()));
+        }
     }
 
     /// The order and the partitions of Kafka's `ConsumerRebalanceListener`
     /// calls (`ConsumerCoordinator.onJoinPrepare`, `onJoinComplete` and
     /// `onLeavePrepare`).
+    /// An assign callback that takes longer than `max_poll_interval` the first
+    /// time that it gets the added partition.
+    struct SlowAssign {
+        slept: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ConsumerRebalanceListener for SlowAssign {
+        async fn on_partitions_revoked(
+            &mut self,
+            _consumer: &Consumer,
+            _partitions: &[(String, i32)],
+        ) -> Result<(), RebalanceListenerError> {
+            Ok(())
+        }
+
+        async fn on_partitions_assigned(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), RebalanceListenerError> {
+            // The partition that the rebalance adds. The first `poll` runs the
+            // callback of the build quickly.
+            if partitions.contains(&partition(1)) && !self.slept {
+                self.slept = true;
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+            }
+            Ok(())
+        }
+    }
+
+    /// Kafka's heartbeat thread leaves the group when the poll timer expires,
+    /// also while a callback runs inside `poll` (`AbstractCoordinator.
+    /// HeartbeatThread.run`, `handlePollTimeoutExpiry`).
+    #[tokio::test]
+    async fn poll_timeout_during_a_callback_leaves_the_group() {
+        let coordinator = MockCoordinator::new(
+            Assignor::CooperativeSticky,
+            vec![vec![partition(0), partition(1)]],
+        );
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut config = start_config(
+            mock.addr.to_string(),
+            Assignor::CooperativeSticky,
+            false,
+            millis(400),
+        );
+        config.heartbeat_interval = millis(50);
+        config.has_rebalance_listener = true;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = spawn_consumer(
+            config,
+            client,
+            Arc::new(AtomicI32::new(0)),
+            MEMBER.into(),
+            StartupState {
+                generation_id: 1,
+                assigned_partitions: vec![partition(0)],
+                next_offsets: HashMap::from([(partition(0), 12)]),
+                positions: HashMap::new(),
+                topic_ids: HashMap::new(),
+                topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
+            },
+        )
+        .await
+        .expect("spawn consumer");
+        consumer.rebalance_listener = Some(Box::new(SlowAssign { slept: false }));
+        consumer.poll(millis(20)).await.expect("first poll");
+        coordinator.heartbeat_error.store(27, Ordering::SeqCst);
+        // Poll until the slow assign callback of the join has run.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while coordinator.leaves.lock().expect("leaves lock").is_empty()
+            && tokio::time::Instant::now() < deadline
+        {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let reasons: Vec<Option<String>> = coordinator
+            .leaves
+            .lock()
+            .expect("leaves lock")
+            .iter()
+            .flat_map(|leave| leave.members.iter().map(|member| member.reason.clone()))
+            .collect();
+        drop(consumer);
+        mock.stop();
+        assert2::assert!(reasons == vec![Some("consumer poll timeout has expired.".to_owned())]);
+    }
+
     #[tokio::test]
     async fn listener_calls_follow_kafkas_order() {
         let p = partition;
+        let case = |assignor, owned: Vec<(String, i32)>, assignment, event, calls| Case {
+            assignor,
+            owned,
+            assignments: vec![assignment],
+            event,
+            commit_on_revoke: false,
+            fail_revoke: false,
+            seek_on_assign: None,
+            calls,
+        };
+        let awaiting = |partitions: Vec<(String, i32)>| Call::AwaitingCallback(partitions);
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for (name, case, expected) in [
             (
                 "eager rebalance",
-                Case {
-                    assignor: Assignor::Range,
-                    owned: vec![p(0), p(1)],
-                    assignments: vec![vec![p(0)]],
-                    event: Event::Heartbeat(27),
-                    commit_on_revoke: false,
-                    calls: 3,
-                },
-                vec![
-                    Call::Assigned(vec![p(0), p(1)]),
-                    Call::Revoked(vec![p(0), p(1)]),
-                    Call::Assigned(vec![p(0)]),
-                ],
+                case(
+                    Assignor::Range,
+                    vec![p(0), p(1)],
+                    vec![p(0)],
+                    Event::Heartbeat(27),
+                    5,
+                ),
+                (
+                    vec![
+                        Call::Assigned(vec![p(0), p(1)]),
+                        awaiting(vec![]),
+                        Call::Revoked(vec![p(0), p(1)]),
+                        Call::Assigned(vec![p(0)]),
+                        awaiting(vec![p(0)]),
+                    ],
+                    vec![],
+                ),
             ),
             (
                 "cooperative rebalance that revokes",
-                Case {
-                    assignor: Assignor::CooperativeSticky,
-                    owned: vec![p(0), p(1)],
-                    assignments: vec![vec![p(0)]],
-                    event: Event::Heartbeat(27),
-                    commit_on_revoke: false,
-                    calls: 4,
-                },
-                vec![
-                    Call::Assigned(vec![p(0), p(1)]),
-                    Call::Revoked(vec![p(1)]),
-                    Call::Assigned(Vec::new()),
-                    Call::Assigned(Vec::new()),
-                ],
+                case(
+                    Assignor::CooperativeSticky,
+                    vec![p(0), p(1)],
+                    vec![p(0)],
+                    Event::Heartbeat(27),
+                    5,
+                ),
+                (
+                    vec![
+                        Call::Assigned(vec![p(0), p(1)]),
+                        awaiting(vec![]),
+                        Call::Revoked(vec![p(1)]),
+                        Call::Assigned(Vec::new()),
+                        Call::Assigned(Vec::new()),
+                    ],
+                    vec![],
+                ),
             ),
             (
                 "cooperative rebalance that adds",
-                Case {
-                    assignor: Assignor::CooperativeSticky,
-                    owned: vec![p(0)],
-                    assignments: vec![vec![p(0), p(1)]],
-                    event: Event::Heartbeat(27),
-                    commit_on_revoke: false,
-                    calls: 2,
-                },
-                vec![Call::Assigned(vec![p(0)]), Call::Assigned(vec![p(1)])],
+                case(
+                    Assignor::CooperativeSticky,
+                    vec![p(0)],
+                    vec![p(0), p(1)],
+                    Event::Heartbeat(27),
+                    4,
+                ),
+                (
+                    vec![
+                        Call::Assigned(vec![p(0)]),
+                        awaiting(vec![]),
+                        Call::Assigned(vec![p(1)]),
+                        awaiting(vec![p(1)]),
+                    ],
+                    vec![],
+                ),
             ),
             (
                 "unknown member id",
-                Case {
-                    assignor: Assignor::Range,
-                    owned: vec![p(0)],
-                    assignments: vec![vec![p(0)]],
-                    event: Event::Heartbeat(25),
-                    commit_on_revoke: false,
-                    calls: 3,
-                },
-                vec![
-                    Call::Assigned(vec![p(0)]),
-                    Call::Lost(vec![p(0)]),
-                    Call::Assigned(vec![p(0)]),
-                ],
+                case(
+                    Assignor::Range,
+                    vec![p(0)],
+                    vec![p(0)],
+                    Event::Heartbeat(25),
+                    5,
+                ),
+                (
+                    vec![
+                        Call::Assigned(vec![p(0)]),
+                        awaiting(vec![]),
+                        Call::Lost(vec![p(0)]),
+                        Call::Assigned(vec![p(0)]),
+                        awaiting(vec![p(0)]),
+                    ],
+                    vec![],
+                ),
             ),
             (
                 "close",
-                Case {
-                    assignor: Assignor::Range,
-                    owned: vec![p(0)],
-                    assignments: vec![vec![p(0)]],
-                    event: Event::Close,
-                    commit_on_revoke: false,
-                    calls: 2,
-                },
-                vec![Call::Assigned(vec![p(0)]), Call::Revoked(vec![p(0)])],
+                case(Assignor::Range, vec![p(0)], vec![p(0)], Event::Close, 3),
+                (
+                    vec![
+                        Call::Assigned(vec![p(0)]),
+                        awaiting(vec![]),
+                        Call::Revoked(vec![p(0)]),
+                    ],
+                    vec![],
+                ),
             ),
             (
                 "a commit in the eager revoke callback",
                 Case {
-                    assignor: Assignor::Range,
-                    owned: vec![p(0)],
-                    assignments: vec![vec![p(0)]],
-                    event: Event::Heartbeat(27),
                     commit_on_revoke: true,
-                    calls: 4,
+                    ..case(
+                        Assignor::Range,
+                        vec![p(0)],
+                        vec![p(0)],
+                        Event::Heartbeat(27),
+                        6,
+                    )
                 },
-                vec![
-                    Call::Assigned(vec![p(0)]),
-                    Call::Revoked(vec![p(0)]),
-                    Call::CommitInRevoke(Ok(())),
-                    Call::Assigned(vec![p(0)]),
-                ],
+                (
+                    vec![
+                        Call::Assigned(vec![p(0)]),
+                        awaiting(vec![]),
+                        Call::Revoked(vec![p(0)]),
+                        Call::CommitInRevoke(Ok(())),
+                        Call::Assigned(vec![p(0)]),
+                        awaiting(vec![p(0)]),
+                    ],
+                    vec![1],
+                ),
+            ),
+            (
+                "a commit in the cooperative revoke callback carries the new generation",
+                Case {
+                    commit_on_revoke: true,
+                    ..case(
+                        Assignor::CooperativeSticky,
+                        vec![p(0), p(1)],
+                        vec![p(0)],
+                        Event::Heartbeat(27),
+                        6,
+                    )
+                },
+                (
+                    vec![
+                        Call::Assigned(vec![p(0), p(1)]),
+                        awaiting(vec![]),
+                        Call::Revoked(vec![p(1)]),
+                        Call::CommitInRevoke(Ok(())),
+                        Call::Assigned(Vec::new()),
+                        Call::Assigned(Vec::new()),
+                    ],
+                    vec![2],
+                ),
+            ),
+            (
+                "a failed cooperative revoke callback fails the poll after the rebalance",
+                Case {
+                    fail_revoke: true,
+                    ..case(
+                        Assignor::CooperativeSticky,
+                        vec![p(0), p(1)],
+                        vec![p(0)],
+                        Event::Heartbeat(27),
+                        6,
+                    )
+                },
+                (
+                    vec![
+                        Call::Assigned(vec![p(0), p(1)]),
+                        awaiting(vec![]),
+                        Call::Revoked(vec![p(1)]),
+                        Call::Assigned(Vec::new()),
+                        Call::Assigned(Vec::new()),
+                        Call::PollError("rebalance listener failed: revoke failed".into()),
+                    ],
+                    vec![],
+                ),
+            ),
+            (
+                "a seek in the assign callback moves the position of the same poll",
+                Case {
+                    seek_on_assign: Some(3),
+                    ..case(Assignor::Range, vec![p(0)], vec![p(0)], Event::Close, 4)
+                },
+                (
+                    vec![
+                        Call::Assigned(vec![p(0)]),
+                        awaiting(vec![]),
+                        Call::Position(Some(3)),
+                        Call::Revoked(vec![p(0)]),
+                    ],
+                    vec![],
+                ),
             ),
         ] {
-            let (calls, _) = run_case(case).await;
-            actual.push((name, calls));
+            actual.push((name, run_case(case).await));
             wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted);

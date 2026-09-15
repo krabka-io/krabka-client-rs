@@ -1535,6 +1535,7 @@ mod tests {
             ),
             rebalance_listener: None,
             listener_calls: tokio::sync::mpsc::unbounded_channel().1,
+            assigned_callback_pending: Arc::default(),
         }
     }
 

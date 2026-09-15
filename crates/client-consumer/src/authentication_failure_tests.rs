@@ -196,6 +196,7 @@ fn consumer(client: Client) -> Consumer {
         close_operation: tokio::sync::watch::Sender::new(crate::GroupMembershipOperation::Default),
         rebalance_listener: None,
         listener_calls: tokio::sync::mpsc::unbounded_channel().1,
+        assigned_callback_pending: Arc::default(),
     }
 }
 
@@ -247,6 +248,9 @@ fn coordinator_state(client: Client) -> CoordinatorState {
         close_operation: tokio::sync::watch::channel(crate::GroupMembershipOperation::Default).1,
         rejoin_reason: String::new(),
         listener_calls: None,
+        assigned_callback_pending: Arc::default(),
+        poll_timer: crate::coordinator::PollTimer::new(krabka_units::secs(300)),
+        poll_timeout_in_callback: false,
         lost_partitions: Vec::new(),
     }
 }

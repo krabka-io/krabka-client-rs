@@ -96,6 +96,7 @@
 //!   cooperative `next_offsets`→`positions` prunes). A is never held while N or
 //!   P is acquired.
 //! - `run` after `UNKNOWN_MEMBER_ID`: **CI alone** while clearing identity.
+//! - `install_generation` (before a cooperative revoke callback): **CI alone**.
 //! - `commit_before_join` (at the start of `join_and_sync`): **CS**, and under
 //!   it CI alone, then AP alone. At the end of `join_and_sync`,
 //!   `restart_interval` takes ND alone.

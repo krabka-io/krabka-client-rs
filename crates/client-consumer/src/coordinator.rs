@@ -501,6 +501,14 @@ pub(crate) struct CoordinatorState {
     /// The partitions that the member lost with its generation. The next join
     /// gives them to `on_partitions_lost`, as Kafka's `onJoinPrepare` does.
     pub lost_partitions: Vec<(String, i32)>,
+    /// The added partitions that wait for `on_partitions_assigned`. `poll`
+    /// does not fetch them.
+    pub assigned_callback_pending: crate::rebalance_listener::AssignedCallbackPending,
+    /// Kafka's `Heartbeat.pollTimer`: `poll` and each completed join reset it.
+    pub poll_timer: PollTimer,
+    /// `true` when the poll timer expired while the task waited for a listener
+    /// callback. The task then leaves the group, as after a poll timeout.
+    pub poll_timeout_in_callback: bool,
 }
 
 /// Remember the owned partitions as lost before a reset clears them.
@@ -543,15 +551,29 @@ async fn call_listener(
         // The consumer is gone.
         return Ok(());
     }
-    let heartbeat = {
+    let (ran_in_time, heartbeat) = {
         let state = &*state;
         let call_done = CancellationToken::new();
         let wait = async {
-            let _ = ran.await;
+            let ran_in_time = wait_for_listener_call(state, ran).await;
             call_done.cancel();
+            ran_in_time
         };
-        tokio::join!(wait, heartbeat_during_join_prepare(state, &call_done)).1
+        tokio::join!(wait, heartbeat_during_join_prepare(state, &call_done))
     };
+    match ran_in_time {
+        CallWait::Ran => state.poll_timer.reset(),
+        CallWait::PollsReset(deadline) => state.poll_timer.deadline = deadline,
+        CallWait::PollTimeout => {
+            // Kafka's heartbeat thread leaves the group when the poll timer
+            // expires, also while a callback runs (`AbstractCoordinator.
+            // HeartbeatThread.run`, `handlePollTimeoutExpiry`).
+            state.poll_timeout_in_callback = true;
+            return Err(ConsumerError::RebalanceFailed(
+                "max_poll_interval expired while a rebalance listener callback waited".into(),
+            ));
+        }
+    }
     match heartbeat {
         Some(HeartbeatOutcome::Fenced) => Err(ConsumerError::FencedInstanceId(
             state.group_instance_id.clone().unwrap_or_default(),
@@ -562,6 +584,49 @@ async fn call_listener(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// How the wait for a listener call ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallWait {
+    /// The callback ran. `poll` ran it, so the poll timer starts again.
+    Ran,
+    /// The consumer dropped the call, with the poll timer deadline after the
+    /// last `poll`.
+    PollsReset(tokio::time::Instant),
+    /// No `poll` came before the poll timer expired.
+    PollTimeout,
+}
+
+/// Wait until `poll` ran a listener call, or until the poll timer expires
+/// without a `poll`.
+async fn wait_for_listener_call(
+    state: &CoordinatorState,
+    ran: tokio::sync::oneshot::Receiver<()>,
+) -> CallWait {
+    let mut ran = ran;
+    let mut deadline = state.poll_timer.deadline;
+    let mut polls = *state.polls.borrow();
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut ran => {
+                return if result.is_ok() {
+                    CallWait::Ran
+                } else {
+                    CallWait::PollsReset(deadline)
+                };
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                let now_polls = *state.polls.borrow();
+                if now_polls == polls {
+                    return CallWait::PollTimeout;
+                }
+                polls = now_polls;
+                deadline = tokio::time::Instant::now() + state.poll_timer.interval;
+            }
+        }
     }
 }
 
@@ -687,6 +752,30 @@ fn set_generation(state: &mut CoordinatorState, generation_id: i32) {
     state
         .current_generation
         .store(generation_id, Ordering::Release);
+}
+
+/// Install `generation_id` for commits and heartbeats, and keep the
+/// assignment. The member id of the join goes with it.
+async fn install_generation(state: &mut CoordinatorState, generation_id: i32) {
+    let mut identity = state.commit_identity.lock().await;
+    identity.generation = generation_id;
+    identity.member_id.clone_from(&state.member_id);
+    drop(identity);
+    set_generation(state, generation_id);
+}
+
+/// Keep `poll` from fetching `partitions` until the returned gate drops after
+/// their assign callback. Without a listener there is no callback to wait for.
+fn assigned_callback_gate(
+    state: &CoordinatorState,
+    partitions: &[(String, i32)],
+) -> Option<crate::rebalance_listener::AssignedCallbackGate> {
+    state.listener_calls.as_ref().map(|_| {
+        crate::rebalance_listener::AssignedCallbackGate::new(
+            &state.assigned_callback_pending,
+            partitions,
+        )
+    })
 }
 
 async fn publish_assignment(
@@ -891,7 +980,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
     let mut known_counts = std::mem::take(&mut state.initial_subscribed_counts);
     let mut last_meta_check = tokio::time::Instant::now();
     // Kafka's `Heartbeat.pollTimer`: `poll` and each completed join reset it.
-    let mut poll_timer = PollTimer::new(state.max_poll_interval);
+    state.poll_timer = PollTimer::new(state.max_poll_interval);
     let mut polls_open = true;
 
     loop {
@@ -912,12 +1001,12 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
             }
             // Kafka's heartbeat thread checks `pollTimeoutExpired` each retry
             // backoff. The task wakes at the deadline of the poll timer.
-            () = tokio::time::sleep_until(poll_timer.deadline), if !state.member_id.is_empty() => {
+            () = tokio::time::sleep_until(state.poll_timer.deadline), if !state.member_id.is_empty() => {
                 TaskEvent::PollTimeout
             }
         };
         if event == TaskEvent::Poll {
-            poll_timer.reset();
+            state.poll_timer.reset();
             if !rejoin.due(&state.polls) {
                 continue;
             }
@@ -925,10 +1014,10 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
             // A `poll` that came while an RPC was in flight resets the timer
             // before the expiry check.
             state.polls.borrow_and_update();
-            poll_timer.reset();
+            state.poll_timer.reset();
         }
 
-        if event != TaskEvent::Poll && !state.member_id.is_empty() && poll_timer.expired() {
+        if event != TaskEvent::Poll && !state.member_id.is_empty() && state.poll_timer.expired() {
             // Take the `poll` count before the `LeaveGroup` goes out: a `poll`
             // during the request starts the join.
             state.rejoin_reason = "consumer pro-actively leaving the group".into();
@@ -979,7 +1068,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                 result = rejoin_group(&mut state) => match result {
                     Ok(snapshot) => {
                         rejoin.complete(&state);
-                        poll_timer.reset();
+                        state.poll_timer.reset();
                         // Re-baseline from the metadata the rejoin's assignment
                         // was actually computed against (the leader's snapshot;
                         // empty for a non-leader, which `merge_counts` leaves
@@ -993,9 +1082,17 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                         if !wait_for_poll_after_error(&mut state.polls, &state.poll_error, &shutdown).await {
                             break;
                         }
-                        poll_timer.reset();
+                        state.poll_timer.reset();
                         state.rejoin_reason = rebalance_failure_reason(&ConsumerError::FencedInstanceId(String::new()));
                         rejoin.request_now(&state);
+                    }
+                    Err(_) if std::mem::take(&mut state.poll_timeout_in_callback) => {
+                        state.rejoin_reason = "consumer pro-actively leaving the group".into();
+                        // The join of the stalled `poll` ends here. The next
+                        // `poll` starts a new one.
+                        rejoin = RejoinRequest::None;
+                        rejoin.request_after_next_poll(&state);
+                        leave_on_poll_timeout(&mut state).await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "rejoin failed; will retry on next tick");
@@ -1024,7 +1121,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                         if !wait_for_poll_after_error(&mut state.polls, &state.poll_error, &shutdown).await {
                             break;
                         }
-                        poll_timer.reset();
+                        state.poll_timer.reset();
                         state.rejoin_reason = heartbeat_rejoin_reason(FENCED_INSTANCE_ID);
                         rejoin.request_now(&state);
                     }
@@ -1057,13 +1154,13 @@ enum TaskEvent {
 
 /// Kafka's `Heartbeat.pollTimer`: it expires when no `poll` and no completed
 /// join came for `max.poll.interval.ms`.
-struct PollTimer {
+pub(crate) struct PollTimer {
     interval: Duration,
     deadline: tokio::time::Instant,
 }
 
 impl PollTimer {
-    fn new(interval: Time) -> Self {
+    pub(crate) fn new(interval: Time) -> Self {
         let interval = interval.to_std();
         Self {
             interval,
@@ -1452,6 +1549,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
             // first → a partition is only visible in `assigned` once its
             // next_offset is established.
             prime_offsets(state, &added).await?;
+            let _gate = assigned_callback_gate(state, &new_assignment);
             publish_assignment(state, &new_assignment, false, new_generation).await;
             {
                 let mut off = state.next_offsets.lock().await;
@@ -1483,6 +1581,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                 // `unwrap_or(0)`), re-delivering records the previous owner
                 // already committed past at revoke time.
                 prime_offsets(state, &added).await?;
+                let _gate = assigned_callback_gate(state, &added);
                 publish_assignment(state, &new_assignment, true, new_generation).await;
                 call_listener(
                     state,
@@ -1500,6 +1599,9 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                 // before it changes the assignment, installs the whole new
                 // assignment, then runs the assign callback with the added
                 // partitions.
+                // Kafka's `onJoinComplete` runs after the join installed the
+                // new generation, so a commit in the callback carries it.
+                install_generation(state, new_generation).await;
                 call_listener(
                     state,
                     crate::rebalance_listener::ListenerCallKind::Revoked,
@@ -1507,6 +1609,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                 )
                 .await?;
                 prime_offsets(state, &added).await?;
+                let gate = assigned_callback_gate(state, &added);
                 publish_assignment(state, &new_assignment, true, new_generation).await;
                 call_listener(
                     state,
@@ -1514,6 +1617,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                     added.clone(),
                 )
                 .await?;
+                drop(gate);
                 // With auto commit on, `commit_before_join` committed the
                 // positions of the revoked partitions before round 1. With
                 // auto commit off, the application commits. The consumer does
@@ -1559,6 +1663,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                     .cloned()
                     .collect();
                 if !revoked2.is_empty() {
+                    install_generation(state, gen2).await;
                     call_listener(
                         state,
                         crate::rebalance_listener::ListenerCallKind::Revoked,
@@ -1567,6 +1672,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                     .await?;
                 }
                 prime_offsets(state, &added2).await?;
+                let _gate = assigned_callback_gate(state, &added2);
                 publish_assignment(state, &assignment2, true, gen2).await;
                 call_listener(
                     state,
@@ -3100,6 +3206,9 @@ mod retry_tests {
             rejoin_reason: String::new(),
             listener_calls: None,
             lost_partitions: Vec::new(),
+            assigned_callback_pending: Arc::default(),
+            poll_timer: PollTimer::new(secs(300)),
+            poll_timeout_in_callback: false,
         };
 
         tokio::time::timeout(
@@ -3703,6 +3812,9 @@ mod retry_tests {
             rejoin_reason: String::new(),
             listener_calls: None,
             lost_partitions: Vec::new(),
+            assigned_callback_pending: Arc::default(),
+            poll_timer: PollTimer::new(secs(300)),
+            poll_timeout_in_callback: false,
         };
         let poll_error = Arc::clone(&state.poll_error);
         let assigned = Arc::clone(&state.assigned);

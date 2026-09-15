@@ -5,6 +5,8 @@
 //! task sends each call to the `Consumer` and waits until `poll` ran it. It
 //! sends heartbeats while it waits.
 
+use std::{collections::HashSet, sync::Arc};
+
 use async_trait::async_trait;
 
 use crate::{consumer::Consumer, error::ConsumerError};
@@ -138,5 +140,46 @@ impl Consumer {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+/// The partitions that wait for their `on_partitions_assigned` call.
+///
+/// The coordinator task publishes an added partition before `poll` runs the
+/// assign callback, because the callback can seek it. `poll` does not fetch
+/// such a partition until the callback ran. Kafka's classic consumer runs the
+/// callback on the thread that fetches, so no fetch comes between the two.
+/// Kafka's `SubscriptionState.markPendingOnAssignedCallback` does the same for
+/// the consumer with a background thread.
+pub(crate) type AssignedCallbackPending = Arc<std::sync::Mutex<HashSet<(String, i32)>>>;
+
+/// Marks partitions as waiting for their assign callback until it drops.
+pub(crate) struct AssignedCallbackGate {
+    pending: AssignedCallbackPending,
+    partitions: Vec<(String, i32)>,
+}
+
+impl AssignedCallbackGate {
+    pub(crate) fn new(pending: &AssignedCallbackPending, partitions: &[(String, i32)]) -> Self {
+        pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(partitions.iter().cloned());
+        Self {
+            pending: Arc::clone(pending),
+            partitions: partitions.to_vec(),
+        }
+    }
+}
+
+impl Drop for AssignedCallbackGate {
+    fn drop(&mut self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for partition in &self.partitions {
+            pending.remove(partition);
+        }
     }
 }
