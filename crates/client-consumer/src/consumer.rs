@@ -109,7 +109,7 @@ pub struct Consumer {
     /// Wakes a `poll` from another task.
     pub(crate) wakeup: crate::control::WakeupHandle,
     /// Rebalances that the application asks for, with their reasons.
-    pub(crate) enforced_rebalances: tokio::sync::mpsc::UnboundedSender<String>,
+    pub(crate) enforced_rebalances: tokio::sync::mpsc::UnboundedSender<(String, u64)>,
     /// Kafka's `default.api.timeout.ms`, the timeout of `position` and
     /// `committed`.
     pub(crate) default_api_timeout: Time,

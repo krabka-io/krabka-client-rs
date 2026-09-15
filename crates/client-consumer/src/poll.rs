@@ -368,6 +368,22 @@ fn reset_timestamp(policy: AutoOffsetReset, now_ms: i64) -> i64 {
     }
 }
 
+/// Run `future`, or return [`ConsumerError::Wakeup`] when `wakeup` comes
+/// first.
+async fn until_woken<F: std::future::Future>(
+    wakeup: Option<&crate::control::WakeupHandle>,
+    future: F,
+) -> Result<F::Output, ConsumerError> {
+    match wakeup {
+        None => Ok(future.await),
+        Some(wakeup) => tokio::select! {
+            biased;
+            () = wakeup.woken() => Err(ConsumerError::Wakeup),
+            output = future => Ok(output),
+        },
+    }
+}
+
 /// Milliseconds since the Unix epoch.
 fn unix_now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -1384,7 +1400,8 @@ impl Consumer {
         // epoch here, so its first `ListOffsets` goes to the leader and not
         // to the bootstrap broker. Kafka's `OffsetFetcher.groupListOffsetRequests`
         // routes with `metadata.currentLeader(tp)` in the same way.
-        self.update_fetch_positions().await
+        let wakeup = self.wakeup.clone();
+        self.update_fetch_positions(Some(&wakeup)).await
     }
 
     /// Refresh the leader epochs, resolve the offset resets and validate the
@@ -1392,22 +1409,30 @@ impl Consumer {
     ///
     /// Return `false` after a transient error, when the caller must try again
     /// later.
-    pub(crate) async fn update_fetch_positions(&self) -> Result<bool, ConsumerError> {
-        if let Err(error) = self.refresh_leader_epochs().await {
+    ///
+    /// With `wakeup`, a wakeup ends each request of the update, as Kafka's
+    /// `ConsumerNetworkClient.poll` throws `WakeupException` while it waits.
+    /// The truncation that the validation found is applied without a wakeup
+    /// check.
+    pub(crate) async fn update_fetch_positions(
+        &self,
+        wakeup: Option<&crate::control::WakeupHandle>,
+    ) -> Result<bool, ConsumerError> {
+        if let Err(error) = until_woken(wakeup, self.refresh_leader_epochs()).await? {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
                 return Ok(false);
             }
             return Err(error);
         }
-        if let Err(error) = self.resolve_reset_sentinels().await {
+        if let Err(error) = until_woken(wakeup, self.resolve_reset_sentinels()).await? {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
                 return Ok(false);
             }
             return Err(error);
         }
-        let truncated = match self.validate_positions().await {
+        let truncated = match until_woken(wakeup, self.validate_positions()).await? {
             Ok(truncated) => truncated,
             Err(error) if is_transient_poll_error(&error) => {
                 self.client.reconnect_bootstrap().await;
@@ -4342,6 +4367,59 @@ mod fetch_path_tests {
                 next.map_err(|error| error.to_string())
             ) == (wakeup.clone(), wakeup, true, Ok(0))
         );
+    }
+
+    /// Kafka's `wakeup` ends a `poll` that waits for a metadata request of
+    /// `updateFetchPositions`, as `ConsumerNetworkClient.poll` throws
+    /// `WakeupException` while it waits.
+    #[tokio::test]
+    async fn wakeup_ends_a_poll_that_waits_for_metadata() {
+        let silent = MockBroker::start(|api_key, _version, _corr_id, _body| {
+            (api_key == api_versions_request::API_KEY).then(|| {
+                encode(
+                    &ApiVersionsResponse {
+                        api_keys: [
+                            (api_versions_request::API_KEY, 0, 3),
+                            (metadata_request::API_KEY, 0, 8),
+                        ]
+                        .into_iter()
+                        .map(|(api_key, min_version, max_version)| ApiVersion {
+                            api_key,
+                            min_version,
+                            max_version,
+                            ..Default::default()
+                        })
+                        .collect(),
+                        ..Default::default()
+                    },
+                    0,
+                )
+            })
+        })
+        .await;
+        let client = Client::builder()
+            .bootstrap(silent.addr.to_string())
+            .request_timeout(secs(30))
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = crate::poll::partition_error_tests::consumer_with_client(client);
+        let handle = consumer.wakeup_handle();
+        let waker = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            handle.wakeup();
+        });
+        let polled = tokio::time::timeout(Duration::from_secs(5), consumer.poll(secs(10)))
+            .await
+            .map(|result| {
+                result
+                    .map(|records| records.len())
+                    .map_err(|error| error.to_string())
+            });
+        waker.await.expect("waker");
+        drop(consumer);
+        silent.stop();
+        assert2::assert!(polled == Ok(Err("the consumer was woken up".to_owned())));
     }
 
     /// One step of a read replica case.

@@ -137,7 +137,11 @@ impl Consumer {
             .unwrap_or(ENFORCED_REBALANCE_REASON);
         // A closed channel means that the coordinator task stopped, and no
         // rebalance can come.
-        let _ = self.enforced_rebalances.send(reason.to_owned());
+        // The `poll` count now: the rebalance starts with the first `poll`
+        // after this call, also when the task sees the request after that
+        // `poll`.
+        let polls = *self.poll_signal.borrow();
+        let _ = self.enforced_rebalances.send((reason.to_owned(), polls));
     }
 }
 

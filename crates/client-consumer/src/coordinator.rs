@@ -500,7 +500,7 @@ pub(crate) struct CoordinatorState {
     pub listener_calls: Option<crate::rebalance_listener::ListenerCalls>,
     /// The reasons of the rebalances that `Consumer::enforce_rebalance` asks
     /// for.
-    pub enforced_rebalances: tokio::sync::mpsc::UnboundedReceiver<String>,
+    pub enforced_rebalances: tokio::sync::mpsc::UnboundedReceiver<(String, u64)>,
     /// The partitions that the member lost with its generation. The next join
     /// gives them to `on_partitions_lost`, as Kafka's `onJoinPrepare` does.
     pub lost_partitions: Vec<(String, i32)>,
@@ -1018,9 +1018,9 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
             }
             // Kafka's `enforceRebalance` calls `requestRejoin`: the next `poll`
             // joins the group again with the reason.
-            Some(reason) = state.enforced_rebalances.recv() => {
+            Some((reason, polls)) = state.enforced_rebalances.recv() => {
                 state.rejoin_reason = reason;
-                rejoin.request_after_next_poll(&state);
+                rejoin.request_after_poll(polls, &state.rebalance_pending);
                 continue;
             }
             // Kafka's heartbeat thread checks `pollTimeoutExpired` each retry
@@ -1231,10 +1231,20 @@ impl RejoinRequest {
 
     /// Request a rejoin that starts when the application polls again.
     fn request_after_next_poll(&mut self, state: &CoordinatorState) {
+        self.request_after_poll(*state.polls.borrow(), &state.rebalance_pending);
+    }
+
+    /// Request a rejoin that starts with the first `poll` after the `poll`
+    /// count `polls`.
+    fn request_after_poll(
+        &mut self,
+        polls: u64,
+        rebalance_pending: &tokio::sync::watch::Sender<bool>,
+    ) {
         if *self == Self::None {
-            *self = Self::AfterPoll(*state.polls.borrow());
+            *self = Self::AfterPoll(polls);
         }
-        state.rebalance_pending.send_replace(true);
+        rebalance_pending.send_replace(true);
     }
 
     /// Request a rejoin that starts at once, because a `poll` already came.
@@ -3079,6 +3089,20 @@ mod retry_tests {
 
     /// A rejoin keeps only the errors that Kafka's consumer raises from
     /// `poll()`, and `poll()` takes each one once.
+    /// Kafka's `enforceRebalance` sets `rejoinNeeded` at the call, so the
+    /// first `poll` after the call joins. The task can see the request after
+    /// that `poll`, so the request keeps the `poll` count of the call.
+    #[test]
+    fn an_enforced_rebalance_is_due_after_a_poll_that_came_before_the_task_saw_it() {
+        let (pending, _pending_rx) = tokio::sync::watch::channel(false);
+        let (polls, polls_rx) = tokio::sync::watch::channel(5_u64);
+        let mut request = RejoinRequest::None;
+        // The application polled after `enforce_rebalance` at count 5.
+        polls.send_replace(6);
+        request.request_after_poll(5, &pending);
+        assert2::assert!((request.due(&polls_rx), *pending.borrow()) == (true, true));
+    }
+
     #[test]
     fn rejoin_errors_reach_poll_only_when_fatal() {
         for (name, error, expected) in [
