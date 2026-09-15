@@ -18,12 +18,13 @@ mod support;
 use std::time::{Duration, Instant};
 
 use assert2::assert;
+use krabka_client_admin::groups::ListGroupsOptions;
 use krabka_client_consumer::{AutoOffsetReset, Consumer};
 use krabka_client_producer::{Producer, ProducerRecord};
 
 /// How long the case waits for the group to join and the first record to
 /// arrive.
-const RECORD_DEADLINE: Duration = Duration::from_secs(60);
+const RECORD_DEADLINE: Duration = Duration::from_mins(1);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
@@ -48,8 +49,17 @@ async fn lists_groups_and_committed_offsets() {
     poll_until_record(&mut consumer).await;
     consumer.commit_sync().await.expect("commit_sync");
 
-    let groups = admin.list_groups().await.expect("list_groups");
-    assert!(groups.contains(&group), "{groups:?}");
+    let groups = admin
+        .list_groups(&ListGroupsOptions::default())
+        .await
+        .expect("list_groups")
+        .all()
+        .expect("every broker lists its groups");
+    let group_ids = groups
+        .iter()
+        .map(|listing| listing.group_id.clone())
+        .collect::<Vec<_>>();
+    assert!(group_ids.contains(&group), "{groups:?}");
 
     let offsets = admin
         .list_consumer_group_offsets(&group)

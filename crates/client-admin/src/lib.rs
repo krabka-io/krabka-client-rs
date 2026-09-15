@@ -1358,9 +1358,11 @@ pub(crate) const NOT_CONTROLLER: i16 = 41;
 /// surfaces today. Unknown codes serialize as `"UNKNOWN"`.
 pub(crate) fn kafka_error_name(code: i16) -> &'static str {
     match code {
+        -1 => "UNKNOWN_SERVER_ERROR",
         0 => "NONE",
         3 => "UNKNOWN_TOPIC_OR_PARTITION",
         7 => "REQUEST_TIMED_OUT",
+        13 => "NETWORK_EXCEPTION",
         14 => "COORDINATOR_LOAD_IN_PROGRESS",
         15 => "COORDINATOR_NOT_AVAILABLE",
         16 => "NOT_COORDINATOR",
@@ -1368,6 +1370,7 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         19 => "NOT_ENOUGH_REPLICAS",
         31 => "CLUSTER_AUTHORIZATION_FAILED",
         33 => "UNSUPPORTED_SASL_MECHANISM",
+        34 => "ILLEGAL_SASL_STATE",
         35 => "UNSUPPORTED_VERSION",
         36 => "TOPIC_ALREADY_EXISTS",
         37 => "INVALID_PARTITIONS",
@@ -1381,6 +1384,7 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         49 => "INVALID_PRODUCER_ID_MAPPING",
         51 => "CONCURRENT_TRANSACTIONS",
         53 => "TRANSACTIONAL_ID_AUTHORIZATION_FAILED",
+        58 => "SASL_AUTHENTICATION_FAILED",
         60 => "REASSIGNMENT_IN_PROGRESS",
         66 => "DELEGATION_TOKEN_EXPIRED",
         83 => "ELIGIBLE_LEADERS_NOT_AVAILABLE",
@@ -1809,10 +1813,12 @@ mod tests {
         // list is exhaustive on purpose: a sampled table lets a deleted arm
         // pass unnoticed, and a wrong name sends an operator to the wrong
         // cause.
-        let cases: [(i16, &str); 38] = [
+        let cases: [(i16, &str); 40] = [
+            (-1, "UNKNOWN_SERVER_ERROR"),
             (0, "NONE"),
             (3, "UNKNOWN_TOPIC_OR_PARTITION"),
             (7, "REQUEST_TIMED_OUT"),
+            (13, "NETWORK_EXCEPTION"),
             (14, "COORDINATOR_LOAD_IN_PROGRESS"),
             (15, "COORDINATOR_NOT_AVAILABLE"),
             (16, "NOT_COORDINATOR"),
@@ -1854,7 +1860,7 @@ mod tests {
             assert2::assert!(kafka_error_name(code) == name, "code {code}");
         }
         assert2::assert!(kafka_error_name(i16::MAX) == "UNKNOWN");
-        assert2::assert!(kafka_error_name(-1) == "UNKNOWN");
+        assert2::assert!(kafka_error_name(-2) == "UNKNOWN");
     }
 
     #[test]
