@@ -491,8 +491,9 @@ mod tests {
         let task_finished = tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .is_ok();
+        let last_request = broker.requests.lock().unwrap().last().cloned();
         let observed = AfterIdle {
-            last_request: broker.requests.lock().unwrap().last().cloned(),
+            last_request,
             cached: metadata_cache.lock().await.contains_key(TOPIC),
             leaders: partition_leaders.len(),
             task_finished,
