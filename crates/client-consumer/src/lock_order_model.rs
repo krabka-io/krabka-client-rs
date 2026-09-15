@@ -58,12 +58,8 @@
 //!
 //! ### seek task (`seek.rs`)
 //! - `seek_to_position` and `request_offset_reset`: **A → N → P** held
-//! - `seek_to_position` and `request_offset_reset`: **A → N → P** held
 //!   together, all released. Region edges: A→N, N→P.
 //!   `position` (`partition_state.rs`) takes A alone, then N→P, then the
-//!   regions of `update_fetch_positions` that the poll task lists below.
-//!   `pause`, `resume` and `paused` take CI alone. The paused set is a
-//!   `std::sync::Mutex` that no region holds while it takes another lock.
 //!   regions of `update_fetch_positions` that the poll task lists below.
 //!   `pause`, `resume` and `paused` take CI alone. The paused set is a
 //!   `std::sync::Mutex` that no region holds while it takes another lock.
