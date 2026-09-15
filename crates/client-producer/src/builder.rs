@@ -617,6 +617,13 @@ pub(crate) async fn init_producer_id_with_retry(
     }
 }
 
+/// Kafka's `ProducerMetadata` names the topics that the producer sends to,
+/// and lets the broker create a missing one.
+const PRODUCER_METADATA_SCOPE: krabka_client_core::MetadataScope =
+    krabka_client_core::MetadataScope::Topics {
+        allow_auto_topic_creation: true,
+    };
+
 #[bon::bon]
 impl Producer {
     /// Build a [`Producer`] pointed at the given bootstrap address.
@@ -781,6 +788,7 @@ impl Producer {
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
             .maybe_security(security.clone())
+            .metadata_scope(PRODUCER_METADATA_SCOPE)
             .build()
             .await?;
 

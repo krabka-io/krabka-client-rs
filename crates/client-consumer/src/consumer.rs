@@ -157,6 +157,8 @@ struct StartConfig {
     /// Kafka's `auto.commit.interval.ms`, or `None` when
     /// `enable.auto.commit` is off.
     auto_commit_interval: Option<Duration>,
+    /// Kafka's `allow.auto.create.topics`.
+    allow_auto_create_topics: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -583,6 +585,17 @@ fn first_join_member_id(resp: &JoinGroupResponse) -> Result<String, ConsumerErro
     Ok(member_id)
 }
 
+/// The metadata scope of a consumer with a topic list subscription. Kafka's
+/// `ConsumerMetadata.newMetadataRequestBuilder` names the subscribed topics
+/// and asks for all topics only for a client-side pattern subscription.
+fn subscription_metadata_scope(
+    allow_auto_create_topics: bool,
+) -> krabka_client_core::MetadataScope {
+    krabka_client_core::MetadataScope::Topics {
+        allow_auto_topic_creation: allow_auto_create_topics,
+    }
+}
+
 fn is_subscribed_topic(subscribe: &[String], name: &str) -> bool {
     subscribe.iter().any(|s| s == name)
 }
@@ -766,6 +779,11 @@ impl Consumer {
         #[builder(default = ConsumerRetryPolicy::default())] retry_policy: ConsumerRetryPolicy,
         #[builder(default = true)] enable_auto_commit: bool,
         #[builder(default = secs(5))] auto_commit_interval: Time,
+        /// Kafka's `allow.auto.create.topics`: the metadata requests name the
+        /// subscribed topics and let a broker with
+        /// `auto.create.topics.enable=true` create a missing one.
+        #[builder(default = true)]
+        allow_auto_create_topics: bool,
     ) -> Result<Self, ConsumerError> {
         // Fail fast on misconfig — before any retry loop.
         if subscribe.is_empty() {
@@ -847,6 +865,7 @@ impl Consumer {
             security,
             retry_policy,
             auto_commit_interval,
+            allow_auto_create_topics,
         };
 
         let started = tokio::time::Instant::now();
@@ -938,6 +957,7 @@ impl Consumer {
             metadata_recovery_rebootstrap_trigger,
             client_rack,
             security,
+            allow_auto_create_topics,
             ..
         } = config;
         let client = Client::builder()
@@ -950,8 +970,10 @@ impl Consumer {
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger)
             .maybe_security(security.clone())
+            .metadata_scope(subscription_metadata_scope(allow_auto_create_topics))
             .build()
             .await?;
+        client.metadata_topics().set(subscribe.iter().cloned());
 
         // `JoinGroupRequest` carries these as `int32` milliseconds, and the
         // JVM coordinator compares them against its own configured bounds.
@@ -1327,6 +1349,7 @@ async fn spawn_consumer(
         security,
         retry_policy,
         auto_commit_interval,
+        allow_auto_create_topics,
     } = config;
     let StartupState {
         generation_id,
@@ -1360,8 +1383,12 @@ async fn spawn_consumer(
         .metadata_recovery_strategy(metadata_recovery_strategy)
         .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger)
         .maybe_security(security.clone())
+        .metadata_scope(subscription_metadata_scope(allow_auto_create_topics))
         .build()
         .await?;
+    coordinator_client
+        .metadata_topics()
+        .set(subscribe.iter().cloned());
 
     let ownership_ids = assigned_partitions
         .iter()
@@ -2826,6 +2853,92 @@ mod auto_commit_tests {
         })
     }
 
+    /// Kafka's `ConsumerMetadata.newMetadataRequestBuilder` names the
+    /// subscribed topics, with `allowAutoTopicCreation` from
+    /// `allow.auto.create.topics`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_requests_name_the_subscribed_topics() {
+        use krabka_protocol::owned::{
+            find_coordinator_response::FindCoordinatorResponse, metadata_request::MetadataRequest,
+        };
+
+        let named = |topics: &[&str], allow| {
+            krabka_client_core::topics_request(topics.iter().map(|&t| t.to_owned()), allow)
+        };
+        for (name, subscribe, allow_auto_create_topics, expected) in [
+            (
+                "subscribe a and b",
+                vec!["a", "b"],
+                true,
+                named(&["a", "b"], true),
+            ),
+            ("auto creation off", vec!["a"], false, named(&["a"], false)),
+        ] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let handler_requests = Arc::clone(&requests);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
+                match api_key {
+                    api_versions_request::API_KEY => Some(encode(
+                        &ApiVersionsResponse {
+                            api_keys: API_VERSIONS
+                                .iter()
+                                .map(|(api_key, min_version, max_version)| ApiVersion {
+                                    api_key: *api_key,
+                                    min_version: *min_version,
+                                    max_version: *max_version,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        0,
+                    )),
+                    find_coordinator_request::API_KEY => Some(encode(
+                        &FindCoordinatorResponse {
+                            node_id: 1,
+                            host: "127.0.0.1".into(),
+                            port: 0,
+                            ..Default::default()
+                        },
+                        version,
+                    )),
+                    metadata_request::API_KEY => {
+                        let client_id_len = body.get_i16();
+                        body.advance(usize::try_from(client_id_len.max(0)).expect("length"));
+                        let request =
+                            MetadataRequest::decode(&mut body, version).expect("decode Metadata");
+                        handler_requests
+                            .lock()
+                            .expect("requests lock")
+                            .push(request);
+                        Some(encode(&MetadataResponse::default(), version))
+                    }
+                    // The test stops at the first `JoinGroup`.
+                    _ => None,
+                }
+            })
+            .await;
+            let mut config =
+                start_config(mock.addr.to_string(), Assignor::Range, false, minutes(1));
+            config.subscribe = subscribe.into_iter().map(str::to_owned).collect();
+            config.allow_auto_create_topics = allow_auto_create_topics;
+            let start = tokio::spawn(Consumer::start_once(config));
+            let first = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(first) = requests.lock().expect("requests lock").first().cloned() {
+                        break first;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the consumer sends Metadata");
+            start.abort();
+            mock.stop();
+            assert2::check!(first == expected, "{name}");
+        }
+    }
+
     pub(super) fn start_config(
         bootstrap: String,
         assignor: Assignor,
@@ -2865,6 +2978,7 @@ mod auto_commit_tests {
             security: None,
             retry_policy: ConsumerRetryPolicy::default(),
             auto_commit_interval: auto_commit.then_some(AUTO_COMMIT_INTERVAL),
+            allow_auto_create_topics: true,
         }
     }
 

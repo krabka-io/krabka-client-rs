@@ -328,6 +328,10 @@ impl ShareConsumer {
         #[builder(default = krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
         metadata_recovery_rebootstrap_trigger: Time,
         security: Option<krabka_client_core::security::ClientSecurity>,
+        /// Kafka's `allow.auto.create.topics`, which
+        /// `ShareConsumerMetadata` reads.
+        #[builder(default = true)]
+        allow_auto_create_topics: bool,
     ) -> Result<Self, ConsumerError> {
         if subscribe.is_empty() {
             return Err(ConsumerError::NotSubscribed);
@@ -383,8 +387,12 @@ impl ShareConsumer {
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
             .maybe_security(security.clone())
+            .metadata_scope(krabka_client_core::MetadataScope::Topics {
+                allow_auto_topic_creation: allow_auto_create_topics,
+            })
             .build()
             .await?;
+        client.metadata_topics().set(subscribe.iter().cloned());
 
         // 1. Join: empty member id + epoch 0 + the subscription. The broker
         //    assigns a member id and bumps us to a live epoch.
@@ -454,8 +462,14 @@ impl ShareConsumer {
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
             .maybe_security(security.clone())
+            .metadata_scope(krabka_client_core::MetadataScope::Topics {
+                allow_auto_topic_creation: allow_auto_create_topics,
+            })
             .build()
             .await?;
+        coordinator_client
+            .metadata_topics()
+            .set(subscribe.iter().cloned());
         let state = ShareCoordinatorState {
             client: coordinator_client,
             group_id: group_id.clone(),
