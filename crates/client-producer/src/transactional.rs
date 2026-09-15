@@ -13,22 +13,34 @@ use std::{
 
 use crate::{error::ProducerError, producer::Producer};
 
-/// The slot holds no abortable error. An error code fits in an `i16`, and
+/// The slot holds no error. An abortable error code fits in an `i16`, and
 /// `-1` is `UNKNOWN_SERVER_ERROR`, so the empty value is outside that range.
-const NO_ABORTABLE_ERROR: i32 = i32::MIN;
+const NO_TXN_ERROR: i32 = i32::MIN;
 
-/// The sentinel that marks the slot as holding a timeout rather than a
-/// broker error code. It is one below `NO_ABORTABLE_ERROR`
-/// (`i32::MIN`), so it stays outside the `i16` code range and cannot
-/// collide with a real, sign-extended code.
+/// The sentinel that marks the slot as holding an abortable timeout rather
+/// than a broker error code. It is one above `NO_TXN_ERROR` (`i32::MIN`), so
+/// it stays outside the `i16` code range and cannot collide with a real,
+/// sign-extended code.
 const ABORTABLE_TIMEOUT: i32 = i32::MIN + 1;
+
+/// The sentinel that marks the slot as holding a fence.
+const FATAL_FENCED: i32 = i32::MIN + 2;
+
+/// The offset that moves a fatal error code out of the abortable code range.
+/// A fatal code `c` is stored as `c + FATAL_CODE_OFFSET`, which is in
+/// `[0x1_0000, 0x1_ffff]`.
+const FATAL_CODE_OFFSET: i32 = 0x1_8000;
+
+/// The lowest stored value of a fatal error code: `i16::MIN +
+/// FATAL_CODE_OFFSET`.
+const FATAL_CODE_MIN: i32 = 0x1_0000;
 
 /// The error that makes the current transaction abort-only.
 ///
 /// Apache Kafka's `TransactionManager` moves to the `ABORTABLE_ERROR` state
 /// when a batch of the transaction fails, or when a coordinator answers with a
 /// code that only an abort can clear (`abortableError`). Every later
-/// `commitTransaction` then fails with the stored error
+/// `commitTransaction` and `send` then fails with the stored error
 /// (`maybeFailWithError`), and only `abortTransaction` clears the state. Kafka
 /// stores the raised exception itself, which is either a broker error code
 /// wrapped in a `KafkaException`, or a client-side `TimeoutException` that
@@ -43,51 +55,122 @@ pub(crate) enum AbortableError {
     Timeout,
 }
 
-/// The error code that makes the current transaction abort-only.
+/// The error that stops every later transactional operation.
 ///
-/// The sender task writes this slot from a synchronous context, so it holds an
-/// atomic rather than a mutex.
-#[derive(Debug)]
-pub(crate) struct AbortableErrorSlot(AtomicI32);
+/// Apache Kafka's `TransactionManager` moves to the `FATAL_ERROR` state when a
+/// coordinator fences the producer, or answers with a code that its handler
+/// passes to `fatalError`. `FATAL_ERROR` is never a valid start state of a
+/// transition, and `maybeFailWithError` throws in `initTransactions`,
+/// `beginTransaction`, `send`, `sendOffsetsToTransaction`,
+/// `commitTransaction` and `abortTransaction`. The application can only close
+/// the producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FatalError {
+    /// A newer epoch owns the transactional id (`PRODUCER_FENCED` or
+    /// `INVALID_PRODUCER_EPOCH`).
+    Fenced,
+    /// A coordinator answered with this code.
+    Server(i16),
+}
 
-impl Default for AbortableErrorSlot {
-    fn default() -> Self {
-        Self(AtomicI32::new(NO_ABORTABLE_ERROR))
+impl FatalError {
+    /// The transaction state after this error.
+    pub(crate) const fn state(self) -> TxnState {
+        match self {
+            Self::Fenced => TxnState::Fenced,
+            Self::Server(_) => TxnState::FatalError,
+        }
+    }
+
+    /// The error that an operation reports in this state.
+    pub(crate) const fn error(self) -> ProducerError {
+        match self {
+            Self::Fenced => ProducerError::FencedProducer,
+            Self::Server(code) => ProducerError::FatalTransactionError(code),
+        }
     }
 }
 
-impl AbortableErrorSlot {
+/// The error state of the transaction: none, abortable, or fatal.
+///
+/// The sender task writes this slot from a synchronous context, so it holds an
+/// atomic rather than a mutex. A fatal error is final: a later abortable error
+/// does not replace it, and a clear does not remove it, as Kafka's
+/// `TransactionManager` allows no transition out of `FATAL_ERROR`.
+#[derive(Debug)]
+pub(crate) struct TxnErrorSlot(AtomicI32);
+
+impl Default for TxnErrorSlot {
+    fn default() -> Self {
+        Self(AtomicI32::new(NO_TXN_ERROR))
+    }
+}
+
+impl TxnErrorSlot {
+    /// Store `value` unless the slot holds a fatal error.
+    fn store_abortable(&self, value: i32) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (!is_fatal(current)).then_some(value)
+            });
+    }
+
     /// Store `code` as the error that the application must abort. A later
     /// error replaces an earlier one, as Kafka's `transitionTo` replaces
-    /// `lastError`.
-    pub(crate) fn set(&self, code: i16) {
-        self.0.store(i32::from(code), Ordering::Release);
+    /// `lastError`. It has no effect after a fatal error.
+    pub(crate) fn set_abortable(&self, code: i16) {
+        self.store_abortable(i32::from(code));
     }
 
     /// Store that the transaction can no longer commit because a batch of it
     /// timed out with no broker code. A later error replaces an earlier one,
-    /// same as [`Self::set`].
-    pub(crate) fn set_timeout(&self) {
-        self.0.store(ABORTABLE_TIMEOUT, Ordering::Release);
+    /// same as [`Self::set_abortable`].
+    pub(crate) fn set_abortable_timeout(&self) {
+        self.store_abortable(ABORTABLE_TIMEOUT);
     }
 
-    /// The stored error, or `None` when the transaction can still commit.
-    pub(crate) fn get(&self) -> Option<AbortableError> {
+    /// Store the fatal error `error`. It replaces any earlier error, as
+    /// Kafka's `transitionToFatalError` replaces `lastError`.
+    pub(crate) fn set_fatal(&self, error: FatalError) {
+        let value = match error {
+            FatalError::Fenced => FATAL_FENCED,
+            FatalError::Server(code) => i32::from(code) + FATAL_CODE_OFFSET,
+        };
+        self.0.store(value, Ordering::Release);
+    }
+
+    /// The stored abortable error, or `None` when the transaction can still
+    /// commit or the error is fatal.
+    pub(crate) fn abortable(&self) -> Option<AbortableError> {
         match self.0.load(Ordering::Acquire) {
-            NO_ABORTABLE_ERROR => None,
             ABORTABLE_TIMEOUT => Some(AbortableError::Timeout),
-            code => Some(AbortableError::Server(
-                i16::try_from(code).unwrap_or(i16::MIN),
-            )),
+            value => i16::try_from(value).ok().map(AbortableError::Server),
         }
     }
 
-    /// Forget the stored error. An abort and a new producer identity both
-    /// clear it, as Kafka's `resetTransactionState` and `InitProducerIdHandler`
-    /// clear `lastError`.
-    pub(crate) fn clear(&self) {
-        self.0.store(NO_ABORTABLE_ERROR, Ordering::Release);
+    /// The stored fatal error, or `None` when there is none.
+    pub(crate) fn fatal(&self) -> Option<FatalError> {
+        match self.0.load(Ordering::Acquire) {
+            FATAL_FENCED => Some(FatalError::Fenced),
+            value if value >= FATAL_CODE_MIN => i16::try_from(value - FATAL_CODE_OFFSET)
+                .ok()
+                .map(FatalError::Server),
+            _ => None,
+        }
     }
+
+    /// Forget the stored abortable error. An abort and a new producer identity
+    /// both clear it, as Kafka's `resetTransactionState` and
+    /// `InitProducerIdHandler` clear `lastError`. A fatal error stays.
+    pub(crate) fn clear_abortable(&self) {
+        self.store_abortable(NO_TXN_ERROR);
+    }
+}
+
+/// Tell if a stored slot value is a fatal error.
+const fn is_fatal(value: i32) -> bool {
+    value == FATAL_FENCED || value >= FATAL_CODE_MIN
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,9 +193,14 @@ pub(crate) enum TxnState {
     /// A guard was dropped or `EndTxn` had an uncertain transport outcome.
     /// `init_transactions` must establish a new epoch before reuse.
     RecoveryRequired,
-    /// The producer is fenced. No further txn is possible without a
-    /// re-init.
+    /// A newer epoch owns the transactional id. Every later transactional
+    /// operation fails with `FencedProducer`, as Kafka's `FATAL_ERROR` state
+    /// does for `ProducerFencedException`.
     Fenced,
+    /// A coordinator answered with a fatal code. Every later transactional
+    /// operation fails with `FatalTransactionError`, as Kafka's `FATAL_ERROR`
+    /// state does.
+    FatalError,
 }
 
 /// Stable identity of a transaction prepared for external two-phase commit.
@@ -879,6 +967,8 @@ mod tests {
         txn_offset_commit: Script,
         produce: Script,
         find_coordinator_requests: usize,
+        /// The number of transactional `InitProducerId` requests.
+        init_producer_id_requests: usize,
         /// The number of `Metadata` requests.
         metadata_requests: usize,
         /// The negotiated version of each `AddPartitionsToTxn` request.
@@ -897,6 +987,8 @@ mod tests {
         Fenced,
         ConcurrentTransactions,
         Server(i16),
+        /// The producer is in the fatal error state after this code.
+        Fatal(i16),
         OutcomeUnknown,
         /// The broker supports no version that the client sends. The fields
         /// are the broker range and the client range.
@@ -911,6 +1003,7 @@ mod tests {
                 Err(ProducerError::FencedProducer) => Self::Fenced,
                 Err(ProducerError::ConcurrentTransactions) => Self::ConcurrentTransactions,
                 Err(ProducerError::Server(code)) => Self::Server(code),
+                Err(ProducerError::FatalTransactionError(code)) => Self::Fatal(code),
                 Err(ProducerError::RecoveryRequired) => Self::OutcomeUnknown,
                 Err(ProducerError::Client(ClientError::IncompatibleVersion {
                     broker_min,
@@ -940,7 +1033,7 @@ mod tests {
             .expect("scripted coordinator")
             .add_partitions_range
             .unwrap_or((0, 5));
-        let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
             if api_key == api_versions_request::API_KEY {
                 return Some(encode_v0(&ApiVersionsResponse {
                     api_keys: vec![
@@ -1058,6 +1151,9 @@ mod tests {
                 }));
             }
             if api_key == init_producer_id_request::API_KEY {
+                if is_transactional_init(body, version) {
+                    coordinator.init_producer_id_requests += 1;
+                }
                 return Some(encode_v0(&InitProducerIdResponse {
                     error_code: 0,
                     producer_id: 7,
@@ -1120,10 +1216,11 @@ mod tests {
             .init_transactions()
             .await
             .expect("init_transactions against the mock coordinator");
-        shared
-            .lock()
-            .expect("scripted coordinator")
-            .find_coordinator_requests = 0;
+        {
+            let mut coordinator = shared.lock().expect("scripted coordinator");
+            coordinator.find_coordinator_requests = 0;
+            coordinator.init_producer_id_requests = 0;
+        }
         (mock, producer, shared)
     }
 
@@ -1151,7 +1248,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn commit_learns_the_outcome_of_a_lost_end_txn() {
         use Reply::{Code, Silent};
-        use TxnResult::{Fenced, OutcomeUnknown, Server};
+        use TxnResult::{Fenced, OutcomeUnknown};
         let cases = [
             ("answered", vec![Code(0)], TxnResult::Ok, 1, TxnState::Ready),
             (
@@ -1205,11 +1302,11 @@ mod tests {
                 TxnState::Fenced,
             ),
             (
-                "refused",
+                "invalid state is fatal",
                 vec![Code(48)],
-                Server(48),
+                TxnResult::Fatal(48),
                 1,
-                TxnState::InTransaction,
+                TxnState::FatalError,
             ),
             (
                 "lost then fenced",
@@ -1398,7 +1495,15 @@ mod tests {
             ("fenced", vec![Code(47)], Fenced, 1, 0),
             ("producer fenced", vec![Code(90)], Fenced, 1, 0),
             ("topic authorization", vec![Code(29)], Server(29), 1, 0),
-            ("invalid state", vec![Code(48)], Server(48), 1, 0),
+            ("operation not attempted", vec![Code(55)], Server(55), 1, 0),
+            ("invalid state", vec![Code(48)], TxnResult::Fatal(48), 1, 0),
+            (
+                "transactional id authorization",
+                vec![Code(53)],
+                TxnResult::Fatal(53),
+                1,
+                0,
+            ),
         ];
         for (name, script, result, add_partitions_requests, coordinator_lookups) in cases {
             let (mock, producer, coordinator) = scripted_producer(Coordinator {
@@ -1568,15 +1673,15 @@ mod tests {
                 TxnState::InTransaction,
             ),
             (
-                "add offsets refused",
+                "add offsets invalid state is fatal",
                 vec![Code(48)],
                 vec![Code(0)],
-                Server(48),
+                TxnResult::Fatal(48),
                 1,
                 0,
                 0,
                 None,
-                TxnState::InTransaction,
+                TxnState::FatalError,
             ),
             (
                 "offset commit unknown topic, then committed",
@@ -1668,7 +1773,7 @@ mod tests {
                     add_offsets_requests: coordinator.add_offsets.requests,
                     txn_offset_commit_requests: coordinator.txn_offset_commit.requests,
                     coordinator_lookups: coordinator.find_coordinator_requests,
-                    abortable_error: producer.txn_abortable_error.get().map(|error| match error {
+                    abortable_error: producer.txn_error.abortable().map(|error| match error {
                         AbortableError::Server(code) => code,
                         AbortableError::Timeout => i16::MIN,
                     }),
@@ -1872,11 +1977,10 @@ mod tests {
             }
             None => TxnResult::Other("the commit succeeded".to_owned()),
         };
-        let abortable_error_after_abort =
-            producer.txn_abortable_error.get().map(|error| match error {
-                AbortableError::Server(code) => code,
-                AbortableError::Timeout => i16::MIN,
-            });
+        let abortable_error_after_abort = producer.txn_error.abortable().map(|error| match error {
+            AbortableError::Server(code) => code,
+            AbortableError::Timeout => i16::MIN,
+        });
         let next_transaction = match producer.begin_transaction().await {
             Ok(transaction) => {
                 TxnResult::from(transaction.abort().await.map_err(|error| error.source))
@@ -2005,6 +2109,257 @@ mod tests {
             };
             assert2::assert!(actual == expected, "{name}");
             mock.stop();
+        }
+    }
+
+    /// The requests that a scripted coordinator got.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct CoordinatorRequests {
+        add_partitions: usize,
+        produce: usize,
+        add_offsets: usize,
+        txn_offset_commit: usize,
+        end_txn: usize,
+        init_producer_id: usize,
+    }
+
+    impl CoordinatorRequests {
+        fn of(coordinator: &SharedCoordinator) -> Self {
+            let coordinator = coordinator.lock().expect("scripted coordinator");
+            Self {
+                add_partitions: coordinator.add_partitions.requests,
+                produce: coordinator.produce.requests,
+                add_offsets: coordinator.add_offsets.requests,
+                txn_offset_commit: coordinator.txn_offset_commit.requests,
+                end_txn: coordinator.end_txn.requests,
+                init_producer_id: coordinator.init_producer_id_requests,
+            }
+        }
+    }
+
+    /// The operation that puts the transaction in an error state.
+    #[derive(Debug, Clone, Copy)]
+    enum Trigger {
+        Send,
+        SendOffsets,
+        Commit,
+    }
+
+    /// What each transactional operation gave after a transaction error, and
+    /// the requests that all of them sent.
+    #[derive(Debug, PartialEq, Eq)]
+    struct AfterTransactionError {
+        trigger: TxnResult,
+        state: TxnState,
+        send: TxnResult,
+        send_offsets: TxnResult,
+        commit: TxnResult,
+        abort: TxnResult,
+        begin_and_abort: TxnResult,
+        init_transactions: TxnResult,
+        requests: CoordinatorRequests,
+    }
+
+    /// Kafka's `TransactionManager.maybeFailWithError` throws the stored error
+    /// in `maybeAddPartition` (so `KafkaProducer.doSend` fails the send),
+    /// `sendOffsetsToTransaction`, `beginCommit`, `beginTransaction` and
+    /// `initializeTransactions`. An abortable error lets `beginAbort` go on,
+    /// and the abort clears it. A fatal error (`fatalError` in the handlers:
+    /// a fence, `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, `INVALID_TXN_STATE`,
+    /// `INVALID_PRODUCER_ID_MAPPING` and an unexpected code) stops every one
+    /// of them, the abort and a new `initTransactions` included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_operation_fails_after_a_transaction_error() {
+        use Reply::Code;
+        use TxnResult::{Fatal, Fenced, Server};
+        let group = krabka_client_consumer::ConsumerGroupMetadata {
+            group_id: "group-a".into(),
+            generation_id: 3,
+            member_id: "member-a".into(),
+            group_instance_id: None,
+        };
+        let fatal = |code, state, requests| AfterTransactionError {
+            trigger: Fatal(code),
+            state,
+            send: Fatal(code),
+            send_offsets: Fatal(code),
+            commit: Fatal(code),
+            abort: Fatal(code),
+            begin_and_abort: Fatal(code),
+            init_transactions: Fatal(code),
+            requests,
+        };
+        let cases = [
+            (
+                "add partitions transactional id authorization",
+                Trigger::Send,
+                Coordinator {
+                    add_partitions: Script::new(&[Code(53)], Code(0)),
+                    ..Coordinator::default()
+                },
+                fatal(
+                    53,
+                    TxnState::FatalError,
+                    CoordinatorRequests {
+                        add_partitions: 1,
+                        ..CoordinatorRequests::default()
+                    },
+                ),
+            ),
+            (
+                "add partitions producer fenced",
+                Trigger::Send,
+                Coordinator {
+                    add_partitions: Script::new(&[Code(90)], Code(0)),
+                    ..Coordinator::default()
+                },
+                AfterTransactionError {
+                    trigger: Fenced,
+                    state: TxnState::Fenced,
+                    send: Fenced,
+                    send_offsets: Fenced,
+                    commit: Fenced,
+                    abort: Fenced,
+                    begin_and_abort: Fenced,
+                    init_transactions: Fenced,
+                    requests: CoordinatorRequests {
+                        add_partitions: 1,
+                        ..CoordinatorRequests::default()
+                    },
+                },
+            ),
+            (
+                "add offsets invalid producer id mapping",
+                Trigger::SendOffsets,
+                Coordinator {
+                    add_offsets: Script::new(&[Code(49)], Code(0)),
+                    ..Coordinator::default()
+                },
+                fatal(
+                    49,
+                    TxnState::FatalError,
+                    CoordinatorRequests {
+                        add_offsets: 1,
+                        ..CoordinatorRequests::default()
+                    },
+                ),
+            ),
+            (
+                "end txn invalid txn state",
+                Trigger::Commit,
+                Coordinator {
+                    end_txn: Script::new(&[Code(48)], Code(0)),
+                    ..Coordinator::default()
+                },
+                fatal(
+                    48,
+                    TxnState::FatalError,
+                    CoordinatorRequests {
+                        end_txn: 1,
+                        ..CoordinatorRequests::default()
+                    },
+                ),
+            ),
+            (
+                "failed batch is abortable",
+                Trigger::Send,
+                Coordinator {
+                    // 42 is INVALID_REQUEST, which Kafka does not retry.
+                    produce: Script::new(&[Code(42)], Code(0)),
+                    ..Coordinator::default()
+                },
+                AfterTransactionError {
+                    trigger: Server(42),
+                    state: TxnState::InTransaction,
+                    send: Server(42),
+                    send_offsets: Server(42),
+                    commit: Server(42),
+                    abort: TxnResult::Ok,
+                    begin_and_abort: TxnResult::Ok,
+                    init_transactions: TxnResult::Ok,
+                    requests: CoordinatorRequests {
+                        add_partitions: 1,
+                        produce: 1,
+                        end_txn: 2,
+                        init_producer_id: 1,
+                        ..CoordinatorRequests::default()
+                    },
+                },
+            ),
+        ];
+        for (name, trigger, coordinator, expected) in cases {
+            let (mock, producer, coordinator) = scripted_producer(coordinator).await;
+            let record = || ProducerRecord {
+                topic: "topic".to_owned(),
+                partition: Some(0),
+                value: Some(bytes::Bytes::from_static(b"v")),
+                ..Default::default()
+            };
+            let transaction = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction");
+            let (trigger_result, transaction) = match trigger {
+                Trigger::Send => {
+                    let receiver = producer.send(record()).await;
+                    let result = receiver.await.expect("the record is resolved").map(drop);
+                    (TxnResult::from(result), transaction)
+                }
+                Trigger::SendOffsets => {
+                    let result = producer
+                        .send_offsets_to_transaction([(("topic".to_owned(), 0), 42)], &group)
+                        .await;
+                    (TxnResult::from(result), transaction)
+                }
+                Trigger::Commit => match transaction.commit().await {
+                    Ok(()) => panic!("{name}: the commit succeeded"),
+                    Err(error) => (TxnResult::from(Err(error.source)), error.transaction),
+                },
+            };
+            let state = *producer.txn_state.lock().await;
+            let send = TxnResult::from(
+                producer
+                    .send(record())
+                    .await
+                    .await
+                    .expect("the record is resolved")
+                    .map(drop),
+            );
+            let send_offsets = TxnResult::from(
+                producer
+                    .send_offsets_to_transaction([(("topic".to_owned(), 0), 43)], &group)
+                    .await,
+            );
+            let (commit, transaction) = match transaction.commit().await {
+                Ok(()) => (TxnResult::Ok, None),
+                Err(error) => (TxnResult::from(Err(error.source)), Some(error.transaction)),
+            };
+            let abort = match transaction {
+                Some(transaction) => {
+                    TxnResult::from(transaction.abort().await.map_err(|error| error.source))
+                }
+                None => TxnResult::Other("the commit succeeded".to_owned()),
+            };
+            let begin_and_abort = match producer.begin_transaction().await {
+                Ok(transaction) => {
+                    TxnResult::from(transaction.abort().await.map_err(|error| error.source))
+                }
+                Err(error) => TxnResult::from(Err(error)),
+            };
+            let init_transactions = TxnResult::from(producer.init_transactions().await);
+            let actual = AfterTransactionError {
+                trigger: trigger_result,
+                state,
+                send,
+                send_offsets,
+                commit,
+                abort,
+                begin_and_abort,
+                init_transactions,
+                requests: CoordinatorRequests::of(&coordinator),
+            };
+            mock.stop();
+            assert2::assert!(actual == expected, "{name}");
         }
     }
 
