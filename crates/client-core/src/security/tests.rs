@@ -24,6 +24,10 @@ const CLIENT_ENCRYPTED_KEY: &str = include_str!("../../tests/fixtures/tls/client
 const CLIENT_KEYSTORE_PEM: &str = include_str!("../../tests/fixtures/tls/client-keystore.pem");
 const CLIENT_P12: &[u8] = include_bytes!("../../tests/fixtures/tls/client.p12");
 const CLIENT_JKS: &[u8] = include_bytes!("../../tests/fixtures/tls/client.jks");
+const CLIENT_LEGACY_P12: &[u8] = include_bytes!("../../tests/fixtures/tls/client-legacy.p12");
+const CLIENT_TWO_P12: &[u8] = include_bytes!("../../tests/fixtures/tls/client-two.p12");
+const CLIENT_TWO_JKS: &[u8] = include_bytes!("../../tests/fixtures/tls/client-two.jks");
+const OTHER_CLIENT: &str = include_str!("../../tests/fixtures/tls/other-client.pem");
 const TRUSTSTORE_P12: &[u8] = include_bytes!("../../tests/fixtures/tls/truststore.p12");
 const TRUSTSTORE_JKS: &[u8] = include_bytes!("../../tests/fixtures/tls/truststore.jks");
 
@@ -43,6 +47,9 @@ impl Fixtures {
             ("client-keystore.pem", CLIENT_KEYSTORE_PEM.as_bytes()),
             ("client.p12", CLIENT_P12),
             ("client.jks", CLIENT_JKS),
+            ("client-legacy.p12", CLIENT_LEGACY_P12),
+            ("client-two.p12", CLIENT_TWO_P12),
+            ("client-two.jks", CLIENT_TWO_JKS),
             ("truststore.p12", TRUSTSTORE_P12),
             ("truststore.jks", TRUSTSTORE_JKS),
         ] {
@@ -419,6 +426,46 @@ async fn key_stores_give_mutual_tls_as_kafka_does() {
             mutual_broker,
             mutual(),
         ),
+        (
+            "mutual TLS with a legacy PBES1 PKCS12 key store",
+            config(
+                pem_trust(),
+                Some(KeyStore::Pkcs12 {
+                    path: fixtures.path("client-legacy.p12"),
+                    password: "store-secret".into(),
+                }),
+            ),
+            OTHER_CA,
+            mutual_broker,
+            mutual(),
+        ),
+        (
+            "PKCS12 key store picks the identity that the broker CA issued",
+            config(
+                pem_trust(),
+                Some(KeyStore::Pkcs12 {
+                    path: fixtures.path("client-two.p12"),
+                    password: "store-secret".into(),
+                }),
+            ),
+            OTHER_CA,
+            mutual_broker,
+            mutual(),
+        ),
+        (
+            "JKS key store picks the identity that the broker CA issued",
+            config(
+                pem_trust(),
+                Some(KeyStore::Jks {
+                    path: fixtures.path("client-two.jks"),
+                    password: "store-secret".into(),
+                    key_password: None,
+                }),
+            ),
+            OTHER_CA,
+            mutual_broker,
+            mutual(),
+        ),
     ])
     .await;
 }
@@ -610,12 +657,17 @@ fn invalid_store_and_protocol_settings_fail_to_build() {
 }
 
 #[test]
-fn key_stores_of_every_format_load_the_same_key_pair() {
+fn key_stores_of_every_format_load_every_key_entry_in_order() {
     let fixtures = Fixtures::new();
     let certificate = |pem: &str| CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
-    let key = PrivateKeyDer::from_pem_slice(CLIENT_KEY.as_bytes()).unwrap();
-    let leaf = vec![certificate(CLIENT)];
-    let chain = vec![certificate(CLIENT), certificate(CA)];
+    let key = || PrivateKeyDer::from_pem_slice(CLIENT_KEY.as_bytes()).unwrap();
+    let chain = || vec![certificate(CLIENT), certificate(CA)];
+    let leaves = |pairs: Vec<stores::KeyPair>| {
+        pairs
+            .into_iter()
+            .map(|(chain, _)| chain[0].clone())
+            .collect::<Vec<_>>()
+    };
     let cases = [
         (
             "PEM files",
@@ -624,7 +676,7 @@ fn key_stores_of_every_format_load_the_same_key_pair() {
                 private_key: fixtures.path("client.key"),
                 key_password: None,
             },
-            leaf,
+            vec![(vec![certificate(CLIENT)], key())],
         ),
         (
             "PEM key store file",
@@ -632,7 +684,7 @@ fn key_stores_of_every_format_load_the_same_key_pair() {
                 path: fixtures.path("client-keystore.pem"),
                 key_password: Some("key-secret".into()),
             },
-            chain.clone(),
+            vec![(chain(), key())],
         ),
         (
             "PKCS12",
@@ -640,7 +692,15 @@ fn key_stores_of_every_format_load_the_same_key_pair() {
                 path: fixtures.path("client.p12"),
                 password: "store-secret".into(),
             },
-            chain.clone(),
+            vec![(chain(), key())],
+        ),
+        (
+            "legacy PKCS12",
+            KeyStore::Pkcs12 {
+                path: fixtures.path("client-legacy.p12"),
+                password: "store-secret".into(),
+            },
+            vec![(chain(), key())],
         ),
         (
             "JKS",
@@ -649,15 +709,76 @@ fn key_stores_of_every_format_load_the_same_key_pair() {
                 password: "store-secret".into(),
                 key_password: Some("key-secret".into()),
             },
-            chain,
+            vec![(chain(), key())],
         ),
     ];
-    for (name, store, expected_chain) in cases {
+    for (name, store, expected) in cases {
+        check!(stores::key_pairs(&store).unwrap() == expected, "{name}");
+    }
+
+    // The two-entry stores hold the untrusted identity first, so a client
+    // that takes the first entry sends the wrong certificate.
+    for store in [
+        KeyStore::Pkcs12 {
+            path: fixtures.path("client-two.p12"),
+            password: "store-secret".into(),
+        },
+        KeyStore::Jks {
+            path: fixtures.path("client-two.jks"),
+            password: "store-secret".into(),
+            key_password: None,
+        },
+    ] {
         check!(
-            stores::key_pair(&store).unwrap() == (expected_chain, key.clone_key()),
-            "{name}"
+            leaves(stores::key_pairs(&store).unwrap())
+                == vec![certificate(OTHER_CLIENT), certificate(CLIENT)],
+            "{store:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn connector_reuses_the_configuration_until_a_setting_changes() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let fixtures = Fixtures::new();
+    let config = TlsConnectorConfig {
+        trust_store: TrustStore::PemFile(fixtures.path("ca.pem")),
+        key_store: Some(KeyStore::Pkcs12 {
+            path: fixtures.path("client.p12"),
+            password: "store-secret".into(),
+        }),
+        ..TlsConnectorConfig::default()
+    };
+    config.connector().expect("the stores load");
+    std::fs::remove_file(fixtures.path("ca.pem")).unwrap();
+    std::fs::remove_file(fixtures.path("client.p12")).unwrap();
+
+    let broker_clone = ClientSecurity {
+        protocol: ListenerProtocol::Ssl,
+        tls: Some(config.clone()),
+        sasl: None,
+        sasl_host: None,
+    }
+    .for_target_host("localhost");
+    let changed = TlsConnectorConfig {
+        protocol: TlsVersion::Tls12,
+        ..config.clone()
+    };
+    let outcomes = (
+        config.connector().is_ok(),
+        broker_clone.tls.unwrap().connector().is_ok(),
+        changed
+            .connector()
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+    );
+    check!(outcomes.0);
+    check!(outcomes.1);
+    check!(
+        outcomes
+            .2
+            .is_err_and(|error| error.starts_with("cannot read "))
+    );
 }
 
 #[test]
@@ -687,6 +808,7 @@ fn kafka_default_tls_settings() {
                 protocol: TlsVersion::Tls13,
                 enabled_protocols: vec![TlsVersion::Tls12, TlsVersion::Tls13],
                 cipher_suites: None,
+                built: BuiltConfig::default(),
             }
     );
 }

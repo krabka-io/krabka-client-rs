@@ -51,16 +51,18 @@ pub(super) fn trust_anchors(store: &TrustStore) -> Result<rustls::RootCertStore,
     Ok(roots)
 }
 
-/// Load the certificate chain and private key of a key store.
+/// Load the certificate chains and private keys of a key store, one for each
+/// private key entry, in store order.
 ///
 /// # Errors
 /// Returns [`TlsConfigError`] when the store does not load, holds no key, or
-/// the key does not decrypt.
-pub(super) fn key_pair(store: &KeyStore) -> Result<KeyPair, TlsConfigError> {
+/// a key does not decrypt. Java's `KeyManagerFactory.init` also fails when
+/// one key entry does not recover.
+pub(super) fn key_pairs(store: &KeyStore) -> Result<Vec<KeyPair>, TlsConfigError> {
     match store {
         KeyStore::PemFile { path, key_password } => {
             let text = read_text(path)?;
-            pem_key_pair(&text, &text, key_password.as_ref())
+            pem_key_pair(&text, &text, key_password.as_ref()).map(|pair| vec![pair])
         }
         KeyStore::PemFiles {
             certificate_chain,
@@ -70,25 +72,38 @@ pub(super) fn key_pair(store: &KeyStore) -> Result<KeyPair, TlsConfigError> {
             &read_text(certificate_chain)?,
             &read_text(private_key)?,
             key_password.as_ref(),
-        ),
+        )
+        .map(|pair| vec![pair]),
         KeyStore::Pem {
             certificate_chain,
             private_key,
             key_password,
-        } => pem_key_pair(certificate_chain, private_key, key_password.as_ref()),
+        } => pem_key_pair(certificate_chain, private_key, key_password.as_ref())
+            .map(|pair| vec![pair]),
         KeyStore::Pkcs12 { path, password } => {
             let store = pkcs12(&read(path)?, password)?;
-            let (_, chain) = store.private_key_chain().ok_or_else(|| {
-                TlsConfigError::Pkcs12("the store holds no private key entry".to_owned())
-            })?;
-            Ok((
-                chain
-                    .certs()
-                    .iter()
-                    .map(|certificate| CertificateDer::from(certificate.as_der().to_vec()))
-                    .collect(),
-                PrivateKeyDer::from(PrivatePkcs8KeyDer::from(chain.key().as_der().to_vec())),
-            ))
+            let pairs = store
+                .entries()
+                .filter_map(|(_, entry)| match entry {
+                    KeyStoreEntry::PrivateKeyChain(chain) => Some((
+                        chain
+                            .certs()
+                            .iter()
+                            .map(|certificate| CertificateDer::from(certificate.as_der().to_vec()))
+                            .collect(),
+                        PrivateKeyDer::from(PrivatePkcs8KeyDer::from(
+                            chain.key().as_der().to_vec(),
+                        )),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if pairs.is_empty() {
+                return Err(TlsConfigError::Pkcs12(
+                    "the store holds no private key entry".to_owned(),
+                ));
+            }
+            Ok(pairs)
         }
         KeyStore::Jks {
             path,
@@ -96,7 +111,7 @@ pub(super) fn key_pair(store: &KeyStore) -> Result<KeyPair, TlsConfigError> {
             key_password,
         } => {
             let store = jks::JksStore::parse(&read(path)?, Some(password))?;
-            store.key_pair(key_password.as_ref().unwrap_or(password))
+            store.key_pairs(key_password.as_ref().unwrap_or(password))
         }
     }
 }

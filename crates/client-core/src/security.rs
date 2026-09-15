@@ -254,6 +254,34 @@ pub struct TlsConnectorConfig {
     /// skips a known suite name that it does not implement, such as a CBC
     /// suite.
     pub cipher_suites: Option<Vec<String>>,
+    /// The configuration that [`Self::connector`] built last, shared by the
+    /// clones of this value.
+    built: BuiltConfig,
+}
+
+/// The last built client configuration and the settings that built it.
+///
+/// Kafka builds the SSL context once per client. The pool clones the
+/// settings for each broker, so a clone reuses the configuration while its
+/// settings, other than the server name, stay the same.
+#[derive(Clone, Default)]
+struct BuiltConfig(Arc<std::sync::Mutex<Option<Built>>>);
+
+/// The settings of a build and the configuration that they gave.
+type Built = (TlsConnectorConfig, Arc<rustls::ClientConfig>);
+
+impl PartialEq for BuiltConfig {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for BuiltConfig {}
+
+impl fmt::Debug for BuiltConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BuiltConfig")
+    }
 }
 
 impl Default for TlsConnectorConfig {
@@ -266,6 +294,7 @@ impl Default for TlsConnectorConfig {
             protocol: TlsVersion::Tls13,
             enabled_protocols: vec![TlsVersion::Tls12, TlsVersion::Tls13],
             cipher_suites: None,
+            built: BuiltConfig::default(),
         }
     }
 }
@@ -334,10 +363,12 @@ impl TlsConnectorConfig {
         };
         let config = match &self.key_store {
             Some(store) => {
-                let (chain, key) = stores::key_pair(store)?;
-                builder
-                    .with_client_auth_cert(chain, key)
-                    .map_err(|error| TlsConfigError::Rustls(error.to_string()))?
+                let key_provider = builder.crypto_provider().key_provider;
+                let identities = stores::key_pairs(store)?
+                    .into_iter()
+                    .map(|(chain, key)| ClientIdentity::new(chain, key, key_provider))
+                    .collect::<Result<Vec<_>, _>>()?;
+                builder.with_client_cert_resolver(Arc::new(IssuerResolver { identities }))
             }
             None => builder.with_no_client_auth(),
         };
@@ -346,10 +377,32 @@ impl TlsConnectorConfig {
 
     /// Build a ready `TlsConnector`.
     ///
+    /// The first call builds the client configuration, and later calls on
+    /// this value or its clones reuse it while the settings stay the same. A
+    /// store file that changes after the first build therefore does not
+    /// change the connections, as a Kafka client reads its stores once.
+    ///
     /// # Errors
     /// Propagates [`Self::build`] failures.
     pub fn connector(&self) -> Result<TlsConnector, TlsConfigError> {
-        Ok(TlsConnector::from(self.build()?))
+        let settings = Self {
+            server_name: String::new(),
+            built: BuiltConfig::default(),
+            ..self.clone()
+        };
+        let mut built = self
+            .built
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((built_settings, config)) = built.as_ref()
+            && *built_settings == settings
+        {
+            return Ok(TlsConnector::from(Arc::clone(config)));
+        }
+        let config = self.build()?;
+        *built = Some((settings, Arc::clone(&config)));
+        Ok(TlsConnector::from(config))
     }
 
     /// The enabled protocol versions at or below [`Self::protocol`].
@@ -406,6 +459,75 @@ fn cipher_suite(name: &str) -> Result<rustls::CipherSuite, TlsConfigError> {
                 .is_some_and(|known| known == name || tls13.as_deref() == Some(known))
         })
         .ok_or_else(|| TlsConfigError::UnknownCipherSuite(name.to_owned()))
+}
+
+/// One client certificate chain and its signing key.
+#[derive(Debug)]
+struct ClientIdentity {
+    key: Arc<rustls::sign::CertifiedKey>,
+    /// The DER issuer names of the certificates of the chain.
+    issuers: Vec<Vec<u8>>,
+}
+
+impl ClientIdentity {
+    fn new(
+        chain: Vec<CertificateDer<'static>>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+        key_provider: &dyn rustls::crypto::KeyProvider,
+    ) -> Result<Self, TlsConfigError> {
+        use x509_cert::der::{Decode as _, Encode as _};
+
+        let issuers = chain
+            .iter()
+            .map(|certificate| {
+                x509_cert::Certificate::from_der(certificate)
+                    .and_then(|certificate| certificate.tbs_certificate().issuer().to_der())
+                    .map_err(|error| TlsConfigError::Pem(format!("invalid certificate: {error}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let signing_key = key_provider
+            .load_private_key(key)
+            .map_err(|error| TlsConfigError::PrivateKey(error.to_string()))?;
+        Ok(Self {
+            key: Arc::new(rustls::sign::CertifiedKey::new(chain, signing_key)),
+            issuers,
+        })
+    }
+}
+
+/// Pick the client identity that the broker can accept, as the `SunX509`
+/// key manager of Kafka's default `ssl.keymanager.algorithm` does in
+/// `chooseClientAlias`: the first key entry whose key type the broker allows
+/// and, when the broker names certificate authorities, whose chain has a
+/// certificate issued by one of them. With no match the client sends no
+/// certificate.
+#[derive(Debug)]
+struct IssuerResolver {
+    identities: Vec<ClientIdentity>,
+}
+
+impl rustls::client::ResolvesClientCert for IssuerResolver {
+    fn resolve(
+        &self,
+        root_hint_subjects: &[&[u8]],
+        sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.identities
+            .iter()
+            .find(|identity| {
+                identity.key.key.choose_scheme(sigschemes).is_some()
+                    && (root_hint_subjects.is_empty()
+                        || identity
+                            .issuers
+                            .iter()
+                            .any(|issuer| root_hint_subjects.contains(&issuer.as_slice())))
+            })
+            .map(|identity| Arc::clone(&identity.key))
+    }
+
+    fn has_certs(&self) -> bool {
+        !self.identities.is_empty()
+    }
 }
 
 /// A server certificate verifier that checks the chain and skips the host

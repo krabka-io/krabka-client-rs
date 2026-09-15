@@ -30,6 +30,13 @@ sign server "/CN=localhost" "DNS:localhost,IP:127.0.0.1" serverAuth
 sign server-wrong-name "/CN=broker.example" "DNS:broker.example" serverAuth
 # Client certificate for mutual TLS.
 sign client "/CN=krabka-client" "DNS:krabka-client" clientAuth
+# Client certificate from the untrusted authority, for key stores with two
+# private key entries.
+openssl req -newkey rsa:2048 -nodes -subj "/CN=krabka-other-client" \
+  -keyout other-client.key -out other-client.csr
+printf 'extendedKeyUsage=clientAuth\n' > other-client.ext
+openssl x509 -req -in other-client.csr -CA other-ca.pem -CAkey other-ca.key -CAcreateserial \
+  -days "$days" -extfile other-client.ext -out other-client.pem
 
 # PKCS#8 keys: openssl writes "PRIVATE KEY" already. Encrypt the client key
 # with PBES2 (PBKDF2-HMAC-SHA256, AES-256-CBC), as Kafka's ssl.key.password
@@ -52,7 +59,31 @@ keytool -importkeystore -noprompt \
   -srckeystore client-openssl.p12 -srcstoretype PKCS12 -srcstorepass store-secret \
   -destkeystore client.jks -deststoretype JKS -deststorepass store-secret \
   -destkeypass key-secret -srcalias client -destalias client
-rm -f client-openssl.p12
+# Key stores with two private key entries: the identity from the untrusted
+# authority, then the trusted one. The PKCS#12 reader orders entries by alias,
+# and a JKS store file keeps Java's hash table order, so each type gets the
+# aliases that put the untrusted entry first.
+openssl pkcs12 -export -name other -passout pass:store-secret \
+  -inkey other-client.key -in other-client.pem -certfile other-ca.pem -out other-openssl.p12
+two_entries() { # type file untrusted-alias trusted-alias
+  keytool -importkeystore -noprompt \
+    -srckeystore other-openssl.p12 -srcstoretype PKCS12 -srcstorepass store-secret \
+    -destkeystore "$2" -deststoretype "$1" -deststorepass store-secret \
+    -srcalias other -destalias "$3"
+  keytool -importkeystore -noprompt \
+    -srckeystore client-openssl.p12 -srcstoretype PKCS12 -srcstorepass store-secret \
+    -destkeystore "$2" -deststoretype "$1" -deststorepass store-secret \
+    -srcalias client -destalias "$4"
+}
+two_entries PKCS12 client-two.p12 a-other b-client
+two_entries JKS client-two.jks other client
+
+# PKCS#12 key store in the legacy format of older keytool versions (PBES1:
+# SHA-1 with 3DES for the key, RC2-40 for the certificates).
+keytool -J-Dkeystore.pkcs12.legacy -importkeystore -noprompt \
+  -srckeystore client-openssl.p12 -srcstoretype PKCS12 -srcstorepass store-secret \
+  -destkeystore client-legacy.p12 -deststoretype PKCS12 -deststorepass store-secret
+rm -f client-openssl.p12 other-openssl.p12 other-client.key
 
 # Trust stores written by keytool.
 keytool -importcert -noprompt -alias ca -file ca.pem \

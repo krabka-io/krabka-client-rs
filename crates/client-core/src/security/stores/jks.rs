@@ -90,21 +90,28 @@ impl JksStore {
         Ok(store)
     }
 
-    /// Recover the first private key entry with `key_password`.
+    /// Recover every private key entry with `key_password`, in store order.
     ///
     /// # Errors
     /// Returns [`TlsConfigError::Jks`] when the store holds no private key
-    /// entry, or when the key password does not recover the key.
-    pub(super) fn key_pair(&self, key_password: &Password) -> Result<KeyPair, TlsConfigError> {
-        let (protected_key, chain) = self
-            .private_keys
-            .first()
-            .ok_or_else(|| jks_error("the store holds no private key entry"))?;
-        let key = recover_key(protected_key, key_password)?;
-        Ok((
-            chain.clone(),
-            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key)),
-        ))
+    /// entry, or when the key password does not recover a key.
+    pub(super) fn key_pairs(
+        &self,
+        key_password: &Password,
+    ) -> Result<Vec<KeyPair>, TlsConfigError> {
+        if self.private_keys.is_empty() {
+            return Err(jks_error("the store holds no private key entry"));
+        }
+        self.private_keys
+            .iter()
+            .map(|(protected_key, chain)| {
+                let key = recover_key(protected_key, key_password)?;
+                Ok((
+                    chain.clone(),
+                    PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key)),
+                ))
+            })
+            .collect()
     }
 }
 

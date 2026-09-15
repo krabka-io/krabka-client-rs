@@ -161,8 +161,9 @@ impl Client {
                 .map_err(ClientError::InvalidConfig)?;
         // Kafka builds the SSL engine factory when it builds the client, so a
         // store that does not load fails the client before any connection.
+        // The connections reuse this configuration.
         if let Some(tls) = security.as_ref().and_then(|security| security.tls.as_ref()) {
-            tls.build()
+            tls.connector()
                 .map_err(|error| ClientError::InvalidConfig(error.to_string()))?;
         }
         let options = ConnectionOptions {

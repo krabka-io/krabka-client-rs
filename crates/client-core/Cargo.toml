@@ -41,6 +41,7 @@ rustls-native-certs = { workspace = true }
 p12-keystore = { workspace = true }
 pkcs8 = { workspace = true }
 sha1 = { workspace = true }
+x509-cert = { workspace = true }
 tokio-rustls = { workspace = true }
 
 [dev-dependencies]
