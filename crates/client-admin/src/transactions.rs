@@ -251,8 +251,9 @@ impl AdminClient {
     /// before the broker gives a verdict), also make the call find the
     /// coordinator again. The call waits between attempts with Kafka's
     /// backoff, and it stops when Kafka's default `default.api.timeout.ms`
-    /// (60 s) elapses. At that time it returns the last error. An attempt that
-    /// is still running at the deadline stops with a timeout error.
+    /// (60 s) elapses. A call whose retries are unresolved at the deadline, or
+    /// whose attempt is still running, fails with a timeout error, as Kafka
+    /// gives a `TimeoutException`.
     ///
     /// # Errors
     ///
@@ -340,8 +341,9 @@ impl AdminClient {
     /// before the broker gives a verdict), also make the call find the
     /// coordinator again. The call waits between attempts with Kafka's
     /// backoff, and it stops when Kafka's default `default.api.timeout.ms`
-    /// (60 s) elapses. At that time it returns the last error. An attempt that
-    /// is still running at the deadline stops with a timeout error.
+    /// (60 s) elapses. A call whose retries are unresolved at the deadline, or
+    /// whose attempt is still running, fails with a timeout error, as Kafka
+    /// gives a `TimeoutException`.
     ///
     /// # Errors
     ///
@@ -497,7 +499,7 @@ mod tests {
 
     use assert2::check;
     use bytes::{Buf, BytesMut};
-    use krabka_client_core::{ClientError, MockBroker};
+    use krabka_client_core::{ClientError, MockBroker, MockReply};
     use krabka_protocol::{
         Decode,
         owned::{
@@ -830,6 +832,9 @@ mod tests {
         unreachable: Option<std::net::SocketAddr>,
         /// The coordinator does not answer the transaction request.
         silent: bool,
+        /// The first `closed_find_coordinators` `FindCoordinator` requests
+        /// close the connection with no answer.
+        closed_find_coordinators: usize,
     }
 
     /// How the coordinator of a retry case behaves.
@@ -842,6 +847,9 @@ mod tests {
         UnreachableOnce,
         /// It does not answer the transaction request.
         Silent,
+        /// The bootstrap broker closes the connection on the first
+        /// `FindCoordinator`.
+        FindCoordinatorClosedOnce,
     }
 
     /// An address on which no listener accepts connections.
@@ -888,10 +896,15 @@ mod tests {
         script: Arc<Mutex<CoordinatorScript>>,
         coordinator: Arc<Mutex<Option<std::net::SocketAddr>>>,
     ) -> MockBroker {
-        MockBroker::start(move |api_key, version, _, _| {
+        MockBroker::start_with_replies(move |api_key, version, _, _| {
             let mut script = script.lock().expect("script lock");
             let script = &mut *script;
-            match api_key {
+            if api_key == find_coordinator_request::API_KEY && script.closed_find_coordinators > 0 {
+                script.closed_find_coordinators -= 1;
+                script.find_coordinator_requests += 1;
+                return MockReply::Close;
+            }
+            let reply = match api_key {
                 api_versions_request::API_KEY => Some(retry_api_versions()),
                 find_coordinator_request::API_KEY => {
                     let error_code = next_code(
@@ -925,7 +938,7 @@ mod tests {
                     let error_code =
                         next_code(&script.coordinator, &mut script.coordinator_requests);
                     if script.silent {
-                        return None;
+                        return MockReply::Silent;
                     }
                     Some(encode_response(
                         &DescribeTransactionsResponse {
@@ -947,7 +960,7 @@ mod tests {
                     let error_code =
                         next_code(&script.coordinator, &mut script.coordinator_requests);
                     if script.silent {
-                        return None;
+                        return MockReply::Silent;
                     }
                     Some(encode_response(
                         &InitProducerIdResponse {
@@ -961,7 +974,8 @@ mod tests {
                     ))
                 }
                 _ => None,
-            }
+            };
+            reply.map_or(MockReply::Silent, MockReply::Respond)
         })
         .await
     }
@@ -1011,6 +1025,9 @@ mod tests {
             unreachable_answers: usize::from(behavior == CoordinatorBehavior::UnreachableOnce),
             unreachable: Some(refused_address().await),
             silent: behavior == CoordinatorBehavior::Silent,
+            closed_find_coordinators: usize::from(
+                behavior == CoordinatorBehavior::FindCoordinatorClosedOnce,
+            ),
             ..CoordinatorScript::default()
         }));
         let coordinator_addr = Arc::new(Mutex::new(None));
@@ -1126,12 +1143,12 @@ mod tests {
                 (failed("DescribeTransactions", 105), 1, 1),
             ),
             (
-                "describe: coordinator load in progress past the timeout fails",
+                "describe: coordinator load in progress past the timeout times out",
                 Describe,
                 vec![0],
                 vec![14],
                 (NOW, CoordinatorBehavior::Normal),
-                (failed("DescribeTransactions", 14), 1, 1),
+                (failed("timeout", TIMED_OUT), 1, 1),
             ),
             (
                 "describe: find coordinator not available, then the coordinator",
@@ -1190,12 +1207,12 @@ mod tests {
                 (failed("InitProducerId", 31), 1, 1),
             ),
             (
-                "fence: concurrent transactions past the timeout fails",
+                "fence: concurrent transactions past the timeout times out",
                 ForceTerminate,
                 vec![0],
                 vec![51],
                 (NOW, CoordinatorBehavior::Normal),
-                (failed("InitProducerId", 51), 1, 1),
+                (failed("timeout", TIMED_OUT), 1, 1),
             ),
             (
                 "fence: find coordinator load in progress, then the coordinator",
@@ -1218,6 +1235,22 @@ mod tests {
         use TransactionCall::{Describe, ForceTerminate};
 
         for case in [
+            (
+                "describe: a closed connection during FindCoordinator recovers",
+                Describe,
+                vec![0],
+                vec![0],
+                (LONG, CoordinatorBehavior::FindCoordinatorClosedOnce),
+                (OK, 2, 1),
+            ),
+            (
+                "fence: a closed connection during FindCoordinator recovers",
+                ForceTerminate,
+                vec![0],
+                vec![0],
+                (LONG, CoordinatorBehavior::FindCoordinatorClosedOnce),
+                (OK, 2, 1),
+            ),
             (
                 "describe: an unreachable coordinator finds the coordinator again",
                 Describe,

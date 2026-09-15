@@ -104,6 +104,18 @@ impl RetryDeadline {
         Instant::now() >= self.deadline
     }
 
+    /// The error of a call whose retries are unresolved at the deadline. Kafka
+    /// fails such a call with a `TimeoutException`, whatever the last
+    /// retriable answer was (`Call.fail`, `AdminApiDriver.onFailure`).
+    pub(crate) fn timeout<T>(&self, last: &Result<T, AdminError>) -> AdminError {
+        tracing::debug!(
+            retries = self.retries,
+            last_error = ?last.as_ref().err(),
+            "admin call deadline passed with an unresolved retriable result"
+        );
+        AdminError::Transport(ClientError::Timeout(Time::from_std(self.policy.timeout)))
+    }
+
     /// Run one attempt, but not past the call deadline. An attempt that is
     /// still running at the deadline stops and gives
     /// [`ClientError::Timeout`], as Kafka's `KafkaAdminClient` times out a
@@ -170,11 +182,11 @@ pub(crate) fn connection_failure_action<T>(error: AdminError) -> RetryAction<T> 
 pub(crate) enum RetryAction<T> {
     /// Return this result.
     Done(Result<T, AdminError>),
-    /// Send the request again to the same coordinator. Return this result
-    /// when the call deadline has passed.
+    /// Send the request again to the same coordinator. When the call deadline
+    /// has passed, the call fails with a timeout.
     SameCoordinator(Result<T, AdminError>),
-    /// Find the coordinator again, then send the request again. Return this
-    /// result when the call deadline has passed.
+    /// Find the coordinator again, then send the request again. When the call
+    /// deadline has passed, the call fails with a timeout.
     FindCoordinator(Result<T, AdminError>),
 }
 
@@ -230,7 +242,7 @@ impl CoordinatorRetry {
             RetryAction::FindCoordinator(last) => (last, true),
         };
         if self.deadline.expired() {
-            return Some(last);
+            return Some(Err(self.deadline.timeout(&last)));
         }
         tracing::debug!(
             find_coordinator = find_next,
@@ -240,7 +252,7 @@ impl CoordinatorRetry {
         self.find_coordinator = find_next;
         self.deadline.backoff().await;
         if self.deadline.expired() {
-            return Some(last);
+            return Some(Err(self.deadline.timeout(&last)));
         }
         None
     }

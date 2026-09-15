@@ -330,15 +330,15 @@ impl AdminClient {
     /// verdict, makes the call find the coordinator again, as Kafka's
     /// `AdminApiDriver.onFailure` does. The call waits between attempts with
     /// Kafka's backoff, and it stops when Kafka's default
-    /// `default.api.timeout.ms` (60 s) elapses. At that time it returns the
-    /// outcomes of the last response. An attempt that is still running at the
-    /// deadline stops with [`ClientError::Timeout`].
+    /// `default.api.timeout.ms` (60 s) elapses. A call whose retries are
+    /// unresolved at the deadline, or whose attempt is still running, fails
+    /// with [`ClientError::Timeout`], as Kafka gives a `TimeoutException`.
     ///
     /// # Errors
     /// Returns an error when encoding, transport, or response handling fails.
     /// Returns [`ClientError::Server`] when `FindCoordinator` answers with an
-    /// error code that Kafka does not retry, or with a retriable code after
-    /// the timeout. Returns [`ClientError::IncompatibleVersion`] when the
+    /// error code that Kafka does not retry. Returns
+    /// [`ClientError::Timeout`] at the deadline. Returns [`ClientError::IncompatibleVersion`] when the
     /// coordinator does not support `OffsetCommit` v9 or lower.
     ///
     /// [`ClientError::IncompatibleVersion`]: krabka_client_core::ClientError::IncompatibleVersion
@@ -547,16 +547,16 @@ impl AdminClient {
     /// failed or lost connection to the coordinator does the same, as
     /// `AdminApiDriver.onFailure` does. The call waits between attempts, and
     /// it stops when Kafka's default `default.api.timeout.ms` (60 s) elapses.
-    /// An attempt that is still running at the deadline stops with
-    /// [`ClientError::Timeout`].
+    /// A call whose retries are unresolved at the deadline, or whose attempt
+    /// is still running, fails with [`ClientError::Timeout`].
     ///
     /// # Errors
     /// Returns an error when encoding, transport, or response handling fails.
     /// Returns [`AdminError::Broker`] when the coordinator answers with a
-    /// group error code that Kafka does not retry, or with a retriable code
-    /// after the timeout. Returns [`ClientError::Server`] when
-    /// `FindCoordinator` answers with an error code that Kafka does not retry,
-    /// or with a retriable code after the timeout. Returns
+    /// group error code that Kafka does not retry. Returns
+    /// [`ClientError::Server`] when `FindCoordinator` answers with an error
+    /// code that Kafka does not retry. Returns [`ClientError::Timeout`] at
+    /// the deadline. Returns
     /// [`ClientError::IncompatibleVersion`] when the coordinator does not
     /// support `OffsetFetch` v2 to v9.
     ///
@@ -1652,6 +1652,7 @@ mod tests {
     enum ListOffsetsError {
         OffsetFetch(i16),
         FindCoordinator(i16),
+        Timeout,
     }
 
     /// The error codes that the mock brokers answer, one per attempt. The
@@ -1671,6 +1672,9 @@ mod tests {
         unreachable: Option<std::net::SocketAddr>,
         /// The coordinator does not answer `OffsetCommit`.
         silent_offset_commit: bool,
+        /// The first `closed_offset_commits` `OffsetCommit` requests close the
+        /// connection with no answer.
+        closed_offset_commits: usize,
     }
 
     /// An address on which no listener accepts connections.
@@ -1701,7 +1705,8 @@ mod tests {
             offset_commit: (2, 9),
             offset_fetch: (2, 9),
         };
-        MockBroker::start(move |api_key, version, _, body| match api_key {
+        let closing = Arc::clone(&script);
+        let handler = move |api_key: i16, version: i16, body: &[u8]| match api_key {
             api_versions_request::API_KEY => Some(api_versions(ranges)),
             offset_commit_request::API_KEY => {
                 let request: OffsetCommitRequest = decode_request(body, version);
@@ -1788,6 +1793,17 @@ mod tests {
                 Some(encode(&response, version, true))
             }
             _ => None,
+        };
+        MockBroker::start_with_replies(move |api_key, version, _, body| {
+            if api_key == offset_commit_request::API_KEY {
+                let mut script = closing.lock().expect("script lock");
+                if script.closed_offset_commits > 0 {
+                    script.closed_offset_commits -= 1;
+                    script.offset_commit_requests += 1;
+                    return MockReply::Close;
+                }
+            }
+            handler(api_key, version, body).map_or(MockReply::Silent, MockReply::Respond)
         })
         .await
     }
@@ -1839,18 +1855,18 @@ mod tests {
                 (offsets(), 2, 2),
             ),
             (
-                "coordinator load in progress past the timeout fails",
+                "coordinator load in progress past the timeout times out",
                 vec![0],
                 vec![14],
                 NOW,
-                (fetch_error(14), 1, 1),
+                (Err(ListOffsetsError::Timeout), 1, 1),
             ),
             (
-                "not coordinator past the timeout fails",
+                "not coordinator past the timeout times out",
                 vec![0],
                 vec![16],
                 NOW,
-                (fetch_error(16), 1, 1),
+                (Err(ListOffsetsError::Timeout), 1, 1),
             ),
             (
                 "group authorization failed is final",
@@ -1881,11 +1897,11 @@ mod tests {
                 (offsets(), 2, 1),
             ),
             (
-                "find coordinator not available past the timeout fails",
+                "find coordinator not available past the timeout times out",
                 vec![15],
                 vec![0],
                 NOW,
-                (find_error(15), 1, 0),
+                (Err(ListOffsetsError::Timeout), 1, 0),
             ),
             (
                 "find coordinator group authorization failed is final",
@@ -1930,6 +1946,7 @@ mod tests {
                     AdminError::Transport(ClientError::Server { error_code }) => {
                         ListOffsetsError::FindCoordinator(error_code)
                     }
+                    AdminError::Transport(ClientError::Timeout(_)) => ListOffsetsError::Timeout,
                     other => panic!("case {name}: unexpected error {other:?}"),
                 });
 
@@ -1961,6 +1978,8 @@ mod tests {
         UnreachableOnce,
         /// It does not answer the group request.
         Silent,
+        /// It closes the connection on the first group request.
+        ClosedOnce,
     }
 
     /// Apache Kafka's `AlterConsumerGroupOffsetsHandler.handleError` retries
@@ -1999,6 +2018,13 @@ mod tests {
                 vec![0],
                 (LONG, normal),
                 (outcome(0), 1, 1),
+            ),
+            (
+                "a closed coordinator connection recovers",
+                vec![0],
+                vec![0],
+                (LONG, Coordinator::ClosedOnce),
+                (outcome(0), 1, 2),
             ),
             (
                 "an unreachable coordinator finds the coordinator again",
@@ -2043,18 +2069,18 @@ mod tests {
                 (outcome(0), 2, 2),
             ),
             (
-                "rebalance in progress past the timeout gives the last outcome",
+                "rebalance in progress past the timeout times out",
                 vec![0],
                 vec![27],
                 (NOW, normal),
-                (outcome(27), 1, 1),
+                (find_error(TIMED_OUT), 1, 1),
             ),
             (
-                "not coordinator past the timeout gives the last outcome",
+                "not coordinator past the timeout times out",
                 vec![0],
                 vec![16],
                 (NOW, normal),
-                (outcome(16), 1, 1),
+                (find_error(TIMED_OUT), 1, 1),
             ),
             (
                 "unknown member id is a final outcome",
@@ -2084,6 +2110,7 @@ mod tests {
                 unreachable_answers: usize::from(coordinator == Coordinator::UnreachableOnce),
                 unreachable: Some(refused_address().await),
                 silent_offset_commit: coordinator == Coordinator::Silent,
+                closed_offset_commits: usize::from(coordinator == Coordinator::ClosedOnce),
                 ..RetryScript::default()
             }));
             let coordinator_addr = Arc::new(Mutex::new(None));
