@@ -244,8 +244,19 @@ fn build_fetch_request(
 /// A Fetch that runs in a task, with the fetch offset of each partition that
 /// it asked for.
 struct InFlightFetch {
-    handle: tokio::task::JoinHandle<Result<FetchResponse, krabka_client_core::ClientError>>,
+    handle: tokio::task::JoinHandle<()>,
+    /// The result of the request. The task sends it before it notifies
+    /// `Fetches::completed`, so a waiter that wakes can always take it.
+    result: tokio::sync::oneshot::Receiver<Result<FetchResponse, krabka_client_core::ClientError>>,
     requested: HashMap<(String, i32), i64>,
+}
+
+/// A Fetch whose task ended: its broker, the fetch offsets it asked for, and
+/// its result, or `None` when the task ended without a result.
+struct CompletedFetch {
+    leader: i32,
+    requested: HashMap<(String, i32), i64>,
+    result: Option<Result<FetchResponse, krabka_client_core::ClientError>>,
 }
 
 /// The Fetch requests of a consumer: at most one in flight per broker, and the
@@ -258,7 +269,34 @@ struct InFlightFetch {
 pub(crate) struct Fetches {
     sessions: HashMap<i32, FetchSession>,
     in_flight: HashMap<i32, InFlightFetch>,
+    /// The Fetch requests whose result the consumer took from `in_flight` and
+    /// did not process yet.
+    ready: Vec<CompletedFetch>,
     completed: Arc<tokio::sync::Notify>,
+}
+
+impl Fetches {
+    /// Move each Fetch whose task sent its result, or ended, to `ready`.
+    fn collect_ready(&mut self) {
+        let leaders: Vec<i32> = self.in_flight.keys().copied().collect();
+        for leader in leaders {
+            let Some(fetch) = self.in_flight.get_mut(&leader) else {
+                continue;
+            };
+            let result = match fetch.result.try_recv() {
+                Ok(result) => Some(result),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => continue,
+            };
+            if let Some(fetch) = self.in_flight.remove(&leader) {
+                self.ready.push(CompletedFetch {
+                    leader,
+                    requested: fetch.requested,
+                    result,
+                });
+            }
+        }
+    }
 }
 
 impl Drop for Fetches {
@@ -862,33 +900,34 @@ impl Consumer {
             );
             let client = self.client.clone();
             let completed = Arc::clone(&self.fetches.completed);
+            let (sender, result) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
-                let result = if should_use_bootstrap_leader(leader) {
+                let response = if should_use_bootstrap_leader(leader) {
                     client.send(request).await
                 } else {
                     client.broker(leader).send(request).await
                 };
+                let _ = sender.send(response);
                 completed.notify_one();
-                result
             });
-            self.fetches
-                .in_flight
-                .insert(leader, InFlightFetch { handle, requested });
+            self.fetches.in_flight.insert(
+                leader,
+                InFlightFetch {
+                    handle,
+                    result,
+                    requested,
+                },
+            );
         }
     }
 
     /// Wait until a Fetch in flight completes, or until `deadline`. Kafka's
     /// `ClassicKafkaConsumer.pollForFetches` bounds the network wait with the
     /// poll timer and returns as soon as a fetch is available.
-    async fn wait_for_fetches(&self, deadline: tokio::time::Instant) {
+    async fn wait_for_fetches(&mut self, deadline: tokio::time::Instant) {
         loop {
-            if self.fetches.in_flight.is_empty()
-                || self
-                    .fetches
-                    .in_flight
-                    .values()
-                    .any(|fetch| fetch.handle.is_finished())
-            {
+            self.fetches.collect_ready();
+            if self.fetches.in_flight.is_empty() || !self.fetches.ready.is_empty() {
                 return;
             }
             tokio::select! {
@@ -913,27 +952,19 @@ impl Consumer {
         &mut self,
         topic_ids: &HashMap<String, krabka_protocol::primitives::uuid::Uuid>,
     ) -> Result<Vec<FetchResponse>, ConsumerError> {
-        let finished: Vec<i32> = self
-            .fetches
-            .in_flight
-            .iter()
-            .filter(|(_, fetch)| fetch.handle.is_finished())
-            .map(|(leader, _)| *leader)
-            .collect();
-        if finished.is_empty() {
+        self.fetches.collect_ready();
+        if self.fetches.ready.is_empty() {
             return Ok(Vec::new());
         }
         let id_to_name = crate::offset_wire::id_to_name(topic_ids);
         let offsets = self.next_offsets.lock().await.clone();
         let mut responses = Vec::new();
         let mut failure = None;
-        for leader in finished {
-            let Some(fetch) = self.fetches.in_flight.remove(&leader) else {
-                continue;
-            };
+        for fetch in std::mem::take(&mut self.fetches.ready) {
+            let leader = fetch.leader;
             let session = self.fetches.sessions.entry(leader).or_default();
-            match fetch.handle.await {
-                Ok(Ok(mut response)) => {
+            match fetch.result {
+                Some(Ok(mut response)) => {
                     let partitions = response
                         .responses
                         .iter()
@@ -967,7 +998,7 @@ impl Consumer {
                     }
                     responses.push(response);
                 }
-                Ok(Err(error)) => {
+                Some(Err(error)) => {
                     session.handle_error();
                     if is_transient_transport_error(&error) {
                         if should_use_bootstrap_leader(leader) {
@@ -979,7 +1010,8 @@ impl Consumer {
                         failure = Some(error);
                     }
                 }
-                Err(_join_error) => session.handle_error(),
+                // The task ended without a result: it panicked or was aborted.
+                None => session.handle_error(),
             }
         }
         match failure {
@@ -3789,10 +3821,10 @@ mod fetch_path_tests {
         assert2::assert!(actual == wanted);
     }
 
-    /// Kafka's `FetchCollector` discards the data of a partition whose position
-    /// changed after the Fetch went out, for example after a seek.
-    #[tokio::test]
-    async fn a_fetch_response_for_a_moved_position_gives_no_records() {
+    /// A Fetch result counts as soon as the task sent it, also while the task
+    /// has not ended yet, so `poll` does not sleep until its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_result_wakes_poll_before_the_task_ends() {
         let sent = SentFetches::default();
         let brokers = start_brokers(&[vec![FetchAnswer::Silent]], &sent).await;
         let mut consumer = consumer_on(&brokers).await;
@@ -3802,10 +3834,38 @@ mod fetch_path_tests {
             -1,
             InFlightFetch {
                 handle: tokio::spawn(async move {
-                    let response = rx.await.expect("response");
+                    let _ = tx.send(Ok(FetchResponse::default()));
                     completed.notify_one();
-                    Ok(response)
+                    // The task ends late.
+                    tokio::time::sleep(Duration::from_secs(3)).await;
                 }),
+                result: rx,
+                requested: HashMap::new(),
+            },
+        );
+        let started = tokio::time::Instant::now();
+        consumer
+            .wait_for_fetches(started + Duration::from_secs(2))
+            .await;
+        let elapsed = started.elapsed();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!(elapsed < Duration::from_millis(500));
+    }
+
+    /// Kafka's `FetchCollector` discards the data of a partition whose position
+    /// changed after the Fetch went out, for example after a seek.
+    #[tokio::test]
+    async fn a_fetch_response_for_a_moved_position_gives_no_records() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(&[vec![FetchAnswer::Silent]], &sent).await;
+        let mut consumer = consumer_on(&brokers).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        consumer.fetches.in_flight.insert(
+            -1,
+            InFlightFetch {
+                handle: tokio::spawn(async {}),
+                result: rx,
                 requested: HashMap::from([(("orders".to_owned(), 0), 5)]),
             },
         );
@@ -3825,7 +3885,7 @@ mod fetch_path_tests {
             }],
             ..Default::default()
         };
-        tx.send(FetchResponse {
+        tx.send(Ok(FetchResponse {
             responses: vec![FetchableTopicResponse {
                 topic: "orders".into(),
                 partitions: vec![PartitionData {
@@ -3837,7 +3897,7 @@ mod fetch_path_tests {
                 ..Default::default()
             }],
             ..Default::default()
-        })
+        }))
         .expect("send response");
         consumer
             .wait_for_fetches(tokio::time::Instant::now() + Duration::from_secs(5))
