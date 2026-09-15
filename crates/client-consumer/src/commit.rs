@@ -1010,6 +1010,7 @@ impl Consumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn commit_sync(&self) -> Result<(), ConsumerError> {
+        self.require_group_id()?;
         let _commit_guard = self.commit_serialization.lock().await;
         let pending = {
             let identity = self.commit_identity.lock().await;
@@ -1060,6 +1061,7 @@ impl Consumer {
         &self,
         offsets: HashMap<(String, i32), OffsetAndMetadata>,
     ) -> Result<(), ConsumerError> {
+        self.require_group_id()?;
         let _commit_guard = self.commit_serialization.lock().await;
         if offsets.is_empty() {
             return Ok(());
@@ -1327,10 +1329,13 @@ impl Consumer {
             .await?;
 
         let current = self.commit_identity.lock().await.clone();
-        let coordinator_alive = self
-            .coordinator_handle
-            .as_ref()
-            .is_none_or(|h| !h.is_finished());
+        // Without a subscription no coordinator task joins the group again, so
+        // a rebalance error fails the commit, as in Kafka.
+        let coordinator_alive = !self.subscription.borrow().is_none()
+            && self
+                .coordinator_handle
+                .as_ref()
+                .is_none_or(|h| !h.is_finished());
         let outcome = commit_response_outcome(
             &resp,
             CommitResponseContext {
@@ -1369,8 +1374,14 @@ impl Consumer {
             generation = self.current_generation.load(Ordering::Relaxed),
         )
     )]
-    pub fn commit_async(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::InvalidGroupId`] without a group id.
+    pub fn commit_async(&self) -> Result<(), ConsumerError> {
+        self.require_group_id()?;
         self.schedule_commit_async();
+        Ok(())
     }
 
     /// Commit the positions in the background, and call `callback` with the
@@ -1380,17 +1391,24 @@ impl Consumer {
     /// [`Consumer::commit_async`] describes. The callback gets the offsets and
     /// the result of the commit that covers this call. The consumer calls it
     /// on a background task.
-    pub fn commit_async_with_callback<F>(&self, callback: F)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::InvalidGroupId`] without a group id. The
+    /// callback then does not run.
+    pub fn commit_async_with_callback<F>(&self, callback: F) -> Result<(), ConsumerError>
     where
         F: FnOnce(&HashMap<(String, i32), OffsetAndMetadata>, Result<(), &ConsumerError>)
             + Send
             + 'static,
     {
+        self.require_group_id()?;
         self.commit_async_callbacks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(Box::new(callback));
         self.schedule_commit_async();
+        Ok(())
     }
 
     fn schedule_commit_async(&self) {
@@ -3305,7 +3323,7 @@ mod tests {
         let blocker = consumer.commit_serialization.lock().await;
 
         for _ in 0..100 {
-            consumer.commit_async();
+            consumer.commit_async().expect("commit_async");
         }
         tokio::task::yield_now().await;
         assert2::assert!(consumer.commit_async_state.load(Ordering::Acquire) == ASYNC_COMMIT_DIRTY);
@@ -3522,9 +3540,11 @@ mod tests {
             )
             .await;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            consumer.commit_async_with_callback(move |offsets, result| {
-                let _ = tx.send((offsets.clone(), result.map_err(ToString::to_string)));
-            });
+            consumer
+                .commit_async_with_callback(move |offsets, result| {
+                    let _ = tx.send((offsets.clone(), result.map_err(ToString::to_string)));
+                })
+                .expect("commit_async_with_callback");
             let completed = tokio::time::timeout(Duration::from_secs(5), rx)
                 .await
                 .expect("callback runs")
@@ -3556,9 +3576,11 @@ mod tests {
         .await;
         consumer.next_offsets.lock().await.clear();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        consumer.commit_async_with_callback(move |offsets, result| {
-            let _ = tx.send((offsets.clone(), result.map_err(ToString::to_string)));
-        });
+        consumer
+            .commit_async_with_callback(move |offsets, result| {
+                let _ = tx.send((offsets.clone(), result.map_err(ToString::to_string)));
+            })
+            .expect("commit_async_with_callback");
         let completed = tokio::time::timeout(Duration::from_secs(5), rx)
             .await
             .expect("callback runs")
@@ -3623,7 +3645,9 @@ mod tests {
             Arc::new(AtomicI32::new(7)),
         )
         .await;
-        consumer.commit_async_with_callback(|_, _| panic!("callback panics"));
+        consumer
+            .commit_async_with_callback(|_, _| panic!("callback panics"))
+            .expect("commit_async_with_callback");
         tokio::time::timeout(Duration::from_secs(5), async {
             while consumer.commit_async_state.load(Ordering::Acquire) != ASYNC_COMMIT_IDLE {
                 tokio::task::yield_now().await;
@@ -3632,11 +3656,44 @@ mod tests {
         .await
         .expect("the worker becomes idle");
         let (tx, rx) = tokio::sync::oneshot::channel();
-        consumer.commit_async_with_callback(move |_, result| {
-            let _ = tx.send(result.map_err(ToString::to_string));
-        });
+        consumer
+            .commit_async_with_callback(move |_, result| {
+                let _ = tx.send(result.map_err(ToString::to_string));
+            })
+            .expect("commit_async_with_callback");
         let second = tokio::time::timeout(Duration::from_secs(5), rx).await;
         mock.stop();
         assert2::assert!(let Ok(Ok(Ok(()))) = second);
+    }
+
+    /// A consumer with a manual assignment has no coordinator task that joins
+    /// the group again, so a rebalance error fails its commit with
+    /// `CommitFailed`, as Kafka's `commitOffsetsSync` throws
+    /// `CommitFailedException`.
+    #[tokio::test]
+    async fn a_rebalance_error_fails_the_commit_of_a_manual_assignment() {
+        let (mock, _sent) = recording_coordinator(ILLEGAL_GENERATION).await;
+        let mut consumer = commit_consumer(
+            &mock,
+            commit_identity(-1, ""),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicI32::new(-1)),
+        )
+        .await;
+        consumer.subscription = crate::subscription::shared(Vec::new(), None, true);
+        consumer
+            .subscription
+            .send_modify(|subscription| subscription.manual_assignment = true);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            consumer.commit_offsets_sync(HashMap::from([(
+                ("topic".into(), 0),
+                OffsetAndMetadata::new(12),
+            )])),
+        )
+        .await
+        .map(|result| result.map_err(|error| error.to_string()));
+        mock.stop();
+        assert2::assert!(result == Ok(Err(ConsumerError::CommitFailed.to_string())));
     }
 }

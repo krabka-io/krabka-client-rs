@@ -345,11 +345,17 @@ pub(crate) const BEGINNING_SENTINEL: i64 = i64::MAX - 1;
 /// `requestOffsetReset(partitions, LATEST)`, resolved with `ListOffsets(-1)`.
 pub(crate) const END_SENTINEL: i64 = i64::MAX - 2;
 
-/// Whether `next_offset` is a reset that `ListOffsets` did not resolve yet.
-/// Kafka's `TopicPartitionState.awaitingReset`: such a partition has no valid
+/// Placeholder for the position of a manually assigned partition: the
+/// committed offset, or a reset when the group has none. Kafka's
+/// `TopicPartitionState.shouldInitialize`.
+pub(crate) const COMMITTED_SENTINEL: i64 = i64::MAX - 3;
+
+/// Whether `next_offset` is a placeholder that a position update did not
+/// resolve yet: a reset (Kafka's `TopicPartitionState.awaitingReset`) or the
+/// committed offset of a new manual assignment. Such a partition has no valid
 /// position, so the consumer does not fetch or commit it.
 pub(crate) fn is_reset_sentinel(next_offset: i64) -> bool {
-    next_offset >= END_SENTINEL
+    next_offset >= COMMITTED_SENTINEL
 }
 
 /// The `ListOffsets` timestamp that resolves a [`LATEST_SENTINEL`] for the
@@ -622,7 +628,7 @@ impl Consumer {
             );
         // Kafka's `ClassicKafkaConsumer.poll` throws `IllegalStateException`
         // without a subscription.
-        if self.subscription.borrow().is_none() {
+        if self.subscription.borrow().is_none() && !self.subscription.borrow().manual_assignment {
             return Err(ConsumerError::NotSubscribed);
         }
         // Kafka's `ConsumerNetworkClient.maybeTriggerWakeup`: a pending
@@ -1338,7 +1344,10 @@ impl Consumer {
                 // Kafka's `SubscriptionState.isFetchableAndSubscribed`: with a
                 // topic subscription, a partition of a topic that the
                 // consumer no longer subscribes to is not fetched.
-                if subscription.pattern.is_none() && !subscription.contains(t) {
+                if !subscription.manual_assignment
+                    && subscription.pattern.is_none()
+                    && !subscription.contains(t)
+                {
                     continue;
                 }
                 // Skip partitions still awaiting validation — they must not be
@@ -1462,6 +1471,13 @@ impl Consumer {
         wakeup: Option<&crate::control::WakeupHandle>,
     ) -> Result<bool, ConsumerError> {
         if let Err(error) = until_woken(wakeup, self.refresh_leader_epochs()).await? {
+            if is_transient_poll_error(&error) {
+                self.client.reconnect_bootstrap().await;
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        if let Err(error) = until_woken(wakeup, self.resolve_committed_sentinels()).await? {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
                 return Ok(false);
@@ -1721,6 +1737,46 @@ impl Consumer {
         results
             .into_iter()
             .try_for_each(|(_, result)| result.authorization())
+    }
+
+    /// Replace each `COMMITTED_SENTINEL` with the committed offset of the
+    /// group, or with the reset of `auto_offset_reset` when the group has none
+    /// or the consumer has no group id. Kafka's
+    /// `refreshCommittedOffsetsIfNeeded` and `resetInitializingPositions`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the `OffsetFetch` request.
+    pub(crate) async fn resolve_committed_sentinels(&self) -> Result<(), ConsumerError> {
+        let keys = keys_at(&*self.next_offsets.lock().await, COMMITTED_SENTINEL);
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let committed = if self.group_id.is_empty() {
+            HashMap::new()
+        } else {
+            self.committed(&keys).await?
+        };
+        let reset = crate::consumer::reset_starting_offset(self.auto_offset_reset);
+        let mut offsets = self.next_offsets.lock().await;
+        let mut positions = self.positions.lock().await;
+        for key in keys {
+            let Some(next) = offsets.get_mut(&key) else {
+                continue;
+            };
+            if *next != COMMITTED_SENTINEL {
+                continue;
+            }
+            match committed.get(&key).cloned().flatten() {
+                Some(offset) => {
+                    *next = offset.offset;
+                    positions.entry(key).or_default().offset_epoch =
+                        LeaderEpoch(offset.leader_epoch.unwrap_or(-1));
+                }
+                None => *next = reset,
+            }
+        }
+        Ok(())
     }
 
     /// Send `ListOffsets(timestamp)` for `keys` to each partition leader.
@@ -4519,6 +4575,79 @@ mod fetch_path_tests {
         drop(consumer);
         stop(brokers);
         assert2::assert!(names == vec!["orders".to_owned(), "payments".to_owned()]);
+    }
+
+    /// Kafka's consumer without `group.id` fetches the partitions of
+    /// `assign` from the reset position, and throws `InvalidGroupIdException`
+    /// for the group calls.
+    #[tokio::test]
+    async fn a_consumer_without_a_group_fetches_its_manual_assignment() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(
+            &[vec![FetchAnswer::Respond {
+                error_code: 0,
+                session_id: 0,
+            }]],
+            &sent,
+        )
+        .await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(brokers[0].addr.to_string())
+            .auto_offset_reset(AutoOffsetReset::Earliest)
+            .build()
+            .await
+            .expect("build");
+        let before_assign = consumer
+            .poll(millis(20))
+            .await
+            .map(|records| records.len())
+            .map_err(|error| error.to_string());
+        consumer
+            .assign(&[("orders".to_owned(), 0)])
+            .await
+            .expect("assign");
+        consumer.poll(millis(300)).await.expect("poll");
+        let fetched: Vec<(i32, String, i32, i64)> = sent
+            .lock()
+            .expect("sent lock")
+            .iter()
+            .flat_map(|(node_id, request)| {
+                request.topics.iter().flat_map(move |topic| {
+                    topic.partitions.iter().map(move |partition| {
+                        (
+                            *node_id,
+                            topic.topic.clone(),
+                            partition.partition,
+                            partition.fetch_offset,
+                        )
+                    })
+                })
+            })
+            .collect();
+        let group_calls = (
+            consumer
+                .commit_sync()
+                .await
+                .map_err(|error| error.to_string()),
+            consumer
+                .subscribe(["orders"])
+                .await
+                .map_err(|error| error.to_string()),
+            consumer
+                .enforce_rebalance(None)
+                .map_err(|error| error.to_string()),
+        );
+        consumer.close().await.expect("close");
+        stop(brokers);
+        let invalid_group = Err(ConsumerError::InvalidGroupId.to_string());
+        assert2::assert!(
+            (before_assign, fetched.first().cloned(), group_calls)
+                == (
+                    Err("not subscribed to any topic".to_owned()),
+                    Some((1, "orders".to_owned(), 0, 0)),
+                    (invalid_group.clone(), invalid_group.clone(), invalid_group)
+                )
+        );
     }
 
     /// One step of a read replica case.
