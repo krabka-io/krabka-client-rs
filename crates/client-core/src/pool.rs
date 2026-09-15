@@ -490,6 +490,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
     /// the next [`refresh_brokers`](Self::refresh_brokers) with brokers,
     /// [`least_loaded`](Self::least_loaded) uses the bootstrap connection.
     pub fn replace_bootstrap_with_server_names(&self, bootstrap: Vec<(SocketAddr, String)>) {
+        self.prefer_bootstrap();
         match self.bootstrap.write() {
             Ok(mut guard) => *guard = bootstrap,
             Err(poisoned) => *poisoned.into_inner() = bootstrap,
@@ -500,6 +501,11 @@ impl<C: BrokerConnector> BrokerPool<C> {
             state.addresses.clear();
             state.address_index = 0;
         }
+    }
+
+    /// Make [`least_loaded`](Self::least_loaded) use the bootstrap connection
+    /// until the next [`refresh_brokers`](Self::refresh_brokers) with brokers.
+    pub fn prefer_bootstrap(&self) {
         self.prefer_bootstrap.store(true, Ordering::Relaxed);
     }
 
@@ -663,6 +669,13 @@ impl<C: BrokerConnector> BrokerPool<C> {
     pub async fn refresh_brokers(&self, brokers: &[BrokerInfo]) {
         if !brokers.is_empty() {
             self.prefer_bootstrap.store(false, Ordering::Relaxed);
+            // Kafka's `Metadata.update` replaces the node list, so a broker
+            // that the new metadata does not name leaves the registry and its
+            // connection closes once no request uses it.
+            let named = brokers.iter().map(|broker| broker.id).collect::<Vec<_>>();
+            self.by_endpoint.retain(|id, _| named.contains(id));
+            self.nodes
+                .retain(|id, _| *id == BOOTSTRAP_ID || named.contains(id));
         }
         for b in brokers {
             let Ok(port) = u16::try_from(b.port) else {

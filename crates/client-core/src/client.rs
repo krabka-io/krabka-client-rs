@@ -311,6 +311,9 @@ impl Client {
     #[tracing::instrument(level = "debug", skip_all, fields(bootstrap = %self.bootstrap))]
     pub async fn reconnect_bootstrap(&self) {
         self.pool.evict_bootstrap();
+        // The retry goes to the bootstrap addresses even when the DNS refresh
+        // below fails and the pool keeps the addresses that it has.
+        self.pool.prefer_bootstrap();
         if let Ok(addrs) = bootstrap::resolve_with_server_names(
             &self.bootstrap,
             self.options.dns_timeout,

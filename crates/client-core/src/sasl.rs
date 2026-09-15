@@ -43,7 +43,7 @@ const MAX_RESERVED_CORRELATION_ID: i32 = i32::MAX;
 /// Kafka's `SaslClientAuthenticator.MIN_RESERVED_CORRELATION_ID`. The SASL
 /// requests of a connection use the reserved ids, so they never share an id
 /// with a normal request.
-const MIN_RESERVED_CORRELATION_ID: i32 = MAX_RESERVED_CORRELATION_ID - 7;
+pub(crate) const MIN_RESERVED_CORRELATION_ID: i32 = MAX_RESERVED_CORRELATION_ID - 7;
 
 /// The next reserved SASL correlation id, as Kafka's
 /// `SaslClientAuthenticator.nextCorrelationId` gives it.
@@ -556,15 +556,22 @@ where
 
     let (service_name, server_name) = service_and_server_name;
     let target_spn = format!("{service_name}/{server_name}");
-    let keytab = keytab_path.to_string_lossy();
-    let initiator = SspiInitiator::new(&keytab, client_principal, &target_spn, kdc_url)
-        .map_err(|e| mechanism_failure(format!("GSSAPI initiator init failed: {e}")))?;
-    let exchange = GssapiClientExchange::new(Box::new(initiator), GSSAPI_MAX_RECV, None);
-
-    // Seed the exchange with no server token; this produces the AP-REQ.
-    let mut step = exchange
-        .step(None)
-        .map_err(|e| mechanism_failure(format!("GSSAPI initiate failed: {e}")))?;
+    let keytab = keytab_path.to_string_lossy().into_owned();
+    let (client_principal, kdc_url) = (client_principal.to_owned(), kdc_url.to_owned());
+    // The first step runs the synchronous AS and TGS exchanges with the KDC.
+    // A blocking worker runs it, so a slow KDC does not hold the runtime and
+    // the connection setup timeout still applies.
+    let mut step = tokio::task::spawn_blocking(move || {
+        let initiator = SspiInitiator::new(&keytab, &client_principal, &target_spn, &kdc_url)
+            .map_err(|e| mechanism_failure(format!("GSSAPI initiator init failed: {e}")))?;
+        let exchange = GssapiClientExchange::new(Box::new(initiator), GSSAPI_MAX_RECV, None);
+        // Seed the exchange with no server token; this produces the AP-REQ.
+        exchange
+            .step(None)
+            .map_err(|e| mechanism_failure(format!("GSSAPI initiate failed: {e}")))
+    })
+    .await
+    .map_err(|e| mechanism_failure(format!("GSSAPI initiate task failed: {e}")))??;
     loop {
         match step {
             ClientStep::Token(token, next) => {
@@ -757,7 +764,8 @@ where
                 "flexible response missing tagged-fields byte".into(),
             ));
         }
-        let _tagged = cur.get_u8();
+        cur = crate::connection::skip_tagged_fields(cur)
+            .map_err(|error| unparsable_response(error.to_string()))?;
     }
     Ok(cur.to_vec())
 }

@@ -622,7 +622,7 @@ impl Connection {
         tracing::Span::current().record("version", version);
 
         // 2. Allocate correlation ID.
-        let corr_id = self.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+        let corr_id = self.next_correlation_id();
 
         // 3. Build request header + encoded body into one frame.
         //
@@ -656,9 +656,8 @@ impl Connection {
         //   - Non-flexible messages: ResponseHeader v0 (no bytes after corr_id).
         let mut cursor: &[u8] = &body_bytes;
         let uses_flexible_resp_header = body_flexible && R::API_KEY != API_VERSIONS_KEY;
-        if uses_flexible_resp_header && !cursor.is_empty() {
-            // Consume the tagged-fields byte (always 0x00 in practice).
-            cursor = &cursor[1..];
+        if uses_flexible_resp_header {
+            cursor = skip_tagged_fields(cursor)?;
         }
 
         let resp = <R::Response as krabka_protocol::Decode>::decode(&mut cursor, version)?;
@@ -674,7 +673,7 @@ impl Connection {
     /// connection writer has stopped before accepting the frame.
     pub async fn send_no_response<R: ProtocolRequest>(&self, req: R) -> Result<(), ClientError> {
         let version = self.inner.versions.negotiate::<R>()?;
-        let corr_id = self.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+        let corr_id = self.next_correlation_id();
         let body_flexible = version >= R::FLEXIBLE_MIN;
         let mut frame = build_request_header(
             ApiKey(R::API_KEY),
@@ -723,7 +722,7 @@ impl Connection {
         api_version: i16,
         body: Bytes,
     ) -> Result<Bytes, ClientError> {
-        let corr_id = self.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+        let corr_id = self.next_correlation_id();
 
         // RequestHeader v2 (flexible). Krabka-private api keys are always
         // declared flexible so the header shape is predictable.
@@ -738,15 +737,10 @@ impl Connection {
 
         let body_bytes = self.dispatch_request(corr_id, frame).await?;
 
-        // ResponseHeader v1: 1-byte empty-tagged-fields marker after the
-        // already-stripped correlation id. Drop it if present.
-        let slice: &[u8] = &body_bytes;
-        let out = if slice.is_empty() {
-            Bytes::new()
-        } else {
-            body_bytes.slice(1..)
-        };
-        Ok(out)
+        // ResponseHeader v1: the tagged fields after the already-stripped
+        // correlation id.
+        let body = skip_tagged_fields(&body_bytes)?;
+        Ok(body_bytes.slice(body_bytes.len() - body.len()..))
     }
 
     /// Negotiated API versions known to this connection.
@@ -761,6 +755,23 @@ impl Connection {
     #[must_use]
     pub fn in_flight(&self) -> usize {
         self.inner.pending.len()
+    }
+
+    /// The next correlation id of a normal request. As Kafka's
+    /// `NetworkClient.nextCorrelationId` does, the ids wrap to 0 before the
+    /// range that SASL re-authentication reserves.
+    fn next_correlation_id(&self) -> i32 {
+        let last_normal = crate::sasl::MIN_RESERVED_CORRELATION_ID - 1;
+        self.inner
+            .next_corr_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current >= last_normal {
+                    0
+                } else {
+                    current + 1
+                })
+            })
+            .unwrap_or(0)
     }
 
     /// Whether the connection has closed: the peer closed it, an I/O error
@@ -782,6 +793,12 @@ impl Connection {
     async fn dispatch_request(&self, corr_id: i32, frame: BytesMut) -> Result<Bytes, ClientError> {
         let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
         self.inner.pending.insert(corr_id, tx);
+        // A caller that drops this future must not leave its id in `pending`,
+        // where it would keep the connection from its idle close.
+        let _registration = PendingRegistration {
+            pending: &self.inner.pending,
+            corr_id,
+        };
 
         self.inner
             .writer_tx
@@ -805,6 +822,53 @@ impl Connection {
             }
         }
     }
+}
+
+/// Removes a request from `pending` when its caller stops waiting.
+struct PendingRegistration<'a> {
+    pending: &'a Pending,
+    corr_id: i32,
+}
+
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        self.pending.remove(&self.corr_id);
+    }
+}
+
+/// Skip the tagged fields of a flexible response header: an unsigned varint
+/// count, then for each field a varint tag, a varint size and the data.
+///
+/// # Errors
+/// Returns a codec error for a header that ends early.
+pub(crate) fn skip_tagged_fields(mut bytes: &[u8]) -> Result<&[u8], ClientError> {
+    fn uvarint(bytes: &mut &[u8]) -> Result<u32, ClientError> {
+        let mut value = 0_u32;
+        for shift in (0..35).step_by(7) {
+            let (&byte, rest) = bytes.split_first().ok_or_else(truncated)?;
+            *bytes = rest;
+            value |= u32::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(truncated())
+    }
+    fn truncated() -> ClientError {
+        ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid tagged fields in a response header",
+        ))
+    }
+    if bytes.is_empty() {
+        return Ok(bytes);
+    }
+    for _ in 0..uvarint(&mut bytes)? {
+        uvarint(&mut bytes)?;
+        let size = usize::try_from(uvarint(&mut bytes)?).map_err(|_| truncated())?;
+        bytes = bytes.get(size..).ok_or_else(truncated)?;
+    }
+    Ok(bytes)
 }
 
 /// Spawn independent reader and writer tasks over the split socket.
@@ -1097,7 +1161,7 @@ async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, Client
 
     let mut version = ApiVersionsRequest::MAX_VERSION;
     loop {
-        let corr_id = conn.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+        let corr_id = conn.next_correlation_id();
         let mut frame = build_request_header(
             ApiKey(ApiVersionsRequest::API_KEY),
             ApiVersion(version),
@@ -1884,6 +1948,58 @@ mod connection_policy_tests {
             check!(observed_features == expected_features, "{name}");
             check!(metadata == Some((0, 12)), "{name}");
         }
+    }
+
+    /// Kafka's `NetworkClient.nextCorrelationId` wraps before the SASL
+    /// reserved range.
+    #[tokio::test]
+    async fn normal_correlation_ids_wrap_before_the_sasl_range() {
+        let (connection, _server) = connection(ConnectionOptions::default()).await;
+        let reserved = crate::sasl::MIN_RESERVED_CORRELATION_ID;
+        connection
+            .inner
+            .next_corr_id
+            .store(reserved - 2, Ordering::Relaxed);
+        let ids = (0..3)
+            .map(|_| connection.next_correlation_id())
+            .collect::<Vec<_>>();
+        check!(ids == vec![reserved - 2, reserved - 1, 0]);
+    }
+
+    #[test]
+    fn flexible_response_headers_skip_every_tagged_field() {
+        for (name, header_and_body, expected) in [
+            ("empty body", vec![], Ok(vec![])),
+            ("no tagged field", vec![0, 7, 8], Ok(vec![7, 8])),
+            (
+                "two tagged fields",
+                vec![2, 1, 2, 0xAA, 0xBB, 5, 0, 7],
+                Ok(vec![7]),
+            ),
+            ("truncated field", vec![1, 1, 4, 0xAA], Err(())),
+        ] {
+            check!(
+                skip_tagged_fields(&header_and_body)
+                    .map(<[u8]>::to_vec)
+                    .map_err(drop)
+                    == expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// A caller that stops waiting leaves nothing in `pending`, so the idle
+    /// close still applies.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_request_leaves_no_pending_entry() {
+        let (connection, _server) = connection(ConnectionOptions::default()).await;
+        let sending = connection.clone();
+        let task = tokio::spawn(async move { sending.send(MetadataRequest::default()).await });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        check!(connection.in_flight() == 1);
+        task.abort();
+        let _ = task.await;
+        check!(connection.in_flight() == 0);
     }
 
     #[test]
