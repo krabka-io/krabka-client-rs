@@ -57,8 +57,13 @@
 //! wait.
 //!
 //! ### seek task (`seek.rs`)
-//! - `seek_to_position`: **A → N → P** held together, all released.
-//!   Region edges: A→N, N→P.
+//! - `seek_to_position` and `request_offset_reset`: **A → N → P** held
+//!   together, all released. Region edges: A→N, N→P.
+//!   `position` (`partition_state.rs`) takes A alone, then N→P, then the
+//!   regions of `update_fetch_positions` that the poll task lists below.
+//!   `current_lag` (`queries.rs`) holds A→N, then takes E alone.
+//!   `pause`, `resume` and `paused` take CI alone. The paused set is a
+//!   `std::sync::Mutex` that no region holds while it takes another lock.
 //!
 //! ### poll task (`poll.rs`, `validate.rs`, `commit.rs`)
 //! - `maybe_auto_commit_async` (commit.rs): CI, N and P each alone
@@ -68,7 +73,7 @@
 //!   takes **CS → ND** after a retriable failure.
 //! - `refresh_leader_epochs` (validate.rs): **P alone** (after the metadata
 //!   `.await`), released; then **T alone** (the tracked `topic_ids` update).
-//! - `resolve_latest_sentinels` (poll.rs): **N alone** for the sentinel
+//! - `resolve_reset_sentinels` (poll.rs): **N alone** for the sentinel
 //!   snapshot, released; then **P alone** in `list_offsets` for the leader
 //!   routes, released before the `ListOffsets` `.await`; then **N alone** to
 //!   apply the offsets. No region takes a second lock.
@@ -76,8 +81,9 @@
 //!   released before the RPC; then **P alone** in the post-RPC apply.
 //!   `apply_truncation` (poll.rs) then holds N and takes AP
 //!   (`AutoCommit::reset_polled`): **N→AP**.
-//! - `poll` fetch-build (poll.rs, the `by_leader` snapshot): **N→P** held
-//!   together, released before the Fetch `.await`.
+//! - `poll` fetch-build (poll.rs, `group_fetches`): **CI alone** for the
+//!   ownership of the paused partitions, then the `by_leader` snapshot:
+//!   **N→P** held together, released before the Fetch `.await`.
 //! - `poll` post-fetch loop (poll.rs): A `assigned.clone()` (released) → **N
 //!   held across the whole processing loop**, and inside it P is acquired
 //!   *second* at each per-partition site, that is **N→P every time** ("offsets
@@ -213,7 +219,7 @@ struct Step {
 /// already dropped:
 ///   1. `maybe_auto_commit_async` (commit.rs): CI, N, P, AP, ND (each alone)
 ///   2. `refresh_leader_epochs` (validate.rs): P  then  T  (each alone)
-///   3. `resolve_latest_sentinels` (poll.rs): N, P, N  (each alone)
+///   3. `resolve_reset_sentinels` (poll.rs): N, P, N  (each alone)
 ///   4. `validate_positions` (validate.rs): N, P  then  P  (N→P snapshot, then P alone)
 ///   5. `poll` fetch-build (poll.rs)      : N, P      (N→P snapshot)
 ///   6. `poll` post-fetch loop (poll.rs)  : N  then (N,P)…  (N held, P second)
@@ -240,7 +246,7 @@ fn poll_program() -> Vec<Op> {
         Release(P),
         Acquire(T),
         Release(T),
-        // --- resolve_latest_sentinels (poll.rs): N alone (sentinel
+        // --- resolve_reset_sentinels (poll.rs): N alone (sentinel
         //     snapshot), P alone (`list_offsets` routes), N alone (apply). ---
         Acquire(N),
         Release(N),
@@ -262,8 +268,11 @@ fn poll_program() -> Vec<Op> {
         Acquire(AP),
         Release(AP),
         Release(N),
-        // --- poll fetch-build (poll.rs `by_leader` snapshot): N→P, dropped
+        // --- poll fetch-build (poll.rs `group_fetches`): CI alone for the
+        //     paused partitions, then the `by_leader` snapshot: N→P, dropped
         //     before the Fetch. ---
+        Acquire(CI),
+        Release(CI),
         Acquire(N),
         Acquire(P),
         Release(P),

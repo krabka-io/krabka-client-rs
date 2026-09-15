@@ -77,7 +77,7 @@ fn is_read_committed(isolation_level: IsolationLevel) -> bool {
     isolation_level == IsolationLevel::ReadCommitted
 }
 
-fn is_transient_transport_error(e: &krabka_client_core::ClientError) -> bool {
+pub(crate) fn is_transient_transport_error(e: &krabka_client_core::ClientError) -> bool {
     matches!(
         e,
         krabka_client_core::ClientError::Connect { .. }
@@ -332,13 +332,28 @@ impl Drop for Fetches {
 const FETCH_SESSION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `ListOffsets` timestamp that asks for the log end offset.
-const LATEST_TIMESTAMP: i64 = -1;
+pub(crate) const LATEST_TIMESTAMP: i64 = -1;
 /// `ListOffsets` timestamp that asks for the log start offset.
-const EARLIEST_TIMESTAMP: i64 = -2;
+pub(crate) const EARLIEST_TIMESTAMP: i64 = -2;
 
 /// Placeholder for "reset with `ListOffsets`", resolved before the next Fetch:
 /// the log end, or the offset for the timestamp of `by_duration`.
 const LATEST_SENTINEL: i64 = i64::MAX;
+
+/// Placeholder for the reset of [`Consumer::seek_to_beginning`]: Kafka's
+/// `requestOffsetReset(partitions, EARLIEST)`, resolved with `ListOffsets(-2)`.
+pub(crate) const BEGINNING_SENTINEL: i64 = i64::MAX - 1;
+
+/// Placeholder for the reset of [`Consumer::seek_to_end`]: Kafka's
+/// `requestOffsetReset(partitions, LATEST)`, resolved with `ListOffsets(-1)`.
+pub(crate) const END_SENTINEL: i64 = i64::MAX - 2;
+
+/// Whether `next_offset` is a reset that `ListOffsets` did not resolve yet.
+/// Kafka's `TopicPartitionState.awaitingReset`: such a partition has no valid
+/// position, so the consumer does not fetch or commit it.
+pub(crate) fn is_reset_sentinel(next_offset: i64) -> bool {
+    next_offset >= END_SENTINEL
+}
 
 /// The `ListOffsets` timestamp that resolves a [`LATEST_SENTINEL`] for the
 /// reset policy at `now_ms`.
@@ -419,7 +434,7 @@ fn build_offsets_request(
 /// with `ClientError::IncompatibleVersion` before the request goes out.
 /// Kafka fails with `UnsupportedVersionException` in that case.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ReadCommittedListOffsets(ListOffsetsRequest);
+pub(crate) struct ReadCommittedListOffsets(pub(crate) ListOffsetsRequest);
 
 impl Encode for ReadCommittedListOffsets {
     fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
@@ -618,6 +633,11 @@ impl Consumer {
         tracing::Span::current().record("leaders", by_leader.len());
         let topic_ids = self.topic_ids.lock().await.clone();
         self.send_fetches(by_leader, &topic_ids);
+        self.fetches.collect_ready();
+        if self.fetches.in_flight.is_empty() && self.fetches.ready.is_empty() {
+            self.wait_without_fetches(&assigned, deadline).await;
+            return Ok(Vec::new());
+        }
         self.wait_for_fetches(deadline).await;
         let responses = self.take_completed_fetches(&topic_ids).await?;
 
@@ -714,6 +734,8 @@ impl Consumer {
     /// The lock order is `assigned`, then `next_offsets`, then `positions`, as
     /// in the coordinator task.
     async fn drain_fetch_buffer(&mut self) -> Vec<ConsumerRecord> {
+        let ownership_ids = self.commit_identity.lock().await.ownership_ids.clone();
+        let paused = self.paused_of(&ownership_ids);
         let assigned_guard = self.assigned.lock().await;
         let assigned: std::collections::HashSet<(String, i32)> =
             assigned_guard.iter().cloned().collect();
@@ -722,6 +744,7 @@ impl Consumer {
         let records = self.fetch_buffer.drain(
             self.max_poll_records,
             &assigned,
+            &paused,
             &mut offsets,
             &mut positions,
         );
@@ -730,6 +753,38 @@ impl Consumer {
         drop(assigned_guard);
         records
     }
+    /// Wait when this `poll` sends no Fetch and none is in flight, for example
+    /// when every partition is paused.
+    ///
+    /// Kafka's `ClassicKafkaConsumer.pollForFetches` waits for the poll timeout,
+    /// or for the retry backoff while a partition has no valid position. A
+    /// listener call that waits also ends the wait after the retry backoff, so
+    /// the next `poll` runs it.
+    async fn wait_without_fetches(
+        &self,
+        assigned: &[(String, i32)],
+        deadline: tokio::time::Instant,
+    ) {
+        let all_positions = {
+            let offsets = self.next_offsets.lock().await;
+            let positions = self.positions.lock().await;
+            assigned.iter().all(|key| {
+                offsets
+                    .get(key)
+                    .is_some_and(|offset| !is_reset_sentinel(*offset))
+                    && !positions
+                        .get(key)
+                        .is_some_and(|position| position.awaiting_validation)
+            })
+        };
+        let until = if all_positions && self.listener_calls.is_empty() {
+            deadline
+        } else {
+            deadline.min(tokio::time::Instant::now() + self.retry_policy.initial_backoff)
+        };
+        tokio::time::sleep_until(until).await;
+    }
+
     /// Decode the fetch responses into the fetch buffer, and act on the
     /// partition errors.
     async fn process_fetch_responses(
@@ -1209,6 +1264,9 @@ impl Consumer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let ownership_ids = self.commit_identity.lock().await.ownership_ids.clone();
+        let paused = self.paused_of(&ownership_ids);
+        let buffered = self.fetch_buffer.buffered_partitions();
         let mut grouped: FetchByLeader = HashMap::new();
         let now = tokio::time::Instant::now();
         let mut refresh_metadata = false;
@@ -1228,10 +1286,15 @@ impl Consumer {
                     continue;
                 }
                 let next = offsets.get(&(t.clone(), *p)).copied().unwrap_or(0);
-                // A `LATEST_SENTINEL` is a reset that `ListOffsets` did not
+                // A reset sentinel is a reset that `ListOffsets` did not
                 // resolve yet. Kafka does not fetch a partition that awaits a
                 // reset, and the sentinel is no offset to fetch from.
-                if next == LATEST_SENTINEL {
+                if is_reset_sentinel(next) {
+                    continue;
+                }
+                // Kafka's `AbstractFetch.fetchablePartitions` leaves out a
+                // paused partition and a partition with buffered records.
+                if paused.contains(&(t.clone(), *p)) || buffered.contains(&(t.clone(), *p)) {
                     continue;
                 }
                 let pos = positions.get(&(t.clone(), *p)).copied().unwrap_or_default();
@@ -1299,6 +1362,15 @@ impl Consumer {
         // epoch here, so its first `ListOffsets` goes to the leader and not
         // to the bootstrap broker. Kafka's `OffsetFetcher.groupListOffsetRequests`
         // routes with `metadata.currentLeader(tp)` in the same way.
+        self.update_fetch_positions().await
+    }
+
+    /// Refresh the leader epochs, resolve the offset resets and validate the
+    /// positions. Kafka's `KafkaConsumer.updateFetchPositions`.
+    ///
+    /// Return `false` after a transient error, when the caller must try again
+    /// later.
+    pub(crate) async fn update_fetch_positions(&self) -> Result<bool, ConsumerError> {
         if let Err(error) = self.refresh_leader_epochs().await {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
@@ -1306,7 +1378,7 @@ impl Consumer {
             }
             return Err(error);
         }
-        if let Err(error) = self.resolve_latest_sentinels().await {
+        if let Err(error) = self.resolve_reset_sentinels().await {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
                 return Ok(false);
@@ -1491,15 +1563,20 @@ fn next_offset_after(batches: &[krabka_protocol::records::RecordBatch]) -> Optio
 }
 
 impl Consumer {
-    /// Replace any `LATEST_SENTINEL` in `next_offsets` with the offset from
-    /// `ListOffsets`: the log end (`timestamp=-1`), or for `by_duration` the
-    /// first offset at or after now minus the duration.
+    /// Replace each reset sentinel in `next_offsets` with the offset from
+    /// `ListOffsets`.
     ///
+    /// A `LATEST_SENTINEL` resolves to the log end (`timestamp=-1`), or for
+    /// `by_duration` to the first offset at or after now minus the duration.
     /// `auto_offset_reset = Latest` plants those sentinels at build time, and
-    /// the `OFFSET_OUT_OF_RANGE` arm of the poll loop plants them again. This
-    /// runs in `prepare_poll`, after the metadata refresh. A partition whose
-    /// row has an error keeps its sentinel. `group_fetches` skips it, and the
-    /// metadata refresh at the start of the next `prepare_poll` lets that
+    /// the `OFFSET_OUT_OF_RANGE` arm of the poll loop plants them again.
+    /// [`Consumer::seek_to_beginning`] plants a `BEGINNING_SENTINEL`
+    /// (`timestamp=-2`) and [`Consumer::seek_to_end`] an `END_SENTINEL`
+    /// (`timestamp=-1`).
+    ///
+    /// This runs in `prepare_poll`, after the metadata refresh. A partition
+    /// whose row has an error keeps its sentinel. `group_fetches` skips it, and
+    /// the metadata refresh at the start of the next `prepare_poll` lets that
     /// poll try again.
     ///
     /// # Errors
@@ -1507,33 +1584,53 @@ impl Consumer {
     /// Returns `TopicAuthorizationFailed` when the broker does not authorize
     /// a topic, and a transport error that is not transient.
     #[tracing::instrument(
-        name = "consumer.resolve_latest_sentinels",
+        name = "consumer.resolve_reset_sentinels",
         level = "debug",
         skip_all,
         fields(group_id = %self.group_id, sentinels = tracing::field::Empty),
         err
     )]
-    async fn resolve_latest_sentinels(&self) -> Result<(), ConsumerError> {
-        let sentinels = keys_at(&*self.next_offsets.lock().await, LATEST_SENTINEL);
-        if sentinels.is_empty() {
+    async fn resolve_reset_sentinels(&self) -> Result<(), ConsumerError> {
+        let by_sentinel = {
+            let offsets = self.next_offsets.lock().await;
+            [
+                (
+                    LATEST_SENTINEL,
+                    reset_timestamp(self.auto_offset_reset, unix_now_ms()),
+                ),
+                (BEGINNING_SENTINEL, EARLIEST_TIMESTAMP),
+                (END_SENTINEL, LATEST_TIMESTAMP),
+            ]
+            .map(|(sentinel, timestamp)| (sentinel, timestamp, keys_at(&offsets, sentinel)))
+        };
+        let count: usize = by_sentinel.iter().map(|(_, _, keys)| keys.len()).sum();
+        if count == 0 {
             return Ok(());
         }
-        tracing::Span::current().record("sentinels", sentinels.len());
-        let timestamp = reset_timestamp(self.auto_offset_reset, unix_now_ms());
-        let result = self.list_offsets(&sentinels, timestamp).await?;
+        tracing::Span::current().record("sentinels", count);
+        let mut results = Vec::new();
+        for (sentinel, timestamp, keys) in by_sentinel {
+            if !keys.is_empty() {
+                results.push((sentinel, self.list_offsets(&keys, timestamp).await?));
+            }
+        }
         {
             // A seek or a rebalance can change a position while the request
             // is in flight. Replace only a sentinel that is still there.
             let mut offsets = self.next_offsets.lock().await;
-            for (key, offset) in &result.offsets {
-                if let Some(next) = offsets.get_mut(key)
-                    && *next == LATEST_SENTINEL
-                {
-                    *next = *offset;
+            for (sentinel, result) in &results {
+                for (key, offset) in &result.offsets {
+                    if let Some(next) = offsets.get_mut(key)
+                        && *next == *sentinel
+                    {
+                        *next = *offset;
+                    }
                 }
             }
         }
-        result.authorization()
+        results
+            .into_iter()
+            .try_for_each(|(_, result)| result.authorization())
     }
 
     /// Send `ListOffsets(timestamp)` for `keys` to each partition leader.
@@ -2453,7 +2550,7 @@ pub(crate) mod partition_error_tests {
     }
 
     /// A consumer of `group-a` on `client` that owns `orders-0` at offset 5.
-    pub(super) fn consumer_with_client(client: Client) -> Consumer {
+    pub(crate) fn consumer_with_client(client: Client) -> Consumer {
         Consumer {
             client,
             group_id: "group-a".into(),
@@ -2491,6 +2588,8 @@ pub(crate) mod partition_error_tests {
             fetches: crate::poll::Fetches::default(),
             client_rack: None,
             metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
+            default_api_timeout: crate::consumer::DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
+            paused: std::sync::Mutex::default(),
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
@@ -3215,6 +3314,10 @@ pub(crate) mod partition_error_tests {
         /// `auto.offset.reset=earliest`: a Fetch row with
         /// `OFFSET_OUT_OF_RANGE`.
         EarliestOutOfRange,
+        /// `seek_to_beginning` of every partition, then `position`.
+        SeekToBeginning,
+        /// `seek_to_end` of every partition, then `position`.
+        SeekToEnd,
     }
 
     /// One `ListOffsets` scenario on two mock brokers.
@@ -3296,6 +3399,22 @@ pub(crate) mod partition_error_tests {
                 consumer
                     .process_fetch_responses(vec![fetch_response(1)], &topic_ids)
                     .await
+            }
+            Reset::SeekToBeginning | Reset::SeekToEnd => {
+                // Kafka's `seekToBeginning` and `seekToEnd` ignore
+                // `auto.offset.reset`.
+                consumer.auto_offset_reset =
+                    AutoOffsetReset::ByDuration(std::time::Duration::from_hours(1));
+                consumer.default_api_timeout = krabka_units::millis(300);
+                let reset = if matches!(exchange.reset, Reset::SeekToBeginning) {
+                    consumer.seek_to_beginning(&[]).await
+                } else {
+                    consumer.seek_to_end(&[]).await
+                };
+                match reset {
+                    Ok(()) => consumer.position("orders", 0).await.map(|_| ()),
+                    Err(error) => Err(error),
+                }
             }
         };
         let requests = sent.lock().expect("sent lock").clone();
@@ -3382,6 +3501,32 @@ pub(crate) mod partition_error_tests {
                     ]))),
                     metadata_requests: 1,
                     next_offset: Some(LATEST_SENTINEL),
+                },
+            ),
+            (
+                "seek to beginning reads the log start",
+                Exchange {
+                    reset: Reset::SeekToBeginning,
+                    ..latest(IsolationLevel::ReadUncommitted, (0, 7))
+                },
+                ListOffsetsOutcome {
+                    requests: vec![("leader", max, expected_list_offsets(0, -2))],
+                    result: Ok(()),
+                    metadata_requests: 1,
+                    next_offset: Some(7),
+                },
+            ),
+            (
+                "seek to end reads the last stable offset",
+                Exchange {
+                    reset: Reset::SeekToEnd,
+                    ..latest(IsolationLevel::ReadCommitted, (0, 40))
+                },
+                ListOffsetsOutcome {
+                    requests: latest_request(1),
+                    result: Ok(()),
+                    metadata_requests: 1,
+                    next_offset: Some(40),
                 },
             ),
             (
@@ -4046,6 +4191,91 @@ mod fetch_path_tests {
             ));
         }
         assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `AbstractFetch.fetchablePartitions` leaves out a paused
+    /// partition, so its leader gets no Fetch until `resume`.
+    #[tokio::test]
+    async fn fetch_leaves_out_a_paused_partition_until_resume() {
+        let respond = vec![FetchAnswer::Respond {
+            error_code: 0,
+            session_id: 0,
+        }];
+        let sent = SentFetches::default();
+        let brokers = start_brokers(&[respond.clone(), respond], &sent).await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer.refresh_leader_epochs().await.expect("metadata");
+        let fetched = |sent: &SentFetches| {
+            let mut partitions: Vec<(i32, i32)> = sent
+                .lock()
+                .expect("sent lock")
+                .drain(..)
+                .flat_map(|(node_id, request)| {
+                    request
+                        .topics
+                        .into_iter()
+                        .flat_map(|topic| topic.partitions)
+                        .map(move |partition| (node_id, partition.partition))
+                })
+                .collect();
+            partitions.sort_unstable();
+            partitions
+        };
+        consumer
+            .pause(&[("orders".to_owned(), 0)])
+            .await
+            .expect("pause");
+        consumer.poll(millis(200)).await.expect("poll");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let paused = fetched(&sent);
+        consumer
+            .resume(&[("orders".to_owned(), 0)])
+            .await
+            .expect("resume");
+        consumer.poll(millis(200)).await.expect("poll");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let resumed = fetched(&sent);
+        let unowned = consumer
+            .position("orders", 9)
+            .await
+            .map_err(|error| error.to_string());
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!(
+            (paused, resumed, unowned)
+                == (
+                    vec![(2, 1)],
+                    vec![(1, 0), (2, 1)],
+                    Err("no current assignment for partition orders-9".to_owned())
+                )
+        );
+    }
+
+    /// Kafka's `pollForFetches` waits for the poll timeout when no partition
+    /// can be fetched, for example when all are paused.
+    #[tokio::test]
+    async fn poll_waits_for_its_timeout_when_every_partition_is_paused() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(
+            &[vec![FetchAnswer::Respond {
+                error_code: 0,
+                session_id: 0,
+            }]],
+            &sent,
+        )
+        .await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer
+            .pause(&[("orders".to_owned(), 0)])
+            .await
+            .expect("pause");
+        let started = tokio::time::Instant::now();
+        let records = consumer.poll(millis(300)).await.expect("poll").len();
+        let waited = started.elapsed() >= Duration::from_millis(250);
+        let fetches = sent.lock().expect("sent lock").len();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!((records, waited, fetches) == (0, true, 0));
     }
 
     /// One step of a read replica case.

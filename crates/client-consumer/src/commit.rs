@@ -429,10 +429,10 @@ pub(crate) type ConsumedPositions = HashMap<(String, i32), ConsumedPosition>;
 
 /// Whether `next_offset` is a fetch position that Kafka can commit.
 ///
-/// `i64::MAX` is the `Latest` sentinel that `poll` has not resolved yet. Kafka's
+/// A reset sentinel is a reset that `poll` has not resolved yet. Kafka's
 /// `SubscriptionState.allConsumed` skips a partition without a valid position.
 fn has_valid_position(next_offset: i64) -> bool {
-    next_offset >= 0 && next_offset != i64::MAX
+    next_offset >= 0 && !crate::poll::is_reset_sentinel(next_offset)
 }
 
 /// Kafka's `SubscriptionState.allConsumed`: the position and leader epoch of
@@ -1783,6 +1783,8 @@ mod tests {
             fetches: crate::poll::Fetches::default(),
             client_rack: None,
             metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
+            default_api_timeout: crate::consumer::DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
+            paused: std::sync::Mutex::default(),
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,

@@ -152,6 +152,53 @@ pub(crate) fn parse_offset_fetch(resp: &OffsetFetchResponse) -> Vec<(String, i32
     out
 }
 
+/// The committed offsets of an `OffsetFetch` response. Kafka's
+/// `ConsumerCoordinator.OffsetFetchResponseHandler`: a partition with offset
+/// `-1` or an error has no committed offset.
+///
+/// v8 and v9 data lives in `groups`, and v0-7 data lives in `topics`.
+pub(crate) fn parse_committed_offsets(
+    resp: &OffsetFetchResponse,
+) -> HashMap<(String, i32), Option<OffsetAndMetadata>> {
+    let committed = |error_code: i16, offset: i64, leader_epoch: i32, metadata: &Option<String>| {
+        (error_code == 0 && offset >= 0).then(|| OffsetAndMetadata {
+            offset,
+            leader_epoch: (leader_epoch >= 0).then_some(leader_epoch),
+            metadata: metadata.clone().unwrap_or_default(),
+        })
+    };
+    let mut out = HashMap::new();
+    for t in &resp.topics {
+        for p in &t.partitions {
+            out.insert(
+                (t.name.clone(), p.partition_index),
+                committed(
+                    p.error_code,
+                    p.committed_offset,
+                    p.committed_leader_epoch,
+                    &p.metadata,
+                ),
+            );
+        }
+    }
+    for g in &resp.groups {
+        for t in &g.topics {
+            for p in &t.partitions {
+                out.insert(
+                    (t.name.clone(), p.partition_index),
+                    committed(
+                        p.error_code,
+                        p.committed_offset,
+                        p.committed_leader_epoch,
+                        &p.metadata,
+                    ),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// `UNKNOWN_TOPIC_OR_PARTITION`: the coordinator does not know the topic.
 const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 /// `TOPIC_AUTHORIZATION_FAILED`: the principal cannot describe the topic.
@@ -262,7 +309,7 @@ fn classify_group_error(code: i16) -> OffsetFetchAction {
 
 /// Whether Apache Kafka's `common/protocol/Errors` maps `code` to an exception
 /// that extends `RetriableException`.
-fn is_retriable_error(code: i16) -> bool {
+pub(crate) fn is_retriable_error(code: i16) -> bool {
     matches!(
         code,
         2 | 3
