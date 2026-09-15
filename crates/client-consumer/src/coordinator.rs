@@ -3763,7 +3763,7 @@ mod refind_tests {
     async fn connect_error_refinds_until_deadline() {
         let client = Client::builder()
             .bootstrap("127.0.0.1:1")
-            .connect_timeout(krabka_units::millis(10))
+            .socket_connection_setup_timeout(krabka_units::millis(10))
             .request_timeout(krabka_units::millis(10))
             .build()
             .await

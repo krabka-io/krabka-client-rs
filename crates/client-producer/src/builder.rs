@@ -807,8 +807,10 @@ impl Producer {
             .dns_timeout(dns_timeout.time())
             .dispatch_queue_capacity(dispatch_queue_capacity.get())
             .frame_max(frame_max.size())
-            .connect_timeout(request_timeout)
             .request_timeout(request_timeout)
+            // Kafka's producer `receive.buffer.bytes` default is 32 KiB, half
+            // the consumer and admin default.
+            .receive_buffer(Some(krabka_units::kibibytes(32)))
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
             .maybe_security(security.clone())

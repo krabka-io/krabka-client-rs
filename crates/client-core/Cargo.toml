@@ -32,6 +32,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "net", "rt", "rt-multi-thread", "io-util", "macros", "sync", "time"] }
 tokio-util = { workspace = true, features = ["codec", "rt"] }
 dashmap = { workspace = true }
+dns-lookup = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 refined_type = { workspace = true }

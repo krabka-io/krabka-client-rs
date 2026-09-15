@@ -144,7 +144,20 @@ impl Client {
         #[builder(into)] bootstrap: String,
         #[builder(into, default = "krabka".to_string())] client_id: String,
         #[builder(default = crate::DEFAULT_CLIENT_DNS_TIMEOUT)] dns_timeout: Time,
-        #[builder(default = crate::DEFAULT_CLIENT_CONNECT_TIMEOUT)] connect_timeout: Time,
+        #[builder(default = crate::DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT)]
+        socket_connection_setup_timeout: Time,
+        #[builder(default = crate::DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX)]
+        socket_connection_setup_timeout_max: Time,
+        #[builder(default = crate::DEFAULT_RECONNECT_BACKOFF)] reconnect_backoff: Time,
+        #[builder(default = crate::DEFAULT_RECONNECT_BACKOFF_MAX)] reconnect_backoff_max: Time,
+        #[builder(default = crate::DEFAULT_CONNECTIONS_MAX_IDLE)] connections_max_idle: Time,
+        #[builder(default)] client_dns_lookup: crate::ClientDnsLookup,
+        #[builder(required, default = Some(crate::DEFAULT_SEND_BUFFER))] send_buffer: Option<
+            krabka_units::ByteSize,
+        >,
+        #[builder(required, default = Some(crate::DEFAULT_RECEIVE_BUFFER))] receive_buffer: Option<
+            krabka_units::ByteSize,
+        >,
         #[builder(default = crate::DEFAULT_CLIENT_REQUEST_TIMEOUT)] request_timeout: Time,
         #[builder(default = crate::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
@@ -175,7 +188,14 @@ impl Client {
         let options = ConnectionOptions {
             client_id,
             dns_timeout,
-            connect_timeout,
+            socket_connection_setup_timeout,
+            socket_connection_setup_timeout_max,
+            reconnect_backoff,
+            reconnect_backoff_max,
+            connections_max_idle,
+            client_dns_lookup,
+            send_buffer,
+            receive_buffer,
             request_timeout,
             dispatch_queue_capacity,
             frame_max,
@@ -210,7 +230,12 @@ impl Client {
         ),
         metadata_scope: MetadataScope,
     ) -> Result<Self, ClientError> {
-        let addrs = bootstrap::resolve_with_server_names(&bootstrap, options.dns_timeout).await?;
+        let addrs = bootstrap::resolve_with_server_names(
+            &bootstrap,
+            options.dns_timeout,
+            options.client_dns_lookup,
+        )
+        .await?;
         let pool = Arc::new(BrokerPool::new_with_server_names(addrs, options.clone()));
         Ok(Client {
             bootstrap,
@@ -225,17 +250,21 @@ impl Client {
         })
     }
 
-    /// Send a request to the bootstrap broker (or any cached open connection).
+    /// Send a request that has no fixed target broker.
+    ///
+    /// Before the first metadata response, the request goes to a bootstrap
+    /// address. After it, the request goes to the least loaded known broker,
+    /// as Kafka's `NetworkClient.leastLoadedNode` picks the node.
     #[tracing::instrument(level = "debug", skip_all, fields(api_key = R::API_KEY), err)]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn send<R: ProtocolRequest>(&self, req: R) -> Result<R::Response, ClientError> {
-        let conn = self.pool.bootstrap_connection().await?;
+        let conn = self.pool.least_loaded().await?;
         conn.send(req).await
     }
 
-    /// Send a request only when the bootstrap broker and client share a
-    /// version at or above `min_version`.
+    /// Send a request, as [`send`](Self::send) routes it, only when the
+    /// broker and client share a version at or above `min_version`.
     ///
     /// # Errors
     /// Returns [`ClientError::IncompatibleVersion`] before dispatch when the
@@ -245,7 +274,7 @@ impl Client {
         req: R,
         min_version: i16,
     ) -> Result<R::Response, ClientError> {
-        let conn = self.pool.bootstrap_connection().await?;
+        let conn = self.pool.least_loaded().await?;
         let (broker_min, broker_max) = conn.advertised_api_range(R::API_KEY).unwrap_or((0, 0));
         let client_min = R::MIN_VERSION.max(min_version);
         let chosen = R::MAX_VERSION.min(broker_max);
@@ -261,15 +290,16 @@ impl Client {
         conn.send(req).await
     }
 
-    /// Send a request to the bootstrap broker without registering a pending
-    /// response. Intended for protocol operations such as Produce `acks=0`.
+    /// Send a request, as [`send`](Self::send) routes it, without registering
+    /// a pending response. Intended for protocol operations such as Produce
+    /// `acks=0`.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection cannot be opened or cannot accept
     /// the encoded request.
     pub async fn send_no_response<R: ProtocolRequest>(&self, req: R) -> Result<(), ClientError> {
-        let conn = self.pool.bootstrap_connection().await?;
+        let conn = self.pool.least_loaded().await?;
         conn.send_no_response(req).await
     }
 
@@ -281,16 +311,24 @@ impl Client {
     #[tracing::instrument(level = "debug", skip_all, fields(bootstrap = %self.bootstrap))]
     pub async fn reconnect_bootstrap(&self) {
         self.pool.evict_bootstrap();
-        if let Ok(addrs) =
-            bootstrap::resolve_with_server_names(&self.bootstrap, self.options.dns_timeout).await
+        if let Ok(addrs) = bootstrap::resolve_with_server_names(
+            &self.bootstrap,
+            self.options.dns_timeout,
+            self.options.client_dns_lookup,
+        )
+        .await
         {
             self.pool.replace_bootstrap_with_server_names(addrs);
         }
     }
 
     async fn rebootstrap_metadata(&self) -> Result<(), ClientError> {
-        let addrs =
-            bootstrap::resolve_with_server_names(&self.bootstrap, self.options.dns_timeout).await?;
+        let addrs = bootstrap::resolve_with_server_names(
+            &self.bootstrap,
+            self.options.dns_timeout,
+            self.options.client_dns_lookup,
+        )
+        .await?;
         self.pool.rebootstrap_with_server_names(addrs);
         self.metadata_recovery.complete_attempt();
         Ok(())
@@ -302,7 +340,8 @@ impl Client {
     ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
         let broker_ids = self.pool.broker_ids();
         if broker_ids.is_empty() {
-            return self.send(request.clone()).await;
+            let connection = self.pool.bootstrap_connection().await?;
+            return connection.send(request.clone()).await;
         }
 
         let mut last_error = None;
@@ -1093,6 +1132,65 @@ mod bootstrap_failover_tests {
         assert2::assert!(healthy_calls.load(Ordering::SeqCst) == 1);
     }
 
+    /// Kafka's `NetworkClient.leastLoadedNode`: after the first metadata
+    /// response, a request with no fixed target goes to a known broker, not
+    /// to the bootstrap address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_goes_to_a_known_broker_after_the_first_metadata() {
+        let counting_handler = |calls: Arc<std::sync::atomic::AtomicUsize>,
+                                port: Arc<AtomicU16>| {
+            move |api_key, version, _corr, _body: &[u8]| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(api_versions_v0());
+                }
+                if api_key == metadata_request::API_KEY {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    return Some(metadata_v_with_port(
+                        version,
+                        7,
+                        port.load(Ordering::SeqCst),
+                    ));
+                }
+                None
+            }
+        };
+        let port = Arc::new(AtomicU16::new(0));
+        let seed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let broker_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let broker = MockBroker::start(counting_handler(
+            Arc::clone(&broker_calls),
+            Arc::clone(&port),
+        ))
+        .await;
+        port.store(broker.addr.port(), Ordering::SeqCst);
+        let seed =
+            MockBroker::start(counting_handler(Arc::clone(&seed_calls), Arc::clone(&port))).await;
+        let client = Client::builder()
+            .bootstrap(seed.addr.to_string())
+            .request_timeout(millis(500))
+            .build()
+            .await
+            .expect("client builds");
+
+        client.send(MetadataRequest::default()).await.unwrap();
+        client.refresh_metadata().await.unwrap();
+        let before = (
+            seed_calls.load(Ordering::SeqCst),
+            broker_calls.load(Ordering::SeqCst),
+        );
+        for _ in 0..3 {
+            client.send(MetadataRequest::default()).await.unwrap();
+        }
+        let after = (
+            seed_calls.load(Ordering::SeqCst),
+            broker_calls.load(Ordering::SeqCst),
+        );
+        seed.stop();
+        broker.stop();
+        assert2::assert!(before == (2, 0));
+        assert2::assert!(after == (2, 3));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconnect_bootstrap_forces_next_send_to_redial() {
         let a = MockBroker::start(handler(0)).await;
@@ -1134,7 +1232,7 @@ mod bootstrap_failover_tests {
         let bootstrap = format!("{},{}", a.addr, b.addr);
         let client = Client::builder()
             .bootstrap(bootstrap)
-            .connect_timeout(millis(500))
+            .socket_connection_setup_timeout(millis(500))
             .request_timeout(millis(500))
             .build()
             .await

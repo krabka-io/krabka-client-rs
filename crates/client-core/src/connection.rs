@@ -4,10 +4,11 @@
 //! correlation-ID multiplexing.
 
 use std::{
+    future::Future,
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicI32, AtomicU64, Ordering},
     },
 };
 
@@ -17,12 +18,12 @@ use krabka_ids::{ApiKey, ApiVersion};
 use krabka_units::{
     ByteSize, Time,
     convert::{ByteSizeExt as _, TimeExt as _},
-    mebibytes, secs,
+    kibibytes, mebibytes, millis, minutes, secs,
 };
 use refined_type::rule::{GreaterI64, GreaterUsize};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
+    net::{TcpSocket, TcpStream},
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
@@ -49,8 +50,24 @@ const API_VERSIONS_KEY: i16 = 18;
 
 /// Default deadline for one client DNS lookup.
 pub const DEFAULT_CLIENT_DNS_TIMEOUT: Time = secs(10);
-/// Default deadline for one client TCP connection attempt.
-pub const DEFAULT_CLIENT_CONNECT_TIMEOUT: Time = secs(30);
+/// Kafka's `socket.connection.setup.timeout.ms` default: the TCP connect
+/// deadline of the first attempt to a broker.
+pub const DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT: Time = secs(10);
+/// Kafka's `socket.connection.setup.timeout.max.ms` default: the connect
+/// deadline grows exponentially per failed attempt up to this value.
+pub const DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX: Time = secs(30);
+/// Kafka's `reconnect.backoff.ms` default.
+pub const DEFAULT_RECONNECT_BACKOFF: Time = millis(50);
+/// Kafka's `reconnect.backoff.max.ms` default.
+pub const DEFAULT_RECONNECT_BACKOFF_MAX: Time = secs(1);
+/// Kafka's producer and consumer `connections.max.idle.ms` default (9
+/// minutes, below the broker's 10 minutes).
+pub const DEFAULT_CONNECTIONS_MAX_IDLE: Time = minutes(9);
+/// Kafka's producer, consumer and admin `send.buffer.bytes` default.
+pub const DEFAULT_SEND_BUFFER: ByteSize = kibibytes(128);
+/// Kafka's consumer and admin `receive.buffer.bytes` default. The producer
+/// default is 32 KiB.
+pub const DEFAULT_RECEIVE_BUFFER: ByteSize = kibibytes(64);
 /// Default deadline for one client request.
 pub const DEFAULT_CLIENT_REQUEST_TIMEOUT: Time = secs(30);
 /// Default capacity of one connection's pending request dispatch queue.
@@ -178,12 +195,48 @@ impl Default for ClientFrameMax {
     }
 }
 
+/// How the client resolves broker host names (Kafka `client.dns.lookup`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClientDnsLookup {
+    /// `use_all_dns_ips`: resolve each host to all its addresses of the family
+    /// of the first address, and try them in turn.
+    #[default]
+    UseAllDnsIps,
+    /// `resolve_canonical_bootstrap_servers_only`: replace each bootstrap
+    /// address with the canonical host name of its reverse lookup, then use
+    /// all addresses as `UseAllDnsIps` does.
+    ResolveCanonicalBootstrapServersOnly,
+}
+
 /// Connect-time + per-request configuration knobs.
 #[derive(Debug, Clone)]
 pub struct ConnectionOptions {
     pub client_id: String,
     pub dns_timeout: ClientDnsTimeout,
-    pub connect_timeout: Time,
+    /// The TCP connect deadline of one attempt
+    /// (`socket.connection.setup.timeout.ms`). The broker pool doubles it,
+    /// with jitter, for each failed attempt to the same broker, up to
+    /// [`Self::socket_connection_setup_timeout_max`].
+    pub socket_connection_setup_timeout: Time,
+    /// `socket.connection.setup.timeout.max.ms`.
+    pub socket_connection_setup_timeout_max: Time,
+    /// The wait before the broker pool connects again to a broker after a
+    /// failure or a disconnect (`reconnect.backoff.ms`). It doubles, with
+    /// jitter, for each failure in a row.
+    pub reconnect_backoff: Time,
+    /// `reconnect.backoff.max.ms`.
+    pub reconnect_backoff_max: Time,
+    /// The connection closes after this time with no request and no response
+    /// (`connections.max.idle.ms`).
+    pub connections_max_idle: Time,
+    /// `client.dns.lookup`.
+    pub client_dns_lookup: ClientDnsLookup,
+    /// The socket send buffer (`send.buffer.bytes`). `None` keeps the
+    /// operating system default, as Kafka's `-1` does.
+    pub send_buffer: Option<ByteSize>,
+    /// The socket receive buffer (`receive.buffer.bytes`). `None` keeps the
+    /// operating system default.
+    pub receive_buffer: Option<ByteSize>,
     pub request_timeout: Time,
     pub dispatch_queue_capacity: ConnectionDispatchQueueCapacity,
     pub frame_max: ClientFrameMax,
@@ -201,7 +254,14 @@ impl Default for ConnectionOptions {
         Self {
             client_id: "krabka".into(),
             dns_timeout: ClientDnsTimeout::default(),
-            connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
+            socket_connection_setup_timeout: DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT,
+            socket_connection_setup_timeout_max: DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
+            reconnect_backoff: DEFAULT_RECONNECT_BACKOFF,
+            reconnect_backoff_max: DEFAULT_RECONNECT_BACKOFF_MAX,
+            connections_max_idle: DEFAULT_CONNECTIONS_MAX_IDLE,
+            client_dns_lookup: ClientDnsLookup::default(),
+            send_buffer: Some(DEFAULT_SEND_BUFFER),
+            receive_buffer: Some(DEFAULT_RECEIVE_BUFFER),
             request_timeout: DEFAULT_CLIENT_REQUEST_TIMEOUT,
             dispatch_queue_capacity: ConnectionDispatchQueueCapacity::default(),
             frame_max: ClientFrameMax::default(),
@@ -270,6 +330,78 @@ fn sasl_error(addr: SocketAddr, source: crate::sasl::OutboundSaslError) -> Clien
     }
 }
 
+/// The last time that a connection sent or received a frame, as milliseconds
+/// since the connection started.
+struct Activity {
+    started: tokio::time::Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    fn last(&self) -> tokio::time::Instant {
+        self.started + std::time::Duration::from_millis(self.last_ms.load(Ordering::Relaxed))
+    }
+}
+
+/// Open a TCP connection with the socket buffers of `options`.
+async fn tcp_connect(
+    addr: SocketAddr,
+    options: &ConnectionOptions,
+) -> Result<TcpStream, ClientError> {
+    let stream = async { configured_socket(addr, options)?.connect(addr).await }
+        .await
+        .map_err(|source| ClientError::Connect { addr, source })?;
+    stream.set_nodelay(true).ok();
+    Ok(stream)
+}
+
+/// A TCP socket for `addr` with the `send.buffer.bytes` and
+/// `receive.buffer.bytes` of `options`.
+fn configured_socket(addr: SocketAddr, options: &ConnectionOptions) -> std::io::Result<TcpSocket> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    if let Some(size) = options.send_buffer {
+        socket.set_send_buffer_size(buffer_size(size))?;
+    }
+    if let Some(size) = options.receive_buffer {
+        socket.set_recv_buffer_size(buffer_size(size))?;
+    }
+    Ok(socket)
+}
+
+/// Run `setup` within `options.socket_connection_setup_timeout`.
+///
+/// Kafka's connection setup timeout covers a node in the `CONNECTING` state:
+/// the TCP connection and the TLS and SASL handshakes, until the client sends
+/// `ApiVersions` (`ClusterConnectionStates.checkingApiVersions`).
+async fn within_setup_timeout<T>(
+    options: &ConnectionOptions,
+    setup: impl Future<Output = Result<T, ClientError>>,
+) -> Result<T, ClientError> {
+    tokio::time::timeout(options.socket_connection_setup_timeout.to_std(), setup)
+        .await
+        .map_err(|_| ClientError::Timeout(options.socket_connection_setup_timeout))?
+}
+
+fn buffer_size(size: ByteSize) -> u32 {
+    u32::try_from(size.bytes_u64()).unwrap_or(u32::MAX)
+}
+
 impl Connection {
     /// Connect to `addr`, negotiate API versions, return a usable `Connection`.
     #[tracing::instrument(level = "debug", skip_all, fields(addr = %addr), err)]
@@ -279,14 +411,7 @@ impl Connection {
         addr: SocketAddr,
         options: ConnectionOptions,
     ) -> Result<Self, ClientError> {
-        let stream =
-            tokio::time::timeout(options.connect_timeout.to_std(), TcpStream::connect(addr))
-                .await
-                .map_err(|_| ClientError::Timeout(options.connect_timeout))?
-                .map_err(|source| ClientError::Connect { addr, source })?;
-
-        stream.set_nodelay(true).ok();
-
+        let stream = within_setup_timeout(&options, tcp_connect(addr, &options)).await?;
         Self::from_stream(Box::new(stream), options).await
     }
 
@@ -341,12 +466,21 @@ impl Connection {
         options: ConnectionOptions,
         security: &crate::security::ClientSecurity,
     ) -> Result<Self, ClientError> {
-        let tcp = tokio::time::timeout(options.connect_timeout.to_std(), TcpStream::connect(addr))
-            .await
-            .map_err(|_| ClientError::Timeout(options.connect_timeout))?
-            .map_err(|source| ClientError::Connect { addr, source })?;
-        tcp.set_nodelay(true).ok();
+        let stream = within_setup_timeout(&options, async {
+            let tcp = tcp_connect(addr, &options).await?;
+            Self::secure_stream(addr, tcp, &options, security).await
+        })
+        .await?;
+        Self::from_stream(stream, options).await
+    }
 
+    /// Run the TLS and SASL handshakes of `security` over `tcp`.
+    async fn secure_stream(
+        addr: SocketAddr,
+        tcp: TcpStream,
+        options: &ConnectionOptions,
+        security: &crate::security::ClientSecurity,
+    ) -> Result<Box<dyn ClientDuplex>, ClientError> {
         // 1. TLS (if the protocol demands it).
         let mut stream: Box<dyn ClientDuplex> = if security.protocol.requires_tls() {
             let tls = security.tls.as_ref().ok_or_else(|| {
@@ -392,8 +526,7 @@ impl Connection {
             .await
             .map_err(|source| sasl_error(addr, source))?;
         }
-
-        Self::from_stream(stream, options).await
+        Ok(stream)
     }
 
     /// Build a `Connection` over a pre-established, optionally
@@ -417,13 +550,18 @@ impl Connection {
             mpsc::channel::<DispatchItem>(options.dispatch_queue_capacity.get());
         let shutdown = CancellationToken::new();
         let pending: Pending = Arc::new(DashMap::new());
+        let activity = Arc::new(Activity::new());
 
         let (reader_handle, writer_handle) = spawn_io_tasks(
             stream,
             writer_rx,
-            shutdown.clone(),
-            Arc::clone(&pending),
-            options.frame_max,
+            IoContext {
+                shutdown: shutdown.clone(),
+                pending: Arc::clone(&pending),
+                activity,
+                frame_max: options.frame_max,
+                max_idle: options.connections_max_idle.to_std(),
+            },
         );
 
         let mut conn = Self {
@@ -616,6 +754,20 @@ impl Connection {
         &self.inner.versions
     }
 
+    /// The number of requests that wait for a response on this connection.
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.inner.pending.len()
+    }
+
+    /// Whether the connection has closed: the peer closed it, an I/O error
+    /// ended it, it was idle for `connections_max_idle`, or [`Self::close`]
+    /// ran. A closed connection fails every request with `Disconnected`.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.shutdown.is_cancelled()
+    }
+
     /// Close the connection, cancelling all background tasks.
     // cargo-mutants: teardown; no observable return to assert against
     #[cfg_attr(test, mutants::skip)]
@@ -642,6 +794,10 @@ impl Connection {
             Ok(Err(_recv_closed)) => Err(ClientError::Disconnected),
             Err(_timeout) => {
                 self.inner.pending.remove(&corr_id);
+                // Kafka's `NetworkClient.handleTimedOutRequests` closes the
+                // connection of a timed-out request: a late response must
+                // not match a later request, and the next use connects again.
+                self.inner.shutdown.cancel();
                 Err(ClientError::Timeout(self.inner.options.request_timeout))
             }
         }
@@ -671,15 +827,25 @@ impl Connection {
 /// so the other task also stops. The reader then fails every outstanding
 /// request with `Disconnected`. A write-half failure therefore reaches
 /// callers promptly instead of stalling them until the request timeout.
+///
+/// Idle close: the writer also closes the connection when no frame went out
+/// or came in for `max_idle` and no request waits for a response, as Kafka's
+/// `Selector` closes a connection idle for `connections.max.idle.ms`.
 fn spawn_io_tasks(
     stream: Box<dyn ClientDuplex>,
     mut writer_rx: mpsc::Receiver<DispatchItem>,
-    shutdown: CancellationToken,
-    pending: Pending,
-    frame_max: ClientFrameMax,
+    context: IoContext,
 ) -> (JoinHandle<()>, JoinHandle<()>) {
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
     use tokio_util::codec::{FramedRead, FramedWrite};
+
+    let IoContext {
+        shutdown,
+        pending,
+        activity,
+        frame_max,
+        max_idle,
+    } = context;
 
     let (read_half, write_half) = tokio::io::split(stream);
     let mut framed_read = FramedRead::new(read_half, crate::transport::codec_with_max(frame_max));
@@ -690,18 +856,18 @@ fn spawn_io_tasks(
     // order. Owns only the write half, so a not-yet-writable socket can never
     // block the reader.
     let writer_shutdown = shutdown.clone();
+    let writer_activity = Arc::clone(&activity);
+    let writer_pending = Arc::clone(&pending);
     let writer = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = writer_shutdown.cancelled() => break,
-                item = writer_rx.recv() => {
-                    let Some(item) = item else { break; };
-                    if framed_write.send(item.bytes).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
+        write_loop(
+            &writer_shutdown,
+            &writer_activity,
+            &writer_pending,
+            max_idle,
+            &mut writer_rx,
+            &mut framed_write,
+        )
+        .await;
         // A write-side failure (or all senders dropped) must wake the reader
         // so it drains pending callers to `Disconnected` rather than letting
         // them wait out the request timeout.
@@ -717,6 +883,7 @@ fn spawn_io_tasks(
                 maybe_frame = framed_read.next() => {
                     let Some(frame) = maybe_frame else { break; };
                     let Ok(frame) = frame else { break; };
+                    activity.touch();
                     if frame.len() < 4 { continue; }
                     let corr_id = i32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
                     if let Some((_, tx)) = pending.remove(&corr_id) {
@@ -737,6 +904,68 @@ fn spawn_io_tasks(
     });
 
     (reader, writer)
+}
+
+/// The shared state of a connection's I/O tasks.
+struct IoContext {
+    shutdown: CancellationToken,
+    pending: Pending,
+    activity: Arc<Activity>,
+    frame_max: ClientFrameMax,
+    max_idle: std::time::Duration,
+}
+
+/// The writer loop: send each dispatched frame in order, and stop when the
+/// connection shuts down, a write fails, or the connection is idle for
+/// `max_idle` with no pending request.
+async fn write_loop<W>(
+    shutdown: &CancellationToken,
+    activity: &Activity,
+    pending: &Pending,
+    max_idle: std::time::Duration,
+    writer_rx: &mut mpsc::Receiver<DispatchItem>,
+    framed_write: &mut W,
+) where
+    W: futures_util::Sink<Bytes> + Unpin,
+{
+    use futures_util::SinkExt;
+
+    loop {
+        let idle_deadline = activity.last() + max_idle;
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            item = writer_rx.recv() => {
+                let Some(item) = item else { break; };
+                activity.touch();
+                // A peer that stops reading can hold a write for ever. The
+                // write must still end when the connection shuts down, for
+                // example after a request timeout.
+                let written = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    written = framed_write.send(item.bytes) => written,
+                };
+                if written.is_err() {
+                    break;
+                }
+                activity.touch();
+            }
+            () = tokio::time::sleep_until(idle_deadline) => {
+                let idle = activity.last() + max_idle <= tokio::time::Instant::now();
+                if idle && pending.is_empty() && writer_rx.is_empty() {
+                    tracing::debug!(
+                        max_idle_ms = max_idle.as_millis(),
+                        "closing a connection idle for connections.max.idle.ms"
+                    );
+                    break;
+                }
+                if idle {
+                    // A request waits for its response. Look again after the
+                    // idle interval.
+                    activity.touch();
+                }
+            }
+        }
+    }
 }
 
 /// Build an encoded `RequestHeader` into a `BytesMut`.
@@ -813,9 +1042,9 @@ async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, Client
         .await
         .map_err(|_| ClientError::Disconnected)?;
 
-    let body_bytes = tokio::time::timeout(conn.inner.options.connect_timeout.to_std(), rx)
+    let body_bytes = tokio::time::timeout(conn.inner.options.request_timeout.to_std(), rx)
         .await
-        .map_err(|_| ClientError::Timeout(conn.inner.options.connect_timeout))?
+        .map_err(|_| ClientError::Timeout(conn.inner.options.request_timeout))?
         .map_err(|_| ClientError::Disconnected)??;
 
     // ResponseHeader v0: only correlation_id (already stripped by the reader).
@@ -856,14 +1085,27 @@ mod tests {
     }
 
     #[test]
+    fn connection_options_default_to_kafka_client_settings() {
+        let options = ConnectionOptions::default();
+        assert!(options.reconnect_backoff == millis(50));
+        assert!(options.reconnect_backoff_max == secs(1));
+        assert!(options.socket_connection_setup_timeout_max == secs(30));
+        assert!(options.connections_max_idle == minutes(9));
+        assert!(options.client_dns_lookup == ClientDnsLookup::UseAllDnsIps);
+        assert!(options.send_buffer == Some(kibibytes(128)));
+        assert!(options.receive_buffer == Some(kibibytes(64)));
+    }
+
+    #[test]
     fn connection_options_own_named_defaults() {
         let options = ConnectionOptions::default();
         assert!(DEFAULT_CLIENT_DNS_TIMEOUT == secs(10));
-        assert!(DEFAULT_CLIENT_CONNECT_TIMEOUT == secs(30));
+        assert!(DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT == secs(10));
+        assert!(DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX == secs(30));
         assert!(DEFAULT_CLIENT_REQUEST_TIMEOUT == secs(30));
         assert!(options.dns_timeout == ClientDnsTimeout::default());
         assert!(options.dns_timeout.time() == DEFAULT_CLIENT_DNS_TIMEOUT);
-        assert!(options.connect_timeout == DEFAULT_CLIENT_CONNECT_TIMEOUT);
+        assert!(options.socket_connection_setup_timeout == DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT);
         assert!(options.request_timeout == DEFAULT_CLIENT_REQUEST_TIMEOUT);
     }
 
@@ -1122,7 +1364,7 @@ mod io_task_tests {
         let stream = TcpStream::connect(addr).await.unwrap();
         let opts = ConnectionOptions {
             request_timeout: secs(5),
-            connect_timeout: secs(5),
+            socket_connection_setup_timeout: secs(5),
             ..Default::default()
         };
         let conn = Connection::from_stream(Box::new(stream), opts)
@@ -1216,5 +1458,202 @@ mod io_task_tests {
 
         conn.close();
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod connection_policy_tests {
+    use std::time::Duration;
+
+    use assert2::check;
+    use krabka_protocol::{
+        Encode,
+        owned::{
+            api_versions_response::{ApiVersion, ApiVersionsResponse},
+            metadata_request::MetadataRequest,
+        },
+    };
+    use krabka_security::ListenerProtocol;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    use super::*;
+    use crate::security::{ClientSecurity, SaslCredentials};
+
+    /// Answer the `ApiVersions` request of `from_stream` on `server`, with
+    /// `Metadata` v0 supported, and return the stream.
+    async fn answer_api_versions(mut server: DuplexStream) -> DuplexStream {
+        let len = server.read_u32().await.unwrap();
+        let mut request = vec![0_u8; len as usize];
+        server.read_exact(&mut request).await.unwrap();
+        let mut body = BytesMut::new();
+        body.put_slice(&request[4..8]);
+        ApiVersionsResponse {
+            api_keys: vec![ApiVersion {
+                api_key: MetadataRequest::API_KEY,
+                min_version: 0,
+                max_version: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode(&mut body, 0)
+        .unwrap();
+        server
+            .write_u32(u32::try_from(body.len()).unwrap())
+            .await
+            .unwrap();
+        server.write_all(&body).await.unwrap();
+        server
+    }
+
+    async fn connection(options: ConnectionOptions) -> (Connection, DuplexStream) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (connection, server) = tokio::join!(
+            Connection::from_stream(Box::new(client), options),
+            answer_api_versions(server)
+        );
+        (connection.unwrap(), server)
+    }
+
+    /// Kafka's `Selector.maybeCloseOldestConnection` closes a connection
+    /// with no traffic for `connections.max.idle.ms`. Each row is the idle
+    /// time after the last response and whether a request waits.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_closes_after_connections_max_idle() {
+        let max_idle = Duration::from_mins(9);
+        let ms = Duration::from_millis;
+        for (name, idle, waiting, closed) in [
+            (
+                "just below the limit",
+                max_idle.saturating_sub(ms(1)),
+                false,
+                false,
+            ),
+            ("just past the limit", max_idle + ms(1), false, true),
+            (
+                "a request waits for its response",
+                max_idle * 2,
+                true,
+                false,
+            ),
+        ] {
+            let (connection, _server) = connection(ConnectionOptions {
+                request_timeout: secs(3600),
+                ..ConnectionOptions::default()
+            })
+            .await;
+            let waiter = waiting.then(|| {
+                let connection = connection.clone();
+                tokio::spawn(async move { connection.send(MetadataRequest::default()).await })
+            });
+            tokio::time::sleep(idle).await;
+            check!(connection.is_closed() == closed, "{name}");
+            if let Some(waiter) = waiter {
+                waiter.abort();
+            }
+        }
+    }
+
+    /// Kafka's `NetworkClient.handleTimedOutRequests` closes the connection
+    /// of a request that timed out.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_timeout_closes_the_connection() {
+        let (connection, _server) = connection(ConnectionOptions {
+            request_timeout: secs(30),
+            ..ConnectionOptions::default()
+        })
+        .await;
+        let result = connection.send(MetadataRequest::default()).await;
+        check!(matches!(result, Err(ClientError::Timeout(_))));
+        check!(connection.is_closed());
+        check!(connection.in_flight() == 0);
+    }
+
+    /// The connection setup timeout covers the TLS and SASL handshakes, as a
+    /// Kafka node stays `CONNECTING` until it sends `ApiVersions`.
+    #[tokio::test]
+    async fn the_setup_timeout_covers_a_sasl_handshake_that_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 1024];
+            while matches!(stream.read(&mut buffer).await, Ok(read) if read > 0) {}
+        });
+        let security = ClientSecurity {
+            protocol: ListenerProtocol::SaslPlaintext,
+            tls: None,
+            sasl: Some(SaslCredentials::Plain {
+                username: "u".into(),
+                password: "p".into(),
+            }),
+            sasl_host: None,
+        };
+        let options = ConnectionOptions {
+            socket_connection_setup_timeout: millis(100),
+            request_timeout: secs(30),
+            ..ConnectionOptions::default()
+        };
+        let started = std::time::Instant::now();
+        let result = Connection::connect_secured(addr, options, &security).await;
+        check!(matches!(result, Err(ClientError::Timeout(timeout)) if timeout == millis(100)));
+        check!(started.elapsed() < Duration::from_secs(5));
+        server.abort();
+    }
+
+    /// A request timeout closes the connection, and the writer ends even
+    /// while a peer that does not read holds its write.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_blocked_by_a_peer_that_does_not_read_ends_at_shutdown() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (connection, _server) = tokio::join!(
+            Connection::from_stream(
+                Box::new(client),
+                ConnectionOptions {
+                    request_timeout: secs(30),
+                    ..ConnectionOptions::default()
+                },
+            ),
+            answer_api_versions(server)
+        );
+        let connection = connection.unwrap();
+        // The raw request is larger than the duplex buffer, so its write
+        // blocks.
+        let result = connection
+            .raw_request(3, 0, Bytes::from(vec![0_u8; 256 * 1024]))
+            .await;
+        check!(matches!(result, Err(ClientError::Timeout(_))));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // The writer task drops the receiver when it ends.
+        check!(connection.inner.writer_tx.is_closed());
+    }
+
+    #[test]
+    fn sockets_get_the_configured_buffer_sizes() {
+        let addr: SocketAddr = "127.0.0.1:9092".parse().unwrap();
+        let requested = kibibytes(96);
+        let configured = configured_socket(
+            addr,
+            &ConnectionOptions {
+                send_buffer: Some(requested),
+                receive_buffer: Some(requested),
+                ..ConnectionOptions::default()
+            },
+        )
+        .unwrap();
+        let untouched = configured_socket(
+            addr,
+            &ConnectionOptions {
+                send_buffer: None,
+                receive_buffer: None,
+                ..ConnectionOptions::default()
+            },
+        )
+        .unwrap();
+        // Linux doubles the value that the socket option sets.
+        let bytes = buffer_size(requested);
+        check!(configured.send_buffer_size().unwrap() >= bytes);
+        check!(configured.recv_buffer_size().unwrap() >= bytes);
+        check!(untouched.send_buffer_size().unwrap() != configured.send_buffer_size().unwrap());
     }
 }
