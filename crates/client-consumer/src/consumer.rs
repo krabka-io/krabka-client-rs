@@ -1860,6 +1860,9 @@ impl Consumer {
         // Kafka's `ConsumerCoordinator.close` runs `maybeAutoCommitOffsetsSync`
         // before the coordinator leaves the group.
         self.auto_commit_on_close(coordinator_deadline).await;
+        // Kafka's `ConsumerCoordinator.close` then waits for the pending
+        // asynchronous commits and runs their callbacks, within the timer.
+        self.wait_for_async_commits(coordinator_deadline).await;
         // Kafka's `ConsumerCoordinator.onLeavePrepare` runs the listener before
         // `LeaveGroup`: lost when the member has no generation or a rebalance
         // runs, revoked otherwise.
@@ -4736,6 +4739,38 @@ mod group_membership_tests {
             wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `ConsumerCoordinator.close` waits for the pending asynchronous
+    /// commits and runs their callbacks before the consumer leaves the group.
+    #[tokio::test]
+    async fn close_waits_for_a_pending_asynchronous_commit() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let consumer = started_consumer(&mock, None).await;
+        // Another commit holds the commit lock for a while, so the
+        // asynchronous commit is still pending when `close` starts.
+        let held = Arc::clone(&consumer.commit_serialization)
+            .lock_owned()
+            .await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+        });
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_in_callback = Arc::clone(&called);
+        consumer.commit_async_with_callback(move |_, _| {
+            called_in_callback.store(true, Ordering::SeqCst);
+        });
+        consumer.close().await.expect("close");
+        let called_before_close_returned = called.load(Ordering::SeqCst);
+        release.await.expect("release");
+        mock.stop();
+        assert2::assert!(called_before_close_returned);
     }
 
     /// Kafka's `enforceRebalance(reason)` makes the next `poll` join the group

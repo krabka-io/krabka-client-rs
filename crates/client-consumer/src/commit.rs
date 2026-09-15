@@ -928,6 +928,29 @@ impl Consumer {
     /// This method commits the current positions and waits for the result, up
     /// to Kafka's default close timeout. A failure goes to the log, and `close`
     /// continues.
+    /// Wait until no asynchronous commit is queued or running, or until
+    /// `deadline`. Kafka's `ConsumerCoordinator.close` polls while
+    /// `pendingAsyncCommits > 0 && timer.notExpired()` and invokes the
+    /// completed callbacks.
+    pub(crate) async fn wait_for_async_commits(&self, deadline: tokio::time::Instant) {
+        let wait = async {
+            loop {
+                if self.commit_async_state.load(Ordering::Acquire) == ASYNC_COMMIT_IDLE {
+                    return;
+                }
+                // The worker holds the lock while it snapshots and sends.
+                drop(self.commit_serialization.lock().await);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        if tokio::time::timeout_at(deadline, wait).await.is_err() {
+            tracing::warn!(
+                group = %self.group_id,
+                "asynchronous commits were still pending when the close timeout expired"
+            );
+        }
+    }
+
     pub(crate) async fn auto_commit_on_close(&self, deadline: tokio::time::Instant) {
         if self.auto_commit.is_none() {
             return;
