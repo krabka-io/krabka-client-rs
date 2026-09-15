@@ -186,6 +186,9 @@ fn consumer(client: Client) -> Consumer {
         poll_error: PollErrorSlot::default(),
         auto_commit: None,
         poll_signal: crate::coordinator::PollSignal::default(),
+        rebalance_pending: tokio::sync::watch::channel(false).1,
+        max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
+        fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
     }
 }
 
@@ -214,7 +217,7 @@ fn coordinator_state(client: Client) -> CoordinatorState {
         positions: Arc::new(Mutex::new(HashMap::new())),
         topic_ids: Arc::new(Mutex::new(HashMap::new())),
         session_timeout: secs(45),
-        rebalance_timeout: minutes(1),
+        max_poll_interval: minutes(1),
         heartbeat_interval: secs(3),
         subscription_metadata_refresh_interval: minutes(5),
         leave_group_timeout: millis(100),
@@ -231,6 +234,7 @@ fn coordinator_state(client: Client) -> CoordinatorState {
         commit_serialization: Arc::new(Mutex::new(())),
         join_prepared: false,
         polls: crate::coordinator::PollSignal::default().subscribe(),
+        rebalance_pending: tokio::sync::watch::Sender::new(false),
     }
 }
 

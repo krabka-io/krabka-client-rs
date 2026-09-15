@@ -148,7 +148,7 @@ async fn consume_records(bootstrap: &str, topic: &str) -> usize {
         .client_id("producer-integration-consumer")
         .group_id(support::unique("producer-integration-group"))
         .session_timeout(krabka_units::secs(30))
-        .rebalance_timeout(krabka_units::secs(2))
+        .max_poll_interval(krabka_units::secs(2))
         .heartbeat_interval(krabka_units::secs(1))
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .subscribe([topic.to_owned()])

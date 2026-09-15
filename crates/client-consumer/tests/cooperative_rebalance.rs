@@ -208,7 +208,7 @@ async fn cooperative_consumer(
         .group_id(group_id)
         .assignor(Assignor::CooperativeSticky)
         .session_timeout(secs(30))
-        .rebalance_timeout(secs(2))
+        .max_poll_interval(secs(2))
         .heartbeat_interval(millis(500))
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .subscribe([topic.to_string()])

@@ -23,6 +23,7 @@ use crate::{
     builder::{AutoOffsetReset, IsolationLevel},
     consumer::{Consumer, ConsumerRecord, Header},
     error::ConsumerError,
+    fetch_buffer::BufferedPartition,
     position::PartitionPosition,
 };
 
@@ -395,9 +396,14 @@ impl Consumer {
     /// side, with the response's `aborted_transactions` list. The broker returns
     /// verbatim bytes.
     ///
-    /// The internal coordinator task handles rebalances transparently and
-    /// mutates the live `assigned` snapshot in place. `poll()` reads that
-    /// snapshot on each call.
+    /// `poll` returns at most `max_poll_records` records. It keeps the rest of
+    /// a fetch for the next call, which then sends no Fetch.
+    ///
+    /// A rebalance that the coordinator asks for starts only when the
+    /// application calls `poll`. The internal coordinator task then runs the
+    /// join and mutates the live `assigned` snapshot in place. For the eager
+    /// protocol, `poll` waits for that join up to `timeout` and fetches nothing
+    /// before it completes. `poll` also resets the `max_poll_interval` timer.
     #[tracing::instrument(
         name = "consumer.poll",
         level = "debug",
@@ -414,30 +420,93 @@ impl Consumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn poll(&mut self, timeout: Time) -> Result<Vec<ConsumerRecord>, ConsumerError> {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(
+                u64::try_from(timeout.millis_i64_trunc()).unwrap_or(0),
+            );
         if !self.prepare_poll().await? {
             return Ok(Vec::new());
+        }
+        if !self.wait_for_rebalance(deadline).await {
+            return Ok(Vec::new());
+        }
+
+        // Records of an earlier fetch come first, without a new Fetch.
+        let buffered = self.drain_fetch_buffer().await;
+        if !buffered.is_empty() {
+            tracing::Span::current().record("records", buffered.len());
+            return Ok(buffered);
         }
 
         // 2. Build a FetchRequest covering every assigned partition.
         let assigned = self.assigned.lock().await.clone();
         tracing::Span::current().record("assigned_partitions", assigned.len());
         if assigned.is_empty() {
-            tokio::time::sleep(timeout.to_std()).await;
+            tokio::time::sleep_until(deadline).await;
             return Ok(Vec::new());
         }
 
         let by_leader = self.group_fetches(&assigned).await;
         tracing::Span::current().record("leaders", by_leader.len());
         let topic_ids = self.topic_ids.lock().await.clone();
-        let responses = self.send_fetches(timeout, by_leader, &topic_ids).await?;
+        let remaining =
+            Time::from_std(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let responses = self.send_fetches(remaining, by_leader, &topic_ids).await?;
 
-        self.process_fetch_responses(responses, &topic_ids).await
+        self.process_fetch_responses(responses, &topic_ids).await?;
+        let records = self.drain_fetch_buffer().await;
+        tracing::Span::current().record("records", records.len());
+        Ok(records)
     }
+
+    /// Wait until the join that the coordinator task runs for this `poll`
+    /// completes, or until `deadline`. Return `false` when the join did not
+    /// complete in time.
+    ///
+    /// For the eager protocol, Kafka's `ConsumerCoordinator.onJoinPrepare`
+    /// revokes every partition before the `JoinGroup` inside `poll`, so that
+    /// `poll` fetches nothing until the join completes. The cooperative
+    /// protocol keeps the owned partitions, and `poll` fetches them while the
+    /// join runs. A member without partitions has nothing to fetch either.
+    async fn wait_for_rebalance(&mut self, deadline: tokio::time::Instant) -> bool {
+        if !*self.rebalance_pending.borrow() {
+            return true;
+        }
+        let eager = self.assignor.rebalance_protocol() == crate::assignor::RebalanceProtocol::Eager;
+        if !eager && !self.assigned.lock().await.is_empty() {
+            return true;
+        }
+        let joined = tokio::time::timeout_at(
+            deadline,
+            self.rebalance_pending.wait_for(|pending| !*pending),
+        )
+        .await;
+        // A closed channel means that the coordinator task stopped. `poll`
+        // then continues with the assignment that it has.
+        joined.is_ok()
+    }
+
+    /// Return up to `max_poll_records` buffered records, and move the consumed
+    /// positions past them.
+    async fn drain_fetch_buffer(&mut self) -> Vec<ConsumerRecord> {
+        let assigned: std::collections::HashSet<(String, i32)> =
+            self.assigned.lock().await.iter().cloned().collect();
+        let mut offsets = self.next_offsets.lock().await;
+        let mut positions = self.positions.lock().await;
+        self.fetch_buffer.drain(
+            self.max_poll_records,
+            &assigned,
+            &mut offsets,
+            &mut positions,
+        )
+    }
+    /// Decode the fetch responses into the fetch buffer, and act on the
+    /// partition errors.
     async fn process_fetch_responses(
         &mut self,
         responses: Vec<krabka_protocol::owned::fetch_response::FetchResponse>,
         topic_ids: &HashMap<String, krabka_protocol::primitives::uuid::Uuid>,
-    ) -> Result<Vec<ConsumerRecord>, ConsumerError> {
+    ) -> Result<(), ConsumerError> {
         // 3. Decode each partition's RecordBatches, advance next-offsets.
         //
         // The wire-level `records` field can carry multiple concatenated
@@ -456,7 +525,7 @@ impl Consumer {
         let still_owned: std::collections::HashSet<(String, i32)> =
             self.assigned.lock().await.iter().cloned().collect();
 
-        let mut out: Vec<ConsumerRecord> = Vec::new();
+        let mut fetched: Vec<BufferedPartition> = Vec::new();
         let mut refresh_after_processing = false;
         // The partitions that answered `OFFSET_OUT_OF_RANGE` under `Earliest`
         // or `None`, with the offset each was fetched from. Both policies need
@@ -596,8 +665,11 @@ impl Consumer {
                     part.last_stable_offset,
                 );
 
-                self.process_partition_records(&mut offsets, &key, &topic_name, part, &mut out)
-                    .await?;
+                if let Some(partition) =
+                    self.process_partition_records(&offsets, &key, &topic_name, part)
+                {
+                    fetched.push(partition);
+                }
             }
         }
         if let Some(auto_commit) = &self.auto_commit {
@@ -606,7 +678,9 @@ impl Consumer {
         // Drop the offsets guard before any `.await`: refreshing metadata is an
         // RPC, and we must never hold a Mutex guard across an await point.
         drop(offsets);
-        tracing::Span::current().record("records", out.len());
+        for partition in fetched {
+            self.fetch_buffer.push(partition);
+        }
         if !out_of_range.is_empty() && self.recover_out_of_range(&out_of_range).await? {
             refresh_after_processing = true;
         }
@@ -618,7 +692,7 @@ impl Consumer {
             // non-fatal — the next refresh_leader_epochs pass retries.
             let _ = self.client.refresh_metadata().await;
         }
-        Ok(out)
+        Ok(())
     }
 
     async fn send_fetches(
@@ -732,13 +806,14 @@ impl Consumer {
         if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
             return Err(error);
         }
-        // After a fatal coordinator error, this `poll` makes the coordinator
-        // task join the group again, as Kafka's `ensureActiveGroup` does.
-        crate::coordinator::note_poll(&self.poll_signal);
         self.apply_pending_seeks().await;
         // Kafka's `ConsumerCoordinator.poll` sends the interval auto commit
         // before `updateFetchPositions`.
         self.maybe_auto_commit_async().await;
+        // This `poll` resets the poll timer of the coordinator task, and lets
+        // it start a rejoin that waits for a `poll`. The positions for the
+        // commit before that join are already recorded above.
+        crate::coordinator::note_poll(&self.poll_signal);
         // Metadata comes first. A partition that has no position yet (a new
         // assignment without a committed offset) gets its leader id and
         // epoch here, so its first `ListOffsets` goes to the leader and not
@@ -772,22 +847,19 @@ impl Consumer {
         Ok(true)
     }
 
-    async fn process_partition_records(
+    /// Decode the records of one partition row into a [`BufferedPartition`].
+    /// The consumed position does not move here. It moves when `poll` returns
+    /// the records.
+    fn process_partition_records(
         &self,
-        offsets: &mut HashMap<(String, i32), i64>,
+        offsets: &HashMap<(String, i32), i64>,
         key: &(String, i32),
         topic_name: &str,
         part: &krabka_protocol::owned::fetch_response::PartitionData,
-        out: &mut Vec<ConsumerRecord>,
-    ) -> Result<(), ConsumerError> {
-        let Some(payload) = &part.records else {
-            return Ok(());
-        };
+    ) -> Option<BufferedPartition> {
         // Legacy MessageSet payloads are skipped here; the consumer
         // only handles v2 batches.
-        let Some(batches) = payload.as_v2() else {
-            return Ok(());
-        };
+        let batches = part.records.as_ref()?.as_v2()?;
         // The broker returns whole record batches whose last offset is
         // >= the requested fetch_offset, even when the batch starts
         // before it (e.g. after an OFFSET_OUT_OF_RANGE reset or when
@@ -796,6 +868,7 @@ impl Consumer {
         // Capture the position now — before `next_offset_after` updates
         // it — so the filter baseline matches the actual fetch offset.
         let fetch_floor = offsets.get(key).copied().unwrap_or(0);
+        let mut records = std::collections::VecDeque::new();
         // read_committed filtering happens entirely client-side: the
         // broker returns verbatim on-disk bytes (control batches,
         // aborted records and all) plus an `aborted_transactions`
@@ -858,7 +931,7 @@ impl Consumer {
                 if offset < fetch_floor {
                     continue;
                 }
-                out.push(ConsumerRecord {
+                records.push_back(ConsumerRecord {
                     topic: topic_name.to_string(),
                     partition: part.partition_index,
                     offset,
@@ -877,20 +950,24 @@ impl Consumer {
                 });
             }
         }
-        if let Some(next) = next_offset_after(batches) {
-            offsets.insert(key.clone(), next);
-            // Advance the position's offset_epoch to the highest batch
-            // leader epoch consumed, so the next Fetch sends the correct
-            // last_fetched_epoch (KIP-320). Lock order holds: offsets is
-            // already locked, positions acquired second.
-            if let Some(last_epoch) = batches.iter().map(|b| b.partition_leader_epoch).max() {
-                let mut positions = self.positions.lock().await;
-                // Wrap the batch's raw wire `partition_leader_epoch`
-                // (`int32`) at the RecordBatch decode boundary.
-                positions.entry(key.clone()).or_default().offset_epoch = LeaderEpoch(last_epoch);
-            }
-        }
-        Ok(())
+        // When `poll` returns the last record, the position moves past every
+        // fetched batch, and the position's offset_epoch becomes the highest
+        // batch leader epoch, so the next Fetch sends the correct
+        // last_fetched_epoch (KIP-320).
+        let next_offset = next_offset_after(batches)?;
+        Some(BufferedPartition {
+            key: key.clone(),
+            position: fetch_floor,
+            records,
+            next_offset,
+            // Wrap the batch's raw wire `partition_leader_epoch` (`int32`) at
+            // the RecordBatch decode boundary.
+            last_epoch: batches
+                .iter()
+                .map(|batch| batch.partition_leader_epoch)
+                .max()
+                .map(LeaderEpoch),
+        })
     }
 }
 
@@ -1771,9 +1848,12 @@ mod offset_advance_tests {
 
 #[cfg(test)]
 mod partition_error_tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use assert2::check;
@@ -1887,6 +1967,9 @@ mod partition_error_tests {
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
             poll_signal: crate::coordinator::PollSignal::default(),
+            rebalance_pending: tokio::sync::watch::channel(false).1,
+            max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
+            fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
         }
     }
 
@@ -1957,6 +2040,198 @@ mod partition_error_tests {
         assert2::assert!((first, second) == (Err(Some(topics)), Ok(true)));
     }
 
+    /// While a join runs, Kafka's eager `onJoinPrepare` has revoked every
+    /// partition, so `poll` fetches nothing until the join completes or the
+    /// poll timeout passes. A cooperative member keeps fetching its owned
+    /// partitions.
+    #[tokio::test(start_paused = true)]
+    async fn poll_waits_for_a_pending_eager_join_but_not_for_a_cooperative_one() {
+        let broker = metadata_counting_broker(Arc::default()).await;
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, assignor, owns_partitions, pending, join_completes_after, expected) in [
+            ("no join", Assignor::Range, true, false, None, (true, 0)),
+            (
+                "eager join completes in time",
+                Assignor::Range,
+                true,
+                true,
+                Some(100),
+                (true, 100),
+            ),
+            (
+                "eager join does not complete in time",
+                Assignor::Range,
+                true,
+                true,
+                None,
+                (false, 500),
+            ),
+            (
+                "cooperative join with owned partitions",
+                Assignor::CooperativeSticky,
+                true,
+                true,
+                None,
+                (true, 0),
+            ),
+            (
+                "cooperative join without partitions",
+                Assignor::CooperativeSticky,
+                false,
+                true,
+                Some(200),
+                (true, 200),
+            ),
+        ] {
+            let mut consumer = consumer_on(&broker).await;
+            consumer.assignor = assignor;
+            if !owns_partitions {
+                consumer.assigned.lock().await.clear();
+            }
+            let pending_sender = tokio::sync::watch::Sender::new(pending);
+            consumer.rebalance_pending = pending_sender.subscribe();
+            let completion = join_completes_after.map(|millis| {
+                let pending_sender = pending_sender.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(millis)).await;
+                    pending_sender.send_replace(false);
+                })
+            });
+            let start = tokio::time::Instant::now();
+            let joined = consumer
+                .wait_for_rebalance(start + Duration::from_millis(500))
+                .await;
+            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).expect("millis");
+            if let Some(completion) = completion {
+                completion.abort();
+            }
+            actual.push((name, (joined, elapsed_ms)));
+            wanted.push((name, expected));
+        }
+        broker.stop();
+        assert2::assert!(actual == wanted);
+    }
+
+    /// One `poll` of the record cap case: the number of records, the first and
+    /// the last offset, and the fetch position after the `poll`.
+    #[derive(Debug, PartialEq)]
+    struct CappedPoll {
+        records: usize,
+        first_offset: Option<i64>,
+        last_offset: Option<i64>,
+        next_offset: Option<i64>,
+    }
+
+    /// Kafka's `FetchCollector.collectFetch` returns at most
+    /// `max.poll.records` records, and keeps the rest of the completed fetch for
+    /// the next `poll`. The position moves only past the returned records, and
+    /// the next `poll` sends no Fetch while buffered records remain.
+    #[tokio::test]
+    async fn poll_returns_at_most_max_poll_records_and_keeps_the_rest_without_a_fetch() {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let fetches_in_mock = Arc::clone(&fetches);
+        let broker = MockBroker::start(move |api_key, version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                let versions = ApiVersionsResponse {
+                    api_keys: vec![
+                        ApiVersion {
+                            api_key: api_versions_request::API_KEY,
+                            min_version: 0,
+                            max_version: 3,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: metadata_request::API_KEY,
+                            min_version: 0,
+                            max_version: 8,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: krabka_protocol::owned::fetch_request::API_KEY,
+                            min_version: 4,
+                            max_version: 11,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                };
+                return Some(encode(&versions, 0));
+            }
+            if api_key == metadata_request::API_KEY {
+                return Some(encode(&MetadataResponse::default(), version));
+            }
+            if api_key != krabka_protocol::owned::fetch_request::API_KEY {
+                return None;
+            }
+            fetches_in_mock.fetch_add(1, Ordering::SeqCst);
+            let batch = krabka_protocol::records::RecordBatch {
+                base_offset: 5,
+                last_offset_delta: 1199,
+                records: (0..1200)
+                    .map(|offset_delta| krabka_protocol::records::Record {
+                        offset_delta,
+                        value: Some(bytes::Bytes::from_static(b"v")),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let mut response = fetch_response(0);
+            response.responses[0].topic = "orders".into();
+            response.responses[0].partitions[0].high_watermark = 1205;
+            response.responses[0].partitions[0].records =
+                Some(krabka_protocol::records::RecordsPayload::V2(vec![batch]));
+            Some(encode(&response, version))
+        })
+        .await;
+        let mut consumer = consumer_on(&broker).await;
+
+        let mut polls = Vec::new();
+        for _ in 0..3 {
+            let records = consumer.poll(secs(5)).await.expect("poll");
+            polls.push(CappedPoll {
+                records: records.len(),
+                first_offset: records.first().map(|record| record.offset),
+                last_offset: records.last().map(|record| record.offset),
+                next_offset: consumer
+                    .next_offsets
+                    .lock()
+                    .await
+                    .get(&("orders".to_string(), 0))
+                    .copied(),
+            });
+        }
+
+        broker.stop();
+        assert2::assert!(
+            (polls, fetches.load(Ordering::SeqCst))
+                == (
+                    vec![
+                        CappedPoll {
+                            records: 500,
+                            first_offset: Some(5),
+                            last_offset: Some(504),
+                            next_offset: Some(505),
+                        },
+                        CappedPoll {
+                            records: 500,
+                            first_offset: Some(505),
+                            last_offset: Some(1004),
+                            next_offset: Some(1005),
+                        },
+                        CappedPoll {
+                            records: 200,
+                            first_offset: Some(1005),
+                            last_offset: Some(1204),
+                            next_offset: Some(1205),
+                        },
+                    ],
+                    1,
+                )
+        );
+    }
+
     /// Kafka's `FetchCollector.handleInitializeErrors` requests a metadata
     /// update for 3, 6 and 100 and does not raise an error. The poll returns
     /// no records, keeps the fetch position, and refreshes metadata. Any code
@@ -2009,7 +2284,7 @@ mod partition_error_tests {
             let result = consumer
                 .process_fetch_responses(vec![fetch_response(error_code)], &topic_ids)
                 .await
-                .map(|records| records.len())
+                .map(|()| consumer.fetch_buffer.len())
                 .map_err(|error| match error {
                     ConsumerError::Server(code) => Some(code),
                     _ => None,
@@ -2105,16 +2380,16 @@ mod partition_error_tests {
             let topic_ids = consumer.topic_ids.lock().await.clone();
 
             let result = match reset {
-                PollReset::None => consumer
-                    .process_fetch_responses(vec![fetch_response(0)], &topic_ids)
-                    .await
-                    .map(|_| ()),
+                PollReset::None => {
+                    consumer
+                        .process_fetch_responses(vec![fetch_response(0)], &topic_ids)
+                        .await
+                }
                 PollReset::LatestOutOfRange => {
                     consumer.auto_offset_reset = AutoOffsetReset::Latest;
                     consumer
                         .process_fetch_responses(vec![fetch_response(1)], &topic_ids)
                         .await
-                        .map(|_| ())
                 }
                 PollReset::EarliestOutOfRange => {
                     consumer.auto_offset_reset = AutoOffsetReset::Earliest;
@@ -2125,7 +2400,6 @@ mod partition_error_tests {
                     consumer
                         .process_fetch_responses(vec![fetch_response(1)], &topic_ids)
                         .await
-                        .map(|_| ())
                 }
                 PollReset::FetchTruncation => {
                     let mut response = fetch_response(0);
@@ -2137,7 +2411,6 @@ mod partition_error_tests {
                     consumer
                         .process_fetch_responses(vec![response], &topic_ids)
                         .await
-                        .map(|_| ())
                 }
                 PollReset::ValidationTruncation => {
                     consumer
@@ -2423,7 +2696,6 @@ mod partition_error_tests {
                 consumer
                     .process_fetch_responses(vec![fetch_response(1)], &topic_ids)
                     .await
-                    .map(|_| ())
             }
         };
         let requests = sent.lock().expect("sent lock").clone();

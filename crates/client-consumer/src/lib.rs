@@ -80,6 +80,7 @@ mod commit;
 mod consumer;
 mod coordinator;
 mod error;
+mod fetch_buffer;
 mod group_metadata;
 #[cfg(test)]
 mod lock_order_model;
@@ -95,7 +96,8 @@ pub use builder::{AutoOffsetReset, IsolationLevel};
 pub use consumer::{
     Consumer, ConsumerFetchMaxBytes, ConsumerFetchPartitionMaxBytes, ConsumerLeaveGroupTimeout,
     ConsumerRecord, ConsumerRetryPolicy, ConsumerSubscriptionMetadataRefreshInterval,
-    DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT, DEFAULT_CONSUMER_SUBSCRIPTION_METADATA_REFRESH_INTERVAL,
+    DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT, DEFAULT_CONSUMER_MAX_POLL_INTERVAL,
+    DEFAULT_CONSUMER_MAX_POLL_RECORDS, DEFAULT_CONSUMER_SUBSCRIPTION_METADATA_REFRESH_INTERVAL,
     Header,
 };
 pub use error::ConsumerError;

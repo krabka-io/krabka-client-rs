@@ -318,7 +318,7 @@ async fn run_consumer(settings: Arc<Settings>, counters: Arc<Counters>) -> Resul
         .client_id("loadgen-consumer")
         .group_id("loadgen-grp")
         .session_timeout(krabka_units::secs(30))
-        .rebalance_timeout(krabka_units::secs(5))
+        .max_poll_interval(krabka_units::secs(5))
         .heartbeat_interval(krabka_units::secs(1))
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .subscribe([settings.topic.clone()])

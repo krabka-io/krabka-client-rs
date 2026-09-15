@@ -1364,6 +1364,9 @@ mod tests {
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
             poll_signal: crate::coordinator::PollSignal::default(),
+            rebalance_pending: tokio::sync::watch::channel(false).1,
+            max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
+            fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
         }
     }
 
