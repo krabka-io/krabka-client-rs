@@ -37,7 +37,8 @@ pub(crate) struct InProgressBatch {
     /// A batch is never allowed to cross a transaction recovery boundary.
     pub transaction_generation: Option<u64>,
     /// Wall-clock time when this batch's first record was appended. The sender
-    /// uses it to decide batch-relative `linger.ms` expiry.
+    /// uses it to decide batch-relative `linger.ms` expiry, and the delivery
+    /// timeout counts from it.
     pub first_append_at: Instant,
     /// Approximate uncompressed body size.
     pub size_bytes: usize,
@@ -95,9 +96,17 @@ impl Accumulator {
     /// The sender calls this for each part of a batch that the broker rejected
     /// with `MESSAGE_TOO_LARGE`, so the parts go out before any newer batch of
     /// the partition. Kafka's `RecordAccumulator.splitAndReenqueue` puts the
-    /// parts at the front of the same deque.
-    pub fn push_front(&mut self, records: Vec<PendingRecord>, transaction_generation: Option<u64>) {
+    /// parts at the front of the same deque. Each part keeps `created_at`, the
+    /// creation time of the rejected batch, as `ProducerBatch.split` keeps
+    /// `createdMs`, so the delivery timeout still counts from it.
+    pub fn push_front(
+        &mut self,
+        records: Vec<PendingRecord>,
+        transaction_generation: Option<u64>,
+        created_at: Instant,
+    ) {
         let mut batch = InProgressBatch::new(transaction_generation);
+        batch.first_append_at = created_at;
         for (index, mut record) in records.into_iter().enumerate() {
             record.offset_delta = i32::try_from(index).unwrap_or(i32::MAX);
             batch.size_bytes += approx_record_size(

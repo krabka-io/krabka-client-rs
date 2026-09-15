@@ -277,7 +277,7 @@ pub struct Producer {
     pub(crate) two_phase_commit_enabled: bool,
     pub(crate) init_retry_timeout: Time,
     pub(crate) init_retry_backoff: Time,
-    pub(crate) init_max_backoff: Time,
+    pub(crate) retry_backoff_max: Time,
     /// An `Arc` wraps it, so the sender task can share the same state without
     /// more synchronization structures.
     pub(crate) txn_state: Arc<Mutex<TxnState>>,
@@ -779,7 +779,7 @@ impl Producer {
         request: EndTxnRequest,
     ) -> (EndTxnDecision, Option<(i64, i16)>) {
         let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
-        let max_backoff = self.init_max_backoff.to_std();
+        let max_backoff = self.retry_backoff_max.to_std();
         let mut backoff = self.init_retry_backoff.to_std();
         let mut earlier_attempt_lost = false;
         loop {
@@ -1340,7 +1340,7 @@ impl Producer {
         CoordinatorRetry {
             deadline: tokio::time::Instant::now() + self.init_retry_timeout.to_std(),
             backoff: self.init_retry_backoff.to_std(),
-            max_backoff: self.init_max_backoff.to_std(),
+            max_backoff: self.retry_backoff_max.to_std(),
         }
     }
 
