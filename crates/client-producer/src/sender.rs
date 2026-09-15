@@ -58,6 +58,7 @@ use dashmap::DashMap;
 use futures::stream::{FuturesUnordered, StreamExt};
 use krabka_protocol::{
     owned::{
+        metadata_response::MetadataResponse,
         produce_request::{PartitionProduceData, ProduceRequest, TopicProduceData},
         produce_response::ProduceResponse,
     },
@@ -2047,17 +2048,28 @@ fn build_single_batch_request(cfg: &SenderConfig, pb: &PreparedBatch) -> Produce
 #[tracing::instrument(level = "debug", skip_all)]
 async fn update_leaders_from_metadata(cfg: &SenderConfig) {
     if let Ok(md) = cfg.transport.refresh_metadata().await {
+        adopt_metadata(&md, &cfg.metadata_cache, &cfg.partition_leaders).await;
+    }
+}
+
+/// Take the partition leaders, and the partition count and id of each
+/// tracked topic, from a metadata response.
+pub(crate) async fn adopt_metadata(
+    md: &MetadataResponse,
+    metadata_cache: &Mutex<HashMap<String, TopicMetadata>>,
+    partition_leaders: &DashMap<(String, i32), i32>,
+) {
+    {
         // Hold the cache lock across the loop so a tracked topic's correction is
         // applied atomically alongside the leader-map update.
-        let mut cache = cfg.metadata_cache.lock().await;
+        let mut cache = metadata_cache.lock().await;
         for t in &md.topics {
             let Some(name) = &t.name else { continue };
             if t.error_code != 0 {
                 continue;
             }
             for p in &t.partitions {
-                cfg.partition_leaders
-                    .insert((name.clone(), p.partition_index), p.leader_id);
+                partition_leaders.insert((name.clone(), p.partition_index), p.leader_id);
             }
             // Take the count and id of a tracked topic from the refresh. A
             // topic can get a new id when it is deleted and created again, and a

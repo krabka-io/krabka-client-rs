@@ -116,6 +116,16 @@ impl MetadataRefresh {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Remove `topics` from the topics that the requests name, as Kafka's
+    /// `ProducerMetadata.retainTopic` drops an idle topic.
+    pub(crate) fn forget(&self, topics: &[String]) {
+        let mut known = self.topics();
+        for topic in topics {
+            known.known.remove(topic);
+            known.new.remove(topic);
+        }
+    }
+
     /// Add `topic` to the topics that the requests name. Kafka's
     /// `KafkaProducer.waitOnMetadata` calls `ProducerMetadata.add` first.
     fn add(&self, topic: &str) {

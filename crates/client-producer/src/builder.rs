@@ -35,6 +35,9 @@ use crate::{
     buffer_pool::BufferPool,
     compression::Compression,
     error::ProducerError,
+    metadata_age::{
+        DEFAULT_PRODUCER_METADATA_MAX_AGE, DEFAULT_PRODUCER_METADATA_MAX_IDLE, MetadataAge,
+    },
     partitioner::{BuiltInPartitioner, PartitionerConfig},
     producer::{Acks, Producer, ProducerIdentity},
     sender,
@@ -734,6 +737,8 @@ impl Producer {
         #[builder(default = DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT)] init_retry_timeout: Duration,
         #[builder(default = DEFAULT_PRODUCER_MAX_IN_FLIGHT)] max_in_flight_per_connection: usize,
         #[builder(default = DEFAULT_PRODUCER_MAX_BLOCK)] max_block: Duration,
+        #[builder(default = DEFAULT_PRODUCER_METADATA_MAX_AGE)] metadata_max_age: Duration,
+        #[builder(default = DEFAULT_PRODUCER_METADATA_MAX_IDLE)] metadata_max_idle: Duration,
         #[builder(default = DEFAULT_PRODUCER_BUFFER_MEMORY)] buffer_memory: usize,
         #[builder(default = DEFAULT_PRODUCER_MAX_REQUEST_SIZE)] max_request_size: usize,
         #[builder(default)]
@@ -883,6 +888,14 @@ impl Producer {
         let prepared_transaction_state = Arc::new(Mutex::new(None));
         let txn_abortable_error = Arc::new(AbortableErrorSlot::default());
 
+        let metadata_refresh = Arc::new(crate::metadata_wait::MetadataRefresh::default());
+        MetadataAge::new(
+            &client,
+            (metadata_max_age, metadata_max_idle),
+            &retry_policy,
+        )?
+        .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
+        .spawn(shutdown.clone());
         let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
             transport: Box::new(ClientTransport::new(client.clone())),
             producer_id,
@@ -934,7 +947,7 @@ impl Producer {
             max_request_size,
             max_in_flight: max_in_flight_per_connection,
             metadata_cache,
-            metadata_refresh: crate::metadata_wait::MetadataRefresh::default(),
+            metadata_refresh,
             partition_leaders,
             accumulators,
             next_seq,

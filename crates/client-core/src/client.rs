@@ -447,8 +447,11 @@ impl Client {
     pub async fn refresh_metadata(
         &self,
     ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
-        self.refresh_metadata_with(self.metadata_topics.request())
-            .await
+        let response = self
+            .refresh_metadata_with(self.metadata_topics.request())
+            .await?;
+        self.metadata_topics.mark_refreshed();
+        Ok(response)
     }
 
     /// Send `request`, parse the broker list from the response, refresh the

@@ -261,7 +261,7 @@ pub struct Producer {
     pub(crate) metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
     /// The metadata refreshes that concurrent sends share while they wait for
     /// a topic. See `MetadataWait`.
-    pub(crate) metadata_refresh: MetadataRefresh,
+    pub(crate) metadata_refresh: Arc<MetadataRefresh>,
     /// Per-`(topic, partition)` leader-id cache. The sender uses it to route
     /// each Produce to the broker that actually leads the partition.
     ///
@@ -1811,7 +1811,7 @@ impl Producer {
         skip_all,
         fields(topic = %topic, num_partitions = tracing::field::Empty),
     )]
-    async fn partition_count(
+    pub(crate) async fn partition_count(
         &self,
         topic: &str,
         partition: Option<i32>,
