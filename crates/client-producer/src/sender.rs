@@ -216,7 +216,7 @@ pub(crate) struct SenderConfig {
     pub max_in_flight: usize,
     pub metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
     /// Per-`(topic, partition)` leader-id cache, shared with the `Producer`.
-    /// `Metadata` fills it; see `Producer::partitions_for`. The sender reads it
+    /// `Metadata` fills it; see `Producer::partition_count`. The sender reads it
     /// to route each Produce to the partition leader, and refreshes it on
     /// `NOT_LEADER_OR_FOLLOWER` and on `UNKNOWN_TOPIC_OR_PARTITION`.
     pub partition_leaders: Arc<DashMap<(String, i32), i32>>,
@@ -1624,7 +1624,7 @@ async fn send_one_batch(
     // every request in the same way.
     //
     // Two cases need this. A batch prepared before its topic existed carries a
-    // ZERO `topic_id`, and `partitions_for` backfills the cache once the topic
+    // ZERO `topic_id`, and `update_leaders_from_metadata` backfills the cache once the topic
     // exists. A batch whose topic was deleted and created again carries the old
     // id, and the broker answers UNKNOWN_TOPIC_ID until the resend carries the
     // id that `update_leaders_from_metadata` stored. The batch resends in

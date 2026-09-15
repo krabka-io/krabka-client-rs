@@ -47,7 +47,7 @@ use crate::{
     builder::{ProducerFlushTimeout, send_init_producer_id},
     compression::Compression,
     error::ProducerError,
-    metadata_wait::{MetadataRefresh, MetadataWait},
+    metadata_wait::{MetadataRefresh, MetadataWait, metadata_request},
     partitioner::UniformStickyPartitioner,
     record::{ProducerRecord, RecordMetadata},
     sender::DrainIntent,
@@ -1683,10 +1683,11 @@ impl Producer {
     /// `partition` is not below the cached count, wait for metadata for at
     /// most `max_block`. See [`MetadataWait::partition_count`].
     ///
-    /// The wait uses [`Client::refresh_metadata`] rather than a bare
-    /// `send(MetadataRequest)`. `refresh_metadata` also teaches the client's
-    /// `BrokerPool` each broker's `(id → addr)` mapping, and that is what lets
-    /// the sender route a Produce to the partition *leader* with
+    /// The wait uses [`Client::refresh_metadata_with`] rather than a bare
+    /// `send(MetadataRequest)`. The request names the topics of the producer
+    /// (see [`metadata_request`]). `refresh_metadata_with` also teaches the
+    /// client's `BrokerPool` each broker's `(id → addr)` mapping, and that is
+    /// what lets the sender route a Produce to the partition *leader* with
     /// `Client::broker(id)`. The wait records each partition's `leader_id` in
     /// `partition_leaders` for the sender to consult.
     #[tracing::instrument(
@@ -1707,7 +1708,9 @@ impl Producer {
             retry_backoff: self.init_retry_backoff.to_std(),
             max_backoff: self.retry_backoff_max.to_std(),
         }
-        .partition_count(topic, partition, || self.client.refresh_metadata())
+        .partition_count(topic, partition, |topics| {
+            self.client.refresh_metadata_with(metadata_request(topics))
+        })
         .await?;
         tracing::Span::current().record("num_partitions", count);
         Ok(count)
@@ -1818,6 +1821,7 @@ fn build_topics_payload(offsets: &[((String, i32), i64)]) -> Vec<TxnOffsetCommit
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
@@ -1834,7 +1838,7 @@ mod tests {
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             find_coordinator_request::{self, FindCoordinatorRequest},
             find_coordinator_response::{self, Coordinator, FindCoordinatorResponse},
-            metadata_request,
+            metadata_request::{self, MetadataRequest},
             metadata_response::{
                 self, MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
                 MetadataResponseTopic,
@@ -2201,17 +2205,38 @@ mod tests {
         Silent,
     }
 
-    /// What one send gave: the delivered partition or the error text, and the
-    /// partitions of every Produce that the broker received.
+    /// What one send gave: the delivered partition or the error text, the
+    /// partitions of every Produce that the broker received, and the distinct
+    /// `Metadata` requests.
     #[derive(Debug, PartialEq, Eq)]
     struct SendOutcome {
         delivered: Result<i32, String>,
         produced_partitions: Vec<i32>,
+        metadata_requests: BTreeSet<RequestedTopics>,
+    }
+
+    /// The topics that a `Metadata` request names (`None` for all topics),
+    /// and its `allow_auto_topic_creation`.
+    type RequestedTopics = (Option<Vec<String>>, bool);
+
+    fn requested_topics(body: &[u8], version: i16) -> MetadataRequest {
+        let header_len =
+            2 + CLIENT_ID.len() + usize::from(version >= metadata_request::FLEXIBLE_MIN);
+        let mut request_body = &body[header_len..];
+        MetadataRequest::decode(&mut request_body, version).expect("decode Metadata")
     }
 
     const METADATA_TOPIC: &str = "orders";
 
-    fn metadata_answer(version: i16, port: u16, answer: MetadataAnswer) -> Option<Vec<u8>> {
+    /// Encode `answer`. A broker lists a topic with an error only when the
+    /// request names it: a request for all topics gives the topics that exist
+    /// and that the client may describe.
+    fn metadata_answer(
+        version: i16,
+        port: u16,
+        answer: MetadataAnswer,
+        named: bool,
+    ) -> Option<Vec<u8>> {
         let MetadataAnswer::Topic {
             error_code,
             partitions,
@@ -2219,6 +2244,7 @@ mod tests {
         else {
             return None;
         };
+        let listed = named || error_code == 0;
         let response = MetadataResponse {
             brokers: vec![MetadataResponseBroker {
                 node_id: 1,
@@ -2226,18 +2252,21 @@ mod tests {
                 port: i32::from(port),
                 ..Default::default()
             }],
-            topics: vec![MetadataResponseTopic {
-                error_code,
-                name: Some(METADATA_TOPIC.into()),
-                partitions: (0..partitions)
-                    .map(|partition_index| MetadataResponsePartition {
-                        partition_index,
-                        leader_id: 1,
-                        ..Default::default()
-                    })
-                    .collect(),
-                ..Default::default()
-            }],
+            topics: listed
+                .then(|| MetadataResponseTopic {
+                    error_code,
+                    name: Some(METADATA_TOPIC.into()),
+                    partitions: (0..partitions)
+                        .map(|partition_index| MetadataResponsePartition {
+                            partition_index,
+                            leader_id: 1,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         let mut buf = BytesMut::new();
@@ -2289,6 +2318,8 @@ mod tests {
         let port = Arc::new(AtomicU16::new(0));
         let handler_port = Arc::clone(&port);
         let metadata_requests = AtomicUsize::new(0);
+        let metadata_log = Arc::new(Mutex::new(BTreeSet::new()));
+        let handler_metadata_log = Arc::clone(&metadata_log);
         let produce_log = Arc::new(Mutex::new(Vec::new()));
         let handler_produce_log = Arc::clone(&produce_log);
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
@@ -2314,7 +2345,26 @@ mod tests {
             if api_key == metadata_request::API_KEY {
                 let index = metadata_requests.fetch_add(1, Ordering::SeqCst);
                 let answer = answers[index.min(answers.len() - 1)];
-                return metadata_answer(version, handler_port.load(Ordering::SeqCst), answer);
+                let request = requested_topics(body, version);
+                let topics = request.topics.map(|topics| {
+                    topics
+                        .into_iter()
+                        .map(|topic| topic.name.unwrap_or_default())
+                        .collect::<Vec<_>>()
+                });
+                let named = topics
+                    .as_ref()
+                    .is_some_and(|topics| topics.iter().any(|topic| topic == METADATA_TOPIC));
+                handler_metadata_log
+                    .lock()
+                    .unwrap()
+                    .insert((topics, request.allow_auto_topic_creation));
+                return metadata_answer(
+                    version,
+                    handler_port.load(Ordering::SeqCst),
+                    answer,
+                    named,
+                );
             }
             if api_key == produce_request::API_KEY {
                 let mut request_body = &body[2 + CLIENT_ID.len()..];
@@ -2355,6 +2405,7 @@ mod tests {
         let outcome = SendOutcome {
             delivered,
             produced_partitions: produce_log.lock().unwrap().clone(),
+            metadata_requests: metadata_log.lock().unwrap().clone(),
         };
         producer.close().await.expect("close producer");
         mock.stop();
@@ -2388,13 +2439,18 @@ mod tests {
             error_code,
             partitions,
         };
+        // Kafka's `ProducerMetadata.newMetadataRequestBuilder` names the
+        // producer's topics and allows auto topic creation.
+        let orders_request = || BTreeSet::from([(Some(vec![METADATA_TOPIC.to_owned()]), true)]);
         let delivered = |partition: i32| SendOutcome {
             delivered: Ok(partition),
             produced_partitions: vec![partition],
+            metadata_requests: orders_request(),
         };
         let failed = |error: &str| SendOutcome {
             delivered: Err(error.to_owned()),
             produced_partitions: vec![],
+            metadata_requests: orders_request(),
         };
         let default_block = crate::builder::DEFAULT_PRODUCER_MAX_BLOCK;
         let short_block = Duration::from_millis(100);
@@ -2498,6 +2554,7 @@ mod tests {
                         error_code: 0,
                         partitions: 3,
                     },
+                    true,
                 );
             }
             if api_key == produce_request::API_KEY && handler_answer.load(Ordering::SeqCst) {

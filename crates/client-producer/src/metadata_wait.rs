@@ -7,7 +7,7 @@
 //! count. [`MetadataWait`] gives the same rules to this producer.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     future::Future,
     sync::{
         Arc,
@@ -18,7 +18,10 @@ use std::{
 
 use dashmap::DashMap;
 use krabka_client_core::ClientError;
-use krabka_protocol::owned::metadata_response::MetadataResponse;
+use krabka_protocol::owned::{
+    metadata_request::{MetadataRequest, MetadataRequestTopic},
+    metadata_response::MetadataResponse,
+};
 use tokio::{sync::Mutex, time::Instant};
 
 use crate::{error::ProducerError, producer::TopicMetadata};
@@ -36,8 +39,8 @@ const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 ///
 /// Many sends can wait for the same topic at the same time. Kafka's producer
 /// then sends one metadata request, and every waiter reads its result. Here a
-/// waiter that finds a response newer than its last look uses that response,
-/// and does not send a request of its own.
+/// waiter that finds a response newer than its last look uses that response
+/// when the request named its topic, and does not send a request of its own.
 #[derive(Debug, Default)]
 pub(crate) struct MetadataRefresh {
     /// The number of responses stored in `last`. A waiter reads it before it
@@ -45,7 +48,61 @@ pub(crate) struct MetadataRefresh {
     generation: AtomicU64,
     /// The last response. A failed refresh clears it. The lock also makes the
     /// waiters send their refreshes one at a time.
-    last: Mutex<Option<Arc<MetadataResponse>>>,
+    last: Mutex<Option<Refreshed>>,
+    /// The topics that the requests name. The lock is never held across an
+    /// `.await`.
+    topics: std::sync::Mutex<ProducerTopics>,
+}
+
+/// A response and the topics that its request named.
+#[derive(Debug)]
+struct Refreshed {
+    topics: Vec<String>,
+    response: Arc<MetadataResponse>,
+}
+
+/// The topics of Kafka's `ProducerMetadata`.
+#[derive(Debug, Default)]
+struct ProducerTopics {
+    /// Every topic that a send waited for (`ProducerMetadata.topics`).
+    known: BTreeSet<String>,
+    /// The known topics that no response has listed yet
+    /// (`ProducerMetadata.newTopics`).
+    new: BTreeSet<String>,
+}
+
+impl ProducerTopics {
+    /// The topics of the next request. Kafka's `Metadata.newMetadataRequestAndVersion`
+    /// asks only for the new topics while there are some
+    /// (`newMetadataRequestBuilderForNewTopics`), and otherwise for all known
+    /// topics (`newMetadataRequestBuilder`).
+    fn next_request(&self) -> Vec<String> {
+        let topics = if self.new.is_empty() {
+            &self.known
+        } else {
+            &self.new
+        };
+        topics.iter().cloned().collect()
+    }
+}
+
+/// The `Metadata` request for `topics`. Kafka's `ProducerMetadata` builds
+/// `new MetadataRequest.Builder(topics, true)`, so the broker may create a
+/// topic that does not exist.
+pub(crate) fn metadata_request(topics: Vec<String>) -> MetadataRequest {
+    MetadataRequest {
+        topics: Some(
+            topics
+                .into_iter()
+                .map(|name| MetadataRequestTopic {
+                    name: Some(name),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        allow_auto_topic_creation: true,
+        ..Default::default()
+    }
 }
 
 impl MetadataRefresh {
@@ -53,28 +110,60 @@ impl MetadataRefresh {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// Return a response newer than generation `seen`, or send a refresh.
+    fn topics(&self) -> std::sync::MutexGuard<'_, ProducerTopics> {
+        self.topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Add `topic` to the topics that the requests name. Kafka's
+    /// `KafkaProducer.waitOnMetadata` calls `ProducerMetadata.add` first.
+    fn add(&self, topic: &str) {
+        let mut topics = self.topics();
+        if topics.known.insert(topic.to_owned()) {
+            topics.new.insert(topic.to_owned());
+        }
+    }
+
+    /// Return a response newer than generation `seen` whose request named
+    /// `topic`, or send a refresh.
     async fn newer_than<F, Fut>(
         &self,
         seen: &mut u64,
+        topic: &str,
         refresh: &mut F,
     ) -> Result<Arc<MetadataResponse>, ClientError>
     where
-        F: FnMut() -> Fut,
+        F: FnMut(Vec<String>) -> Fut,
         Fut: Future<Output = Result<MetadataResponse, ClientError>>,
     {
         let mut last = self.last.lock().await;
         let current = self.generation();
         if current != *seen
-            && let Some(response) = last.as_ref()
+            && let Some(refreshed) = last.as_ref()
+            && refreshed.topics.iter().any(|named| named == topic)
         {
             *seen = current;
-            return Ok(Arc::clone(response));
+            return Ok(Arc::clone(&refreshed.response));
         }
-        match refresh().await {
+        let topics = self.topics().next_request();
+        match refresh(topics.clone()).await {
             Ok(response) => {
+                {
+                    // Kafka's `ProducerMetadata.update` removes each topic of
+                    // the response from the new topics.
+                    let mut known = self.topics();
+                    for entry in &response.topics {
+                        if let Some(name) = entry.name.as_deref() {
+                            known.new.remove(name);
+                        }
+                    }
+                }
                 let response = Arc::new(response);
-                *last = Some(Arc::clone(&response));
+                *last = Some(Refreshed {
+                    topics,
+                    response: Arc::clone(&response),
+                });
                 *seen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
                 Ok(response)
             }
@@ -166,7 +255,9 @@ impl MetadataWait<'_> {
     /// Return the partition count of `topic`, and wait for metadata that
     /// holds the topic, and `partition` when it is `Some`.
     ///
-    /// `refresh` sends one metadata request. The wait sends it again after a
+    /// `refresh` sends one metadata request for the given topics. The request
+    /// names `topic` and the other topics of the producer, as Kafka's
+    /// `ProducerMetadata` does. The wait sends it again after a
     /// pause that starts at `retry_backoff` and doubles up to `max_backoff`,
     /// as Kafka's `Metadata.timeToAllowUpdate` does (without jitter).
     ///
@@ -183,7 +274,7 @@ impl MetadataWait<'_> {
         mut refresh: F,
     ) -> Result<i32, ProducerError>
     where
-        F: FnMut() -> Fut,
+        F: FnMut(Vec<String>) -> Fut,
         Fut: Future<Output = Result<MetadataResponse, ClientError>>,
     {
         let mut seen = self.refresh.generation();
@@ -200,6 +291,7 @@ impl MetadataWait<'_> {
             return Ok(count);
         }
 
+        self.refresh.add(topic);
         let deadline = Instant::now().checked_add(self.max_block);
         let timeout = |partition_count: Option<i32>| ProducerError::MetadataTimeout {
             topic: topic.to_owned(),
@@ -212,8 +304,11 @@ impl MetadataWait<'_> {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(timeout(known));
             }
-            let Some(attempt) =
-                before(deadline, self.refresh.newer_than(&mut seen, &mut refresh)).await
+            let Some(attempt) = before(
+                deadline,
+                self.refresh.newer_than(&mut seen, topic, &mut refresh),
+            )
+            .await
             else {
                 return Err(timeout(known));
             };
@@ -418,7 +513,7 @@ mod tests {
         let started = Instant::now();
         let result = state
             .wait(max_block)
-            .partition_count(TOPIC, partition, || script.refresh())
+            .partition_count(TOPIC, partition, |_| script.refresh())
             .await
             .map_err(|error| error.to_string());
         WaitOutcome {
@@ -738,11 +833,11 @@ mod tests {
         let script = Script::new(vec![topic(0, 2)]);
         let wait = state.wait(Duration::from_mins(1));
         let first = wait
-            .partition_count(TOPIC, None, || script.refresh())
+            .partition_count(TOPIC, None, |_| script.refresh())
             .await
             .expect("topic found");
         let second = wait
-            .partition_count(TOPIC, Some(1), || script.refresh())
+            .partition_count(TOPIC, Some(1), |_| script.refresh())
             .await
             .expect("cached");
         let mut leaders: Vec<_> = state
@@ -756,6 +851,94 @@ mod tests {
         assert2::assert!(leaders == vec![((TOPIC.to_owned(), 0), 1), ((TOPIC.to_owned(), 1), 1)]);
     }
 
+    /// The refresh names the awaited topic. While a topic is new, the request
+    /// names only the new topics. After a response lists the topic, the
+    /// request names every topic of the producer. Kafka's `ProducerMetadata`
+    /// builds its requests in the same way.
+    #[tokio::test(start_paused = true)]
+    async fn the_refresh_names_the_topics_of_the_producer() {
+        let state = Producerless::new();
+        let requests = std::sync::Mutex::new(Vec::new());
+        let refresh = |topics: Vec<String>| {
+            let answer = {
+                let mut requests = requests.lock().expect("requests");
+                requests.push(topics.clone());
+                MetadataResponse {
+                    topics: topics
+                        .iter()
+                        .map(|name| {
+                            // `payments` has no leader on its first listing.
+                            let pending = name == "payments" && requests.len() == 2;
+                            MetadataResponseTopic {
+                                error_code: if pending { LEADER_NOT_AVAILABLE } else { 0 },
+                                name: Some(name.clone()),
+                                partitions: if pending {
+                                    Vec::new()
+                                } else {
+                                    vec![MetadataResponsePartition::default()]
+                                },
+                                ..Default::default()
+                            }
+                        })
+                        .collect(),
+                    ..Default::default()
+                }
+            };
+            async move { Ok(answer) }
+        };
+        let wait = state.wait(Duration::from_mins(1));
+        let orders = wait.partition_count("orders", None, refresh).await;
+        let payments = wait.partition_count("payments", None, refresh).await;
+        // A partition beyond the count makes a known topic ask again, and
+        // the request names every topic. A short limit ends the wait after
+        // that one request.
+        let beyond = state
+            .wait(Duration::from_millis(50))
+            .partition_count("orders", Some(1), refresh)
+            .await
+            .map_err(|error| error.to_string());
+        let named = |topics: &[&str]| topics.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert2::assert!(
+            (
+                orders.map_err(|error| error.to_string()),
+                payments.map_err(|error| error.to_string()),
+                beyond,
+                requests.into_inner().expect("requests"),
+            ) == (
+                Ok(1),
+                Ok(1),
+                Err(
+                    "Partition 1 of topic orders with partition count 1 is not present in metadata after 50 ms."
+                        .into()
+                ),
+                vec![
+                    named(&["orders"]),
+                    named(&["payments"]),
+                    named(&["orders", "payments"]),
+                    named(&["orders", "payments"]),
+                ],
+            )
+        );
+    }
+
+    /// `metadata_request` names the topics and allows auto topic creation,
+    /// as Kafka's `ProducerMetadata.newMetadataRequestBuilder` does.
+    #[test]
+    fn the_metadata_request_names_the_topics_and_allows_auto_creation() {
+        let topic = |name: &str| MetadataRequestTopic {
+            name: Some(name.into()),
+            ..Default::default()
+        };
+        assert2::assert!(
+            metadata_request(vec!["orders".into(), "payments".into()])
+                == MetadataRequest {
+                    topics: Some(vec![topic("orders"), topic("payments")]),
+                    allow_auto_topic_creation: true,
+                    ..Default::default()
+                }
+        );
+    }
+
     /// Waits that start together share one refresh, as the waiters of Kafka's
     /// producer share one metadata update.
     #[tokio::test(start_paused = true)]
@@ -764,7 +947,7 @@ mod tests {
         let script = Script::new(vec![topic(UNKNOWN_TOPIC_OR_PARTITION, 0), topic(0, 6)]);
         let wait = state.wait(Duration::from_mins(1));
         let results = futures::future::join_all(
-            (0..8).map(|_| wait.partition_count(TOPIC, None, || script.refresh())),
+            (0..8).map(|_| wait.partition_count(TOPIC, None, |_| script.refresh())),
         )
         .await
         .into_iter()
