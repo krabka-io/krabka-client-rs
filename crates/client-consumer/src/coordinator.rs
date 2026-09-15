@@ -689,7 +689,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                         merge_counts(&mut known_counts, &snapshot);
                     }
                     Err(ConsumerError::FencedInstanceId(group_instance_id)) => {
-                        stop_fenced_member(&mut state, group_instance_id).await;
+                        stop_fenced_member(&mut state, &shutdown, group_instance_id).await;
                         break;
                     }
                     Err(e) => {
@@ -717,7 +717,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     }
                     HeartbeatOutcome::Fenced => {
                         let group_instance_id = state.group_instance_id.clone().unwrap_or_default();
-                        stop_fenced_member(&mut state, group_instance_id).await;
+                        stop_fenced_member(&mut state, &shutdown, group_instance_id).await;
                         break;
                     }
                 },
@@ -737,18 +737,23 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
 
 /// Stop the member after the coordinator fenced its `group.instance.id`.
 ///
-/// This function clears the assignment, the member id and the generation, so
-/// `poll()` fetches nothing and a commit sends nothing. It then keeps the
-/// fenced error for the next `poll()`. The caller stops the task. The shutdown
+/// This function cancels `shutdown`, so a commit fails from now on. It then
+/// clears the assignment, the member id and the generation, so `poll()` fetches
+/// nothing. It then keeps the fenced error for the next `poll()`. The caller stops the task. The shutdown
 /// path sends no `LeaveGroup`, because the member id is empty. Kafka resets the
 /// generation to `NO_GENERATION`, so `AbstractCoordinator.maybeLeaveGroup`
 /// sends no `LeaveGroup` either.
-async fn stop_fenced_member(state: &mut CoordinatorState, group_instance_id: String) {
+async fn stop_fenced_member(
+    state: &mut CoordinatorState,
+    shutdown: &CancellationToken,
+    group_instance_id: String,
+) {
     tracing::error!(
         group = %state.group_id,
         group_instance_id = %group_instance_id,
         "another consumer joined with the same group.instance.id; the member stops"
     );
+    shutdown.cancel();
     state.member_id.clear();
     publish_assignment(state, &[], false, -1).await;
     *state
@@ -2700,6 +2705,7 @@ mod retry_tests {
     #[derive(Debug, PartialEq, Eq)]
     struct TaskObservation {
         task_exited: bool,
+        shutdown_cancelled: bool,
         poll_error: Option<String>,
         assigned: Vec<(String, i32)>,
         generation: i32,
@@ -2860,6 +2866,7 @@ mod retry_tests {
                 .map(ToString::to_string);
             let observation = TaskObservation {
                 task_exited: task.is_finished(),
+                shutdown_cancelled: shutdown.is_cancelled(),
                 poll_error,
                 assigned: assigned.lock().await.clone(),
                 generation: generation.load(Ordering::SeqCst),
@@ -2903,6 +2910,7 @@ mod retry_tests {
                 },
                 TaskObservation {
                     task_exited: false,
+                    shutdown_cancelled: false,
                     poll_error: None,
                     assigned: owned.clone(),
                     generation: 1,
@@ -2919,6 +2927,7 @@ mod retry_tests {
                 },
                 TaskObservation {
                     task_exited: true,
+                    shutdown_cancelled: true,
                     poll_error: Some(fenced.into()),
                     assigned: Vec::new(),
                     generation: -1,
@@ -2935,6 +2944,7 @@ mod retry_tests {
                 },
                 TaskObservation {
                     task_exited: false,
+                    shutdown_cancelled: false,
                     poll_error: None,
                     assigned: owned.clone(),
                     generation: 1,
@@ -2951,6 +2961,7 @@ mod retry_tests {
                 },
                 TaskObservation {
                     task_exited: false,
+                    shutdown_cancelled: false,
                     poll_error: None,
                     assigned: owned.clone(),
                     generation: 1,
@@ -2967,6 +2978,7 @@ mod retry_tests {
                 },
                 TaskObservation {
                     task_exited: true,
+                    shutdown_cancelled: true,
                     poll_error: Some(fenced.into()),
                     assigned: Vec::new(),
                     generation: -1,
@@ -2983,6 +2995,7 @@ mod retry_tests {
                 },
                 TaskObservation {
                     task_exited: true,
+                    shutdown_cancelled: true,
                     poll_error: Some(fenced.into()),
                     assigned: Vec::new(),
                     generation: -1,
