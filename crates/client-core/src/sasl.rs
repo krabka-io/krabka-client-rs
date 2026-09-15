@@ -20,6 +20,7 @@ use krabka_ids::{ApiKey, ApiVersion};
 use krabka_protocol::{
     Decode, Encode,
     owned::{
+        api_versions_request::ApiVersionsRequest, api_versions_response::ApiVersionsResponse,
         sasl_authenticate_request::SaslAuthenticateRequest,
         sasl_authenticate_response::SaslAuthenticateResponse,
         sasl_handshake_request::SaslHandshakeRequest,
@@ -35,11 +36,56 @@ use crate::ClientFrameMax;
 
 const API_KEY_SASL_HANDSHAKE: i16 = 17;
 const API_KEY_SASL_AUTHENTICATE: i16 = 36;
+const API_KEY_API_VERSIONS: i16 = 18;
+
+/// Kafka's `SaslClientAuthenticator.MAX_RESERVED_CORRELATION_ID`.
+const MAX_RESERVED_CORRELATION_ID: i32 = i32::MAX;
+/// Kafka's `SaslClientAuthenticator.MIN_RESERVED_CORRELATION_ID`. The SASL
+/// requests of a connection use the reserved ids, so they never share an id
+/// with a normal request.
+const MIN_RESERVED_CORRELATION_ID: i32 = MAX_RESERVED_CORRELATION_ID - 7;
+
+/// The next reserved SASL correlation id, as Kafka's
+/// `SaslClientAuthenticator.nextCorrelationId` gives it.
+fn next_correlation_id(corr_id: &mut i32) -> i32 {
+    if *corr_id < MIN_RESERVED_CORRELATION_ID {
+        *corr_id = MIN_RESERVED_CORRELATION_ID;
+    }
+    let current = *corr_id;
+    *corr_id = corr_id.wrapping_add(1);
+    current
+}
 
 #[derive(Clone, Copy)]
 struct SaslPolicy<'a> {
     client_id: &'a str,
     frame_max: ClientFrameMax,
+    /// The `SaslAuthenticate` version, or `None` when the broker does not list
+    /// `SaslAuthenticate` and the tokens go without a Kafka header
+    /// (`DISABLE_KAFKA_SASL_AUTHENTICATE_HEADER`).
+    authenticate_version: Option<i16>,
+}
+
+/// The `SaslHandshake` and `SaslAuthenticate` versions for a broker's
+/// `ApiVersions` answer, as Kafka's
+/// `SaslClientAuthenticator.setSaslAuthenticateAndHandshakeVersions` picks
+/// them: the highest version of each that both sides support. With no
+/// `SaslHandshake` entry the handshake uses version 0, and with no
+/// `SaslAuthenticate` entry the tokens go without a Kafka header.
+fn sasl_versions(response: &ApiVersionsResponse) -> (i16, Option<i16>) {
+    let max = |api_key: i16| {
+        response
+            .api_keys
+            .iter()
+            .find(|key| key.api_key == api_key)
+            .map(|key| key.max_version)
+    };
+    let handshake = max(API_KEY_SASL_HANDSHAKE).map_or(0, |version| {
+        version.min(krabka_protocol::owned::sasl_handshake_request::MAX_VERSION)
+    });
+    let authenticate = max(API_KEY_SASL_AUTHENTICATE)
+        .map(|version| version.min(krabka_protocol::owned::sasl_authenticate_request::MAX_VERSION));
+    (handshake, authenticate)
 }
 
 /// Maximum receive size advertised in the client's RFC 4752 security-layer
@@ -178,8 +224,11 @@ fn unparsable_response(message: String) -> OutboundSaslError {
 
 /// Run the outbound SASL handshake to completion over `stream`.
 ///
-/// This function sends `SaslHandshake` with the mechanism in `creds`, then
-/// drives the mechanism-specific `SaslAuthenticate` round-trips. `server_name`
+/// This function sends `ApiVersions` v0, then `SaslHandshake` with the
+/// mechanism in `creds` at the version that the broker lists, then drives the
+/// mechanism-specific `SaslAuthenticate` round-trips, as Kafka's
+/// `SaslClientAuthenticator` does. The requests use Kafka's reserved SASL
+/// correlation ids. `server_name`
 /// is the broker's canonical hostname. Only the GSSAPI path uses it, to build
 /// the target SPN (`service_name/server_name`). The function returns once the
 /// broker has accepted the credentials. The same `stream` is then usable for
@@ -199,17 +248,27 @@ pub async fn outbound_sasl<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
 {
+    let mut corr_id = MIN_RESERVED_CORRELATION_ID;
+    // Step 1: ApiVersions v0, as Kafka's `SaslClientAuthenticator` sends it
+    //         first. A broker reads a request that it cannot parse as a
+    //         GSSAPI token, so the client uses version 0.
+    let api_versions = send_api_versions(stream, &mut corr_id, client_id, frame_max).await?;
+    let (handshake_version, authenticate_version) = sasl_versions(&api_versions);
     let policy = SaslPolicy {
         client_id,
         frame_max,
+        authenticate_version,
     };
-    // Step 1: ApiVersions. The JVM client always sends this first; we
-    //         skip it for simplicity. The broker's pre-auth allowlist
-    //         tolerates skipping ApiVersions.
-    // Step 2: SaslHandshake with the chosen mechanism — establishes
-    //         which SASL flow the broker will run.
-    let mut corr_id: i32 = 1;
-    send_sasl_handshake(stream, creds.mechanism(), &mut corr_id, policy).await?;
+    // Step 2: SaslHandshake with the chosen mechanism, at the version that
+    //         ApiVersions allows.
+    send_sasl_handshake(
+        stream,
+        creds.mechanism(),
+        handshake_version,
+        &mut corr_id,
+        policy,
+    )
+    .await?;
     // Step 3: SaslAuthenticate (one round for PLAIN, two for SCRAM, three
     //         for GSSAPI).
     match creds {
@@ -294,15 +353,49 @@ where
     )))
 }
 
-/// Send `SaslHandshakeRequest v1` with the wire name for `mechanism`,
-/// read `SaslHandshakeResponse v1`, fail if `error_code != 0`.
+/// Send `ApiVersions` v0 and read the response.
+async fn send_api_versions<S>(
+    stream: &mut S,
+    corr_id: &mut i32,
+    client_id: &str,
+    frame_max: ClientFrameMax,
+) -> Result<ApiVersionsResponse, OutboundSaslError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+{
+    let mut body = BytesMut::new();
+    ApiVersionsRequest::default()
+        .encode(&mut body, 0)
+        .map_err(|e| OutboundSaslError::Codec(format!("ApiVersions encode: {e}")))?;
+    let resp_bytes = round_trip(
+        stream,
+        ApiKey(API_KEY_API_VERSIONS),
+        ApiVersion(0),
+        next_correlation_id(corr_id),
+        false,
+        &body,
+        SaslPolicy {
+            client_id,
+            frame_max,
+            authenticate_version: None,
+        },
+    )
+    .await?;
+    let mut cur: &[u8] = &resp_bytes;
+    ApiVersionsResponse::decode(&mut cur, 0)
+        .map_err(|e| unparsable_response(format!("ApiVersions decode: {e}")))
+}
+
+/// Send `SaslHandshake` at `version` with the wire name for `mechanism`, read
+/// the response, and fail if `error_code != 0`.
 ///
-/// Wire framing: `SaslHandshake v1` uses the non-flexible request header
-/// (v1, no trailing tagged-fields byte) and a non-flexible response
+/// Wire framing: `SaslHandshake` v0 and v1 use the non-flexible request
+/// header (v1, no trailing tagged-fields byte) and a non-flexible response
 /// header (v0, bare `correlation_id`).
 async fn send_sasl_handshake<S>(
     stream: &mut S,
     mechanism: SaslMechanism,
+    version: i16,
     corr_id: &mut i32,
     policy: SaslPolicy<'_>,
 ) -> Result<(), OutboundSaslError>
@@ -314,21 +407,20 @@ where
         ..Default::default()
     };
     let mut body = BytesMut::new();
-    req.encode(&mut body, 1)
+    req.encode(&mut body, version)
         .map_err(|e| OutboundSaslError::Codec(format!("SaslHandshake encode: {e}")))?;
     let resp_bytes = round_trip(
         stream,
         ApiKey(API_KEY_SASL_HANDSHAKE),
-        ApiVersion(1),
-        *corr_id,
+        ApiVersion(version),
+        next_correlation_id(corr_id),
         false,
         &body,
         policy,
     )
     .await?;
-    *corr_id += 1;
     let mut cur: &[u8] = &resp_bytes;
-    let resp = SaslHandshakeResponse::decode(&mut cur, 1)
+    let resp = SaslHandshakeResponse::decode(&mut cur, version)
         .map_err(|e| unparsable_response(format!("SaslHandshake decode: {e}")))?;
     handshake_result(mechanism, &resp)
 }
@@ -495,8 +587,13 @@ where
     }
 }
 
-/// Frame a `SaslAuthenticate v2` request carrying `auth_bytes`, send it,
-/// read the response, return the decoded `SaslAuthenticateResponse v2`.
+/// Send one SASL token and read the answer of the broker.
+///
+/// With a `SaslAuthenticate` version, the token goes in a `SaslAuthenticate`
+/// request at that version. Without one, the token goes as a size-prefixed
+/// frame with no Kafka header, and the answer is a size-prefixed token, as
+/// Kafka's `SaslClientAuthenticator.sendSaslClientToken` and `receiveToken`
+/// do. Such an answer counts as a response with no error.
 async fn send_sasl_authenticate<S>(
     stream: &mut S,
     auth_bytes: Vec<u8>,
@@ -506,28 +603,70 @@ async fn send_sasl_authenticate<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
 {
+    let Some(version) = policy.authenticate_version else {
+        return send_raw_token(stream, &auth_bytes, policy.frame_max).await;
+    };
     let req = SaslAuthenticateRequest {
         auth_bytes: bytes::Bytes::from(auth_bytes),
         ..Default::default()
     };
     let mut body = BytesMut::new();
-    req.encode(&mut body, 2)
+    req.encode(&mut body, version)
         .map_err(|e| OutboundSaslError::Codec(format!("SaslAuthenticate encode: {e}")))?;
     let resp_bytes = round_trip(
         stream,
         ApiKey(API_KEY_SASL_AUTHENTICATE),
-        ApiVersion(2),
-        *corr_id,
-        true,
+        ApiVersion(version),
+        next_correlation_id(corr_id),
+        version >= krabka_protocol::owned::sasl_authenticate_request::FLEXIBLE_MIN,
         &body,
         policy,
     )
     .await?;
-    *corr_id += 1;
     let mut cur: &[u8] = &resp_bytes;
-    let resp = SaslAuthenticateResponse::decode(&mut cur, 2)
+    let resp = SaslAuthenticateResponse::decode(&mut cur, version)
         .map_err(|e| unparsable_response(format!("SaslAuthenticate decode: {e}")))?;
     Ok(resp)
+}
+
+/// Send `token` as a size-prefixed frame and read the size-prefixed answer.
+async fn send_raw_token<S>(
+    stream: &mut S,
+    token: &[u8],
+    frame_max: ClientFrameMax,
+) -> Result<SaslAuthenticateResponse, OutboundSaslError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+{
+    if token.len() > frame_max.bytes() {
+        return Err(OutboundSaslError::Codec(format!(
+            "SASL token encoded {} bytes, maximum {}",
+            token.len(),
+            frame_max.bytes()
+        )));
+    }
+    stream
+        .write_u32(
+            u32::try_from(token.len())
+                .map_err(|_| OutboundSaslError::Codec("token size exceeds u32".into()))?,
+        )
+        .await?;
+    stream.write_all(token).await?;
+    stream.flush().await?;
+    let len = usize::try_from(stream.read_u32().await?)
+        .map_err(|_| OutboundSaslError::Codec("SASL token length does not fit usize".into()))?;
+    if len > frame_max.bytes() {
+        return Err(OutboundSaslError::Codec(format!(
+            "SASL token announced {len} bytes, maximum {}",
+            frame_max.bytes()
+        )));
+    }
+    let mut answer = vec![0_u8; len];
+    stream.read_exact(&mut answer).await?;
+    Ok(SaslAuthenticateResponse {
+        auth_bytes: bytes::Bytes::from(answer),
+        ..Default::default()
+    })
 }
 
 /// Send one framed request and return the response body bytes.
@@ -557,6 +696,7 @@ where
     let SaslPolicy {
         client_id,
         frame_max,
+        ..
     } = policy;
     let mut frame = BytesMut::with_capacity(16 + body.len());
     // RequestHeader: api_key + version + corr_id + client_id (i16 NULLABLE_STRING).
@@ -667,6 +807,44 @@ mod tests {
         req
     }
 
+    /// Answer the `ApiVersions` v0 request that starts the SASL exchange, and
+    /// list `SaslHandshake` v0-v1 and `SaslAuthenticate` v0-v2.
+    async fn answer_api_versions<S>(stream: &mut S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use krabka_protocol::owned::api_versions_response::ApiVersion as Advertised;
+
+        let mut body = BytesMut::new();
+        ApiVersionsResponse {
+            api_keys: vec![
+                Advertised {
+                    api_key: API_KEY_SASL_HANDSHAKE,
+                    min_version: 0,
+                    max_version: 1,
+                    ..Default::default()
+                },
+                Advertised {
+                    api_key: API_KEY_SASL_AUTHENTICATE,
+                    min_version: 0,
+                    max_version: 2,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+        .encode(&mut body, 0)
+        .unwrap();
+        let request = reply_frame(stream, &body, false).await;
+        assert_request_header(
+            &request,
+            ApiKey(API_KEY_API_VERSIONS),
+            ApiVersion(0),
+            MIN_RESERVED_CORRELATION_ID,
+            false,
+        );
+    }
+
     macro_rules! decode_sasl_authenticate_frame {
         ($req:expr, $corr_id:expr) => {{
             assert_request_header(
@@ -683,10 +861,154 @@ mod tests {
         }};
     }
 
+    /// One frame that the client sent in a SASL exchange.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Frame {
+        /// A Kafka request: API key, version and correlation id.
+        Request(i16, i16, i32),
+        /// A size-prefixed token with no Kafka header.
+        Token(Vec<u8>),
+    }
+
+    /// Kafka's `SaslClientAuthenticator` sends `ApiVersions` v0 first, then
+    /// `SaslHandshake` and `SaslAuthenticate` at the highest versions that the
+    /// broker lists. With no `SaslAuthenticate` entry the token goes with no
+    /// Kafka header. Each row gives the `(SaslHandshake, SaslAuthenticate)`
+    /// maxima that the broker lists.
+    #[tokio::test]
+    async fn plain_exchange_uses_the_sasl_versions_that_api_versions_lists() {
+        use krabka_protocol::owned::api_versions_response::ApiVersion as Advertised;
+
+        const C: i32 = MIN_RESERVED_CORRELATION_ID;
+        for (name, listed, expected) in [
+            (
+                "current broker",
+                (Some(1), Some(2)),
+                vec![
+                    Frame::Request(API_KEY_API_VERSIONS, 0, C),
+                    Frame::Request(API_KEY_SASL_HANDSHAKE, 1, C + 1),
+                    Frame::Request(API_KEY_SASL_AUTHENTICATE, 2, C + 2),
+                ],
+            ),
+            (
+                "SaslAuthenticate v1",
+                (Some(1), Some(1)),
+                vec![
+                    Frame::Request(API_KEY_API_VERSIONS, 0, C),
+                    Frame::Request(API_KEY_SASL_HANDSHAKE, 1, C + 1),
+                    Frame::Request(API_KEY_SASL_AUTHENTICATE, 1, C + 2),
+                ],
+            ),
+            (
+                "no SaslAuthenticate",
+                (Some(0), None),
+                vec![
+                    Frame::Request(API_KEY_API_VERSIONS, 0, C),
+                    Frame::Request(API_KEY_SASL_HANDSHAKE, 0, C + 1),
+                    Frame::Token(b"\0u\0p".to_vec()),
+                ],
+            ),
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(8192);
+            let server_task = tokio::spawn(async move {
+                let mut frames = Vec::new();
+                for _ in 0..3 {
+                    let len = server.read_u32().await.unwrap();
+                    let mut request = vec![0_u8; len as usize];
+                    server.read_exact(&mut request).await.unwrap();
+                    if frames.len() == 2 && listed.1.is_none() {
+                        frames.push(Frame::Token(request));
+                        server.write_u32(0).await.unwrap();
+                        continue;
+                    }
+                    let api_key = i16::from_be_bytes([request[0], request[1]]);
+                    let version = i16::from_be_bytes([request[2], request[3]]);
+                    let corr_id =
+                        i32::from_be_bytes([request[4], request[5], request[6], request[7]]);
+                    frames.push(Frame::Request(api_key, version, corr_id));
+                    let mut body = BytesMut::new();
+                    body.put_i32(corr_id);
+                    match api_key {
+                        API_KEY_API_VERSIONS => ApiVersionsResponse {
+                            api_keys: [
+                                (API_KEY_SASL_HANDSHAKE, listed.0),
+                                (API_KEY_SASL_AUTHENTICATE, listed.1),
+                            ]
+                            .into_iter()
+                            .filter_map(|(api_key, max)| {
+                                max.map(|max_version| Advertised {
+                                    api_key,
+                                    min_version: 0,
+                                    max_version,
+                                    ..Default::default()
+                                })
+                            })
+                            .collect(),
+                            ..Default::default()
+                        }
+                        .encode(&mut body, 0)
+                        .unwrap(),
+                        API_KEY_SASL_HANDSHAKE => SaslHandshakeResponse::default()
+                            .encode(&mut body, version)
+                            .unwrap(),
+                        _ => {
+                            if version >= 2 {
+                                body.put_u8(0);
+                            }
+                            SaslAuthenticateResponse::default()
+                                .encode(&mut body, version)
+                                .unwrap();
+                        }
+                    }
+                    server
+                        .write_u32(u32::try_from(body.len()).unwrap())
+                        .await
+                        .unwrap();
+                    server.write_all(&body).await.unwrap();
+                }
+                frames
+            });
+            let result = outbound_sasl(
+                &mut client,
+                &SaslCredentials::Plain {
+                    username: "u".into(),
+                    password: "p".into(),
+                },
+                "localhost",
+                TEST_CLIENT_ID,
+                ClientFrameMax::default(),
+            )
+            .await;
+            let frames = timeout(Duration::from_secs(1), server_task)
+                .await
+                .expect("server saw three frames")
+                .unwrap();
+            check!(result.is_ok(), "{name}: {result:?}");
+            check!(frames == expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn sasl_correlation_ids_stay_in_the_reserved_range() {
+        let mut corr_id = i32::MAX - 1;
+        let ids = (0..4)
+            .map(|_| next_correlation_id(&mut corr_id))
+            .collect::<Vec<_>>();
+        check!(
+            ids == vec![
+                i32::MAX - 1,
+                i32::MAX,
+                MIN_RESERVED_CORRELATION_ID,
+                MIN_RESERVED_CORRELATION_ID + 1
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn outbound_plain_completes() {
         let (mut client, mut server) = tokio::io::duplex(8192);
         let server_task = tokio::spawn(async move {
+            answer_api_versions(&mut server).await;
             // 1. SaslHandshake v1 → error_code 0 + empty mechanisms.
             let mut hs = BytesMut::new();
             SaslHandshakeResponse {
@@ -700,7 +1022,7 @@ mod tests {
                 &hs_req,
                 ApiKey(API_KEY_SASL_HANDSHAKE),
                 ApiVersion(1),
-                1,
+                MIN_RESERVED_CORRELATION_ID + 1,
                 false,
             );
             let mut hs_body = request_body(&hs_req, false);
@@ -717,7 +1039,8 @@ mod tests {
             .encode(&mut au, 2)
             .unwrap();
             let au_req = reply_frame(&mut server, &au, true).await;
-            let au_decoded = decode_sasl_authenticate_frame!(au_req, 2);
+            let au_decoded =
+                decode_sasl_authenticate_frame!(au_req, MIN_RESERVED_CORRELATION_ID + 2);
             assert_eq!(au_decoded.auth_bytes.as_ref(), b"\0u\0p");
         });
         let creds = SaslCredentials::Plain {
@@ -748,6 +1071,7 @@ mod tests {
             let expected = format!("n,,\x01auth=Bearer {token}\x01\x01").into_bytes();
             let (mut client, mut server) = tokio::io::duplex(8192);
             let server_task = tokio::spawn(async move {
+                answer_api_versions(&mut server).await;
                 let mut handshake = BytesMut::new();
                 SaslHandshakeResponse {
                     error_code: 0,
@@ -770,7 +1094,8 @@ mod tests {
                 .encode(&mut authenticate, 2)
                 .unwrap();
                 let request = reply_frame(&mut server, &authenticate, true).await;
-                let decoded = decode_sasl_authenticate_frame!(request, 2);
+                let decoded =
+                    decode_sasl_authenticate_frame!(request, MIN_RESERVED_CORRELATION_ID + 2);
                 check!(decoded.auth_bytes.as_ref() == expected);
             });
 
@@ -800,6 +1125,7 @@ mod tests {
         std::fs::write(&token_path, "invalid").unwrap();
         let (mut client, mut server) = tokio::io::duplex(8192);
         let server_task = tokio::spawn(async move {
+            answer_api_versions(&mut server).await;
             let mut handshake = BytesMut::new();
             SaslHandshakeResponse {
                 error_code: 0,
@@ -818,7 +1144,7 @@ mod tests {
             .encode(&mut challenge, 2)
             .unwrap();
             let first = reply_frame(&mut server, &challenge, true).await;
-            let _ = decode_sasl_authenticate_frame!(first, 2);
+            let _ = decode_sasl_authenticate_frame!(first, MIN_RESERVED_CORRELATION_ID + 2);
 
             let mut rejected = BytesMut::new();
             SaslAuthenticateResponse {
@@ -829,7 +1155,8 @@ mod tests {
             .encode(&mut rejected, 2)
             .unwrap();
             let final_request = reply_frame(&mut server, &rejected, true).await;
-            let decoded = decode_sasl_authenticate_frame!(final_request, 3);
+            let decoded =
+                decode_sasl_authenticate_frame!(final_request, MIN_RESERVED_CORRELATION_ID + 3);
             check!(decoded.auth_bytes.as_ref() == b"\x01");
         });
 
@@ -860,9 +1187,10 @@ mod tests {
     async fn send_sasl_authenticate_increments_correlation_id_and_sends_auth_bytes() {
         let (mut client, mut server) = tokio::io::duplex(8192);
         let server_task = tokio::spawn(async move {
-            for (expected_corr, expected_payload) in
-                [(7, b"first".as_ref()), (8, b"second".as_ref())]
-            {
+            for (expected_corr, expected_payload) in [
+                (MIN_RESERVED_CORRELATION_ID, b"first".as_ref()),
+                (MIN_RESERVED_CORRELATION_ID + 1, b"second".as_ref()),
+            ] {
                 let mut au = BytesMut::new();
                 SaslAuthenticateResponse {
                     error_code: 0,
@@ -876,6 +1204,8 @@ mod tests {
             }
         });
 
+        // An id below the reserved range starts the range, as Kafka's
+        // `nextCorrelationId` does.
         let mut corr_id = 7;
         send_sasl_authenticate(
             &mut client,
@@ -884,11 +1214,12 @@ mod tests {
             SaslPolicy {
                 client_id: TEST_CLIENT_ID,
                 frame_max: ClientFrameMax::default(),
+                authenticate_version: Some(2),
             },
         )
         .await
         .unwrap();
-        assert_eq!(corr_id, 8);
+        assert_eq!(corr_id, MIN_RESERVED_CORRELATION_ID + 1);
         send_sasl_authenticate(
             &mut client,
             b"second".to_vec(),
@@ -896,11 +1227,12 @@ mod tests {
             SaslPolicy {
                 client_id: TEST_CLIENT_ID,
                 frame_max: ClientFrameMax::default(),
+                authenticate_version: Some(2),
             },
         )
         .await
         .unwrap();
-        assert_eq!(corr_id, 9);
+        assert_eq!(corr_id, MIN_RESERVED_CORRELATION_ID + 2);
         timeout(Duration::from_secs(1), server_task)
             .await
             .expect("server observed both authenticate frames")
@@ -911,6 +1243,7 @@ mod tests {
     async fn outbound_scram_rejects_broker_error_on_first_round() {
         let (mut client, mut server) = tokio::io::duplex(8192);
         let server_task = tokio::spawn(async move {
+            answer_api_versions(&mut server).await;
             let mut hs = BytesMut::new();
             SaslHandshakeResponse {
                 error_code: 0,
@@ -923,7 +1256,7 @@ mod tests {
                 &hs_req,
                 ApiKey(API_KEY_SASL_HANDSHAKE),
                 ApiVersion(1),
-                1,
+                MIN_RESERVED_CORRELATION_ID + 1,
                 false,
             );
             let mut hs_body = request_body(&hs_req, false);
@@ -939,7 +1272,7 @@ mod tests {
             .encode(&mut au, 2)
             .unwrap();
             let au_req = reply_frame(&mut server, &au, true).await;
-            let _ = decode_sasl_authenticate_frame!(au_req, 2);
+            let _ = decode_sasl_authenticate_frame!(au_req, MIN_RESERVED_CORRELATION_ID + 2);
         });
 
         let creds = SaslCredentials::Scram {
@@ -970,6 +1303,7 @@ mod tests {
     async fn outbound_scram_rejects_broker_error_on_second_round() {
         let (mut client, mut server) = tokio::io::duplex(8192);
         let server_task = tokio::spawn(async move {
+            answer_api_versions(&mut server).await;
             let mut hs = BytesMut::new();
             SaslHandshakeResponse {
                 error_code: 0,
@@ -982,7 +1316,7 @@ mod tests {
                 &hs_req,
                 ApiKey(API_KEY_SASL_HANDSHAKE),
                 ApiVersion(1),
-                1,
+                MIN_RESERVED_CORRELATION_ID + 1,
                 false,
             );
 
@@ -992,7 +1326,8 @@ mod tests {
             let first_req_len = server.read_u32().await.unwrap();
             let mut first_req = vec![0u8; first_req_len as usize];
             server.read_exact(&mut first_req).await.unwrap();
-            let first_auth = decode_sasl_authenticate_frame!(first_req, 2);
+            let first_auth =
+                decode_sasl_authenticate_frame!(first_req, MIN_RESERVED_CORRELATION_ID + 2);
             let server_first = match scram_server.step(&first_auth.auth_bytes) {
                 StepResult::Continue(bytes, _next) => bytes,
                 other => panic!("server first SCRAM step must continue, got {other:?}"),
@@ -1006,7 +1341,13 @@ mod tests {
             }
             .encode(&mut first_resp, 2)
             .unwrap();
-            write_response_frame(&mut server, 2, &first_resp, true).await;
+            write_response_frame(
+                &mut server,
+                MIN_RESERVED_CORRELATION_ID + 2,
+                &first_resp,
+                true,
+            )
+            .await;
 
             let mut second_resp = BytesMut::new();
             SaslAuthenticateResponse {
@@ -1017,7 +1358,7 @@ mod tests {
             .encode(&mut second_resp, 2)
             .unwrap();
             let second_req = reply_frame(&mut server, &second_resp, true).await;
-            let _ = decode_sasl_authenticate_frame!(second_req, 3);
+            let _ = decode_sasl_authenticate_frame!(second_req, MIN_RESERVED_CORRELATION_ID + 3);
         });
 
         let creds = SaslCredentials::Scram {
@@ -1066,6 +1407,7 @@ mod tests {
             SaslPolicy {
                 client_id: TEST_CLIENT_ID,
                 frame_max: ClientFrameMax::default(),
+                authenticate_version: Some(2),
             },
         )
         .await
@@ -1100,6 +1442,7 @@ mod tests {
             SaslPolicy {
                 client_id: TEST_CLIENT_ID,
                 frame_max: ClientFrameMax::default(),
+                authenticate_version: Some(2),
             },
         )
         .await
@@ -1131,6 +1474,7 @@ mod tests {
             SaslPolicy {
                 client_id: TEST_CLIENT_ID,
                 frame_max: crate::ClientFrameMax::default(),
+                authenticate_version: Some(2),
             },
         )
         .await
@@ -1151,6 +1495,7 @@ mod tests {
             SaslPolicy {
                 client_id: "",
                 frame_max: crate::ClientFrameMax::try_from(krabka_units::bytes(10)).unwrap(),
+                authenticate_version: Some(2),
             },
         )
         .await
@@ -1181,6 +1526,7 @@ mod tests {
             SaslPolicy {
                 client_id: "",
                 frame_max: crate::ClientFrameMax::try_from(krabka_units::bytes(16)).unwrap(),
+                authenticate_version: Some(2),
             },
         )
         .await

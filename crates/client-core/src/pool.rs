@@ -20,6 +20,7 @@ use crate::{
     bootstrap::{bounded_lookup, filter_preferred_addresses},
     connection::{Connection, ConnectionOptions},
     error::ClientError,
+    version::FinalizedFeatures,
 };
 
 /// Information about a single Kafka broker, as reported by a `MetadataResponse`.
@@ -60,6 +61,9 @@ pub trait BrokerConnector: Send + Sync {
 
     /// The number of requests that wait for a response on `connection`.
     fn in_flight(connection: &Self::Conn) -> usize;
+
+    /// The finalized feature levels that the broker of `connection` sent.
+    fn finalized_features(connection: &Self::Conn) -> FinalizedFeatures;
 }
 
 /// Production [`BrokerConnector`]: opens a real [`Connection`] that honours
@@ -102,6 +106,10 @@ impl BrokerConnector for TcpConnector {
 
     fn in_flight(connection: &Connection) -> usize {
         connection.in_flight()
+    }
+
+    fn finalized_features(connection: &Connection) -> FinalizedFeatures {
+        connection.versions().finalized_features().clone()
     }
 }
 
@@ -266,6 +274,9 @@ pub struct BrokerPool<C: BrokerConnector = TcpConnector> {
     /// Set by a bootstrap reconnect: untargeted requests use the bootstrap
     /// connection until the pool learns brokers again.
     prefer_bootstrap: AtomicBool,
+    /// The finalized features with the highest epoch that a connection saw,
+    /// as Kafka's `ApiVersions.update` keeps them.
+    finalized_features: std::sync::Mutex<FinalizedFeatures>,
 }
 
 impl BrokerPool<TcpConnector> {
@@ -319,6 +330,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
             policy,
             connector,
             prefer_bootstrap: AtomicBool::new(false),
+            finalized_features: std::sync::Mutex::default(),
         }
     }
 
@@ -369,6 +381,15 @@ impl<C: BrokerConnector> BrokerPool<C> {
             .await?;
         let connection = Arc::new(connection);
         node.state().ready(Arc::clone(&connection));
+        let features = C::finalized_features(&connection);
+        let mut known = self
+            .finalized_features
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if features.epoch > known.epoch {
+            *known = features;
+        }
+        drop(known);
         Ok(connection)
     }
 
@@ -683,6 +704,17 @@ impl<C: BrokerConnector> BrokerPool<C> {
             .collect::<Vec<_>>();
         ids.sort_unstable();
         ids
+    }
+
+    /// The finalized feature levels with the highest epoch that any
+    /// connection of the pool received, as Kafka's `ApiVersions.getMaxFinalizedFeaturesInfo`
+    /// gives them.
+    #[must_use]
+    pub fn finalized_features(&self) -> FinalizedFeatures {
+        self.finalized_features
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Close every open connection in the pool. Consumes the pool.

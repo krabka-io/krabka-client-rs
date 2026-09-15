@@ -1008,64 +1008,135 @@ fn build_request_header(
     buf
 }
 
-/// Send an `ApiVersionsRequest` at version 0 and return the negotiated table.
+/// The client software name that `ApiVersions` v3 and later sends (KIP-511).
+pub const CLIENT_SOFTWARE_NAME: &str = "krabka-client-rs";
+
+/// The client software version that `ApiVersions` v3 and later sends.
+pub const CLIENT_SOFTWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Kafka's `UNSUPPORTED_VERSION` error code.
+const UNSUPPORTED_VERSION: i16 = 35;
+
+/// The `ApiVersions` request of a new connection at `version`, as Kafka's
+/// `ApiVersionsRequest.Builder` fills it.
+pub(crate) fn api_versions_request()
+-> krabka_protocol::owned::api_versions_request::ApiVersionsRequest {
+    krabka_protocol::owned::api_versions_request::ApiVersionsRequest {
+        client_software_name: CLIENT_SOFTWARE_NAME.to_owned(),
+        client_software_version: CLIENT_SOFTWARE_VERSION.to_owned(),
+        ..Default::default()
+    }
+}
+
+/// Decode an `ApiVersions` response body sent for a request at `version`.
+///
+/// Kafka's `ApiVersionsResponse.parse` falls back to version 0: a broker that
+/// does not support `version` answers with a version 0 `UNSUPPORTED_VERSION`
+/// response. A body that does not decode to its end at `version` is read as
+/// version 0.
+pub(crate) fn decode_api_versions_response(
+    body: &[u8],
+    version: i16,
+) -> Result<krabka_protocol::owned::api_versions_response::ApiVersionsResponse, ClientError> {
+    use krabka_protocol::{Decode as _, owned::api_versions_response::ApiVersionsResponse};
+
+    let decode = |version| {
+        let mut cursor = body;
+        let response = ApiVersionsResponse::decode(&mut cursor, version)?;
+        if cursor.is_empty() {
+            Ok(response)
+        } else {
+            Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "ApiVersions response v{version} has {} bytes after its end",
+                    cursor.len()
+                ),
+            )))
+        }
+    };
+    match decode(version) {
+        Err(_) if version != 0 => decode(0),
+        result => result,
+    }
+}
+
+/// The next `ApiVersions` version after a response at `version`, or `None`
+/// when the response ends the negotiation.
+///
+/// Kafka's `NetworkClient.handleApiVersionsResponse` retries an
+/// `UNSUPPORTED_VERSION` answer to a version above 0 at the highest
+/// `ApiVersions` version that the broker lists, or at version 0.
+pub(crate) fn api_versions_retry_version(
+    response: &krabka_protocol::owned::api_versions_response::ApiVersionsResponse,
+    version: i16,
+) -> Option<i16> {
+    use krabka_protocol::owned::api_versions_request::API_KEY;
+
+    (response.error_code == UNSUPPORTED_VERSION && version > 0).then(|| {
+        response
+            .api_keys
+            .iter()
+            .find(|key| key.api_key == API_KEY)
+            .map_or(0, |key| key.max_version)
+            .min(version - 1)
+            .max(0)
+    })
+}
+
+/// Send `ApiVersions` and return the broker's table.
 ///
 /// This is the bootstrap step inside `connect`. No version table exists yet,
-/// so this function cannot use `Connection::send`. Every broker supports
-/// version 0.
+/// so this function cannot use `Connection::send`. The first request uses the
+/// highest version of the client, as Kafka's `NetworkClient` does, and an
+/// `UNSUPPORTED_VERSION` answer makes it retry at the version that the broker
+/// lists.
 #[tracing::instrument(level = "debug", skip_all, err)]
 async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, ClientError> {
-    use krabka_protocol::{
-        Encode,
-        owned::{
-            api_versions_request::ApiVersionsRequest, api_versions_response::ApiVersionsResponse,
-        },
-    };
+    use krabka_protocol::{Encode, owned::api_versions_request::ApiVersionsRequest};
 
-    let req = ApiVersionsRequest::default();
-    let corr_id = conn.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+    let mut version = ApiVersionsRequest::MAX_VERSION;
+    loop {
+        let corr_id = conn.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
+        let mut frame = build_request_header(
+            ApiKey(ApiVersionsRequest::API_KEY),
+            ApiVersion(version),
+            corr_id,
+            &conn.inner.options.client_id,
+            version >= ApiVersionsRequest::FLEXIBLE_MIN,
+        );
+        api_versions_request().encode(&mut frame, version)?;
 
-    // v0 is non-flexible: header v1, no tagged-fields byte.
-    let mut frame = build_request_header(
-        ApiKey(ApiVersionsRequest::API_KEY),
-        ApiVersion(0),
-        corr_id,
-        &conn.inner.options.client_id,
-        false,
-    );
-    req.encode(&mut frame, 0)?;
+        let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
+        conn.inner.pending.insert(corr_id, tx);
+        conn.inner
+            .writer_tx
+            .send(DispatchItem {
+                bytes: frame.freeze(),
+            })
+            .await
+            .map_err(|_| ClientError::Disconnected)?;
 
-    let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
-    conn.inner.pending.insert(corr_id, tx);
-    conn.inner
-        .writer_tx
-        .send(DispatchItem {
-            bytes: frame.freeze(),
-        })
-        .await
-        .map_err(|_| ClientError::Disconnected)?;
+        let body_bytes = tokio::time::timeout(conn.inner.options.request_timeout.to_std(), rx)
+            .await
+            .map_err(|_| ClientError::Timeout(conn.inner.options.request_timeout))?
+            .map_err(|_| ClientError::Disconnected)??;
 
-    let body_bytes = tokio::time::timeout(conn.inner.options.request_timeout.to_std(), rx)
-        .await
-        .map_err(|_| ClientError::Timeout(conn.inner.options.request_timeout))?
-        .map_err(|_| ClientError::Disconnected)??;
-
-    // ResponseHeader v0: only correlation_id (already stripped by the reader).
-    // No tagged-fields byte — this holds for all ApiVersionsResponse versions,
-    // including flexible ones (the Kafka asymmetry documented in `send`).
-    let mut cursor: &[u8] = &body_bytes;
-    let resp = <ApiVersionsResponse as krabka_protocol::Decode>::decode(&mut cursor, 0)?;
-    if resp.error_code != 0 {
-        return Err(ClientError::Server {
-            error_code: resp.error_code,
-        });
+        // ResponseHeader v0: only correlation_id (already stripped by the
+        // reader), for every ApiVersions version (the Kafka asymmetry
+        // documented in `send`).
+        let response = decode_api_versions_response(&body_bytes, version)?;
+        if let Some(retry) = api_versions_retry_version(&response, version) {
+            version = retry;
+            continue;
+        }
+        if response.error_code != 0 {
+            return Err(ClientError::Server {
+                error_code: response.error_code,
+            });
+        }
+        return Ok(ApiVersionTable::from_response(&response));
     }
-
-    let entries = resp
-        .api_keys
-        .iter()
-        .map(|k| (k.api_key, k.min_version, k.max_version));
-    Ok(ApiVersionTable::from_entries(entries))
 }
 
 #[cfg(test)]
@@ -1162,7 +1233,18 @@ mod secured_tests {
         let server = tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
             // (body, flexible_response_header)
-            let replies: [(BytesMut, bool); 3] = [
+            let replies: [(BytesMut, bool); 4] = [
+                {
+                    // The ApiVersions v0 that starts the SASL exchange lists
+                    // the SASL APIs.
+                    let crate::mock::MockReply::Respond(body) = crate::mock::MockSaslAnswer::Accept
+                        .reply(krabka_protocol::owned::api_versions_request::API_KEY, 0)
+                        .unwrap()
+                    else {
+                        unreachable!("ApiVersions v0 has a reply")
+                    };
+                    (BytesMut::from(&body[..]), false)
+                },
                 {
                     let mut b = BytesMut::new();
                     SaslHandshakeResponse {
@@ -1629,6 +1711,179 @@ mod connection_policy_tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
         // The writer task drops the receiver when it ends.
         check!(connection.inner.writer_tx.is_closed());
+    }
+
+    /// How a scripted broker answers each `ApiVersions` version.
+    #[derive(Clone, Copy, Debug)]
+    enum Broker {
+        /// It supports `ApiVersions` up to this version, and lists it in an
+        /// `UNSUPPORTED_VERSION` answer, as Kafka 2.4 and later do.
+        ListsUpTo(i16),
+        /// It supports only version 0 and lists nothing in its
+        /// `UNSUPPORTED_VERSION` answer.
+        OnlyVersionZero,
+    }
+
+    /// Kafka's `NetworkClient` sends `ApiVersions` at its highest version and
+    /// retries an `UNSUPPORTED_VERSION` answer at the version that the broker
+    /// lists, or at version 0. A version 3 or later answer holds the finalized
+    /// features.
+    #[tokio::test]
+    async fn api_versions_negotiation_follows_the_broker_and_keeps_the_features() {
+        use krabka_protocol::{
+            Decode as _,
+            owned::{
+                api_versions_request::ApiVersionsRequest,
+                api_versions_response::{FinalizedFeatureKey, SupportedFeatureKey},
+            },
+        };
+
+        let features = |version: i16| {
+            if version >= 3 {
+                crate::FinalizedFeatures {
+                    epoch: 7,
+                    levels: std::collections::BTreeMap::from([(
+                        "transaction.version".to_owned(),
+                        2,
+                    )]),
+                }
+            } else {
+                crate::FinalizedFeatures::default()
+            }
+        };
+        let software = |version: i16| {
+            if version >= 3 {
+                (
+                    CLIENT_SOFTWARE_NAME.to_owned(),
+                    CLIENT_SOFTWARE_VERSION.to_owned(),
+                )
+            } else {
+                (String::new(), String::new())
+            }
+        };
+        for (name, broker, expected_versions, expected_features) in [
+            (
+                "a broker at version 5",
+                Broker::ListsUpTo(5),
+                vec![5],
+                features(5),
+            ),
+            (
+                "a broker at version 3",
+                Broker::ListsUpTo(3),
+                vec![5, 3],
+                features(3),
+            ),
+            (
+                "a broker at version 2",
+                Broker::ListsUpTo(2),
+                vec![5, 2],
+                features(2),
+            ),
+            (
+                "an old broker",
+                Broker::OnlyVersionZero,
+                vec![5, 0],
+                features(0),
+            ),
+        ] {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let script = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                loop {
+                    let Ok(len) = server.read_u32().await else {
+                        return seen;
+                    };
+                    let mut request = vec![0_u8; len as usize];
+                    server.read_exact(&mut request).await.unwrap();
+                    let version = i16::from_be_bytes([request[2], request[3]]);
+                    let client_id_len = usize::from(u16::from_be_bytes([request[8], request[9]]));
+                    let mut body = &request[10 + client_id_len + usize::from(version >= 3)..];
+                    let decoded = ApiVersionsRequest::decode(&mut body, version).unwrap();
+                    seen.push((
+                        version,
+                        (
+                            decoded.client_software_name,
+                            decoded.client_software_version,
+                        ),
+                    ));
+                    let max = match broker {
+                        Broker::ListsUpTo(max) => max,
+                        Broker::OnlyVersionZero => 0,
+                    };
+                    let (response, encoded_at) = if version > max {
+                        let api_keys = match broker {
+                            Broker::ListsUpTo(max) => vec![ApiVersion {
+                                api_key: ApiVersionsRequest::API_KEY,
+                                min_version: 0,
+                                max_version: max,
+                                ..Default::default()
+                            }],
+                            Broker::OnlyVersionZero => Vec::new(),
+                        };
+                        (
+                            ApiVersionsResponse {
+                                error_code: UNSUPPORTED_VERSION,
+                                api_keys,
+                                ..Default::default()
+                            },
+                            0,
+                        )
+                    } else {
+                        (
+                            ApiVersionsResponse {
+                                api_keys: vec![ApiVersion {
+                                    api_key: MetadataRequest::API_KEY,
+                                    min_version: 0,
+                                    max_version: 12,
+                                    ..Default::default()
+                                }],
+                                supported_features: vec![SupportedFeatureKey {
+                                    name: "transaction.version".into(),
+                                    min_version: 0,
+                                    max_version: 2,
+                                    ..Default::default()
+                                }],
+                                finalized_features_epoch: 7,
+                                finalized_features: vec![FinalizedFeatureKey {
+                                    name: "transaction.version".into(),
+                                    max_version_level: 2,
+                                    min_version_level: 2,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                            version,
+                        )
+                    };
+                    let mut frame = BytesMut::new();
+                    frame.put_slice(&request[4..8]);
+                    response.encode(&mut frame, encoded_at).unwrap();
+                    server
+                        .write_u32(u32::try_from(frame.len()).unwrap())
+                        .await
+                        .unwrap();
+                    server.write_all(&frame).await.unwrap();
+                }
+            });
+            let connection =
+                Connection::from_stream(Box::new(client), ConnectionOptions::default())
+                    .await
+                    .unwrap();
+            let observed_features = connection.versions().finalized_features().clone();
+            let metadata = connection.advertised_api_range(MetadataRequest::API_KEY);
+            connection.close();
+            let seen = script.await.unwrap();
+            check!(
+                seen == expected_versions
+                    .iter()
+                    .map(|version| (*version, software(*version)))
+                    .collect::<Vec<_>>(),
+                "{name}"
+            );
+            check!(observed_features == expected_features, "{name}");
+            check!(metadata == Some((0, 12)), "{name}");
+        }
     }
 
     #[test]
