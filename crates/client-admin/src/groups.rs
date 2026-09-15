@@ -38,8 +38,8 @@ use std::{
 
 use bytes::BufMut;
 use krabka_client_core::{
-    ClientError, Connection, ConnectionOptions, CoordinatorKeyType, build_find_coordinator,
-    coordinator_endpoint,
+    AuthenticationError, ClientError, Connection, ConnectionOptions, CoordinatorKeyType,
+    SaslAuthenticationError, build_find_coordinator, coordinator_endpoint,
 };
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
@@ -246,6 +246,13 @@ pub struct GroupListing {
 impl GroupListing {
     /// Whether the group is a classic group with no protocol type, as Kafka's
     /// `GroupListing.isSimpleConsumerGroup` decides.
+    ///
+    /// A group with no type (`None`, from `ListGroups` v4 or lower) gives
+    /// `false`, as in Kafka, where `type.filter(gt -> gt == CLASSIC)` is empty
+    /// for `Optional.empty()`. Such a broker lists only classic groups, so a
+    /// caller that wants Kafka's older `listConsumerGroups` answer
+    /// (`ConsumerGroupListing.isSimpleConsumerGroup`, which is
+    /// `protocolType.isEmpty()`) reads [`GroupListing::protocol_type`] alone.
     #[must_use]
     pub fn is_simple_consumer_group(&self) -> bool {
         self.group_type == Some(GroupType::Classic) && self.protocol_type.is_empty()
@@ -355,9 +362,14 @@ impl AdminClient {
     ///   other brokers stay in [`ListGroupsResult::valid`].
     /// - `COORDINATOR_LOAD_IN_PROGRESS` (14) and `COORDINATOR_NOT_AVAILABLE`
     ///   (15) make the call send `ListGroups` to that broker again. A failed
-    ///   connection or a lost connection also makes the call try again. The
-    ///   call stops when Kafka's default `default.api.timeout.ms` (60 s)
-    ///   elapses, and then reports the last error for the broker.
+    ///   connection or a lost connection also makes the call try again. A
+    ///   rejected TLS or SASL authentication does not. It is an error for that
+    ///   broker at once.
+    /// - Kafka's default `default.api.timeout.ms` (60 s) is the deadline of
+    ///   each broker. Each attempt on a broker (connection, TLS and SASL
+    ///   handshakes, and request) gets the time that remains. A broker that
+    ///   has not answered at the deadline gives `REQUEST_TIMED_OUT` (7), with
+    ///   the last error in the message.
     /// - A filter that the broker version does not support gives
     ///   `UNSUPPORTED_VERSION` (35) for that broker. `states_filter` needs
     ///   `ListGroups` v4 (KIP-518) and `types_filter` needs v5 (KIP-848).
@@ -429,7 +441,7 @@ impl AdminClient {
                     node_id: broker.node_id,
                     host: broker.host,
                     port: broker.port,
-                    error: list_groups_kafka_error(&error),
+                    error,
                 }),
             }
         }
@@ -672,9 +684,18 @@ fn list_groups_min_version(options: &ListGroupsOptions) -> i16 {
 }
 
 /// Sends `ListGroups` to one broker until it answers, as one Kafka
-/// `listGroups` node call does. `COORDINATOR_LOAD_IN_PROGRESS`,
-/// `COORDINATOR_NOT_AVAILABLE`, a failed connection and a lost connection
-/// retry until `retry.timeout` has elapsed since `start`.
+/// `listGroups` node call does.
+///
+/// `COORDINATOR_LOAD_IN_PROGRESS`, `COORDINATOR_NOT_AVAILABLE`, a failed
+/// connection and a lost connection make the call try again. A rejected
+/// authentication does not, because Kafka's `Call.fail` does not retry an
+/// `AuthenticationException`.
+///
+/// `retry.timeout` after `start` is the deadline of the call. Each attempt
+/// (the TCP connection, the TLS and SASL handshakes, and the `ListGroups`
+/// request) gets the time that remains. When the deadline passes, the call
+/// fails with `REQUEST_TIMED_OUT` (7), as Kafka's `Call.fail` gives a
+/// `TimeoutException` for a call past its deadline.
 async fn list_groups_on_broker(
     broker: &MetadataResponseBroker,
     options: ConnectionOptions,
@@ -682,32 +703,59 @@ async fn list_groups_on_broker(
     min_version: i16,
     start: tokio::time::Instant,
     retry: CoordinatorRetry,
-) -> Result<Vec<ListedGroup>, AdminError> {
+) -> Result<Vec<ListedGroup>, KafkaError> {
     let host_port = format_host_port(&broker.host, broker.port);
+    let deadline = start + retry.timeout;
     let mut backoff = retry.initial_backoff;
     let mut connection = None;
-    loop {
-        let last = match list_groups_attempt(
+    let mut attempts = 0_u32;
+    let mut last = None;
+    while tokio::time::Instant::now() < deadline {
+        attempts += 1;
+        let attempt = list_groups_attempt(
             &mut connection,
             &host_port,
             &options,
             request.clone(),
             min_version,
-        )
-        .await
-        {
-            RetryAction::Done(result) => return result,
-            RetryAction::SameCoordinator(last) | RetryAction::FindCoordinator(last) => last,
-        };
-        if start.elapsed() >= retry.timeout {
-            return last;
+        );
+        match tokio::time::timeout_at(deadline, attempt).await {
+            Ok(RetryAction::Done(result)) => {
+                return result.map_err(|error| list_groups_kafka_error(&error));
+            }
+            Ok(RetryAction::SameCoordinator(result) | RetryAction::FindCoordinator(result)) => {
+                match result {
+                    Ok(groups) => return Ok(groups),
+                    Err(error) => last = Some(error),
+                }
+            }
+            Err(_) => break,
         }
         tracing::debug!(
             node_id = broker.node_id,
             "ListGroups got a retriable error; retrying"
         );
-        tokio::time::sleep(backoff).await;
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + backoff)).await;
         backoff = backoff.saturating_mul(2).min(retry.max_backoff);
+    }
+    Err(list_groups_timeout(attempts, last.as_ref()))
+}
+
+/// The `REQUEST_TIMED_OUT` error of a `ListGroups` node call past its
+/// deadline. The message names the attempts and the last retriable error, as
+/// the `TimeoutException` of Kafka's `Call.handleTimeoutFailure` holds the
+/// attempt count and the cause.
+fn list_groups_timeout(attempts: u32, last: Option<&AdminError>) -> KafkaError {
+    const REQUEST_TIMED_OUT: i16 = 7;
+    let cause = last
+        .map(|error| format!("; last error: {error}"))
+        .unwrap_or_default();
+    KafkaError {
+        code: REQUEST_TIMED_OUT,
+        name: kafka_error_name(REQUEST_TIMED_OUT),
+        message: Some(format!(
+            "ListGroups timed out after {attempts} attempt(s){cause}"
+        )),
     }
 }
 
@@ -724,6 +772,9 @@ async fn list_groups_attempt(
         Some(current) => current,
         None => match AdminClient::connect_one(host_port, options.clone()).await {
             Ok(new) => connection.insert(new),
+            Err(error) if error.is_authentication_failure() => {
+                return RetryAction::Done(Err(error));
+            }
             Err(error) => return RetryAction::SameCoordinator(Err(error)),
         },
     };
@@ -757,11 +808,20 @@ async fn list_groups_attempt(
 
 /// The Kafka error code of a `ListGroups` failure on one broker, as Kafka's
 /// `Errors.forException` maps the exception class.
+///
+/// A rejected authentication maps as its Kafka exception class does:
+/// `UnsupportedSaslMechanismException` to 33, `IllegalSaslStateException` to
+/// 34, `SaslAuthenticationException` to 58, and `SslAuthenticationException`
+/// to 40, the code of its superclass `InvalidConfigurationException`.
 fn list_groups_kafka_error(error: &AdminError) -> KafkaError {
     const UNKNOWN_SERVER_ERROR: i16 = -1;
     const REQUEST_TIMED_OUT: i16 = 7;
     const NETWORK_EXCEPTION: i16 = 13;
+    const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
+    const ILLEGAL_SASL_STATE: i16 = 34;
     const UNSUPPORTED_VERSION: i16 = 35;
+    const INVALID_CONFIG: i16 = 40;
+    const SASL_AUTHENTICATION_FAILED: i16 = 58;
     let (code, message) = match error {
         AdminError::Broker { code, message, .. } => (*code, message.clone()),
         AdminError::Transport(ClientError::IncompatibleVersion { .. }) => {
@@ -773,6 +833,21 @@ fn list_groups_kafka_error(error: &AdminError) -> KafkaError {
         AdminError::Transport(
             ClientError::Connect { .. } | ClientError::Disconnected | ClientError::Io(_),
         ) => (NETWORK_EXCEPTION, Some(error.to_string())),
+        AdminError::Transport(ClientError::Authentication { source, .. }) => {
+            let code = match source {
+                AuthenticationError::Tls(_) => INVALID_CONFIG,
+                AuthenticationError::Sasl(SaslAuthenticationError::UnsupportedMechanism(_)) => {
+                    UNSUPPORTED_SASL_MECHANISM
+                }
+                AuthenticationError::Sasl(SaslAuthenticationError::IllegalState(_)) => {
+                    ILLEGAL_SASL_STATE
+                }
+                AuthenticationError::Sasl(SaslAuthenticationError::Failed(_)) => {
+                    SASL_AUTHENTICATION_FAILED
+                }
+            };
+            (code, Some(error.to_string()))
+        }
         _ => (UNKNOWN_SERVER_ERROR, Some(error.to_string())),
     };
     KafkaError {
@@ -986,7 +1061,11 @@ mod tests {
 
     use assert2::assert;
     use bytes::{Buf, BytesMut};
-    use krabka_client_core::{ClientError, MockBroker};
+    use krabka_client_core::{
+        AuthenticationError, ClientError, MockBroker, MockReply, MockSaslAnswer,
+        SaslAuthenticationError,
+        security::{ClientSecurity, SaslCredentials},
+    };
     use krabka_protocol::{
         Decode,
         owned::{
@@ -1002,6 +1081,7 @@ mod tests {
                 OffsetFetchResponseGroup, OffsetFetchResponsePartition,
                 OffsetFetchResponsePartitions, OffsetFetchResponseTopic, OffsetFetchResponseTopics,
             },
+            sasl_handshake_request,
         },
     };
 
@@ -1867,7 +1947,27 @@ mod tests {
         cluster: Arc<Mutex<Vec<std::net::SocketAddr>>>,
         requests: Arc<Mutex<Vec<(i16, ListGroupsRequest)>>>,
     ) -> MockBroker {
-        MockBroker::start(move |api_key, version, _, body| match api_key {
+        MockBroker::start_with_replies(move |api_key, version, _, body| {
+            MockSaslAnswer::Accept
+                .reply(api_key, version)
+                .unwrap_or_else(|| {
+                    list_groups_reply(&script, &cluster, &requests, api_key, version, body)
+                        .map_or(MockReply::Silent, MockReply::Respond)
+                })
+        })
+        .await
+    }
+
+    /// The reply of a `list_groups_broker` to one request other than SASL.
+    fn list_groups_reply(
+        script: &ListGroupsBroker,
+        cluster: &Mutex<Vec<std::net::SocketAddr>>,
+        requests: &Mutex<Vec<(i16, ListGroupsRequest)>>,
+        api_key: i16,
+        version: i16,
+        body: &[u8],
+    ) -> Option<Vec<u8>> {
+        match api_key {
             api_versions_request::API_KEY => Some(encode(
                 &ApiVersionsResponse {
                     api_keys: vec![
@@ -1942,8 +2042,7 @@ mod tests {
                 ))
             }
             _ => None,
-        })
-        .await
+        }
     }
 
     /// An expected broker failure: node id, error code and message.
@@ -1961,8 +2060,12 @@ mod tests {
         requests: [Vec<(i16, ListGroupsRequest)>; 3],
     }
 
-    const LONG: Duration = Duration::from_secs(5);
-    const NOW: Duration = Duration::ZERO;
+    /// The deadline of a case that ends before it.
+    const LONG: Duration = Duration::from_secs(10);
+    /// A deadline that ends before the first retry, which waits `BACKOFF`.
+    const SHORT: Duration = Duration::from_millis(500);
+    /// The wait between two `ListGroups` attempts on one broker.
+    const BACKOFF: Duration = Duration::from_secs(1);
 
     fn plain(version: i16) -> (i16, ListGroupsRequest) {
         (version, ListGroupsRequest::default())
@@ -2066,8 +2169,8 @@ mod tests {
                 &case.options,
                 CoordinatorRetry {
                     timeout: case.timeout,
-                    initial_backoff: Duration::from_millis(1),
-                    max_backoff: Duration::from_millis(1),
+                    initial_backoff: BACKOFF,
+                    max_backoff: BACKOFF,
                 },
             )
             .await
@@ -2110,7 +2213,8 @@ mod tests {
     /// Apache Kafka's `KafkaAdminClient.listGroups` sends `Metadata`, then
     /// `ListGroups` to every broker, and merges the answers: one listing per
     /// group id, and one error per failed broker. It retries 14 and 15 on the
-    /// broker until the timeout.
+    /// broker until the deadline, and then `Call.fail` gives a
+    /// `TimeoutException` (7) with the last error as its cause.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_groups_asks_every_broker_and_merges() {
         for case in [
@@ -2153,9 +2257,21 @@ mod tests {
                 name: "broker 2 answers coordinator not available until the timeout",
                 brokers: [groups(&["a"]), broker_error(15), groups(&["c"])],
                 options: ListGroupsOptions::default(),
-                timeout: NOW,
+                timeout: SHORT,
                 valid: vec![stable_listing("a"), stable_listing("c")],
-                errors: vec![(2, 15, None)],
+                errors: vec![(
+                    2,
+                    7,
+                    Some(format!(
+                        "ListGroups timed out after 1 attempt(s); last error: {}",
+                        AdminError::Broker {
+                            api: "ListGroups",
+                            code: 15,
+                            name: "COORDINATOR_NOT_AVAILABLE",
+                            message: None,
+                        }
+                    )),
+                )],
                 requests: [vec![plain(5)], vec![plain(5)], vec![plain(5)]],
             },
             ListGroupsCase {
@@ -2304,6 +2420,216 @@ mod tests {
             },
         ] {
             run_list_groups_case(case).await;
+        }
+    }
+
+    /// Broker 2 of a SASL cluster in
+    /// `list_groups_isolates_a_secured_broker_that_stalls_or_rejects`.
+    #[derive(Clone, Copy, Debug)]
+    enum SecuredBroker {
+        /// Accepts TCP and never answers the SASL exchange.
+        Stalls,
+        /// Answers `SaslAuthenticate` with `SASL_AUTHENTICATION_FAILED` (58).
+        RejectsAuthentication,
+    }
+
+    /// A started `SecuredBroker`. `connections` counts the TCP connections
+    /// that it accepts, or the `SaslHandshake` requests that it answers.
+    struct StartedSecuredBroker {
+        addr: std::net::SocketAddr,
+        connections: Arc<AtomicUsize>,
+        mock: Option<MockBroker>,
+        listener: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl SecuredBroker {
+        async fn start(self) -> StartedSecuredBroker {
+            let connections = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&connections);
+            match self {
+                Self::Stalls => {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("listener binds");
+                    let addr = listener.local_addr().expect("listener address");
+                    let task = tokio::spawn(async move {
+                        let mut open = Vec::new();
+                        while let Ok((stream, _)) = listener.accept().await {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            open.push(stream);
+                        }
+                    });
+                    StartedSecuredBroker {
+                        addr,
+                        connections,
+                        mock: None,
+                        listener: Some(task),
+                    }
+                }
+                Self::RejectsAuthentication => {
+                    let mock = MockBroker::start_with_replies(move |api_key, version, _, _| {
+                        if api_key == sasl_handshake_request::API_KEY {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                        }
+                        MockSaslAnswer::AuthenticateError(SASL_AUTHENTICATION_FAILED)
+                            .reply(api_key, version)
+                            .unwrap_or(MockReply::Silent)
+                    })
+                    .await;
+                    StartedSecuredBroker {
+                        addr: mock.addr,
+                        connections,
+                        mock: Some(mock),
+                        listener: None,
+                    }
+                }
+            }
+        }
+
+        /// The error code and message that `list_groups` reports for the
+        /// broker at `addr`.
+        fn expected_error(self, addr: std::net::SocketAddr) -> (i16, Option<String>) {
+            match self {
+                Self::Stalls => (
+                    7,
+                    Some("ListGroups timed out after 1 attempt(s)".to_owned()),
+                ),
+                Self::RejectsAuthentication => (
+                    SASL_AUTHENTICATION_FAILED,
+                    Some(
+                        AdminError::Transport(ClientError::Authentication {
+                            addr,
+                            source: AuthenticationError::Sasl(SaslAuthenticationError::Failed(
+                                "SaslAuthenticate(PLAIN) error_code=58 \
+                                 error_message=Some(\"rejected by mock broker\")"
+                                    .to_owned(),
+                            )),
+                        })
+                        .to_string(),
+                    ),
+                ),
+            }
+        }
+    }
+
+    impl StartedSecuredBroker {
+        fn stop(self) {
+            if let Some(mock) = self.mock {
+                mock.stop();
+            }
+            if let Some(listener) = self.listener {
+                listener.abort();
+            }
+        }
+    }
+
+    const SASL_AUTHENTICATION_FAILED: i16 = 58;
+
+    /// A broker that stalls during the SASL exchange, or that rejects
+    /// authentication, fails on its own. The groups of the other brokers stay
+    /// in the result.
+    ///
+    /// Kafka bounds each node call of `listGroups` by the call deadline
+    /// (`KafkaAdminClient` `timeoutCallsInFlight`, and `Call.fail` gives a
+    /// `TimeoutException`). Kafka fails a node call with the
+    /// `AuthenticationException` of the node and does not retry it
+    /// (`handleResponses`, `Call.fail`: the exception is not a
+    /// `RetriableException`). `ApiError.fromThrowable` maps
+    /// `SaslAuthenticationException` to 58.
+    ///
+    /// The test runs in real time. With paused time, Tokio moves the clock
+    /// forward while loopback I/O is in flight, and the healthy brokers time
+    /// out too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_groups_isolates_a_secured_broker_that_stalls_or_rejects() {
+        const RETRY: CoordinatorRetry = CoordinatorRetry {
+            timeout: Duration::from_secs(2),
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(100),
+        };
+        for broker_2 in [SecuredBroker::Stalls, SecuredBroker::RejectsAuthentication] {
+            let cluster = Arc::new(Mutex::new(Vec::new()));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let broker_1 =
+                list_groups_broker(groups(&["a"]), Arc::clone(&cluster), Arc::clone(&requests))
+                    .await;
+            let broker_2_started = broker_2.start().await;
+            let broker_3 =
+                list_groups_broker(groups(&["c"]), Arc::clone(&cluster), Arc::clone(&requests))
+                    .await;
+            let broker_2_addr = broker_2_started.addr;
+            *cluster.lock().expect("cluster lock") =
+                vec![broker_1.addr, broker_2_addr, broker_3.addr];
+            let admin = AdminClient::connect_secured(
+                &[broker_1.addr.to_string()],
+                Some(ClientSecurity {
+                    protocol: krabka_security::ListenerProtocol::SaslPlaintext,
+                    tls: None,
+                    sasl: Some(SaslCredentials::Plain {
+                        username: "alice".into(),
+                        password: "secret".into(),
+                    }),
+                    sasl_host: None,
+                }),
+            )
+            .await
+            .expect("admin connects");
+
+            let outcome = tokio::time::timeout(
+                RETRY.timeout * 5,
+                admin.list_groups_with_retry(&ListGroupsOptions::default(), RETRY),
+            )
+            .await
+            .map(|result| result.expect("list_groups succeeds"));
+            let observed = (outcome, broker_2_started.connections.load(Ordering::SeqCst));
+
+            let (code, message) = broker_2.expected_error(broker_2_addr);
+            let expected = (
+                Ok(ListGroupsResult {
+                    valid: vec![stable_listing("a"), stable_listing("c")],
+                    errors: vec![ListGroupsError {
+                        node_id: 2,
+                        host: broker_2_addr.ip().to_string(),
+                        port: i32::from(broker_2_addr.port()),
+                        error: KafkaError {
+                            code,
+                            name: kafka_error_name(code),
+                            message,
+                        },
+                    }],
+                }),
+                1,
+            );
+            broker_1.stop();
+            broker_2_started.stop();
+            broker_3.stop();
+            assert!(observed == expected, "case {broker_2:?}");
+        }
+    }
+
+    /// Kafka's `GroupListing.isSimpleConsumerGroup` is
+    /// `type.filter(gt -> gt == GroupType.CLASSIC).isPresent() && protocol.isEmpty()`.
+    /// A listing with no type is not a simple consumer group.
+    #[test]
+    fn is_simple_consumer_group_matches_kafka() {
+        for (group_type, protocol_type, expected) in [
+            (Some(GroupType::Classic), "", true),
+            (Some(GroupType::Classic), "consumer", false),
+            (Some(GroupType::Consumer), "", false),
+            (Some(GroupType::Unknown), "", false),
+            (None, "", false),
+            (None, "consumer", false),
+        ] {
+            let listing = GroupListing {
+                group_id: "g".into(),
+                group_type,
+                protocol_type: protocol_type.into(),
+                group_state: None,
+            };
+            assert!(
+                listing.is_simple_consumer_group() == expected,
+                "type {group_type:?}, protocol type {protocol_type:?}"
+            );
         }
     }
 
