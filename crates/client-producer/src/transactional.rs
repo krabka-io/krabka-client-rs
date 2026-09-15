@@ -976,6 +976,11 @@ mod tests {
         /// The `AddPartitionsToTxn` version range that the mock advertises.
         /// A Kafka broker advertises 0 to 5.
         add_partitions_range: Option<(i16, i16)>,
+        /// Build the producer with `transaction_two_phase_commit_enable`. The
+        /// mock then advertises `InitProducerId` v6.
+        two_phase_commit: bool,
+        /// The linger of the producer. Zero when `None`.
+        linger: Option<Duration>,
     }
 
     type SharedCoordinator = Arc<std::sync::Mutex<Coordinator>>;
@@ -1028,11 +1033,14 @@ mod tests {
         let handler_port = Arc::clone(&port_cell);
         let shared = Arc::new(std::sync::Mutex::new(coordinator));
         let handler_shared = Arc::clone(&shared);
-        let add_partitions_range = shared
-            .lock()
-            .expect("scripted coordinator")
-            .add_partitions_range
-            .unwrap_or((0, 5));
+        let (add_partitions_range, two_phase_commit, linger) = {
+            let coordinator = shared.lock().expect("scripted coordinator");
+            (
+                coordinator.add_partitions_range.unwrap_or((0, 5)),
+                coordinator.two_phase_commit,
+                coordinator.linger.unwrap_or(Duration::ZERO),
+            )
+        };
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
             if api_key == api_versions_request::API_KEY {
                 return Some(encode_v0(&ApiVersionsResponse {
@@ -1053,6 +1061,12 @@ mod tests {
                             api_key: produce_request::API_KEY,
                             min_version: 3,
                             max_version: 13,
+                            ..Default::default()
+                        },
+                        ApiVersion {
+                            api_key: init_producer_id_request::API_KEY,
+                            min_version: 0,
+                            max_version: if two_phase_commit { 6 } else { 0 },
                             ..Default::default()
                         },
                     ],
@@ -1154,12 +1168,19 @@ mod tests {
                 if is_transactional_init(body, version) {
                     coordinator.init_producer_id_requests += 1;
                 }
-                return Some(encode_v0(&InitProducerIdResponse {
+                let mut buf = BytesMut::new();
+                if version >= init_producer_id_response::FLEXIBLE_MIN {
+                    buf.extend_from_slice(&[0]);
+                }
+                InitProducerIdResponse {
                     error_code: 0,
                     producer_id: 7,
                     producer_epoch: 3,
                     ..Default::default()
-                }));
+                }
+                .encode(&mut buf, version)
+                .expect("encode InitProducerId");
+                return Some(buf.to_vec());
             }
             if api_key == end_txn_request::API_KEY {
                 return match coordinator.end_txn.next() {
@@ -1205,6 +1226,8 @@ mod tests {
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
             .transactional_id("test-txn")
+            .transaction_two_phase_commit_enable(two_phase_commit)
+            .linger(linger)
             .request_timeout(Duration::from_millis(100))
             .retry_backoff(Duration::from_millis(1))
             .init_retry_timeout(Duration::from_millis(1500))
@@ -2110,6 +2133,59 @@ mod tests {
             assert2::assert!(actual == expected, "{name}");
             mock.stop();
         }
+    }
+
+    /// What `prepare_transaction` gave after a batch failed during its flush.
+    #[derive(Debug, PartialEq, Eq)]
+    struct PrepareAfterFailedFlush {
+        record: TxnResult,
+        prepare: TxnResult,
+        state: TxnState,
+    }
+
+    /// Kafka's `KafkaProducer.prepareTransaction` flushes, and then
+    /// `TransactionManager.prepareTransaction` calls `maybeFailWithError`. A
+    /// batch that fails during the flush therefore stops the prepare.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepare_fails_when_a_batch_fails_during_its_flush() {
+        let (mock, producer, _coordinator) = scripted_producer(Coordinator {
+            // 42 is INVALID_REQUEST, which Kafka does not retry.
+            produce: Script::new(&[Reply::Code(42)], Reply::Code(0)),
+            two_phase_commit: true,
+            // The record stays in the accumulator until the prepare flushes.
+            linger: Some(Duration::from_secs(60)),
+            ..Coordinator::default()
+        })
+        .await;
+        let transaction = producer
+            .begin_transaction()
+            .await
+            .expect("begin transaction");
+        let receiver = producer
+            .send(ProducerRecord {
+                topic: "topic".to_owned(),
+                partition: Some(0),
+                value: Some(bytes::Bytes::from_static(b"v")),
+                ..Default::default()
+            })
+            .await;
+        let prepare = TxnResult::from(transaction.prepare().await.map(drop));
+        let record = TxnResult::from(receiver.await.expect("the record is resolved").map(drop));
+        let actual = PrepareAfterFailedFlush {
+            record,
+            prepare,
+            state: *producer.txn_state.lock().await,
+        };
+        drop(transaction);
+        mock.stop();
+        assert2::assert!(
+            actual
+                == PrepareAfterFailedFlush {
+                    record: TxnResult::Server(42),
+                    prepare: TxnResult::Server(42),
+                    state: TxnState::InTransaction,
+                }
+        );
     }
 
     /// The requests that a scripted coordinator got.

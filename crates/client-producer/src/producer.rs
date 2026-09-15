@@ -585,9 +585,7 @@ impl Producer {
                 "prepare_transaction requires transaction_two_phase_commit_enable=true",
             ));
         }
-        // Kafka's `TransactionManager.prepareTransaction` calls
-        // `maybeFailWithError`, which throws in both error states.
-        if let Some(error) = self.transaction_error_state() {
+        if let Some(error) = self.fatal_error_state() {
             return Err(error);
         }
         if self.transaction_recovery_required() {
@@ -605,6 +603,14 @@ impl Producer {
         }
 
         if let Err(error) = self.flush().await {
+            *self.txn_state.lock().await = TxnState::InTransaction;
+            return Err(error);
+        }
+        // Kafka's `KafkaProducer.prepareTransaction` flushes first, and then
+        // `TransactionManager.prepareTransaction` calls `maybeFailWithError`,
+        // which throws in both error states. A batch that failed during the
+        // flush has set the error by now.
+        if let Some(error) = self.transaction_error_state() {
             *self.txn_state.lock().await = TxnState::InTransaction;
             return Err(error);
         }

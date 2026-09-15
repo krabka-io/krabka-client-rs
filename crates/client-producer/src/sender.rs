@@ -1395,6 +1395,7 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
                     terminal_fail_batch(cfg, pb, ProducerError::Server(code));
                 }
                 BatchVerdict::Fatal(code) => {
+                    record_transaction_fatal_error(cfg, &pb, code);
                     fail_batch(pb.records, fatal_error(code));
                     finish_in_flight(cfg);
                 }
@@ -1470,6 +1471,7 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
             // processed (their in-flight slots are counted, so they must be
             // released), then fence the producer and stop sending.
             BatchVerdict::Fatal(code) => {
+                record_transaction_fatal_error(cfg, &pb, code);
                 fail_batch(pb.records, fatal_error(code));
                 finish_in_flight(cfg);
                 fenced = Some(Vec::new());
@@ -1549,6 +1551,25 @@ impl PipelineState {
             .and_modify(|offset| *offset = (*offset).max(last_offset))
             .or_insert(last_offset);
     }
+}
+
+/// Move the transaction to the fatal error state when a batch of it failed with
+/// the fatal `code`.
+///
+/// Kafka's `Sender.failBatch` calls `TransactionManager.handleFailedBatch`,
+/// and `maybeTransitionToErrorState` makes `CLUSTER_AUTHORIZATION_FAILED`,
+/// `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, `PRODUCER_FENCED`,
+/// `UNSUPPORTED_VERSION` and `INVALID_PRODUCER_ID_MAPPING` fatal
+/// (`transitionToFatalError`). Every later transactional operation then fails.
+fn record_transaction_fatal_error(cfg: &SenderConfig, pb: &PreparedBatch, code: i16) {
+    if BatchMode::of(&pb.record_batch) != BatchMode::Transactional {
+        return;
+    }
+    cfg.txn_error.set_fatal(if code == codes::PRODUCER_FENCED {
+        FatalError::Fenced
+    } else {
+        FatalError::Server(code)
+    });
 }
 
 /// The error for the records of a batch that failed with a fatal code.
@@ -5521,6 +5542,81 @@ mod harness {
             .expect("the sender keeps accepting sends after the abortable error");
         assert2::assert!(metadata.partition == 1);
         shutdown(h).await;
+    }
+
+    /// A transactional batch that fails with a fatal code moves the
+    /// transaction to the fatal error state, as Kafka's
+    /// `TransactionManager.maybeTransitionToErrorState` does. An idempotent
+    /// batch leaves the transaction error slot alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fatal_transactional_batch_sets_the_fatal_error() {
+        /// What the failed record gave, and the stored transaction errors.
+        #[derive(Debug, PartialEq, Eq)]
+        struct FatalBatch {
+            record: String,
+            fatal: Option<FatalError>,
+            abortable: Option<AbortableError>,
+        }
+        let cases = [
+            (
+                "transactional id authorization",
+                BatchMode::Transactional,
+                53,
+                FatalBatch {
+                    record: "broker error_code 53".to_owned(),
+                    fatal: Some(FatalError::Server(53)),
+                    abortable: None,
+                },
+            ),
+            (
+                "producer fenced",
+                BatchMode::Transactional,
+                90,
+                FatalBatch {
+                    record: "fenced by newer producer instance".to_owned(),
+                    fatal: Some(FatalError::Fenced),
+                    abortable: None,
+                },
+            ),
+            (
+                "unsupported version",
+                BatchMode::Transactional,
+                35,
+                FatalBatch {
+                    record: "broker error_code 35".to_owned(),
+                    fatal: Some(FatalError::Server(35)),
+                    abortable: None,
+                },
+            ),
+            (
+                "idempotent batch",
+                BatchMode::Idempotent,
+                53,
+                FatalBatch {
+                    record: "broker error_code 53".to_owned(),
+                    fatal: None,
+                    abortable: None,
+                },
+            ),
+        ];
+        for (name, mode, code, expected) in cases {
+            let transport = MockTransport::new(Duration::ZERO);
+            transport.inject_code_once(0, code);
+            let h = spawn_sender_full(transport, 1, millis(1), 0, secs(30), Acks::All, mode);
+            let ack = produce_burst(&h, "t", 0, 1).await.pop().expect("ack");
+            let record = tokio::time::timeout(Duration::from_secs(1), ack)
+                .await
+                .expect("ack resolves")
+                .expect("sender remains")
+                .map_or_else(|error| error.to_string(), |_| "acked".to_owned());
+            let actual = FatalBatch {
+                record,
+                fatal: h.txn_error.fatal(),
+                abortable: h.txn_error.abortable(),
+            };
+            shutdown(h).await;
+            assert2::assert!(actual == expected, "{name}");
+        }
     }
 
     /// The same rule for a batch that reached the delivery timeout with no
