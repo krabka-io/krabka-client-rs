@@ -56,7 +56,7 @@ use krabka_protocol::{
 
 use crate::{
     AdminClient, AdminError, KafkaError, format_host_port, kafka_error_if, kafka_error_name,
-    retry::{KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, retry_coordinator_call},
+    retry::{CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy},
     send_connection_at_least,
 };
 
@@ -353,11 +353,15 @@ impl AdminClient {
         offsets: &BTreeMap<(String, i32), i64>,
         retry: RetryPolicy,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        retry_coordinator_call(retry, async |find_coordinator| {
-            self.offset_commit_attempt(group, offsets, find_coordinator)
-                .await
-        })
-        .await
+        let mut retry = CoordinatorRetry::new(retry);
+        loop {
+            let action = self
+                .offset_commit_attempt(group, offsets, retry.find_coordinator())
+                .await;
+            if let Some(result) = retry.next(action).await {
+                return result;
+            }
+        }
     }
 
     /// One attempt of `alter_consumer_group_offsets`. When `find_coordinator`
@@ -567,10 +571,15 @@ impl AdminClient {
         group: &str,
         retry: RetryPolicy,
     ) -> Result<BTreeMap<(String, i32), i64>, AdminError> {
-        retry_coordinator_call(retry, async |find_coordinator| {
-            self.offset_fetch_attempt(group, find_coordinator).await
-        })
-        .await
+        let mut retry = CoordinatorRetry::new(retry);
+        loop {
+            let action = self
+                .offset_fetch_attempt(group, retry.find_coordinator())
+                .await;
+            if let Some(result) = retry.next(action).await {
+                return result;
+            }
+        }
     }
 
     /// One attempt of `list_consumer_group_offsets`. When `find_coordinator`

@@ -16,7 +16,7 @@ use krabka_units::{Time, convert::TimeExt as _};
 
 use crate::{
     AdminClient, AdminError, kafka_error_name,
-    retry::{KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, retry_coordinator_call},
+    retry::{CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy},
 };
 
 /// `COORDINATOR_LOAD_IN_PROGRESS`: the coordinator is loading its state.
@@ -294,24 +294,41 @@ impl AdminClient {
         retry: RetryPolicy,
     ) -> Result<(), AdminError> {
         let mut coordinator = None;
-        retry_coordinator_call(retry, async |find_coordinator| {
-            let connection = match self
-                .transaction_coordinator(transactional_id, &mut coordinator, find_coordinator)
-                .await
-            {
-                Ok(connection) => connection,
-                Err(action) => return action,
-            };
-            let request = force_terminate_request(
-                transactional_id,
-                self.options.request_timeout.millis_i32(),
-            );
-            match connection.send(request).await {
-                Ok(response) => fence_retry_action(response.error_code),
-                Err(error) => coordinator_transport_action(error.into()),
+        let mut retry = CoordinatorRetry::new(retry);
+        loop {
+            let action = self
+                .force_terminate_attempt(
+                    transactional_id,
+                    &mut coordinator,
+                    retry.find_coordinator(),
+                )
+                .await;
+            if let Some(result) = retry.next(action).await {
+                return result;
             }
-        })
-        .await
+        }
+    }
+
+    /// One attempt of `force_terminate_transaction`.
+    async fn force_terminate_attempt(
+        &self,
+        transactional_id: &str,
+        coordinator: &mut Option<Connection>,
+        find_coordinator: bool,
+    ) -> RetryAction<()> {
+        let connection = match self
+            .transaction_coordinator(transactional_id, coordinator, find_coordinator)
+            .await
+        {
+            Ok(connection) => connection,
+            Err(action) => return action,
+        };
+        let request =
+            force_terminate_request(transactional_id, self.options.request_timeout.millis_i32());
+        match connection.send(request).await {
+            Ok(response) => fence_retry_action(response.error_code),
+            Err(error) => coordinator_transport_action(error.into()),
+        }
     }
 
     /// Reads the transaction coordinator's current state for one transactional
@@ -365,25 +382,44 @@ impl AdminClient {
         retry: RetryPolicy,
     ) -> Result<TransactionDescription, AdminError> {
         let mut coordinator = None;
-        retry_coordinator_call(retry, async |find_coordinator| {
-            let connection = match self
-                .transaction_coordinator(transactional_id, &mut coordinator, find_coordinator)
-                .await
-            {
-                Ok(connection) => connection,
-                Err(action) => return action,
-            };
-            match connection
-                .send(describe_transactions_request(transactional_id))
-                .await
-            {
-                Ok(response) => {
-                    describe_retry_action(transaction_description(transactional_id, response))
-                }
-                Err(error) => coordinator_transport_action(error.into()),
+        let mut retry = CoordinatorRetry::new(retry);
+        loop {
+            let action = self
+                .describe_transaction_attempt(
+                    transactional_id,
+                    &mut coordinator,
+                    retry.find_coordinator(),
+                )
+                .await;
+            if let Some(result) = retry.next(action).await {
+                return result;
             }
-        })
-        .await
+        }
+    }
+
+    /// One attempt of `describe_transaction`.
+    async fn describe_transaction_attempt(
+        &self,
+        transactional_id: &str,
+        coordinator: &mut Option<Connection>,
+        find_coordinator: bool,
+    ) -> RetryAction<TransactionDescription> {
+        let connection = match self
+            .transaction_coordinator(transactional_id, coordinator, find_coordinator)
+            .await
+        {
+            Ok(connection) => connection,
+            Err(action) => return action,
+        };
+        match connection
+            .send(describe_transactions_request(transactional_id))
+            .await
+        {
+            Ok(response) => {
+                describe_retry_action(transaction_description(transactional_id, response))
+            }
+            Err(error) => coordinator_transport_action(error.into()),
+        }
     }
 
     /// Returns the connection to the transaction coordinator of
@@ -1099,5 +1135,20 @@ mod tests {
                 "case {name}"
             );
         }
+    }
+
+    fn assert_send<T: Send>(_: T) {}
+
+    /// A caller can spawn every retrying admin call on a multi-thread
+    /// runtime, so each future must be `Send`.
+    #[test]
+    fn retrying_admin_call_futures_are_send() {
+        let _ = |admin: &mut AdminClient,
+                 offsets: &std::collections::BTreeMap<(String, i32), i64>| {
+            assert_send(admin.alter_consumer_group_offsets("workers", offsets));
+            assert_send(admin.list_consumer_group_offsets("workers"));
+            assert_send(admin.describe_transaction("payments"));
+            assert_send(admin.force_terminate_transaction("payments"));
+        };
     }
 }

@@ -128,37 +128,62 @@ pub(crate) enum RetryAction<T> {
     FindCoordinator(Result<T, AdminError>),
 }
 
-/// Run a coordinator call until an attempt is final or the deadline passes.
+/// The retry state of one coordinator call.
 ///
-/// `attempt` gets `true` when it must find the coordinator first. The first
-/// attempt always finds the coordinator. After a retriable result the call
-/// waits for the backoff, as Kafka's `AdminApiDriver` does, and returns the
-/// last result when the deadline has passed.
-pub(crate) async fn retry_coordinator_call<T>(
-    policy: RetryPolicy,
-    mut attempt: impl AsyncFnMut(bool) -> RetryAction<T>,
-) -> Result<T, AdminError> {
-    let mut deadline = policy.start();
-    let mut find_coordinator = true;
-    loop {
-        let (last, find_next) = match attempt(find_coordinator).await {
-            RetryAction::Done(result) => return result,
+/// The caller runs one attempt at a time and hands its [`RetryAction`] to
+/// [`CoordinatorRetry::next`]. The first attempt always finds the coordinator.
+/// After a retriable result the call waits for the backoff, as Kafka's
+/// `AdminApiDriver` does, and returns the last result when the deadline has
+/// passed.
+///
+/// The loop lives in the caller, not in a closure, so that the future of the
+/// call stays `Send`.
+#[derive(Debug)]
+pub(crate) struct CoordinatorRetry {
+    deadline: RetryDeadline,
+    find_coordinator: bool,
+}
+
+impl CoordinatorRetry {
+    /// The retry state of a call that starts now.
+    pub(crate) fn new(policy: RetryPolicy) -> Self {
+        Self {
+            deadline: policy.start(),
+            find_coordinator: true,
+        }
+    }
+
+    /// Whether the next attempt must find the coordinator first.
+    pub(crate) const fn find_coordinator(&self) -> bool {
+        self.find_coordinator
+    }
+
+    /// Handle the result of one attempt. Returns the result of the call when
+    /// the attempt is final or the deadline has passed, and `None` after the
+    /// backoff when the caller must run another attempt.
+    pub(crate) async fn next<T>(
+        &mut self,
+        action: RetryAction<T>,
+    ) -> Option<Result<T, AdminError>> {
+        let (last, find_next) = match action {
+            RetryAction::Done(result) => return Some(result),
             RetryAction::SameCoordinator(last) => (last, false),
             RetryAction::FindCoordinator(last) => (last, true),
         };
-        if deadline.expired() {
-            return last;
+        if self.deadline.expired() {
+            return Some(last);
         }
         tracing::debug!(
             find_coordinator = find_next,
-            retries = deadline.retries(),
+            retries = self.deadline.retries(),
             "admin coordinator call got a retriable error; retrying"
         );
-        find_coordinator = find_next;
-        deadline.backoff().await;
-        if deadline.expired() {
-            return last;
+        self.find_coordinator = find_next;
+        self.deadline.backoff().await;
+        if self.deadline.expired() {
+            return Some(last);
         }
+        None
     }
 }
 
