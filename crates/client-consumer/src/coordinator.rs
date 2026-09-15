@@ -1517,13 +1517,12 @@ async fn refind_after(state: &CoordinatorState, ctx: &str) {
     err
 )]
 async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, ConsumerError> {
-    let owned: Vec<(String, i32)> = state.assigned.lock().await.clone();
     let JoinOutcome {
+        owned,
         assignment: new_assignment,
         generation: new_generation,
         topic_partitions,
-        ..
-    } = join_and_sync(state, &owned).await?;
+    } = join_and_sync(state).await?;
 
     let old_set: HashSet<(String, i32)> = owned.iter().cloned().collect();
     let new_set: HashSet<(String, i32)> = new_assignment.iter().cloned().collect();
@@ -1636,13 +1635,12 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                 // `ConsumerCoordinator.onJoinComplete` requests it with this
                 // reason.
                 state.rejoin_reason = "need to revoke partitions and re-join".into();
-                let owned_after_revoke: Vec<(String, i32)> = state.assigned.lock().await.clone();
                 let JoinOutcome {
+                    owned: owned_after_revoke,
                     assignment: assignment2,
                     generation: gen2,
                     topic_partitions: topic_partitions2,
-                    ..
-                } = join_and_sync(state, &owned_after_revoke).await?;
+                } = join_and_sync(state).await?;
                 let owned_after_revoke_set: HashSet<(String, i32)> =
                     owned_after_revoke.iter().cloned().collect();
                 let added2: Vec<(String, i32)> = assignment2
@@ -2006,6 +2004,9 @@ async fn commit_turn(
 }
 
 struct JoinOutcome {
+    /// The partitions that the member owned when it sent the `JoinGroup`,
+    /// after the join preparation.
+    owned: Vec<(String, i32)>,
     assignment: Vec<(String, i32)>,
     generation: i32,
     topic_partitions: HashMap<String, i32>,
@@ -2148,12 +2149,12 @@ async fn perform_join(
     ),
     err
 )]
-async fn join_and_sync(
-    state: &mut CoordinatorState,
-    owned: &[(String, i32)],
-) -> Result<JoinOutcome, ConsumerError> {
+async fn join_and_sync(state: &mut CoordinatorState) -> Result<JoinOutcome, ConsumerError> {
     join_prepare(state).await?;
-    let join_resp = perform_join(state, owned).await?;
+    // The preparation can reset the member and clear its partitions, as
+    // Kafka's `onJoinPrepare` does. The subscription names what is left.
+    let owned = state.assigned.lock().await.clone();
+    let join_resp = perform_join(state, &owned).await?;
     // The broker may have refreshed our member_id on this join too.
     if !join_resp.member_id.is_empty() {
         state.member_id.clone_from(&join_resp.member_id);
@@ -2185,6 +2186,7 @@ async fn join_and_sync(
         auto_commit.restart_interval().await;
     }
     Ok(JoinOutcome {
+        owned,
         assignment: my_assignment,
         generation: generation_id,
         topic_partitions: leader.topic_partitions,

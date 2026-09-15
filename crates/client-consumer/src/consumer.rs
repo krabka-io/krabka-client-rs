@@ -2877,7 +2877,7 @@ mod auto_commit_tests {
 
     /// How the mock coordinator answers one `OffsetCommit`.
     #[derive(Clone, Copy, Debug)]
-    enum CommitReply {
+    pub(super) enum CommitReply {
         /// Send no response.
         Drop,
         /// Answer each partition with this error code.
@@ -2915,7 +2915,7 @@ mod auto_commit_tests {
         generation: AtomicI32,
         /// The answers to the next `OffsetCommit` requests. An empty queue
         /// answers with success.
-        commit_replies: std::sync::Mutex<VecDeque<CommitReply>>,
+        pub(super) commit_replies: std::sync::Mutex<VecDeque<CommitReply>>,
         /// When `true`, the next `OffsetCommit` makes the next `Heartbeat`
         /// answer `REBALANCE_IN_PROGRESS`.
         rebalance_on_commit: std::sync::atomic::AtomicBool,
@@ -4524,6 +4524,87 @@ mod group_membership_tests {
             wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `onJoinPrepare` gives up the partitions of a member that the
+    /// coordinator no longer knows, and the `JoinGroup` that follows owns
+    /// nothing. Here a heartbeat during the pre-join auto commit answers
+    /// `UNKNOWN_MEMBER_ID`.
+    #[tokio::test]
+    async fn a_join_after_the_member_was_reset_during_preparation_owns_nothing() {
+        let coordinator =
+            MockCoordinator::new(Assignor::CooperativeSticky, vec![vec![partition(0)]]);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut config = start_config(
+            mock.addr.to_string(),
+            Assignor::CooperativeSticky,
+            true,
+            minutes(1),
+        );
+        config.heartbeat_interval = millis(50);
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = spawn_consumer(
+            config,
+            client,
+            Arc::new(AtomicI32::new(0)),
+            MEMBER.into(),
+            StartupState {
+                generation_id: 1,
+                assigned_partitions: vec![partition(0)],
+                next_offsets: HashMap::from([(partition(0), 12)]),
+                positions: HashMap::new(),
+                topic_ids: HashMap::new(),
+                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
+            },
+        )
+        .await
+        .expect("spawn consumer");
+        consumer.poll(millis(20)).await.expect("first poll");
+        // The pre-join auto commit gets no answer, so the task heartbeats while
+        // it waits.
+        coordinator
+            .commit_replies
+            .lock()
+            .expect("commit replies lock")
+            .push_back(super::auto_commit_tests::CommitReply::Drop);
+        coordinator.heartbeat_error.store(27, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut reset = false;
+        while coordinator.joins.lock().expect("joins lock").is_empty()
+            && tokio::time::Instant::now() < deadline
+        {
+            let _ = consumer.poll(millis(20)).await;
+            let committing = coordinator
+                .requests()
+                .iter()
+                .any(|request| matches!(request, GroupRequest::OffsetCommit(_)));
+            if committing && !reset {
+                coordinator.heartbeat_error.store(25, Ordering::SeqCst);
+                reset = true;
+            }
+        }
+        let subscriptions: Vec<(Vec<(String, i32)>, i32)> = coordinator
+            .joins
+            .lock()
+            .expect("joins lock")
+            .iter()
+            .flat_map(|join| join.protocols.iter())
+            .map(|protocol| {
+                let subscription = crate::builder::decode_subscription(&protocol.metadata);
+                (subscription.owned, subscription.generation_id)
+            })
+            .collect();
+        drop(consumer);
+        mock.stop();
+        assert2::assert!(subscriptions.first() == Some(&(Vec::new(), -1)));
     }
 
     /// A heartbeat can request a rebalance after the start of `poll` signalled
