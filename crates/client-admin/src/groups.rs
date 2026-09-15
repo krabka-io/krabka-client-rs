@@ -31,10 +31,7 @@
 //! codes as Apache Kafka's `ListConsumerGroupOffsetsHandler.handleGroupError`
 //! does, until Kafka's default `default.api.timeout.ms` (60 s) elapses.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Duration,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::BufMut;
 use krabka_client_core::{
@@ -59,6 +56,7 @@ use krabka_protocol::{
 
 use crate::{
     AdminClient, AdminError, KafkaError, format_host_port, kafka_error_if, kafka_error_name,
+    retry::{KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, retry_coordinator_call},
     send_connection_at_least,
 };
 
@@ -315,37 +313,74 @@ impl AdminClient {
     /// The request names each topic, so the client negotiates `OffsetCommit`
     /// v9 or lower, as Apache Kafka's `AlterConsumerGroupOffsetsHandler` does.
     ///
+    /// The call retries the partition error codes as Apache Kafka's
+    /// `AlterConsumerGroupOffsetsHandler.handleError` does. One retriable code
+    /// in the response makes the call send all the offsets again:
+    ///
+    /// - `COORDINATOR_LOAD_IN_PROGRESS` (14) and `REBALANCE_IN_PROGRESS` (27):
+    ///   send the request again to the same coordinator.
+    /// - `COORDINATOR_NOT_AVAILABLE` (15) and `NOT_COORDINATOR` (16): find the
+    ///   coordinator again, then send the request again.
+    ///
+    /// A `FindCoordinator` answer of 14 or 15 also makes the call find the
+    /// coordinator again. A lost connection to the coordinator makes the call
+    /// find the coordinator again, as Kafka's `AdminApiDriver.onFailure` does.
+    /// The call waits between attempts with Kafka's backoff, and it stops when
+    /// Kafka's default `default.api.timeout.ms` (60 s) elapses. At that time
+    /// it returns the outcomes of the last response.
+    ///
     /// # Errors
     /// Returns an error when encoding, transport, or response handling fails.
-    /// Returns [`ClientError::IncompatibleVersion`] when the coordinator does
-    /// not support `OffsetCommit` v9 or lower.
+    /// Returns [`ClientError::Server`] when `FindCoordinator` answers with an
+    /// error code that Kafka does not retry, or with a retriable code after
+    /// the timeout. Returns [`ClientError::IncompatibleVersion`] when the
+    /// coordinator does not support `OffsetCommit` v9 or lower.
     ///
     /// [`ClientError::IncompatibleVersion`]: krabka_client_core::ClientError::IncompatibleVersion
+    /// [`ClientError::Server`]: krabka_client_core::ClientError::Server
     pub async fn alter_consumer_group_offsets(
         &mut self,
         group: &str,
         offsets: &BTreeMap<(String, i32), i64>,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        self.reconnect_group_coordinator(group).await?;
-        let response = self
-            .conn
-            .send(offset_commit_request(group, offsets))
-            .await?;
-        Ok(response
-            .topics
-            .into_iter()
-            .flat_map(|topic| {
-                let name = topic.name;
-                topic
-                    .partitions
-                    .into_iter()
-                    .map(move |partition| ConsumerGroupOffsetOutcome {
-                        topic: name.clone(),
-                        partition: partition.partition_index,
-                        error: kafka_error_if(partition.error_code, None),
-                    })
-            })
-            .collect())
+        self.alter_consumer_group_offsets_with_retry(group, offsets, KAFKA_ADMIN_RETRY)
+            .await
+    }
+
+    async fn alter_consumer_group_offsets_with_retry(
+        &mut self,
+        group: &str,
+        offsets: &BTreeMap<(String, i32), i64>,
+        retry: RetryPolicy,
+    ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
+        retry_coordinator_call(retry, async |find_coordinator| {
+            self.offset_commit_attempt(group, offsets, find_coordinator)
+                .await
+        })
+        .await
+    }
+
+    /// One attempt of `alter_consumer_group_offsets`. When `find_coordinator`
+    /// is set, the attempt first finds the group coordinator and connects to
+    /// it.
+    async fn offset_commit_attempt(
+        &mut self,
+        group: &str,
+        offsets: &BTreeMap<(String, i32), i64>,
+        find_coordinator: bool,
+    ) -> RetryAction<Vec<ConsumerGroupOffsetOutcome>> {
+        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
+            return action;
+        }
+        match self.conn.send(offset_commit_request(group, offsets)).await {
+            Ok(response) => offset_commit_retry_action(response),
+            Err(AdminError::Transport(error))
+                if AdminClient::is_retriable_transport_error(&error) =>
+            {
+                RetryAction::FindCoordinator(Err(error.into()))
+            }
+            Err(error) => RetryAction::Done(Err(error)),
+        }
     }
 
     /// Lists the groups of the whole cluster, as Apache Kafka's
@@ -393,7 +428,7 @@ impl AdminClient {
     async fn list_groups_with_retry(
         &self,
         options: &ListGroupsOptions,
-        retry: CoordinatorRetry,
+        retry: RetryPolicy,
     ) -> Result<ListGroupsResult, AdminError> {
         let start = tokio::time::Instant::now();
         let brokers = self.list_groups_brokers(start, retry).await?;
@@ -457,7 +492,7 @@ impl AdminClient {
     async fn list_groups_brokers(
         &self,
         start: tokio::time::Instant,
-        retry: CoordinatorRetry,
+        retry: RetryPolicy,
     ) -> Result<Vec<MetadataResponseBroker>, AdminError> {
         let mut backoff = retry.initial_backoff;
         loop {
@@ -530,29 +565,12 @@ impl AdminClient {
     async fn list_consumer_group_offsets_with_retry(
         &mut self,
         group: &str,
-        retry: CoordinatorRetry,
+        retry: RetryPolicy,
     ) -> Result<BTreeMap<(String, i32), i64>, AdminError> {
-        let start = tokio::time::Instant::now();
-        let mut backoff = retry.initial_backoff;
-        let mut find_coordinator = true;
-        loop {
-            let (last, find_next) = match self.offset_fetch_attempt(group, find_coordinator).await {
-                RetryAction::Done(result) => return result,
-                RetryAction::SameCoordinator(last) => (last, false),
-                RetryAction::FindCoordinator(last) => (last, true),
-            };
-            if start.elapsed() >= retry.timeout {
-                return last;
-            }
-            tracing::debug!(
-                group,
-                find_coordinator = find_next,
-                "consumer group offset listing got a retriable coordinator error; retrying"
-            );
-            find_coordinator = find_next;
-            tokio::time::sleep(backoff).await;
-            backoff = backoff.saturating_mul(2).min(retry.max_backoff);
-        }
+        retry_coordinator_call(retry, async |find_coordinator| {
+            self.offset_fetch_attempt(group, find_coordinator).await
+        })
+        .await
     }
 
     /// One attempt of `list_consumer_group_offsets`. When `find_coordinator`
@@ -563,22 +581,33 @@ impl AdminClient {
         group: &str,
         find_coordinator: bool,
     ) -> RetryAction<BTreeMap<(String, i32), i64>> {
-        if find_coordinator {
-            match self.reconnect_group_coordinator(group).await {
-                Ok(()) => {}
-                Err(AdminError::Transport(ClientError::Server { error_code }))
-                    if is_retriable_find_coordinator_error(error_code) =>
-                {
-                    return RetryAction::FindCoordinator(Err(AdminError::Transport(
-                        ClientError::Server { error_code },
-                    )));
-                }
-                Err(error) => return RetryAction::Done(Err(error)),
-            }
+        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
+            return action;
         }
         match self.conn.send(offset_fetch_request(group)).await {
             Ok(response) => offset_fetch_retry_action(committed_offsets(group, response)),
             Err(error) => RetryAction::Done(Err(error)),
+        }
+    }
+
+    /// Finds the group coordinator and connects to it. A `FindCoordinator`
+    /// answer that Kafka's `CoordinatorStrategy.handleError` retries gives
+    /// [`RetryAction::FindCoordinator`]. Another failure gives
+    /// [`RetryAction::Done`].
+    async fn find_group_coordinator_attempt<T>(
+        &mut self,
+        group: &str,
+    ) -> Result<(), RetryAction<T>> {
+        match self.reconnect_group_coordinator(group).await {
+            Ok(()) => Ok(()),
+            Err(AdminError::Transport(ClientError::Server { error_code }))
+                if is_retriable_find_coordinator_error(error_code) =>
+            {
+                Err(RetryAction::FindCoordinator(Err(AdminError::Transport(
+                    ClientError::Server { error_code },
+                ))))
+            }
+            Err(error) => Err(RetryAction::Done(Err(error))),
         }
     }
 
@@ -599,39 +628,6 @@ const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
 const COORDINATOR_NOT_AVAILABLE: i16 = 15;
 /// `NOT_COORDINATOR`: the broker does not coordinate the group.
 const NOT_COORDINATOR: i16 = 16;
-
-/// The retry limits of a group coordinator call.
-#[derive(Clone, Copy, Debug)]
-struct CoordinatorRetry {
-    /// The call does not retry after this time elapses.
-    timeout: Duration,
-    /// The wait before the first retry.
-    initial_backoff: Duration,
-    /// The wait between retries doubles up to this limit.
-    max_backoff: Duration,
-}
-
-/// Apache Kafka's admin client defaults: `default.api.timeout.ms` (60000),
-/// `retry.backoff.ms` (100) and `retry.backoff.max.ms` (1000), from
-/// `AdminClientConfig` and `CommonClientConfigs`.
-const KAFKA_ADMIN_RETRY: CoordinatorRetry = CoordinatorRetry {
-    timeout: Duration::from_mins(1),
-    initial_backoff: Duration::from_millis(100),
-    max_backoff: Duration::from_secs(1),
-};
-
-/// What a group coordinator call does after one attempt.
-#[derive(Debug)]
-enum RetryAction<T> {
-    /// Return this result.
-    Done(Result<T, AdminError>),
-    /// Send the request again to the same coordinator. Return this result
-    /// when the retry timeout has elapsed.
-    SameCoordinator(Result<T, AdminError>),
-    /// Find the coordinator again, then send the request again. Return this
-    /// result when the retry timeout has elapsed.
-    FindCoordinator(Result<T, AdminError>),
-}
 
 /// Whether Kafka's `CoordinatorStrategy.handleError` retries this
 /// `FindCoordinator` error code.
@@ -657,6 +653,49 @@ fn offset_fetch_retry_action<T>(result: Result<T, AdminError>) -> RetryAction<T>
             ..
         }) => RetryAction::FindCoordinator(result),
         result => RetryAction::Done(result),
+    }
+}
+
+/// `REBALANCE_IN_PROGRESS`: the group is rebalancing.
+const REBALANCE_IN_PROGRESS: i16 = 27;
+
+/// Map one `OffsetCommit` response to a retry action, as Kafka's
+/// `AlterConsumerGroupOffsetsHandler.handleResponse` does. A partition with 14
+/// or 27 retries the request on the same coordinator. A partition with 15 or
+/// 16 unmaps the group, so the next attempt finds the coordinator again. The
+/// unmap wins when both occur, as the handler returns `ApiResult.unmapped`.
+/// Every other code is a final per-partition outcome.
+fn offset_commit_retry_action(
+    response: OffsetCommitResponse,
+) -> RetryAction<Vec<ConsumerGroupOffsetOutcome>> {
+    let outcomes: Vec<ConsumerGroupOffsetOutcome> = response
+        .topics
+        .into_iter()
+        .flat_map(|topic| {
+            let name = topic.name;
+            topic
+                .partitions
+                .into_iter()
+                .map(move |partition| ConsumerGroupOffsetOutcome {
+                    topic: name.clone(),
+                    partition: partition.partition_index,
+                    error: kafka_error_if(partition.error_code, None),
+                })
+        })
+        .collect();
+    let codes = || {
+        outcomes
+            .iter()
+            .filter_map(|outcome| outcome.error.as_ref().map(|error| error.code))
+    };
+    if codes().any(|code| matches!(code, COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR)) {
+        RetryAction::FindCoordinator(Ok(outcomes))
+    } else if codes()
+        .any(|code| matches!(code, COORDINATOR_LOAD_IN_PROGRESS | REBALANCE_IN_PROGRESS))
+    {
+        RetryAction::SameCoordinator(Ok(outcomes))
+    } else {
+        RetryAction::Done(Ok(outcomes))
     }
 }
 
@@ -702,7 +741,7 @@ async fn list_groups_on_broker(
     request: ListGroupsRequest,
     min_version: i16,
     start: tokio::time::Instant,
-    retry: CoordinatorRetry,
+    retry: RetryPolicy,
 ) -> Result<Vec<ListedGroup>, KafkaError> {
     let host_port = format_host_port(&broker.host, broker.port);
     let deadline = start + retry.timeout;
@@ -1054,9 +1093,12 @@ fn offset_commit_request(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use assert2::assert;
@@ -1599,11 +1641,14 @@ mod tests {
     /// The error codes that the mock brokers answer, one per attempt. The
     /// last code repeats. A code of 0 answers with the coordinator or with the
     /// offsets of `offset_fetch_response`.
+    #[derive(Default)]
     struct RetryScript {
         find_coordinator: Vec<i16>,
         offset_fetch: Vec<i16>,
+        offset_commit: Vec<i16>,
         find_coordinator_requests: usize,
         offset_fetch_requests: usize,
+        offset_commit_requests: usize,
     }
 
     impl RetryScript {
@@ -1615,7 +1660,9 @@ mod tests {
     }
 
     /// A mock broker that answers `FindCoordinator` from `script` with
-    /// `coordinator` as the coordinator, and `OffsetFetch` from `script`.
+    /// `coordinator` as the coordinator, and `OffsetFetch` and `OffsetCommit`
+    /// from `script`. An `OffsetCommit` answer puts its code on each
+    /// partition of the request.
     async fn scripted_group_broker(
         script: Arc<Mutex<RetryScript>>,
         coordinator: Arc<Mutex<Option<std::net::SocketAddr>>>,
@@ -1624,8 +1671,40 @@ mod tests {
             offset_commit: (2, 9),
             offset_fetch: (2, 9),
         };
-        MockBroker::start(move |api_key, version, _, _| match api_key {
+        MockBroker::start(move |api_key, version, _, body| match api_key {
             api_versions_request::API_KEY => Some(api_versions(ranges)),
+            offset_commit_request::API_KEY => {
+                let request: OffsetCommitRequest = decode_request(body, version);
+                let mut script = script.lock().expect("script lock");
+                let script = &mut *script;
+                let error_code =
+                    RetryScript::next(&script.offset_commit, &mut script.offset_commit_requests);
+                let response = OffsetCommitResponse {
+                    topics: request
+                        .topics
+                        .iter()
+                        .map(|topic| OffsetCommitResponseTopic {
+                            name: topic.name.clone(),
+                            partitions: topic
+                                .partitions
+                                .iter()
+                                .map(|partition| OffsetCommitResponsePartition {
+                                    partition_index: partition.partition_index,
+                                    error_code,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                Some(encode(
+                    &response,
+                    version,
+                    version >= offset_commit_request::FLEXIBLE_MIN,
+                ))
+            }
             find_coordinator_request::API_KEY => {
                 let mut script = script.lock().expect("script lock");
                 let script = &mut *script;
@@ -1770,8 +1849,7 @@ mod tests {
             let script = Arc::new(Mutex::new(RetryScript {
                 find_coordinator,
                 offset_fetch,
-                find_coordinator_requests: 0,
-                offset_fetch_requests: 0,
+                ..RetryScript::default()
             }));
             let coordinator_addr = Arc::new(Mutex::new(None));
             let coordinator =
@@ -1786,10 +1864,11 @@ mod tests {
             let result = admin
                 .list_consumer_group_offsets_with_retry(
                     "workers",
-                    CoordinatorRetry {
+                    RetryPolicy {
                         timeout,
                         initial_backoff: Duration::from_millis(1),
                         max_backoff: Duration::from_millis(1),
+                        jitter: 0.0,
                     },
                 )
                 .await
@@ -1813,6 +1892,137 @@ mod tests {
                     result,
                     script.find_coordinator_requests,
                     script.offset_fetch_requests
+                ) == expected,
+                "case {name}"
+            );
+        }
+    }
+
+    /// Apache Kafka's `AlterConsumerGroupOffsetsHandler.handleError` retries
+    /// `COORDINATOR_LOAD_IN_PROGRESS` (14) and `REBALANCE_IN_PROGRESS` (27) on
+    /// the same coordinator, unmaps the group on `COORDINATOR_NOT_AVAILABLE`
+    /// (15) and `NOT_COORDINATOR` (16) so the driver finds the coordinator
+    /// again, and keeps every other partition code as the outcome.
+    /// `CoordinatorStrategy.handleError` retries a `FindCoordinator` answer of
+    /// 14 or 15. The driver stops at the call timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alter_consumer_group_offsets_retries_coordinator_errors_as_kafka_does() {
+        const LONG: Duration = Duration::from_secs(5);
+        const NOW: Duration = Duration::ZERO;
+        let outcome = |code| {
+            Ok(vec![ConsumerGroupOffsetOutcome {
+                topic: "orders".into(),
+                partition: 2,
+                error: kafka_error_if(code, None),
+            }])
+        };
+        let find_error = |code| Err(code);
+        for (name, find_coordinator, offset_commit, timeout, expected) in [
+            ("no error", vec![0], vec![0], LONG, (outcome(0), 1, 1)),
+            (
+                "coordinator load in progress retries on the same coordinator",
+                vec![0],
+                vec![14, 14, 0],
+                LONG,
+                (outcome(0), 1, 3),
+            ),
+            (
+                "rebalance in progress retries on the same coordinator",
+                vec![0],
+                vec![27, 0],
+                LONG,
+                (outcome(0), 1, 2),
+            ),
+            (
+                "coordinator not available finds the coordinator again",
+                vec![0],
+                vec![15, 0],
+                LONG,
+                (outcome(0), 2, 2),
+            ),
+            (
+                "not coordinator finds the coordinator again",
+                vec![0],
+                vec![16, 0],
+                LONG,
+                (outcome(0), 2, 2),
+            ),
+            (
+                "rebalance in progress past the timeout gives the last outcome",
+                vec![0],
+                vec![27],
+                NOW,
+                (outcome(27), 1, 1),
+            ),
+            (
+                "not coordinator past the timeout gives the last outcome",
+                vec![0],
+                vec![16],
+                NOW,
+                (outcome(16), 1, 1),
+            ),
+            (
+                "unknown member id is a final outcome",
+                vec![0],
+                vec![25],
+                LONG,
+                (outcome(25), 1, 1),
+            ),
+            (
+                "find coordinator answers coordinator not available, then the coordinator",
+                vec![15, 0],
+                vec![0],
+                LONG,
+                (outcome(0), 2, 1),
+            ),
+            (
+                "find coordinator group authorization failed is final",
+                vec![30],
+                vec![0],
+                LONG,
+                (find_error(30), 1, 0),
+            ),
+        ] {
+            let script = Arc::new(Mutex::new(RetryScript {
+                find_coordinator,
+                offset_commit,
+                ..RetryScript::default()
+            }));
+            let coordinator_addr = Arc::new(Mutex::new(None));
+            let coordinator =
+                scripted_group_broker(Arc::clone(&script), Arc::clone(&coordinator_addr)).await;
+            *coordinator_addr.lock().expect("coordinator lock") = Some(coordinator.addr);
+            let bootstrap =
+                scripted_group_broker(Arc::clone(&script), Arc::clone(&coordinator_addr)).await;
+            let mut admin = AdminClient::connect(&[bootstrap.addr.to_string()])
+                .await
+                .expect("admin connects");
+
+            let result = admin
+                .alter_consumer_group_offsets_with_retry(
+                    "workers",
+                    &BTreeMap::from([(("orders".into(), 2), 41)]),
+                    RetryPolicy {
+                        timeout,
+                        initial_backoff: Duration::from_millis(1),
+                        max_backoff: Duration::from_millis(1),
+                        jitter: 0.0,
+                    },
+                )
+                .await
+                .map_err(|error| match error {
+                    AdminError::Transport(ClientError::Server { error_code }) => error_code,
+                    other => panic!("case {name}: unexpected error {other:?}"),
+                });
+
+            bootstrap.stop();
+            coordinator.stop();
+            let script = script.lock().expect("script lock");
+            assert!(
+                (
+                    result,
+                    script.find_coordinator_requests,
+                    script.offset_commit_requests
                 ) == expected,
                 "case {name}"
             );
@@ -2167,10 +2377,11 @@ mod tests {
         let result = admin
             .list_groups_with_retry(
                 &case.options,
-                CoordinatorRetry {
+                RetryPolicy {
                     timeout: case.timeout,
                     initial_backoff: BACKOFF,
                     max_backoff: BACKOFF,
+                    jitter: 0.0,
                 },
             )
             .await
@@ -2542,10 +2753,11 @@ mod tests {
     /// out too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_groups_isolates_a_secured_broker_that_stalls_or_rejects() {
-        const RETRY: CoordinatorRetry = CoordinatorRetry {
+        const RETRY: RetryPolicy = RetryPolicy {
             timeout: Duration::from_secs(2),
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_millis(100),
+            jitter: 0.0,
         };
         for broker_2 in [SecuredBroker::Stalls, SecuredBroker::RejectsAuthentication] {
             let cluster = Arc::new(Mutex::new(Vec::new()));

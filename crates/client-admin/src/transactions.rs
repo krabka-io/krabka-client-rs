@@ -1,7 +1,7 @@
 //! Transaction administration.
 
 use bytes::BufMut;
-use krabka_client_core::{CoordinatorKeyType, build_find_coordinator};
+use krabka_client_core::{ClientError, Connection, CoordinatorKeyType, build_find_coordinator};
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
     owned::{
@@ -14,7 +14,78 @@ use krabka_protocol::{
 };
 use krabka_units::{Time, convert::TimeExt as _};
 
-use crate::{AdminClient, AdminError, kafka_error_name};
+use crate::{
+    AdminClient, AdminError, kafka_error_name,
+    retry::{KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, retry_coordinator_call},
+};
+
+/// `COORDINATOR_LOAD_IN_PROGRESS`: the coordinator is loading its state.
+const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
+/// `COORDINATOR_NOT_AVAILABLE`: no broker coordinates the transactional ID now.
+const COORDINATOR_NOT_AVAILABLE: i16 = 15;
+/// `NOT_COORDINATOR`: the broker does not coordinate the transactional ID.
+const NOT_COORDINATOR: i16 = 16;
+/// `CONCURRENT_TRANSACTIONS`: the coordinator is completing a transaction.
+const CONCURRENT_TRANSACTIONS: i16 = 51;
+
+/// The retry action after a failed connection to, or request on, the
+/// coordinator. A lost or failed connection makes Kafka's
+/// `AdminApiDriver.onFailure` find the coordinator again. A rejected
+/// authentication and every other error are final.
+fn coordinator_transport_action<T>(error: AdminError) -> RetryAction<T> {
+    match &error {
+        AdminError::Transport(
+            ClientError::Connect { .. }
+            | ClientError::Timeout(_)
+            | ClientError::Disconnected
+            | ClientError::Io(_),
+        ) => RetryAction::FindCoordinator(Err(error)),
+        _ => RetryAction::Done(Err(error)),
+    }
+}
+
+/// Map the result of one `DescribeTransactions` attempt to a retry action, as
+/// Kafka's `DescribeTransactionsHandler.handleError` does. 14 retries on the
+/// same coordinator. 15 and 16 unmap the transactional ID, so the next attempt
+/// finds the coordinator again. Every other result is final.
+fn describe_retry_action(
+    result: Result<TransactionDescription, AdminError>,
+) -> RetryAction<TransactionDescription> {
+    match result {
+        Err(AdminError::Broker {
+            code: COORDINATOR_LOAD_IN_PROGRESS,
+            ..
+        }) => RetryAction::SameCoordinator(result),
+        Err(AdminError::Broker {
+            code: COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR,
+            ..
+        }) => RetryAction::FindCoordinator(result),
+        result => RetryAction::Done(result),
+    }
+}
+
+/// Map the error code of one `InitProducerId` answer to a retry action, as
+/// Kafka's `FenceProducersHandler.handleError` does. 14 and 51 retry on the
+/// same coordinator. 15 and 16 unmap the transactional ID, so the next attempt
+/// finds the coordinator again. Every other code is final.
+fn fence_retry_action(error_code: i16) -> RetryAction<()> {
+    if error_code == 0 {
+        return RetryAction::Done(Ok(()));
+    }
+    let result = Err(AdminError::Broker {
+        api: "InitProducerId",
+        code: error_code,
+        name: kafka_error_name(error_code),
+        message: None,
+    });
+    match error_code {
+        COORDINATOR_LOAD_IN_PROGRESS | CONCURRENT_TRANSACTIONS => {
+            RetryAction::SameCoordinator(result)
+        }
+        COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => RetryAction::FindCoordinator(result),
+        _ => RetryAction::Done(result),
+    }
+}
 
 /// The transaction coordinator's view of one transactional ID.
 ///
@@ -183,6 +254,18 @@ impl AdminClient {
     /// The client negotiates `InitProducerId` v5 or lower, as Kafka's
     /// `FenceProducersHandler` does. v6 is an unstable version.
     ///
+    /// The call retries as Apache Kafka's `FenceProducersHandler.handleError` does:
+    ///
+    /// - `COORDINATOR_LOAD_IN_PROGRESS` (14) and `CONCURRENT_TRANSACTIONS` (51): send the request again to the same coordinator.
+    /// - `COORDINATOR_NOT_AVAILABLE` (15) and `NOT_COORDINATOR` (16): find the
+    ///   coordinator again, then send the request again.
+    ///
+    /// A `FindCoordinator` answer of 14 or 15, and a failed or lost connection
+    /// to the coordinator, also make the call find the coordinator again. The
+    /// call waits between attempts with Kafka's backoff, and it stops when
+    /// Kafka's default `default.api.timeout.ms` (60 s) elapses. At that time
+    /// it returns the last error.
+    ///
     /// # Errors
     ///
     /// Returns [`AdminError::Protocol`] for an empty transactional ID, or the
@@ -201,30 +284,34 @@ impl AdminClient {
             ));
         }
 
-        let response = self
-            .conn
-            .send(build_find_coordinator(
-                transactional_id,
-                CoordinatorKeyType::Transaction,
-            ))
-            .await?;
-        let coordinator = coordinator_address(transactional_id, response)?;
-        let connection = Self::connect_one(&coordinator, self.options.clone()).await?;
-        let response = connection
-            .send(force_terminate_request(
+        self.force_terminate_transaction_with_retry(transactional_id, KAFKA_ADMIN_RETRY)
+            .await
+    }
+
+    async fn force_terminate_transaction_with_retry(
+        &self,
+        transactional_id: &str,
+        retry: RetryPolicy,
+    ) -> Result<(), AdminError> {
+        let mut coordinator = None;
+        retry_coordinator_call(retry, async |find_coordinator| {
+            let connection = match self
+                .transaction_coordinator(transactional_id, &mut coordinator, find_coordinator)
+                .await
+            {
+                Ok(connection) => connection,
+                Err(action) => return action,
+            };
+            let request = force_terminate_request(
                 transactional_id,
                 self.options.request_timeout.millis_i32(),
-            ))
-            .await?;
-        if response.error_code != 0 {
-            return Err(AdminError::Broker {
-                api: "InitProducerId",
-                code: response.error_code,
-                name: kafka_error_name(response.error_code),
-                message: None,
-            });
-        }
-        Ok(())
+            );
+            match connection.send(request).await {
+                Ok(response) => fence_retry_action(response.error_code),
+                Err(error) => coordinator_transport_action(error.into()),
+            }
+        })
+        .await
     }
 
     /// Reads the transaction coordinator's current state for one transactional
@@ -236,6 +323,18 @@ impl AdminClient {
     /// this to verify the authority of a writer. It joins no group and holds
     /// no producer state. The returned producer ID and producer epoch are the
     /// only generation from which the coordinator accepts writes.
+    ///
+    /// The call retries as Apache Kafka's `DescribeTransactionsHandler.handleError` does:
+    ///
+    /// - `COORDINATOR_LOAD_IN_PROGRESS` (14): send the request again to the same coordinator.
+    /// - `COORDINATOR_NOT_AVAILABLE` (15) and `NOT_COORDINATOR` (16): find the
+    ///   coordinator again, then send the request again.
+    ///
+    /// A `FindCoordinator` answer of 14 or 15, and a failed or lost connection
+    /// to the coordinator, also make the call find the coordinator again. The
+    /// call waits between attempts with Kafka's backoff, and it stops when
+    /// Kafka's default `default.api.timeout.ms` (60 s) elapses. At that time
+    /// it returns the last error.
     ///
     /// # Errors
     ///
@@ -256,19 +355,80 @@ impl AdminClient {
             ));
         }
 
+        self.describe_transaction_with_retry(transactional_id, KAFKA_ADMIN_RETRY)
+            .await
+    }
+
+    async fn describe_transaction_with_retry(
+        &self,
+        transactional_id: &str,
+        retry: RetryPolicy,
+    ) -> Result<TransactionDescription, AdminError> {
+        let mut coordinator = None;
+        retry_coordinator_call(retry, async |find_coordinator| {
+            let connection = match self
+                .transaction_coordinator(transactional_id, &mut coordinator, find_coordinator)
+                .await
+            {
+                Ok(connection) => connection,
+                Err(action) => return action,
+            };
+            match connection
+                .send(describe_transactions_request(transactional_id))
+                .await
+            {
+                Ok(response) => {
+                    describe_retry_action(transaction_description(transactional_id, response))
+                }
+                Err(error) => coordinator_transport_action(error.into()),
+            }
+        })
+        .await
+    }
+
+    /// Returns the connection to the transaction coordinator of
+    /// `transactional_id`. When `find_coordinator` is set, or when no
+    /// connection is open, the attempt first sends `FindCoordinator` and
+    /// connects to the coordinator that it names.
+    ///
+    /// A `FindCoordinator` answer of `COORDINATOR_LOAD_IN_PROGRESS` (14) or
+    /// `COORDINATOR_NOT_AVAILABLE` (15) and a failed connection to the
+    /// coordinator give [`RetryAction::FindCoordinator`], as Kafka's
+    /// `CoordinatorStrategy.handleError` and `AdminApiDriver.onFailure` do.
+    async fn transaction_coordinator<'c, T>(
+        &self,
+        transactional_id: &str,
+        coordinator: &'c mut Option<Connection>,
+        find_coordinator: bool,
+    ) -> Result<&'c Connection, RetryAction<T>> {
+        if find_coordinator {
+            *coordinator = None;
+        }
+        if let Some(connection) = coordinator {
+            return Ok(connection);
+        }
         let response = self
             .conn
             .send(build_find_coordinator(
                 transactional_id,
                 CoordinatorKeyType::Transaction,
             ))
-            .await?;
-        let coordinator = coordinator_address(transactional_id, response)?;
-        let connection = Self::connect_one(&coordinator, self.options.clone()).await?;
-        let response = connection
-            .send(describe_transactions_request(transactional_id))
-            .await?;
-        transaction_description(transactional_id, response)
+            .await
+            .map_err(|error| RetryAction::Done(Err(error)))?;
+        let address = match coordinator_address(transactional_id, response) {
+            Ok(address) => address,
+            Err(
+                error @ AdminError::Broker {
+                    code: COORDINATOR_LOAD_IN_PROGRESS | COORDINATOR_NOT_AVAILABLE,
+                    ..
+                },
+            ) => return Err(RetryAction::FindCoordinator(Err(error))),
+            Err(error) => return Err(RetryAction::Done(Err(error))),
+        };
+        match Self::connect_one(&address, self.options.clone()).await {
+            Ok(connection) => Ok(coordinator.insert(connection)),
+            Err(error) => Err(coordinator_transport_action(error)),
+        }
     }
 
     /// Reads the transaction coordinator's current state for each ID in
@@ -304,7 +464,10 @@ impl AdminClient {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use assert2::check;
     use bytes::{Buf, BytesMut};
@@ -314,7 +477,7 @@ mod tests {
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
-            find_coordinator_request,
+            describe_transactions_request, find_coordinator_request,
             find_coordinator_response::Coordinator,
             metadata_request,
             metadata_response::MetadataResponse,
@@ -618,5 +781,323 @@ mod tests {
 
         let error = transaction_description("payments", response).expect_err("missing row");
         assert2::assert!(matches!(error, AdminError::Protocol(_)));
+    }
+
+    /// The transaction admin call of a retry case.
+    #[derive(Clone, Copy, Debug)]
+    enum TransactionCall {
+        Describe,
+        ForceTerminate,
+    }
+
+    /// The error codes that the mock brokers answer, one per request. The last
+    /// code repeats.
+    #[derive(Default)]
+    struct CoordinatorScript {
+        find_coordinator: Vec<i16>,
+        coordinator: Vec<i16>,
+        find_coordinator_requests: usize,
+        coordinator_requests: usize,
+    }
+
+    fn next_code(codes: &[i16], requests: &mut usize) -> i16 {
+        let code = codes[(*requests).min(codes.len() - 1)];
+        *requests += 1;
+        code
+    }
+
+    /// An `ApiVersions` response for the retry mocks.
+    fn retry_api_versions() -> Vec<u8> {
+        let api_version = |api_key, min_version, max_version| ApiVersion {
+            api_key,
+            min_version,
+            max_version,
+            ..Default::default()
+        };
+        encode_response(
+            &ApiVersionsResponse {
+                api_keys: vec![
+                    api_version(api_versions_request::API_KEY, 0, 0),
+                    api_version(find_coordinator_request::API_KEY, 0, 0),
+                    api_version(metadata_request::API_KEY, 13, 13),
+                    api_version(init_producer_id_request::API_KEY, 0, 0),
+                    api_version(describe_transactions_request::API_KEY, 0, 0),
+                ],
+                ..Default::default()
+            },
+            0,
+            false,
+        )
+    }
+
+    /// A mock broker that answers `FindCoordinator` with `coordinator`, and
+    /// `DescribeTransactions` and `InitProducerId` with the codes of `script`.
+    async fn scripted_transaction_broker(
+        script: Arc<Mutex<CoordinatorScript>>,
+        coordinator: Arc<Mutex<Option<std::net::SocketAddr>>>,
+    ) -> MockBroker {
+        MockBroker::start(move |api_key, version, _, _| {
+            let mut script = script.lock().expect("script lock");
+            let script = &mut *script;
+            match api_key {
+                api_versions_request::API_KEY => Some(retry_api_versions()),
+                find_coordinator_request::API_KEY => {
+                    let error_code = next_code(
+                        &script.find_coordinator,
+                        &mut script.find_coordinator_requests,
+                    );
+                    let addr = coordinator
+                        .lock()
+                        .expect("coordinator lock")
+                        .expect("coordinator address");
+                    Some(encode_response(
+                        &FindCoordinatorResponse {
+                            error_code,
+                            node_id: 2,
+                            host: addr.ip().to_string(),
+                            port: i32::from(addr.port()),
+                            ..Default::default()
+                        },
+                        version,
+                        false,
+                    ))
+                }
+                describe_transactions_request::API_KEY => {
+                    let error_code =
+                        next_code(&script.coordinator, &mut script.coordinator_requests);
+                    Some(encode_response(
+                        &DescribeTransactionsResponse {
+                            transaction_states: vec![TransactionState {
+                                error_code,
+                                transactional_id: "payments".to_owned(),
+                                transaction_state: "Ongoing".to_owned(),
+                                producer_id: 4242,
+                                producer_epoch: 7,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        version,
+                        true,
+                    ))
+                }
+                init_producer_id_request::API_KEY => {
+                    let error_code =
+                        next_code(&script.coordinator, &mut script.coordinator_requests);
+                    Some(encode_response(
+                        &InitProducerIdResponse {
+                            error_code,
+                            producer_id: 4242,
+                            producer_epoch: 8,
+                            ..Default::default()
+                        },
+                        version,
+                        false,
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .await
+    }
+
+    /// Apache Kafka's `DescribeTransactionsHandler.handleError` retries
+    /// `COORDINATOR_LOAD_IN_PROGRESS` (14) on the same coordinator.
+    /// `FenceProducersHandler.handleError` retries 14 and
+    /// `CONCURRENT_TRANSACTIONS` (51) on the same coordinator. Both unmap the
+    /// transactional ID on `COORDINATOR_NOT_AVAILABLE` (15) and
+    /// `NOT_COORDINATOR` (16), so the driver finds the coordinator again, and
+    /// fail on every other code. `CoordinatorStrategy.handleError` retries a
+    /// `FindCoordinator` answer of 14 or 15. The driver stops at the call
+    /// timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transaction_calls_retry_coordinator_errors_as_kafka_does() {
+        use TransactionCall::{Describe, ForceTerminate};
+
+        const LONG: Duration = Duration::from_secs(5);
+        const NOW: Duration = Duration::ZERO;
+        let ok = || Ok(());
+        let failed = |api, code| Err((api, code));
+        for (name, call, find_coordinator, coordinator, timeout, expected) in [
+            (
+                "describe: no error",
+                Describe,
+                vec![0],
+                vec![0],
+                LONG,
+                (ok(), 1, 1),
+            ),
+            (
+                "describe: coordinator load in progress retries on the same coordinator",
+                Describe,
+                vec![0],
+                vec![14, 14, 0],
+                LONG,
+                (ok(), 1, 3),
+            ),
+            (
+                "describe: not coordinator finds the coordinator again",
+                Describe,
+                vec![0],
+                vec![16, 0],
+                LONG,
+                (ok(), 2, 2),
+            ),
+            (
+                "describe: coordinator not available finds the coordinator again",
+                Describe,
+                vec![0],
+                vec![15, 0],
+                LONG,
+                (ok(), 2, 2),
+            ),
+            (
+                "describe: concurrent transactions is final",
+                Describe,
+                vec![0],
+                vec![51],
+                LONG,
+                (failed("DescribeTransactions", 51), 1, 1),
+            ),
+            (
+                "describe: transactional id not found is final",
+                Describe,
+                vec![0],
+                vec![105],
+                LONG,
+                (failed("DescribeTransactions", 105), 1, 1),
+            ),
+            (
+                "describe: coordinator load in progress past the timeout fails",
+                Describe,
+                vec![0],
+                vec![14],
+                NOW,
+                (failed("DescribeTransactions", 14), 1, 1),
+            ),
+            (
+                "describe: find coordinator not available, then the coordinator",
+                Describe,
+                vec![15, 0],
+                vec![0],
+                LONG,
+                (ok(), 2, 1),
+            ),
+            (
+                "describe: find coordinator authorization failed is final",
+                Describe,
+                vec![53],
+                vec![0],
+                LONG,
+                (failed("FindCoordinator", 53), 1, 0),
+            ),
+            (
+                "fence: no error",
+                ForceTerminate,
+                vec![0],
+                vec![0],
+                LONG,
+                (ok(), 1, 1),
+            ),
+            (
+                "fence: coordinator load in progress retries on the same coordinator",
+                ForceTerminate,
+                vec![0],
+                vec![14, 0],
+                LONG,
+                (ok(), 1, 2),
+            ),
+            (
+                "fence: concurrent transactions retries on the same coordinator",
+                ForceTerminate,
+                vec![0],
+                vec![51, 51, 0],
+                LONG,
+                (ok(), 1, 3),
+            ),
+            (
+                "fence: not coordinator finds the coordinator again",
+                ForceTerminate,
+                vec![0],
+                vec![16, 0],
+                LONG,
+                (ok(), 2, 2),
+            ),
+            (
+                "fence: cluster authorization failed is final",
+                ForceTerminate,
+                vec![0],
+                vec![31],
+                LONG,
+                (failed("InitProducerId", 31), 1, 1),
+            ),
+            (
+                "fence: concurrent transactions past the timeout fails",
+                ForceTerminate,
+                vec![0],
+                vec![51],
+                NOW,
+                (failed("InitProducerId", 51), 1, 1),
+            ),
+            (
+                "fence: find coordinator load in progress, then the coordinator",
+                ForceTerminate,
+                vec![14, 0],
+                vec![0],
+                LONG,
+                (ok(), 2, 1),
+            ),
+        ] {
+            let script = Arc::new(Mutex::new(CoordinatorScript {
+                find_coordinator,
+                coordinator,
+                ..CoordinatorScript::default()
+            }));
+            let coordinator_addr = Arc::new(Mutex::new(None));
+            let coordinator =
+                scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr))
+                    .await;
+            *coordinator_addr.lock().expect("coordinator lock") = Some(coordinator.addr);
+            let bootstrap =
+                scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr))
+                    .await;
+            let admin = AdminClient::connect(&[bootstrap.addr.to_string()])
+                .await
+                .expect("admin connects");
+            let retry = RetryPolicy {
+                timeout,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                jitter: 0.0,
+            };
+
+            let result = match call {
+                Describe => admin
+                    .describe_transaction_with_retry("payments", retry)
+                    .await
+                    .map(|_| ()),
+                ForceTerminate => {
+                    admin
+                        .force_terminate_transaction_with_retry("payments", retry)
+                        .await
+                }
+            }
+            .map_err(|error| match error {
+                AdminError::Broker { api, code, .. } => (api, code),
+                other => panic!("case {name}: unexpected error {other:?}"),
+            });
+
+            bootstrap.stop();
+            coordinator.stop();
+            let script = script.lock().expect("script lock");
+            assert2::assert!(
+                (
+                    result,
+                    script.find_coordinator_requests,
+                    script.coordinator_requests
+                ) == expected,
+                "case {name}"
+            );
+        }
     }
 }

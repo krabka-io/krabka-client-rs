@@ -28,6 +28,7 @@ pub mod groups;
 pub mod log_dirs;
 pub mod quorum;
 pub mod quotas;
+mod retry;
 pub mod topics;
 pub mod transactions;
 pub mod users;
@@ -1368,6 +1369,7 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         16 => "NOT_COORDINATOR",
         17 => "INVALID_TOPIC_EXCEPTION",
         19 => "NOT_ENOUGH_REPLICAS",
+        27 => "REBALANCE_IN_PROGRESS",
         31 => "CLUSTER_AUTHORIZATION_FAILED",
         33 => "UNSUPPORTED_SASL_MECHANISM",
         34 => "ILLEGAL_SASL_STATE",
