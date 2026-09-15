@@ -108,8 +108,6 @@ impl Consumer {
         drop(positions);
         drop(offsets);
         drop(assigned);
-        // The cached high watermark described the position before the seek.
-        self.end_offsets.lock().await.remove(&key);
         Ok(())
     }
 }

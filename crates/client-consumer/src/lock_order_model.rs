@@ -57,8 +57,8 @@
 //! wait.
 //!
 //! ### seek task (`seek.rs`)
-//! - `seek_to_position`: **A → N → P** held together, all released, then
-//!   **E alone**. Region edges: A→N, N→P.
+//! - `seek_to_position`: **A → N → P** held together, all released.
+//!   Region edges: A→N, N→P.
 //!
 //! ### poll task (`poll.rs`, `validate.rs`, `commit.rs`)
 //! - `maybe_auto_commit_async` (commit.rs): CI, N and P each alone
@@ -297,7 +297,7 @@ fn poll_program() -> Vec<Op> {
 }
 
 /// `seek_to_position` (seek.rs): `assigned`, `next_offsets` and `positions`
-/// held together, then `end_offsets` alone.
+/// held together.
 fn seek_program() -> Vec<Op> {
     vec![
         Acquire(A),
@@ -306,8 +306,6 @@ fn seek_program() -> Vec<Op> {
         Release(P),
         Release(N),
         Release(A),
-        Acquire(E),
-        Release(E),
     ]
 }
 

@@ -2662,7 +2662,15 @@ mod security_arg_tests {
         assert2::assert!(consumer.at_log_end().await);
 
         consumer.seek("orders", 0, 0).await.unwrap();
-        assert2::assert!(!consumer.at_log_end().await);
+        // A seek keeps the end offset of the last fetch, as Kafka's
+        // `TopicPartitionState.seekValidated` keeps the high watermark.
+        let end = consumer
+            .end_offsets
+            .lock()
+            .await
+            .get(&("orders".to_owned(), 0))
+            .copied();
+        assert2::assert!((consumer.at_log_end().await, end) == (false, Some(12)));
     }
 
     /// Regression: the generation that the commit path stamps must track the

@@ -520,6 +520,21 @@ fn pending_positions(
         .collect()
 }
 
+/// When a synchronous commit raises the positions for the commit before a
+/// `JoinGroup`. See [`AutoCommit::record_sent`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordSent {
+    /// A commit of the fetch positions records them before it sends, so a
+    /// commit before a `JoinGroup` cannot move the committed offset back
+    /// behind a request whose result is not known.
+    BeforeSend,
+    /// A commit of caller-selected offsets records only what the coordinator
+    /// acknowledged. Such an offset can be past the fetch position, and a
+    /// rejected one must not reach the commit before a `JoinGroup`. Kafka's
+    /// `onJoinPrepare` commits `allConsumed`, the fetch positions.
+    AfterAck,
+}
+
 /// How an automatic commit ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AutoCommitOutcome {
@@ -941,7 +956,8 @@ impl Consumer {
             if pending.is_empty() {
                 return Ok(());
             }
-            self.commit_pending_offsets(pending).await
+            self.commit_pending_offsets(pending, RecordSent::BeforeSend)
+                .await
         };
         match tokio::time::timeout(AUTO_COMMIT_CLOSE_TIMEOUT, commit).await {
             Ok(Ok(())) => {}
@@ -1001,7 +1017,8 @@ impl Consumer {
         }
         tracing::Span::current().record("partitions", pending.len());
 
-        self.commit_pending_offsets(pending).await
+        self.commit_pending_offsets(pending, RecordSent::BeforeSend)
+            .await
     }
 
     /// Commit caller-selected offsets for currently assigned partitions.
@@ -1041,7 +1058,8 @@ impl Consumer {
                 .collect::<HashMap<_, _>>()
         };
 
-        self.commit_pending_offsets(pending).await
+        self.commit_pending_offsets(pending, RecordSent::AfterAck)
+            .await
     }
 
     /// Fail a synchronous commit when the consumer is not part of an active
@@ -1072,6 +1090,7 @@ impl Consumer {
     async fn commit_pending_offsets(
         &self,
         mut pending: HashMap<(String, i32), (OffsetAndMetadata, u64)>,
+        record: RecordSent,
     ) -> Result<(), ConsumerError> {
         let retry_start = tokio::time::Instant::now();
         let mut retry_backoff = self.retry_policy.initial_backoff;
@@ -1085,7 +1104,9 @@ impl Consumer {
 
             let mut assignment_changed = Box::pin(self.assignment_changed.notified());
             assignment_changed.as_mut().enable();
-            if let Some(auto_commit) = &self.auto_commit {
+            if record == RecordSent::BeforeSend
+                && let Some(auto_commit) = &self.auto_commit
+            {
                 auto_commit.record_sent(pending_positions(&pending)).await;
             }
             let topics = build_commit_topics(
@@ -1128,6 +1149,8 @@ impl Consumer {
             };
             match outcome {
                 CommitOutcome::Acked(acknowledged) => {
+                    self.record_acknowledged(record, &pending, &acknowledged)
+                        .await;
                     pending.retain(|partition, _| !acknowledged.contains(partition));
                     if pending.is_empty() {
                         return Ok(());
@@ -1142,6 +1165,8 @@ impl Consumer {
                         error_code = code,
                         "offset commit deferred until the coordinator rejoins",
                     );
+                    self.record_acknowledged(record, &pending, &acknowledged)
+                        .await;
                     pending.retain(|partition, _| !acknowledged.contains(partition));
                     let current_identity = self.commit_identity.lock().await.clone();
                     retain_continuously_owned(&mut pending, &current_identity.ownership_ids);
@@ -1168,6 +1193,8 @@ impl Consumer {
                     // Kafka's `ConsumerCoordinator.commitOffsetsSync` sends the
                     // commit again while it fails with a retriable error and
                     // the timeout has not passed.
+                    self.record_acknowledged(record, &pending, &acknowledged)
+                        .await;
                     pending.retain(|partition, _| !acknowledged.contains(partition));
                     if pending.is_empty() {
                         return Ok(());
@@ -1190,6 +1217,29 @@ impl Consumer {
                 }
             }
         }
+    }
+
+    /// Raise the positions for the commit before a `JoinGroup` to the
+    /// `acknowledged` offsets of `pending`, for a [`RecordSent::AfterAck`]
+    /// commit.
+    async fn record_acknowledged(
+        &self,
+        record: RecordSent,
+        pending: &HashMap<(String, i32), (OffsetAndMetadata, u64)>,
+        acknowledged: &HashSet<(String, i32)>,
+    ) {
+        if record != RecordSent::AfterAck {
+            return;
+        }
+        let Some(auto_commit) = &self.auto_commit else {
+            return;
+        };
+        let acked = pending
+            .iter()
+            .filter(|(partition, _)| acknowledged.contains(*partition))
+            .map(|(partition, value)| (partition.clone(), value.clone()))
+            .collect();
+        auto_commit.record_sent(pending_positions(&acked)).await;
     }
 
     /// Wait `backoff` before the next attempt of a synchronous commit that
@@ -1403,7 +1453,15 @@ impl Consumer {
                         tracing::warn!(%error, "commit_async failed");
                     }
                     for callback in waiting {
-                        callback(&sent, result.as_ref().copied());
+                        // A panic in one callback must not stop the worker in
+                        // the running state, which would disable later
+                        // asynchronous commits.
+                        let call = std::panic::AssertUnwindSafe(|| {
+                            callback(&sent, result.as_ref().copied());
+                        });
+                        if std::panic::catch_unwind(call).is_err() {
+                            tracing::error!("an offset commit callback panicked");
+                        }
                     }
                 }
 
@@ -3483,5 +3541,78 @@ mod tests {
             .expect("callback sends");
         mock.stop();
         assert2::assert!((completed, sent_partitions(&sent)) == ((HashMap::new(), Ok(())), vec![]));
+    }
+
+    /// Kafka's `onJoinPrepare` commits the fetch positions. An explicit offset
+    /// reaches the commit before a `JoinGroup` only after the coordinator
+    /// acknowledged it, so a rejected offset past the position is never
+    /// committed by the auto commit.
+    #[tokio::test]
+    async fn explicit_offsets_reach_the_pre_join_commit_only_after_an_ack() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, error_code, expected) in [
+            (
+                "acknowledged",
+                0,
+                HashMap::from([(("topic".to_string(), 0), (100, 4))]),
+            ),
+            ("metadata too large", 12, HashMap::new()),
+        ] {
+            let (mock, _sent) = recording_coordinator(error_code).await;
+            let mut consumer = commit_consumer(
+                &mock,
+                commit_identity(7, "member-a"),
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(AtomicI32::new(7)),
+            )
+            .await;
+            let auto_commit = AutoCommit::new(Duration::from_secs(5));
+            consumer.auto_commit = Some(auto_commit.clone());
+            let _ = consumer
+                .commit_offsets_sync(HashMap::from([(
+                    ("topic".into(), 0),
+                    OffsetAndMetadata {
+                        offset: 100,
+                        leader_epoch: Some(4),
+                        metadata: "note".into(),
+                    },
+                )]))
+                .await;
+            mock.stop();
+            let ownership = consumer.commit_identity.lock().await.ownership_ids.clone();
+            actual.push((name, auto_commit.polled_offsets(&ownership).await));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// A panic in an application callback does not stop later asynchronous
+    /// commits.
+    #[tokio::test]
+    async fn asynchronous_commits_continue_after_a_callback_panics() {
+        let (mock, _sent) = recording_coordinator(0).await;
+        let consumer = commit_consumer(
+            &mock,
+            commit_identity(7, "member-a"),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicI32::new(7)),
+        )
+        .await;
+        consumer.commit_async_with_callback(|_, _| panic!("callback panics"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while consumer.commit_async_state.load(Ordering::Acquire) != ASYNC_COMMIT_IDLE {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the worker becomes idle");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        consumer.commit_async_with_callback(move |_, result| {
+            let _ = tx.send(result.map_err(ToString::to_string));
+        });
+        let second = tokio::time::timeout(Duration::from_secs(5), rx).await;
+        mock.stop();
+        assert2::assert!(let Ok(Ok(Ok(()))) = second);
     }
 }
