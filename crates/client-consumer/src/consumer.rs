@@ -1486,19 +1486,29 @@ async fn resolve_initial_assignment(
     //    BrokerPool learns each broker's (id → addr) mapping up front,
     //    letting `poll`/`validate` route to partition leaders immediately
     //    rather than waiting for the first `refresh_leader_epochs` pass.
-    let md = client.refresh_metadata().await?;
+    let is_leader = is_group_leader(&r2.leader, member_id);
+    // Kafka's `ConsumerCoordinator.onLeaderElected`: the leader fetches
+    // metadata for the topics of every member.
+    let group_topics = if is_leader {
+        crate::coordinator::group_subscription_topics(r2, subscribe)
+    } else {
+        subscribe.clone()
+    };
+    client.metadata_topics().set(group_topics.iter().cloned());
+    let md = client.refresh_metadata().await;
+    client.metadata_topics().set(subscribe.iter().cloned());
+    let md = md?;
     let mut topic_ids: HashMap<String, WireUuid> = HashMap::new();
     let mut topic_partitions: HashMap<String, i32> = HashMap::new();
     for t in &md.topics {
         let Some(name) = &t.name else { continue };
-        if is_subscribed_topic(subscribe, name) {
+        if is_subscribed_topic(&group_topics, name) {
             let count = i32::try_from(t.partitions.len()).unwrap_or(i32::MAX);
             topic_partitions.insert(name.clone(), count);
             topic_ids.insert(name.clone(), t.topic_id);
         }
     }
 
-    let is_leader = is_group_leader(&r2.leader, member_id);
     tracing::Span::current().record("generation", r2.generation_id);
     tracing::Span::current().record("is_leader", is_leader);
     let assignments_for_sync: Vec<SyncGroupRequestAssignment> = if is_leader {
