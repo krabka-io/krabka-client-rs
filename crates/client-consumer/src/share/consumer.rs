@@ -279,6 +279,9 @@ pub struct ShareConsumer {
     pub(crate) prev_delivered: Vec<(WireUuid, i32, i64, i64)>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) hb_handle: Option<JoinHandle<()>>,
+    /// A fatal heartbeat error that the next `poll()` returns. The heartbeat
+    /// loop holds the other `Arc`.
+    pub(crate) poll_error: crate::coordinator::PollErrorSlot,
 }
 
 #[bon::bon]
@@ -438,6 +441,7 @@ impl ShareConsumer {
         let assignment = Arc::new(Mutex::new(assignment_vec));
         let topic_names = Arc::new(Mutex::new(topic_names));
         let shutdown = CancellationToken::new();
+        let poll_error = crate::coordinator::PollErrorSlot::default();
 
         // 4. Spawn the heartbeat loop on its own connection so a parked
         //    request on the data path can't head-of-line-block heartbeats
@@ -462,6 +466,7 @@ impl ShareConsumer {
             subscribe,
             heartbeat_interval: hb_interval,
             leave_heartbeat_timeout,
+            poll_error: Arc::clone(&poll_error),
         };
         let hb_handle = tokio::spawn(super::coordinator::run(state, shutdown.clone()));
 
@@ -482,6 +487,7 @@ impl ShareConsumer {
             prev_delivered: Vec::new(),
             shutdown,
             hb_handle: Some(hb_handle),
+            poll_error,
         })
     }
 }
@@ -726,6 +732,7 @@ mod tests {
             prev_delivered: Vec::new(),
             shutdown: CancellationToken::new(),
             hb_handle: None,
+            poll_error: crate::coordinator::PollErrorSlot::default(),
         }
     }
 

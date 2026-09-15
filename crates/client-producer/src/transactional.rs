@@ -1841,4 +1841,94 @@ mod tests {
             mock.stop();
         }
     }
+
+    /// How a coordinator call with a rejected authentication ended.
+    #[derive(Debug, PartialEq, Eq)]
+    struct RejectedCoordinator {
+        rejected: bool,
+        rejecting_handshakes: usize,
+        state: TxnState,
+    }
+
+    /// Kafka's `Sender.runOnce` catches an `AuthenticationException` from the
+    /// transaction coordinator and fails every pending transactional request
+    /// (`TransactionManager.authenticationFailed`). The producer does not
+    /// retry `AddPartitionsToTxn` or `EndTxn`, and it does not find another
+    /// coordinator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordinator_sasl_rejection_is_not_retried() {
+        use krabka_client_core::{
+            Client, MockReply, MockSaslAnswer,
+            security::{ClientSecurity, SaslCredentials},
+        };
+        use krabka_security::ListenerProtocol;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Call {
+            AddPartitions,
+            Commit,
+        }
+
+        for (call, state) in [
+            (Call::AddPartitions, TxnState::InTransaction),
+            (Call::Commit, TxnState::RecoveryRequired),
+        ] {
+            let (mock, producer, _coordinator) = scripted_producer(Coordinator::default()).await;
+            let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::clone(&handshakes);
+            let answer = MockSaslAnswer::AuthenticateError(58);
+            let rejecting =
+                MockBroker::start_with_replies(move |api_key, version, _corr, _body| {
+                    if api_key == krabka_protocol::owned::sasl_handshake_request::API_KEY {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    answer.reply(api_key, version).unwrap_or(MockReply::Silent)
+                })
+                .await;
+            let rejecting_client = Client::builder()
+                .bootstrap(rejecting.addr.to_string())
+                .security(ClientSecurity {
+                    protocol: ListenerProtocol::SaslPlaintext,
+                    tls: None,
+                    sasl: Some(SaslCredentials::Plain {
+                        username: "alice".into(),
+                        password: "secret".into(),
+                    }),
+                    sasl_host: None,
+                })
+                .build()
+                .await
+                .expect("client");
+            let transaction = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction");
+            *producer.txn_coord_client.lock().await = Some(rejecting_client);
+
+            let result = match call {
+                Call::AddPartitions => producer.register_transaction_partition("topic", 0).await,
+                Call::Commit => transaction.commit().await.map_err(|error| error.source),
+            };
+            let actual = RejectedCoordinator {
+                rejected: matches!(
+                    result,
+                    Err(ProducerError::Client(ClientError::Authentication { .. }))
+                ),
+                rejecting_handshakes: handshakes.load(Ordering::SeqCst),
+                state: *producer.txn_state.lock().await,
+            };
+
+            rejecting.stop();
+            mock.stop();
+            assert2::assert!(
+                actual
+                    == RejectedCoordinator {
+                        rejected: true,
+                        rejecting_handshakes: 1,
+                        state,
+                    },
+                "{call:?}"
+            );
+        }
+    }
 }

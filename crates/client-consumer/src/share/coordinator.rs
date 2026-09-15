@@ -26,6 +26,8 @@ use krabka_units::{Time, convert::TimeExt as _};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::error::ConsumerError;
+
 /// `FENCED_MEMBER_EPOCH`. The member epoch is behind the broker's. Rejoin.
 const FENCED_MEMBER_EPOCH: i16 = 110;
 /// `UNKNOWN_MEMBER_ID`. The broker has forgotten this member because the
@@ -50,10 +52,13 @@ pub(crate) struct ShareCoordinatorState {
     pub subscribe: Vec<String>,
     pub heartbeat_interval: Time,
     pub leave_heartbeat_timeout: Time,
+    /// A fatal heartbeat error that the next `poll()` returns. This slot is
+    /// shared with the parent [`ShareConsumer`].
+    pub poll_error: crate::coordinator::PollErrorSlot,
 }
 
 /// Outcome of a single `ShareGroupHeartbeat` RPC.
-enum HeartbeatOutcome {
+pub(crate) enum HeartbeatOutcome {
     /// `error_code == 0`, the steady state.
     Ok,
     /// Fenced, unknown-member, or stale-epoch. Reset to epoch 0 and re-send the
@@ -165,7 +170,10 @@ async fn leave_group(state: &ShareCoordinatorState) {
     skip_all,
     fields(group_id = %state.group_id, member_id = %state.member_id, rejoining)
 )]
-async fn heartbeat_once(state: &ShareCoordinatorState, rejoining: bool) -> HeartbeatOutcome {
+pub(crate) async fn heartbeat_once(
+    state: &ShareCoordinatorState,
+    rejoining: bool,
+) -> HeartbeatOutcome {
     let epoch = *state.member_epoch.lock().await;
     let subscribed = if rejoining {
         Some(state.subscribe.clone())
@@ -207,6 +215,10 @@ async fn heartbeat_once(state: &ShareCoordinatorState, rejoining: bool) -> Heart
         },
         Err(e) => {
             tracing::warn!(error = %e, "share heartbeat send failed");
+            // Kafka's `AbstractHeartbeatRequestManager.onFailure` gives a
+            // non-retriable error, such as an `AuthenticationException`, to
+            // the application `poll` as an `ErrorEvent`.
+            crate::coordinator::report_rejoin_error(&state.poll_error, ConsumerError::Client(e));
             HeartbeatOutcome::Transient
         }
     }
@@ -334,6 +346,7 @@ mod tests {
             subscribe: vec!["topic-a".into()],
             heartbeat_interval: krabka_units::secs(1),
             leave_heartbeat_timeout: krabka_units::millis(37),
+            poll_error: crate::coordinator::PollErrorSlot::default(),
         };
 
         tokio::time::timeout(Duration::from_secs(1), leave_group(&state))
@@ -362,6 +375,7 @@ mod tests {
             subscribe: vec!["topic-a".into()],
             heartbeat_interval: krabka_units::secs(1),
             leave_heartbeat_timeout: krabka_units::secs(5),
+            poll_error: crate::coordinator::PollErrorSlot::default(),
         }
     }
 
@@ -463,5 +477,97 @@ mod tests {
     #[test]
     fn hex_topic_id_formats_all_uuid_bytes() {
         assert2::assert!(hex_topic_id(id(9)) == "00000000000000000000000000000009");
+    }
+
+    /// Kafka's `AbstractHeartbeatRequestManager.onFailure` gives a
+    /// non-retriable heartbeat error to the application `poll`. A SASL
+    /// rejection on the share heartbeat connection must reach
+    /// `ShareConsumer::poll`, also with an empty assignment.
+    #[tokio::test]
+    async fn share_heartbeat_sasl_rejection_is_returned_from_poll() {
+        use krabka_client_core::{
+            AuthenticationError, ClientError, MockReply, MockSaslAnswer, SaslAuthenticationError,
+            security::{ClientSecurity, SaslCredentials},
+        };
+        use krabka_security::ListenerProtocol;
+
+        use crate::share::{
+            DEFAULT_SHARE_CONSUMER_FETCH_MAX, DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS,
+            DEFAULT_SHARE_CONSUMER_FETCH_MIN, ShareAckMode, ShareAcquireMode, ShareConsumer,
+        };
+
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&handshakes);
+        let answer = MockSaslAnswer::AuthenticateError(58);
+        let mock = MockBroker::start_with_replies(move |api_key, version, _corr, _body| {
+            if api_key == krabka_protocol::owned::sasl_handshake_request::API_KEY {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            answer.reply(api_key, version).unwrap_or(MockReply::Silent)
+        })
+        .await;
+        let client = |bootstrap: String| async move {
+            Client::builder()
+                .bootstrap(bootstrap)
+                .security(ClientSecurity {
+                    protocol: ListenerProtocol::SaslPlaintext,
+                    tls: None,
+                    sasl: Some(SaslCredentials::Plain {
+                        username: "alice".into(),
+                        password: "secret".into(),
+                    }),
+                    sasl_host: None,
+                })
+                .build()
+                .await
+                .unwrap()
+        };
+        let poll_error = crate::coordinator::PollErrorSlot::default();
+        let mut state = state().await;
+        state.client = client(mock.addr.to_string()).await;
+        state.poll_error = Arc::clone(&poll_error);
+        let mut consumer = ShareConsumer {
+            client: client(mock.addr.to_string()).await,
+            group_id: "group-a".into(),
+            member_id: "member-a".into(),
+            member_epoch: Arc::new(Mutex::new(3)),
+            assignment: Arc::new(Mutex::new(Vec::new())),
+            topic_names: Arc::new(Mutex::new(HashMap::new())),
+            share_session_epoch: 0,
+            fetch_min: DEFAULT_SHARE_CONSUMER_FETCH_MIN,
+            fetch_max: DEFAULT_SHARE_CONSUMER_FETCH_MAX,
+            fetch_max_records: DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS,
+            acquire_mode: ShareAcquireMode::BatchOptimized,
+            ack_mode: ShareAckMode::Explicit,
+            pending_acks: Vec::new(),
+            prev_delivered: Vec::new(),
+            shutdown: CancellationToken::new(),
+            hb_handle: None,
+            poll_error,
+        };
+
+        let outcome = heartbeat_once(&state, false).await;
+        let rejection = match consumer.poll(krabka_units::millis(1)).await {
+            Err(ConsumerError::Client(ClientError::Authentication {
+                source: AuthenticationError::Sasl(error),
+                ..
+            })) => Some(error),
+            _ => None,
+        };
+        let handshakes = handshakes.load(Ordering::SeqCst);
+
+        mock.stop();
+        assert2::assert!(matches!(outcome, HeartbeatOutcome::Transient));
+        assert2::assert!(
+            (rejection, handshakes)
+                == (
+                    Some(SaslAuthenticationError::Failed(
+                        "SaslAuthenticate(PLAIN) error_code=58 \
+                         error_message=Some(\"rejected by mock broker\")"
+                            .into()
+                    )),
+                    1
+                )
+        );
     }
 }
