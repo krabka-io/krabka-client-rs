@@ -795,11 +795,14 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
             None => continue,
         };
         // A partition with a resend in flight keeps its one slot; skip it.
-        if capped || occupied.contains(&key) {
-            // Records wait for a broker that this cycle cannot send to.
-            // Kafka's `Sender.sendProducerData` notes the same case when
-            // `NetworkClient.ready` refuses a node with ready data.
-            if track_latency && acc.lock().await.queue_size() > 0 {
+        let waits_for_resend = occupied.contains(&key);
+        if capped || waits_for_resend {
+            // Records wait behind a resend to their broker. Kafka's
+            // `Sender.sendProducerData` notes the same case when
+            // `NetworkClient.ready` refuses a node with ready data. The cap of
+            // this cycle alone does not note the broker: the cycle did not
+            // try it, and its connection can be idle.
+            if track_latency && waits_for_resend && acc.lock().await.queue_size() > 0 {
                 note_node_latency(cfg, state, &key, now, false);
             }
             continue;
@@ -4401,6 +4404,50 @@ mod harness {
                     (3, drained),
                 ])
         );
+    }
+
+    /// The cap of one drain cycle does not note a broker as waiting. The
+    /// cycle did not try the broker, so its records did not wait for it.
+    /// Kafka notes a node only when `NetworkClient.ready` refuses it
+    /// (`Sender.sendProducerData`).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_cycle_cap_does_not_note_an_untried_broker() {
+        let partitioner = Arc::new(BuiltInPartitioner::new(PartitionerConfig {
+            sticky_batch_size: 16 * 1024,
+            ignore_keys: false,
+            adaptive_partitioning: true,
+            availability_timeout: Duration::from_millis(100),
+        }));
+        // One Produce per cycle, and three partitions on three brokers.
+        let (mut cfg, _transport) = direct_config(partitioner, 1);
+        for (partition, leader) in [(0, 1), (1, 2), (2, 3)] {
+            cfg.partition_leaders
+                .insert(("t".to_owned(), partition), leader);
+            queue_batches(&cfg, "t", partition, 1).await;
+        }
+        let earlier = Instant::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let now = Instant::now();
+        let seen = NodeLatency {
+            ready_at: earlier,
+            drained_at: earlier,
+        };
+        let mut state = PipelineState::default();
+        for leader in [1, 2, 3] {
+            state.node_latency.insert(leader, seen);
+        }
+
+        drain_once(&mut cfg, &mut state, DrainIntent::Force).await;
+
+        // The cycle sends one batch. The broker that got it is drained now,
+        // and the two brokers that the cap left out keep their old times.
+        let drained = NodeLatency {
+            ready_at: now,
+            drained_at: now,
+        };
+        let mut latencies: Vec<NodeLatency> = state.node_latency.values().copied().collect();
+        latencies.sort_unstable_by_key(|latency| latency.drained_at);
+        assert2::assert!(latencies == vec![seen, seen, drained]);
     }
 
     /// A one-shot transport error mid-stream must NOT drop or reorder. The
