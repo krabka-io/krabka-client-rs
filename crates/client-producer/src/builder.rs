@@ -619,6 +619,11 @@ impl Producer {
     /// idempotent producer accepts at most 5 in-flight requests per
     /// connection, and a `transactional_id` requires idempotence.
     ///
+    /// The builder has no `enable_metrics_push` option. The producer does not
+    /// push client metrics (KIP-714), so it never sends
+    /// `GetTelemetrySubscriptions` or `PushTelemetry`. Kafka's
+    /// `enable.metrics.push` is `true` by default.
+    ///
     /// When `client_id` is not set, the client id is
     /// `producer-<transactional_id>`, or `producer-<n>` with a process-wide
     /// sequence number.
