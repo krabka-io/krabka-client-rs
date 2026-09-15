@@ -12,6 +12,7 @@ use tokio::{
 };
 
 use crate::{
+    buffer_pool::MemoryReservation,
     error::ProducerError,
     record::{Header, RecordMetadata},
 };
@@ -43,6 +44,10 @@ pub(crate) struct InProgressBatch {
     /// Approximate uncompressed body size.
     pub size_bytes: usize,
     pub records: Vec<PendingRecord>,
+    /// The buffer memory of the batch. It returns to the pool when the batch
+    /// is dropped. A part of a split batch holds none, as Kafka's split
+    /// batches do not come from the `BufferPool`.
+    pub memory: Option<MemoryReservation>,
 }
 
 impl InProgressBatch {
@@ -52,6 +57,7 @@ impl InProgressBatch {
             first_append_at: Instant::now(),
             size_bytes: 0,
             records: Vec::new(),
+            memory: None,
         }
     }
 
@@ -119,6 +125,40 @@ impl Accumulator {
         self.ready.push_front(batch);
     }
 
+    /// Tell if a record of `record_size` bytes starts a new batch, which
+    /// needs buffer memory.
+    pub fn needs_new_batch(&self, record_size: usize, transaction_generation: Option<u64>) -> bool {
+        match &self.current {
+            None => true,
+            Some(b) => {
+                b.transaction_generation != transaction_generation
+                    || (b.size_bytes + record_size > self.batch_size && !b.is_empty())
+            }
+        }
+    }
+
+    /// Append a record with no buffer memory for a new batch.
+    #[cfg(test)]
+    pub fn try_append(
+        &mut self,
+        key: Option<Bytes>,
+        value: Option<Bytes>,
+        headers: Vec<Header>,
+        timestamp_ms: i64,
+        transaction_generation: Option<u64>,
+    ) -> AppendResult {
+        self.append(
+            key,
+            value,
+            headers,
+            timestamp_ms,
+            transaction_generation,
+            None,
+        )
+    }
+
+    /// Append a record. When the record starts a new batch, the batch takes
+    /// `memory`. Otherwise `memory` returns to the pool at once.
     #[tracing::instrument(
         level = "trace",
         skip_all,
@@ -128,30 +168,25 @@ impl Accumulator {
             headers = headers.len(),
         ),
     )]
-    pub fn try_append(
+    pub fn append(
         &mut self,
         key: Option<Bytes>,
         value: Option<Bytes>,
         headers: Vec<Header>,
         timestamp_ms: i64,
         transaction_generation: Option<u64>,
+        memory: Option<MemoryReservation>,
     ) -> AppendResult {
-        // Approximate the per-record size: 8 bytes overhead + key + value + headers.
         let record_size = approx_record_size(key.as_deref(), value.as_deref(), &headers);
-
-        let need_new_batch = match &self.current {
-            None => true,
-            Some(b) => {
-                b.transaction_generation != transaction_generation
-                    || (b.size_bytes + record_size > self.batch_size && !b.is_empty())
-            }
-        };
+        let need_new_batch = self.needs_new_batch(record_size, transaction_generation);
 
         if need_new_batch {
             if let Some(prev) = self.current.take() {
                 self.ready.push_back(prev);
             }
-            self.current = Some(InProgressBatch::new(transaction_generation));
+            let mut batch = InProgressBatch::new(transaction_generation);
+            batch.memory = memory;
+            self.current = Some(batch);
         }
 
         let batch = self
@@ -188,7 +223,13 @@ impl Accumulator {
     }
 }
 
-fn approx_record_size(key: Option<&[u8]>, value: Option<&[u8]>, headers: &[Header]) -> usize {
+/// Approximate the size of a record: 8 bytes of overhead, the key, the value
+/// and the headers.
+pub(crate) fn approx_record_size(
+    key: Option<&[u8]>,
+    value: Option<&[u8]>,
+    headers: &[Header],
+) -> usize {
     let mut n = 8usize; // varint overhead estimate
     n += key.map_or(0, <[u8]>::len) + 4;
     n += value.map_or(0, <[u8]>::len) + 4;

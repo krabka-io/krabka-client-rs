@@ -1696,6 +1696,73 @@ mod tests {
         next_transaction: TxnResult,
     }
 
+    /// A send after `prepare_transaction` fails at once with the state error.
+    /// It does not wait for buffer memory first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_in_preparing_state_fails_before_waiting_for_memory() {
+        let (mock, producer, _coordinator) = scripted_producer(Coordinator::default()).await;
+        let _transaction = producer
+            .begin_transaction()
+            .await
+            .expect("begin transaction");
+        *producer.txn_state.lock().await = TxnState::Preparing;
+        let _all_memory = producer
+            .buffer_pool
+            .allocate(producer.buffer_pool.total(), Duration::ZERO)
+            .await
+            .expect("the pool is free");
+
+        let send = producer.send(ProducerRecord {
+            topic: "topic".to_owned(),
+            partition: Some(0),
+            value: Some(bytes::Bytes::from_static(b"v")),
+            ..Default::default()
+        });
+        let outcome = match tokio::time::timeout(Duration::from_secs(2), send).await {
+            Ok(receiver) => receiver
+                .await
+                .expect("the send is resolved")
+                .map(drop)
+                .map_err(|error| error.to_string()),
+            Err(_) => Err("waited".to_owned()),
+        };
+        mock.stop();
+        assert2::assert!(
+            outcome
+                == Err(
+                    "invalid transaction state: send is not allowed after prepare_transaction"
+                        .to_owned()
+                )
+        );
+    }
+
+    /// Concurrent transactional sends to one partition all complete. A send
+    /// takes the transaction state lock before the accumulator lock, also
+    /// when it checks for buffer memory, so two sends cannot wait for each
+    /// other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_transactional_sends_to_one_partition_complete() {
+        let (mock, producer, _coordinator) = scripted_producer(Coordinator::default()).await;
+        let _transaction = producer
+            .begin_transaction()
+            .await
+            .expect("begin transaction");
+        let sends = (0..200).map(|_| {
+            producer.send(ProducerRecord {
+                topic: "topic".to_owned(),
+                partition: Some(0),
+                value: Some(bytes::Bytes::from_static(b"v")),
+                ..Default::default()
+            })
+        });
+        let enqueued =
+            tokio::time::timeout(Duration::from_secs(10), futures::future::join_all(sends))
+                .await
+                .map(|receivers| receivers.len());
+        mock.stop();
+        assert2::assert!(enqueued == Ok(200));
+    }
+
     /// Kafka's `Sender.failBatch` calls
     /// `TransactionManager.handleFailedBatch`, which moves a transactional
     /// producer to `ABORTABLE_ERROR`. `commitTransaction` then fails in

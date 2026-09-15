@@ -76,6 +76,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     accumulator::{AccumulatorMap, InProgressBatch, PendingRecord},
+    buffer_pool::MemoryReservation,
     compression::Compression,
     error::ProducerError,
     error_class::{self, ErrorClass},
@@ -555,6 +556,10 @@ struct PreparedBatch {
     /// records when the retries or the delivery timeout ends.
     last_failure: Option<SendFailure>,
     transaction_generation: Option<u64>,
+    /// The buffer memory of the batch. It returns to the pool when the batch
+    /// completes and is dropped, as Kafka's `Sender` deallocates a batch when
+    /// it completes.
+    _memory: Option<MemoryReservation>,
 }
 
 /// Why one send of a batch did not ack it.
@@ -1153,6 +1158,7 @@ async fn prepare_batch(
         backoff_attempts: 0,
         last_failure: None,
         transaction_generation: batch.transaction_generation,
+        _memory: batch.memory,
     }
 }
 
@@ -2064,7 +2070,19 @@ fn fail_batch(records: Vec<PendingRecord>, err: ProducerError) {
             ProducerError::Closed => Some(ProducerError::Closed),
             ProducerError::FlushTimeout => Some(ProducerError::FlushTimeout),
             ProducerError::SendTimeout => Some(ProducerError::SendTimeout),
-            ProducerError::BufferFull => Some(ProducerError::BufferFull),
+            ProducerError::BufferExhausted {
+                size,
+                max_block,
+                total,
+                available,
+                poolable,
+            } => Some(ProducerError::BufferExhausted {
+                size: *size,
+                max_block: *max_block,
+                total: *total,
+                available: *available,
+                poolable: *poolable,
+            }),
             ProducerError::BatchTooLarge { batch_size } => Some(ProducerError::BatchTooLarge {
                 batch_size: *batch_size,
             }),
@@ -2145,6 +2163,7 @@ mod tests {
             backoff_attempts: 0,
             last_failure: None,
             transaction_generation: None,
+            _memory: None,
         };
         (pb, rx)
     }
@@ -5033,6 +5052,7 @@ mod harness {
             backoff_attempts: 0,
             last_failure: None,
             transaction_generation: None,
+            _memory: None,
         };
         (pb, rx)
     }
