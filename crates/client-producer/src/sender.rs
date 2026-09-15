@@ -4276,7 +4276,7 @@ mod harness {
             txn_pid_epoch: Arc::new(Mutex::new((-1, -1))),
             txn_recovery_required: Arc::new(AtomicBool::new(false)),
             txn_recovery_generation: Arc::new(AtomicU64::new(0)),
-            txn_abortable_error: Arc::new(AbortableErrorSlot::default()),
+            txn_error: Arc::new(TxnErrorSlot::default()),
         };
         (cfg, transport)
     }
