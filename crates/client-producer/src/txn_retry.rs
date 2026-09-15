@@ -24,7 +24,8 @@
 //!   `COORDINATOR_NOT_AVAILABLE` and `NOT_COORDINATOR` find the coordinator
 //!   again and send the request again. Every other `RetriableException` sends
 //!   the request again. `INVALID_PRODUCER_EPOCH` and `PRODUCER_FENCED` fence
-//!   the producer.
+//!   the producer. A code that the handler passes to `fatalError` gives a
+//!   `Fatal` decision, and the producer then moves to its fatal error state.
 
 use crate::error_class;
 
@@ -62,6 +63,10 @@ const REQUEST_TIMED_OUT: i16 = 7;
 const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
 /// `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`.
 const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
+/// `INVALID_TXN_STATE`.
+const INVALID_TXN_STATE: i16 = 48;
+/// `INVALID_PRODUCER_ID_MAPPING`.
+const INVALID_PRODUCER_ID_MAPPING: i16 = 49;
 
 /// The result of one send to the transaction coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,9 +99,13 @@ pub(crate) enum EndTxnDecision {
     /// application must abort the transaction. No earlier attempt was lost, so
     /// this request changed nothing.
     Abortable(i16),
-    /// The coordinator refused the request with this code. No earlier attempt
-    /// was lost, so this request changed nothing.
-    Refused(i16),
+    /// The coordinator refused the request with this fatal code. No earlier
+    /// attempt was lost, so this request changed nothing. The producer can do
+    /// no more transactional work.
+    Fatal(i16),
+    /// The retry deadline ended while the coordinator answered this retriable
+    /// code. No attempt was lost, so the caller can retry.
+    TimedOut(i16),
     /// An earlier attempt was lost, and this answer does not show whether
     /// that attempt took effect.
     OutcomeUnknown,
@@ -108,9 +117,14 @@ pub(crate) enum EndTxnDecision {
 /// failed in transport. After that, only `NONE` is proof of the outcome. A
 /// fence or a refusal can come from a newer epoch that completed or aborted the
 /// transaction after the lost attempt, so the outcome stays unknown.
+///
+/// `committed` is the result that the request asks for. Kafka's
+/// `EndTxnHandler` makes `TRANSACTION_ABORTABLE` fatal for an abort, because
+/// an abort that is abortable again would loop.
 pub(crate) const fn decide_end_txn(
     attempt: CoordinatorAttempt,
     earlier_attempt_lost: bool,
+    committed: bool,
 ) -> EndTxnDecision {
     match attempt {
         CoordinatorAttempt::Answered(NONE) => EndTxnDecision::Complete,
@@ -123,10 +137,13 @@ pub(crate) const fn decide_end_txn(
         CoordinatorAttempt::Answered(INVALID_PRODUCER_EPOCH | PRODUCER_FENCED) => {
             EndTxnDecision::Fenced
         }
+        CoordinatorAttempt::Answered(TRANSACTION_ABORTABLE) if !committed => {
+            EndTxnDecision::Fatal(TRANSACTION_ABORTABLE)
+        }
         CoordinatorAttempt::Answered(code @ (UNKNOWN_PRODUCER_ID | TRANSACTION_ABORTABLE)) => {
             EndTxnDecision::Abortable(code)
         }
-        CoordinatorAttempt::Answered(code) => EndTxnDecision::Refused(code),
+        CoordinatorAttempt::Answered(code) => EndTxnDecision::Fatal(code),
     }
 }
 
@@ -142,7 +159,7 @@ pub(crate) const fn decide_end_txn_at_deadline(
             EndTxnDecision::ConcurrentTransactions
         }
         CoordinatorAttempt::Answered(code) if !earlier_attempt_lost => {
-            EndTxnDecision::Refused(code)
+            EndTxnDecision::TimedOut(code)
         }
         CoordinatorAttempt::Answered(_) | CoordinatorAttempt::Lost => {
             EndTxnDecision::OutcomeUnknown
@@ -166,11 +183,19 @@ pub(crate) enum AddPartitionsDecision {
     /// The coordinator refused the request with this code, and the application
     /// must abort the transaction.
     Abortable(i16),
-    /// The coordinator refused the request with this code.
-    Refused(i16),
+    /// The coordinator refused the request with this fatal code.
+    Fatal(i16),
 }
 
 /// Decide what one `AddPartitionsToTxn` attempt means.
+///
+/// Kafka's `AddPartitionsToTxnHandler.handleResponse`: 15 and 16 find the
+/// coordinator again, every other `RetriableException` sends the request
+/// again, `INVALID_PRODUCER_EPOCH` and `PRODUCER_FENCED` fence the producer,
+/// and `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, `INVALID_TXN_STATE` and
+/// `INVALID_PRODUCER_ID_MAPPING` are fatal. Every other code, which includes
+/// `TOPIC_AUTHORIZATION_FAILED`, `OPERATION_NOT_ATTEMPTED` and an unexpected
+/// code, gives an abortable error.
 pub(crate) const fn decide_add_partitions(attempt: CoordinatorAttempt) -> AddPartitionsDecision {
     match attempt {
         CoordinatorAttempt::Answered(NONE) => AddPartitionsDecision::Added,
@@ -182,10 +207,12 @@ pub(crate) const fn decide_add_partitions(attempt: CoordinatorAttempt) -> AddPar
         CoordinatorAttempt::Answered(INVALID_PRODUCER_EPOCH | PRODUCER_FENCED) => {
             AddPartitionsDecision::Fenced
         }
-        CoordinatorAttempt::Answered(code @ (UNKNOWN_PRODUCER_ID | TRANSACTION_ABORTABLE)) => {
-            AddPartitionsDecision::Abortable(code)
-        }
-        CoordinatorAttempt::Answered(code) => AddPartitionsDecision::Refused(code),
+        CoordinatorAttempt::Answered(
+            code @ (TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+            | INVALID_TXN_STATE
+            | INVALID_PRODUCER_ID_MAPPING),
+        ) => AddPartitionsDecision::Fatal(code),
+        CoordinatorAttempt::Answered(code) => AddPartitionsDecision::Abortable(code),
     }
 }
 
@@ -194,7 +221,7 @@ pub(crate) const fn decide_add_partitions(attempt: CoordinatorAttempt) -> AddPar
 ///
 /// The rules follow the handler of each request in Kafka's
 /// `TransactionManager`. `fatalError` in those handlers becomes
-/// [`TxnRequestDecision::Refused`], except for `INVALID_PRODUCER_EPOCH` and
+/// [`TxnRequestDecision::Fatal`], except for `INVALID_PRODUCER_EPOCH` and
 /// `PRODUCER_FENCED`, which give [`TxnRequestDecision::Fenced`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxnRequestDecision {
@@ -210,8 +237,8 @@ pub(crate) enum TxnRequestDecision {
     /// The coordinator refused the request with this code, and the application
     /// must abort the transaction.
     Abortable(i16),
-    /// The coordinator refused the request with this code.
-    Refused(i16),
+    /// The coordinator refused the request with this fatal code.
+    Fatal(i16),
 }
 
 /// Decide what one `AddOffsetsToTxn` attempt means.
@@ -235,7 +262,7 @@ pub(crate) const fn decide_add_offsets_to_txn(attempt: CoordinatorAttempt) -> Tx
         CoordinatorAttempt::Answered(
             code @ (UNKNOWN_PRODUCER_ID | GROUP_AUTHORIZATION_FAILED | TRANSACTION_ABORTABLE),
         ) => TxnRequestDecision::Abortable(code),
-        CoordinatorAttempt::Answered(code) => TxnRequestDecision::Refused(code),
+        CoordinatorAttempt::Answered(code) => TxnRequestDecision::Fatal(code),
     }
 }
 
@@ -271,7 +298,7 @@ pub(crate) const fn decide_txn_offset_commit(attempt: CoordinatorAttempt) -> Txn
             | GROUP_ID_NOT_FOUND
             | STALE_MEMBER_EPOCH),
         ) => TxnRequestDecision::Abortable(code),
-        CoordinatorAttempt::Answered(code) => TxnRequestDecision::Refused(code),
+        CoordinatorAttempt::Answered(code) => TxnRequestDecision::Fatal(code),
     }
 }
 
@@ -299,7 +326,7 @@ pub(crate) const fn decide_init_producer_id(attempt: CoordinatorAttempt) -> TxnR
             | CLUSTER_AUTHORIZATION_FAILED
             | TRANSACTION_ABORTABLE),
         ) => TxnRequestDecision::Abortable(code),
-        CoordinatorAttempt::Answered(code) => TxnRequestDecision::Refused(code),
+        CoordinatorAttempt::Answered(code) => TxnRequestDecision::Fatal(code),
     }
 }
 
@@ -316,7 +343,7 @@ mod tests {
     #[test]
     fn each_end_txn_answer_maps_to_one_decision() {
         use CoordinatorAttempt::{Answered, Lost};
-        use EndTxnDecision::{Abortable, Complete, Fenced, OutcomeUnknown, Refused, Retry};
+        use EndTxnDecision::{Abortable, Complete, Fatal, Fenced, OutcomeUnknown, Retry};
         let resend = Retry { rediscover: false };
         let rediscover = Retry { rediscover: true };
         let cases = [
@@ -344,9 +371,16 @@ mod tests {
                 true,
                 OutcomeUnknown,
             ),
-            ("first invalid state", Answered(48), false, Refused(48)),
+            ("first invalid state", Answered(48), false, Fatal(48)),
             ("retried invalid state", Answered(48), true, OutcomeUnknown),
-            ("first id mapping", Answered(49), false, Refused(49)),
+            ("first id mapping", Answered(49), false, Fatal(49)),
+            (
+                "first transactional id authorization",
+                Answered(53),
+                false,
+                Fatal(53),
+            ),
+            ("first unexpected code", Answered(42), false, Fatal(42)),
             ("retried id mapping", Answered(49), true, OutcomeUnknown),
             (
                 "first unknown producer id",
@@ -358,18 +392,52 @@ mod tests {
             ("retried abortable", Answered(120), true, OutcomeUnknown),
         ];
         for (name, attempt, earlier_attempt_lost, expected) in cases {
-            let actual = decide_end_txn(attempt, earlier_attempt_lost);
+            let actual = decide_end_txn(attempt, earlier_attempt_lost, true);
             assert!(actual == expected, "{name}");
+        }
+    }
+
+    /// Kafka's `EndTxnHandler` makes `TRANSACTION_ABORTABLE` fatal for an
+    /// abort, and abortable for a commit. The other codes do not depend on the
+    /// result that the request asks for.
+    #[test]
+    fn end_txn_abort_makes_transaction_abortable_fatal() {
+        use CoordinatorAttempt::Answered;
+        use EndTxnDecision::{Abortable, Complete, Fatal, Fenced};
+        let cases = [
+            ("commit abortable", true, Answered(120), Abortable(120)),
+            ("abort abortable", false, Answered(120), Fatal(120)),
+            (
+                "commit unknown producer id",
+                true,
+                Answered(59),
+                Abortable(59),
+            ),
+            (
+                "abort unknown producer id",
+                false,
+                Answered(59),
+                Abortable(59),
+            ),
+            ("abort invalid state", false, Answered(48), Fatal(48)),
+            ("abort fenced", false, Answered(90), Fenced),
+            ("abort none", false, Answered(0), Complete),
+        ];
+        for (name, committed, attempt, expected) in cases {
+            assert!(
+                decide_end_txn(attempt, false, committed) == expected,
+                "{name}"
+            );
         }
     }
 
     #[test]
     fn end_txn_deadline_reports_unknown_only_after_a_lost_attempt() {
         use CoordinatorAttempt::{Answered, Lost};
-        use EndTxnDecision::{ConcurrentTransactions, OutcomeUnknown, Refused};
+        use EndTxnDecision::{ConcurrentTransactions, OutcomeUnknown, TimedOut};
         let cases = [
-            ("loading, nothing lost", Answered(14), false, Refused(14)),
-            ("moved, nothing lost", Answered(16), false, Refused(16)),
+            ("loading, nothing lost", Answered(14), false, TimedOut(14)),
+            ("moved, nothing lost", Answered(16), false, TimedOut(16)),
             (
                 "concurrent, nothing lost",
                 Answered(51),
@@ -393,7 +461,7 @@ mod tests {
 
     #[test]
     fn each_add_partitions_answer_maps_to_one_decision() {
-        use AddPartitionsDecision::{Abortable, Added, Fenced, Refused, Retry};
+        use AddPartitionsDecision::{Abortable, Added, Fatal, Fenced, Retry};
         use CoordinatorAttempt::{Answered, Lost};
         let resend = Retry { rediscover: false };
         let rediscover = Retry { rediscover: true };
@@ -407,11 +475,12 @@ mod tests {
             ("request timed out", Answered(7), resend),
             ("invalid epoch", Answered(47), Fenced),
             ("producer fenced", Answered(90), Fenced),
-            ("topic authorization", Answered(29), Refused(29)),
-            ("invalid state", Answered(48), Refused(48)),
-            ("id mapping", Answered(49), Refused(49)),
-            ("transactional id authorization", Answered(53), Refused(53)),
-            ("operation not attempted", Answered(55), Refused(55)),
+            ("topic authorization", Answered(29), Abortable(29)),
+            ("invalid state", Answered(48), Fatal(48)),
+            ("id mapping", Answered(49), Fatal(49)),
+            ("transactional id authorization", Answered(53), Fatal(53)),
+            ("operation not attempted", Answered(55), Abortable(55)),
+            ("unexpected code", Answered(42), Abortable(42)),
             ("unknown producer id", Answered(59), Abortable(59)),
             ("abortable", Answered(120), Abortable(120)),
         ];
@@ -427,7 +496,7 @@ mod tests {
     #[test]
     fn each_add_offsets_to_txn_answer_maps_to_one_decision() {
         use CoordinatorAttempt::{Answered, Lost};
-        use TxnRequestDecision::{Abortable, Done, Fenced, Refused, Retry};
+        use TxnRequestDecision::{Abortable, Done, Fatal, Fenced, Retry};
         let resend = Retry { rediscover: false };
         let rediscover = Retry { rediscover: true };
         let cases: [RequestDecisionRow; 14] = [
@@ -443,8 +512,8 @@ mod tests {
             ("unknown producer id", Answered(59), Abortable(59)),
             ("group authorization", Answered(30), Abortable(30)),
             ("transaction abortable", Answered(120), Abortable(120)),
-            ("invalid state", Answered(48), Refused(48)),
-            ("id mapping", Answered(49), Refused(49)),
+            ("invalid state", Answered(48), Fatal(48)),
+            ("id mapping", Answered(49), Fatal(49)),
         ];
         for (name, attempt, expected) in cases {
             assert!(decide_add_offsets_to_txn(attempt) == expected, "{name}");
@@ -454,7 +523,7 @@ mod tests {
     #[test]
     fn each_txn_offset_commit_answer_maps_to_one_decision() {
         use CoordinatorAttempt::{Answered, Lost};
-        use TxnRequestDecision::{Abortable, Done, Fenced, Refused, Retry};
+        use TxnRequestDecision::{Abortable, Done, Fatal, Fenced, Retry};
         let resend = Retry { rediscover: false };
         let rediscover = Retry { rediscover: true };
         let cases: [RequestDecisionRow; 17] = [
@@ -474,7 +543,7 @@ mod tests {
             ("illegal generation", Answered(22), Abortable(22)),
             ("group id not found", Answered(69), Abortable(69)),
             ("stale member epoch", Answered(113), Abortable(113)),
-            ("unsupported message format", Answered(43), Refused(43)),
+            ("unsupported message format", Answered(43), Fatal(43)),
         ];
         for (name, attempt, expected) in cases {
             assert!(decide_txn_offset_commit(attempt) == expected, "{name}");
@@ -484,7 +553,7 @@ mod tests {
     #[test]
     fn each_init_producer_id_answer_maps_to_one_decision() {
         use CoordinatorAttempt::{Answered, Lost};
-        use TxnRequestDecision::{Abortable, Done, Fenced, Refused, Retry};
+        use TxnRequestDecision::{Abortable, Done, Fatal, Fenced, Retry};
         let resend = Retry { rediscover: false };
         let rediscover = Retry { rediscover: true };
         let cases: [RequestDecisionRow; 12] = [
@@ -503,7 +572,7 @@ mod tests {
                 Abortable(53),
             ),
             ("cluster authorization", Answered(31), Abortable(31)),
-            ("invalid state", Answered(48), Refused(48)),
+            ("invalid state", Answered(48), Fatal(48)),
         ];
         for (name, attempt, expected) in cases {
             assert!(decide_init_producer_id(attempt) == expected, "{name}");

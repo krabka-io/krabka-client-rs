@@ -23,23 +23,22 @@
 //! It keeps only what a deadlock can depend on: **which task holds which
 //! `tokio::sync::Mutex` and where each task is suspended.**
 //!
-//! ## The ten shared `tokio::sync::Mutex`es
+//! ## The nine shared `tokio::sync::Mutex`es
 //!
 //! `Consumer` declares them in `consumer.rs`, in the `Consumer` mutex fields,
 //! and shares them into `CoordinatorState` with `Arc::clone`:
 //!
 //! | id | field          | abbrev |
 //! |----|----------------|--------|
-//! | 0  | `pending_seeks`| PS     |
-//! | 1  | `assigned`     | A      |
-//! | 2  | `next_offsets` | N      |
-//! | 3  | `positions`    | P      |
-//! | 4  | `topic_ids`    | T      |
-//! | 5  | `commit_identity` | CI  |
-//! | 6  | `commit_serialization` | CS |
-//! | 7  | `end_offsets`  | E      |
-//! | 8  | `AutoCommit::polled` | AP |
-//! | 9  | `AutoCommit::next_due` | ND |
+//! | 0  | `assigned`     | A      |
+//! | 1  | `next_offsets` | N      |
+//! | 2  | `positions`    | P      |
+//! | 3  | `topic_ids`    | T      |
+//! | 4  | `commit_identity` | CI  |
+//! | 5  | `commit_serialization` | CS |
+//! | 6  | `end_offsets`  | E      |
+//! | 7  | `AutoCommit::polled` | AP |
+//! | 8  | `AutoCommit::next_due` | ND |
 //!
 //! ## Modeled lock-holding regions (sequences where >1 guard is alive at once,
 //! plus single-lock regions for completeness). Citations are to the real code.
@@ -57,10 +56,16 @@
 //! its wait for the lock (`commit_turn`). The rebalance timeout also bounds that
 //! wait.
 //!
-//! ### poll task (`poll.rs`, `seek.rs`, `validate.rs`, `commit.rs`)
-//! - `apply_pending_seeks` (seek.rs): PS fast-path probe (released) → A
-//!   `assigned.clone()` (released) → **PS → N → P** held together, all released
-//!   at scope end. Region edges: PS→N, N→P.
+//! ### seek task (`seek.rs`)
+//! - `seek_to_position` and `request_offset_reset`: **A → N → P** held
+//!   together, all released. Region edges: A→N, N→P.
+//!   `position` (`partition_state.rs`) takes A alone, then N→P, then the
+//!   regions of `update_fetch_positions` that the poll task lists below.
+//!   `current_lag` (`queries.rs`) holds A→N, then takes E alone.
+//!   `pause`, `resume` and `paused` take CI alone. The paused set is a
+//!   `std::sync::Mutex` that no region holds while it takes another lock.
+//!
+//! ### poll task (`poll.rs`, `validate.rs`, `commit.rs`)
 //! - `maybe_auto_commit_async` (commit.rs): CI, N and P each alone
 //!   (`consumed_positions`), then AP alone, then ND. While it holds ND it tries
 //!   CS with `try_lock_owned`, which never waits, so the model has no ND → CS
@@ -68,7 +73,7 @@
 //!   takes **CS → ND** after a retriable failure.
 //! - `refresh_leader_epochs` (validate.rs): **P alone** (after the metadata
 //!   `.await`), released; then **T alone** (the tracked `topic_ids` update).
-//! - `resolve_latest_sentinels` (poll.rs): **N alone** for the sentinel
+//! - `resolve_reset_sentinels` (poll.rs): **N alone** for the sentinel
 //!   snapshot, released; then **P alone** in `list_offsets` for the leader
 //!   routes, released before the `ListOffsets` `.await`; then **N alone** to
 //!   apply the offsets. No region takes a second lock.
@@ -76,8 +81,9 @@
 //!   released before the RPC; then **P alone** in the post-RPC apply.
 //!   `apply_truncation` (poll.rs) then holds N and takes AP
 //!   (`AutoCommit::reset_polled`): **N→AP**.
-//! - `poll` fetch-build (poll.rs, the `by_leader` snapshot): **N→P** held
-//!   together, released before the Fetch `.await`.
+//! - `poll` fetch-build (poll.rs, `group_fetches`): **CI alone** for the
+//!   ownership of the paused partitions, then the `by_leader` snapshot:
+//!   **N→P** held together, released before the Fetch `.await`.
 //! - `poll` post-fetch loop (poll.rs): A `assigned.clone()` (released) → **N
 //!   held across the whole processing loop**, and inside it P is acquired
 //!   *second* at each per-partition site, that is **N→P every time** ("offsets
@@ -96,6 +102,7 @@
 //!   cooperative `next_offsets`→`positions` prunes). A is never held while N or
 //!   P is acquired.
 //! - `run` after `UNKNOWN_MEMBER_ID`: **CI alone** while clearing identity.
+//! - `install_generation` (before a cooperative revoke callback): **CI alone**.
 //! - `commit_before_join` (at the start of `join_and_sync`): **CS**, and under
 //!   it CI alone, then AP alone. At the end of `join_and_sync`,
 //!   `restart_interval` takes ND alone.
@@ -117,10 +124,10 @@
 //! ## The lock hierarchy these regions imply
 //!
 //! Collecting every "hold L1 while acquiring L2" edge actually observed:
-//!   PS → N, N → P, N → E, A → N, A → CI, CS → CI, CI → N, CS → N, CS → P,
+//!   N → P, N → E, A → N, A → CI, CS → CI, CI → N, CS → N, CS → P,
 //!   CS → T, CS → ND, CS → AP, N → AP.
 //! The resulting partial order is acyclic: `A < CI < N < P`,
-//! `CS < CI < N < P`, `PS < N < P`, `CS < T`, `CS < ND`, `CS < AP`, and
+//! `CS < CI < N < P`, `CS < T`, `CS < ND`, `CS < AP`, and
 //! `N < AP`. No region takes a lock while it holds AP.
 //! This is acyclic ⇒ the prediction is **deadlock-free**, and the model proves
 //! it exhaustively across all task interleavings.
@@ -131,17 +138,16 @@ use stateright::{Checker, Model, Property};
 
 /// Lock identifiers. The order here is incidental. The model assumes no
 /// hierarchy and discovers cycles purely from the acquire/release sequences.
-const PS: u8 = 0; // pending_seeks
-const A: u8 = 1; // assigned
-const N: u8 = 2; // next_offsets
-const P: u8 = 3; // positions
-const T: u8 = 4; // topic_ids
-const CI: u8 = 5; // commit_identity
-const CS: u8 = 6; // commit_serialization
-const E: u8 = 7; // end_offsets
-const AP: u8 = 8; // AutoCommit::polled
-const ND: u8 = 9; // AutoCommit::next_due
-const NUM_LOCKS: usize = 10;
+const A: u8 = 0; // assigned
+const N: u8 = 1; // next_offsets
+const P: u8 = 2; // positions
+const T: u8 = 3; // topic_ids
+const CI: u8 = 4; // commit_identity
+const CS: u8 = 5; // commit_serialization
+const E: u8 = 6; // end_offsets
+const AP: u8 = 7; // AutoCommit::polled
+const ND: u8 = 8; // AutoCommit::next_due
+const NUM_LOCKS: usize = 9;
 
 /// A single lock operation in a task's program. `Acquire` is a suspension
 /// point, a `.lock().await`. `Release` drops a guard at the end of a scope or
@@ -211,29 +217,14 @@ struct Step {
 /// The region boundaries are faithful to the real source and are anchored by
 /// function. So are the RPC `.await`s between them, where all guards are
 /// already dropped:
-///   1. `apply_pending_seeks` (seek.rs)   : PS, N, P  (PS→N→P held)
-///      `maybe_auto_commit_async` (commit.rs): CI, N, P, AP, ND (each alone)
+///   1. `maybe_auto_commit_async` (commit.rs): CI, N, P, AP, ND (each alone)
 ///   2. `refresh_leader_epochs` (validate.rs): P  then  T  (each alone)
-///   3. `resolve_latest_sentinels` (poll.rs): N, P, N  (each alone)
+///   3. `resolve_reset_sentinels` (poll.rs): N, P, N  (each alone)
 ///   4. `validate_positions` (validate.rs): N, P  then  P  (N→P snapshot, then P alone)
 ///   5. `poll` fetch-build (poll.rs)      : N, P      (N→P snapshot)
 ///   6. `poll` post-fetch loop (poll.rs)  : N  then (N,P)…  (N held, P second)
 fn poll_program() -> Vec<Op> {
     vec![
-        // --- apply_pending_seeks (seek.rs) ---
-        // fast-path PS probe (`pending_seeks`), released immediately.
-        Acquire(PS),
-        Release(PS),
-        // assigned snapshot (`assigned.clone()`), released at end of statement.
-        Acquire(A),
-        Release(A),
-        // held region: PS (`pending_seeks`) → N → P, all dropped at scope end.
-        Acquire(PS),
-        Acquire(N),
-        Acquire(P),
-        Release(P),
-        Release(N),
-        Release(PS),
         // --- maybe_auto_commit_async (commit.rs): identity, offsets and
         //     positions snapshots, each alone. ---
         Acquire(CI),
@@ -255,7 +246,7 @@ fn poll_program() -> Vec<Op> {
         Release(P),
         Acquire(T),
         Release(T),
-        // --- resolve_latest_sentinels (poll.rs): N alone (sentinel
+        // --- resolve_reset_sentinels (poll.rs): N alone (sentinel
         //     snapshot), P alone (`list_offsets` routes), N alone (apply). ---
         Acquire(N),
         Release(N),
@@ -277,8 +268,11 @@ fn poll_program() -> Vec<Op> {
         Acquire(AP),
         Release(AP),
         Release(N),
-        // --- poll fetch-build (poll.rs `by_leader` snapshot): N→P, dropped
+        // --- poll fetch-build (poll.rs `group_fetches`): CI alone for the
+        //     paused partitions, then the `by_leader` snapshot: N→P, dropped
         //     before the Fetch. ---
+        Acquire(CI),
+        Release(CI),
         Acquire(N),
         Acquire(P),
         Release(P),
@@ -308,6 +302,19 @@ fn poll_program() -> Vec<Op> {
         Acquire(AP),
         Release(AP),
         Release(N),
+    ]
+}
+
+/// `seek_to_position` (seek.rs): `assigned`, `next_offsets` and `positions`
+/// held together.
+fn seek_program() -> Vec<Op> {
+    vec![
+        Acquire(A),
+        Acquire(N),
+        Acquire(P),
+        Release(P),
+        Release(N),
+        Release(A),
     ]
 }
 
@@ -643,9 +650,32 @@ mod tests {
         checker.assert_properties();
     }
 
+    /// A `seek` races the poll task, the coordinator task and a synchronous
+    /// commit. The protocol is still deadlock-free.
+    #[test]
+    fn seek_is_deadlock_free() {
+        let checker = run_model(vec![
+            ("poll", poll_program()),
+            ("seek", seek_program()),
+            ("coordinator", coordinator_program()),
+            ("commit-sync", commit_program()),
+        ])
+        .spawn_bfs()
+        .join();
+        eprintln!(
+            "[lock_order/seek] unique={} generated={} depth={}",
+            checker.unique_state_count(),
+            checker.state_count(),
+            checker.max_depth(),
+        );
+        assert2::assert!(checker.state_count() < MAX_STATES);
+        assert2::assert!(checker.max_depth() < MAX_DEPTH);
+        checker.assert_properties();
+    }
+
     /// Two poll tasks race the coordinator, for example in a buggy double-poll.
     /// The protocol is still deadlock-free, because every region respects the
-    /// same PS<N<P order.
+    /// same N<P order.
     #[test]
     fn two_pollers_and_coordinator_are_deadlock_free() {
         let checker = run_model(vec![

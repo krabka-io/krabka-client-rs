@@ -125,6 +125,16 @@ impl BrokerConnector for RecordingConnector {
     fn in_flight(connection: &StubConn) -> usize {
         connection.in_flight.load(Ordering::SeqCst)
     }
+
+    fn finalized_features(connection: &StubConn) -> FinalizedFeatures {
+        FinalizedFeatures {
+            epoch: i64::from(connection.addr.port() % 10),
+            levels: std::collections::BTreeMap::from([(
+                "transaction.version".to_owned(),
+                i16::try_from(connection.addr.port() % 10).unwrap(),
+            )]),
+        }
+    }
 }
 
 fn addr(port: u16) -> SocketAddr {
@@ -547,4 +557,50 @@ async fn least_loaded_goes_back_to_bootstrap_after_a_reconnect_or_when_every_bro
             "{name}"
         );
     }
+}
+
+/// Kafka's `ApiVersions.update` keeps the finalized features of the node with
+/// the highest epoch. The stub gives each broker the epoch and level of its
+/// port's last digit.
+#[tokio::test(start_paused = true)]
+async fn the_pool_keeps_the_finalized_features_with_the_highest_epoch() {
+    let pool = pool(&[], RecordingConnector::new());
+    pool.refresh_brokers(&[
+        broker(1, "127.0.0.1", 9003),
+        broker(2, "127.0.0.1", 9005),
+        broker(3, "127.0.0.1", 9004),
+    ])
+    .await;
+    check!(pool.finalized_features() == FinalizedFeatures::default());
+    let mut seen = Vec::new();
+    for id in [1, 2, 3] {
+        pool.get(id).await.unwrap();
+        seen.push(pool.finalized_features().epoch);
+    }
+    check!(seen == vec![3, 5, 5]);
+    check!(pool.finalized_features().level("transaction.version") == Some(5));
+}
+
+/// Kafka's `Metadata.update` replaces the node list: a broker that new
+/// metadata does not name leaves the registry and the least loaded choice.
+#[tokio::test(start_paused = true)]
+async fn brokers_that_new_metadata_omits_leave_the_pool() {
+    let pool = pool(&[addr(1000)], RecordingConnector::new());
+    pool.refresh_brokers(&[broker(1, "127.0.0.1", 9001), broker(2, "127.0.0.1", 9002)])
+        .await;
+    let removed = pool.get(2).await.unwrap();
+    pool.refresh_brokers(&[broker(1, "127.0.0.1", 9001)]).await;
+    check!(pool.broker_ids() == vec![1]);
+    check!(Arc::strong_count(&removed) == 1);
+    check!(pool.least_loaded().await.unwrap().addr == addr(9001));
+}
+
+/// A bootstrap reconnect whose DNS refresh fails still sends the next
+/// untargeted request to the bootstrap addresses that the pool has.
+#[tokio::test(start_paused = true)]
+async fn prefer_bootstrap_keeps_the_known_bootstrap_addresses() {
+    let pool = pool(&[addr(1000)], RecordingConnector::new());
+    pool.refresh_brokers(&[broker(1, "127.0.0.1", 9001)]).await;
+    pool.prefer_bootstrap();
+    check!(pool.least_loaded().await.unwrap().addr == addr(1000));
 }

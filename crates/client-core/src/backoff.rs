@@ -95,7 +95,7 @@ pub(crate) fn random_below(bound: usize) -> usize {
 }
 
 /// A random value in `[0, 1)`.
-fn random_unit() -> f64 {
+pub(crate) fn random_unit() -> f64 {
     f64::from(random_bits()) / 4_294_967_296.0
 }
 

@@ -160,6 +160,8 @@ impl ProtocolRequest for ReleasedInitProducerId {
     const MIN_VERSION: i16 = init_producer_id_request::MIN_VERSION;
     /// The latest released `InitProducerId` version.
     const MAX_VERSION: i16 = 5;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = init_producer_id_request::FLEXIBLE_MIN;
     type Response = InitProducerIdResponse;
 }

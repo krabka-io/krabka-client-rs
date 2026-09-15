@@ -72,8 +72,14 @@ pub enum MockSaslAnswer {
 const MOCK_SASL_MECHANISM: &str = "PLAIN";
 
 impl MockSaslAnswer {
-    /// The reply to a `SaslHandshake` or `SaslAuthenticate` request, or `None`
-    /// for any other API key.
+    /// The reply to the `ApiVersions` v0 request that starts a SASL exchange,
+    /// or to a `SaslHandshake` or `SaslAuthenticate` request, or `None` for any
+    /// other request.
+    ///
+    /// The `ApiVersions` v0 reply lists only `SaslHandshake` v0-v1 and
+    /// `SaslAuthenticate` v0-v2. A client sends the `ApiVersions` of an
+    /// authenticated connection at a higher version, and the handler of the
+    /// test answers it.
     ///
     /// # Panics
     /// Panics if a SASL response does not encode at `version`.
@@ -82,6 +88,8 @@ impl MockSaslAnswer {
         use krabka_protocol::{
             Encode,
             owned::{
+                api_versions_request,
+                api_versions_response::{ApiVersion, ApiVersionsResponse},
                 sasl_authenticate_request,
                 sasl_authenticate_response::{self, SaslAuthenticateResponse},
                 sasl_handshake_request,
@@ -91,6 +99,23 @@ impl MockSaslAnswer {
 
         let mut body = BytesMut::new();
         match (api_key, self) {
+            (api_versions_request::API_KEY, _) if version == 0 => ApiVersionsResponse {
+                api_keys: [
+                    (sasl_handshake_request::API_KEY, 1),
+                    (sasl_authenticate_request::API_KEY, 2),
+                ]
+                .into_iter()
+                .map(|(api_key, max_version)| ApiVersion {
+                    api_key,
+                    min_version: 0,
+                    max_version,
+                    ..Default::default()
+                })
+                .collect(),
+                ..Default::default()
+            }
+            .encode(&mut body, 0)
+            .unwrap(),
             (sasl_handshake_request::API_KEY, Self::HandshakeError(error_code)) => {
                 SaslHandshakeResponse {
                     error_code,

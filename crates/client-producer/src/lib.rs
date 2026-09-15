@@ -64,6 +64,7 @@ mod client_failover_model;
 mod compression;
 mod error;
 mod error_class;
+mod metadata_age;
 mod metadata_wait;
 mod partitioner;
 mod producer;
@@ -84,9 +85,16 @@ pub use builder::{
     DEFAULT_PRODUCER_RETRY_BACKOFF_MAX, DEFAULT_PRODUCER_TRANSACTION_TIMEOUT, ProducerFlushTimeout,
     ProducerRetryPolicy, ProducerThroughputPolicy,
 };
-pub use compression::Compression;
+pub use compression::{
+    Compression, CompressionLevels, DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL,
+    DEFAULT_PRODUCER_COMPRESSION_LZ4_LEVEL, DEFAULT_PRODUCER_COMPRESSION_ZSTD_LEVEL,
+};
 pub use error::{ProducerError, RecordSizeLimit};
 pub use krabka_client_consumer::ConsumerGroupMetadata;
+pub use metadata_age::{
+    DEFAULT_PRODUCER_METADATA_MAX_AGE, DEFAULT_PRODUCER_METADATA_MAX_IDLE,
+    MIN_PRODUCER_METADATA_MAX_IDLE,
+};
 pub use partitioner::partition_for_key;
 pub use producer::{Acks, Producer};
 pub use record::{Header, ProducerRecord, RecordMetadata};

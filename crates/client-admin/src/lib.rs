@@ -995,14 +995,14 @@ where
         .advertised_api_range(R::API_KEY)
         .unwrap_or((0, 0));
     let client_min = R::MIN_VERSION.max(min_version);
-    let chosen = R::MAX_VERSION.min(broker_max);
+    let chosen = R::LATEST_STABLE_VERSION.min(broker_max);
     if chosen < client_min || chosen < broker_min {
         return Err(ClientError::IncompatibleVersion {
             api_key: R::API_KEY,
             broker_min,
             broker_max,
             client_min,
-            client_max: R::MAX_VERSION,
+            client_max: R::LATEST_STABLE_VERSION,
         });
     }
     connection.send(request).await
@@ -1611,6 +1611,18 @@ mod tests {
                                                 api_key: metadata_request::API_KEY,
                                                 min_version: 0,
                                                 max_version: 12,
+                                                ..Default::default()
+                                            },
+                                            ApiVersion {
+                                                api_key: sasl_handshake_request::API_KEY,
+                                                min_version: 0,
+                                                max_version: 1,
+                                                ..Default::default()
+                                            },
+                                            ApiVersion {
+                                                api_key: sasl_authenticate_request::API_KEY,
+                                                min_version: 0,
+                                                max_version: 2,
                                                 ..Default::default()
                                             },
                                         ],
