@@ -79,6 +79,124 @@ impl Compression {
     }
 }
 
+/// Default gzip compression level. Kafka's `compression.gzip.level` default
+/// is `CompressionType.GZIP.defaultLevel()`, which is
+/// `Deflater.DEFAULT_COMPRESSION` (-1).
+pub const DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL: i32 = -1;
+/// Default lz4 compression level. Kafka's `compression.lz4.level` default is
+/// 9.
+pub const DEFAULT_PRODUCER_COMPRESSION_LZ4_LEVEL: i32 = 9;
+/// Default zstd compression level. Kafka's `compression.zstd.level` default
+/// is 3.
+pub const DEFAULT_PRODUCER_COMPRESSION_ZSTD_LEVEL: i32 = 3;
+
+/// The lowest and highest gzip levels: `Deflater.BEST_SPEED` and
+/// `Deflater.BEST_COMPRESSION`.
+const GZIP_LEVELS: (i32, i32) = (1, 9);
+/// The lowest and highest lz4 levels, from `net.jpountz.lz4.LZ4Constants`.
+const LZ4_LEVELS: (i32, i32) = (1, 17);
+/// The lowest and highest zstd levels: `ZSTD_minCLevel` and `ZSTD_MAX_CLEVEL`.
+const ZSTD_LEVELS: (i32, i32) = (-131_072, 22);
+
+/// Validated compression levels of the producer (KIP-390).
+///
+/// Kafka's `ProducerConfig` defines `compression.gzip.level`,
+/// `compression.lz4.level` and `compression.zstd.level`, and checks each one
+/// with `CompressionType.levelValidator`, whatever `compression.type` is.
+/// `KafkaProducer.configureCompression` then gives the level of the chosen
+/// codec to the codec.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompressionLevels {
+    gzip: i32,
+    lz4: i32,
+    zstd: i32,
+}
+
+impl CompressionLevels {
+    /// Validate the three levels as Kafka's `ProducerConfig` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns Kafka's `ConfigException` message, with the krabka option name,
+    /// for the first level that is out of range: gzip 1 to 9 or -1, lz4 1 to
+    /// 17, zstd -131072 to 22.
+    pub fn new(gzip: i32, lz4: i32, zstd: i32) -> Result<Self, String> {
+        let (gzip_min, gzip_max) = GZIP_LEVELS;
+        if gzip > gzip_max || (gzip < gzip_min && gzip != DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL) {
+            return Err(invalid_level(
+                "compression_gzip_level",
+                gzip,
+                &format!(
+                    "Value must be between {gzip_min} and {gzip_max} or equal to {DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL}"
+                ),
+            ));
+        }
+        check_range("compression_lz4_level", lz4, LZ4_LEVELS)?;
+        check_range("compression_zstd_level", zstd, ZSTD_LEVELS)?;
+        Ok(Self { gzip, lz4, zstd })
+    }
+
+    #[must_use]
+    pub const fn gzip(self) -> i32 {
+        self.gzip
+    }
+
+    #[must_use]
+    pub const fn lz4(self) -> i32 {
+        self.lz4
+    }
+
+    #[must_use]
+    pub const fn zstd(self) -> i32 {
+        self.zstd
+    }
+
+    /// The level of `compression`, or `None` for a codec with no levels.
+    #[must_use]
+    pub const fn level(self, compression: Compression) -> Option<i32> {
+        match compression {
+            Compression::Gzip => Some(self.gzip),
+            Compression::Lz4 => Some(self.lz4),
+            Compression::Zstd => Some(self.zstd),
+            Compression::None | Compression::Snappy => None,
+        }
+    }
+}
+
+impl Default for CompressionLevels {
+    fn default() -> Self {
+        Self {
+            gzip: DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL,
+            lz4: DEFAULT_PRODUCER_COMPRESSION_LZ4_LEVEL,
+            zstd: DEFAULT_PRODUCER_COMPRESSION_ZSTD_LEVEL,
+        }
+    }
+}
+
+/// Kafka's `ConfigDef.Range.ensureValid`.
+fn check_range(name: &str, level: i32, (min, max): (i32, i32)) -> Result<(), String> {
+    if level < min {
+        Err(invalid_level(
+            name,
+            level,
+            &format!("Value must be at least {min}"),
+        ))
+    } else if level > max {
+        Err(invalid_level(
+            name,
+            level,
+            &format!("Value must be no more than {max}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Kafka's `ConfigException(name, value, message)` text.
+fn invalid_level(name: &str, level: i32, message: &str) -> String {
+    format!("Invalid value {level} for configuration {name}: {message}")
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -89,6 +207,89 @@ mod tests {
         let raw = b"hello producer";
         let out = Compression::None.compress(raw).unwrap();
         assert2::assert!(out.as_ref() == raw);
+    }
+
+    /// Each row is one set of levels and the result of Kafka's validators:
+    /// `CompressionType.GZIP.levelValidator` for gzip, and
+    /// `ConfigDef.Range.ensureValid` for lz4 and zstd.
+    #[test]
+    fn compression_levels_follow_kafka_validators() {
+        let levels = |gzip, lz4, zstd| CompressionLevels { gzip, lz4, zstd };
+        let gzip_error = |level: i32| {
+            Err(format!(
+                "Invalid value {level} for configuration compression_gzip_level: Value must be \
+                 between 1 and 9 or equal to -1"
+            ))
+        };
+        let cases = [
+            ("defaults", (-1, 9, 3), Ok(levels(-1, 9, 3))),
+            (
+                "lowest levels",
+                (1, 1, -131_072),
+                Ok(levels(1, 1, -131_072)),
+            ),
+            ("highest levels", (9, 17, 22), Ok(levels(9, 17, 22))),
+            ("gzip zero", (0, 9, 3), gzip_error(0)),
+            ("gzip below the default", (-2, 9, 3), gzip_error(-2)),
+            ("gzip above nine", (10, 9, 3), gzip_error(10)),
+            (
+                "lz4 zero",
+                (-1, 0, 3),
+                Err(
+                    "Invalid value 0 for configuration compression_lz4_level: Value must be at \
+                     least 1"
+                        .to_owned(),
+                ),
+            ),
+            (
+                "lz4 above seventeen",
+                (-1, 18, 3),
+                Err(
+                    "Invalid value 18 for configuration compression_lz4_level: Value must be \
+                     no more than 17"
+                        .to_owned(),
+                ),
+            ),
+            (
+                "zstd below the minimum",
+                (-1, 9, -131_073),
+                Err(
+                    "Invalid value -131073 for configuration compression_zstd_level: Value must \
+                     be at least -131072"
+                        .to_owned(),
+                ),
+            ),
+            (
+                "zstd above twenty-two",
+                (-1, 9, 23),
+                Err(
+                    "Invalid value 23 for configuration compression_zstd_level: Value must be \
+                     no more than 22"
+                        .to_owned(),
+                ),
+            ),
+        ];
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, (gzip, lz4, zstd), expected) in cases {
+            actual.push((name, CompressionLevels::new(gzip, lz4, zstd)));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+        assert2::assert!(CompressionLevels::default() == levels(-1, 9, 3));
+        assert2::assert!(
+            [
+                Compression::None,
+                Compression::Gzip,
+                Compression::Snappy,
+                Compression::Lz4,
+                Compression::Zstd,
+            ]
+            .map(|compression| levels(5, 12, 19).level(compression))
+                == [None, Some(5), None, Some(12), Some(19)]
+        );
+        let set = levels(5, 12, 19);
+        assert2::assert!([set.gzip(), set.lz4(), set.zstd()] == [5, 12, 19]);
     }
 
     #[test]

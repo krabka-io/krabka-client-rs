@@ -7,7 +7,11 @@
 
 use std::collections::HashMap;
 
-/// Returns `member_id → Vec<(topic, partition)>` assignments.
+use super::MemberKey;
+
+/// Returns `member_id → Vec<(topic, partition)>` assignments. Members sort as
+/// Kafka's `AbstractPartitionAssignor.MemberInfo` does, so a static member
+/// keeps its range across restarts.
 #[must_use]
 #[tracing::instrument(
     name = "consumer.assignor.range",
@@ -15,14 +19,14 @@ use std::collections::HashMap;
     skip_all,
     fields(members = members.len(), topics = topic_partitions.len())
 )]
-pub fn assign(
-    mut members: Vec<(String, Vec<String>)>,
+pub fn assign_members(
+    mut members: Vec<(MemberKey, Vec<String>)>,
     topic_partitions: &HashMap<String, i32>,
 ) -> HashMap<String, Vec<(String, i32)>> {
     members.sort_by(|(a, _), (b, _)| a.cmp(b));
     let mut out: HashMap<String, Vec<(String, i32)>> = members
         .iter()
-        .map(|(m, _)| (m.clone(), Vec::new()))
+        .map(|(m, _)| (m.member_id.clone(), Vec::new()))
         .collect();
 
     // For determinism, iterate topics in sorted order.
@@ -33,7 +37,7 @@ pub fn assign(
         let subscribed: Vec<&String> = members
             .iter()
             .filter(|(_, subs)| subs.iter().any(|t| t == topic))
-            .map(|(m, _)| m)
+            .map(|(m, _)| &m.member_id)
             .collect();
         if subscribed.is_empty() || partition_count <= 0 {
             continue;
@@ -60,6 +64,27 @@ pub fn assign(
 mod tests {
 
     use super::*;
+
+    fn assign(
+        members: Vec<(String, Vec<String>)>,
+        topic_partitions: &HashMap<String, i32>,
+    ) -> HashMap<String, Vec<(String, i32)>> {
+        assign_members(
+            members
+                .into_iter()
+                .map(|(member_id, topics)| {
+                    (
+                        MemberKey {
+                            member_id,
+                            group_instance_id: None,
+                        },
+                        topics,
+                    )
+                })
+                .collect(),
+            topic_partitions,
+        )
+    }
 
     #[test]
     fn one_member_takes_everything() {

@@ -31,7 +31,10 @@ use krabka_protocol::{
     primitives::uuid::Uuid as WireUuid,
 };
 
-use crate::coordinator::{COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR};
+use crate::{
+    commit::OffsetAndMetadata,
+    coordinator::{COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR},
+};
 
 /// An `OffsetFetch` request that names its topics, capped at v9.
 ///
@@ -61,6 +64,8 @@ impl ProtocolRequest for TopicNameOffsetFetch {
     const MIN_VERSION: i16 = offset_fetch_request::MIN_VERSION;
     /// The last `OffsetFetch` version that carries topic names.
     const MAX_VERSION: i16 = 9;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = offset_fetch_request::FLEXIBLE_MIN;
     type Response = OffsetFetchResponse;
 }
@@ -141,6 +146,53 @@ pub(crate) fn parse_offset_fetch(resp: &OffsetFetchResponse) -> Vec<(String, i32
                         p.committed_leader_epoch,
                     ));
                 }
+            }
+        }
+    }
+    out
+}
+
+/// The committed offsets of an `OffsetFetch` response. Kafka's
+/// `ConsumerCoordinator.OffsetFetchResponseHandler`: a partition with offset
+/// `-1` or an error has no committed offset.
+///
+/// v8 and v9 data lives in `groups`, and v0-7 data lives in `topics`.
+pub(crate) fn parse_committed_offsets(
+    resp: &OffsetFetchResponse,
+) -> HashMap<(String, i32), Option<OffsetAndMetadata>> {
+    let committed = |error_code: i16, offset: i64, leader_epoch: i32, metadata: &Option<String>| {
+        (error_code == 0 && offset >= 0).then(|| OffsetAndMetadata {
+            offset,
+            leader_epoch: (leader_epoch >= 0).then_some(leader_epoch),
+            metadata: metadata.clone().unwrap_or_default(),
+        })
+    };
+    let mut out = HashMap::new();
+    for t in &resp.topics {
+        for p in &t.partitions {
+            out.insert(
+                (t.name.clone(), p.partition_index),
+                committed(
+                    p.error_code,
+                    p.committed_offset,
+                    p.committed_leader_epoch,
+                    &p.metadata,
+                ),
+            );
+        }
+    }
+    for g in &resp.groups {
+        for t in &g.topics {
+            for p in &t.partitions {
+                out.insert(
+                    (t.name.clone(), p.partition_index),
+                    committed(
+                        p.error_code,
+                        p.committed_offset,
+                        p.committed_leader_epoch,
+                        &p.metadata,
+                    ),
+                );
             }
         }
     }
@@ -257,7 +309,7 @@ fn classify_group_error(code: i16) -> OffsetFetchAction {
 
 /// Whether Apache Kafka's `common/protocol/Errors` maps `code` to an exception
 /// that extends `RetriableException`.
-fn is_retriable_error(code: i16) -> bool {
+pub(crate) fn is_retriable_error(code: i16) -> bool {
     matches!(
         code,
         2 | 3
@@ -322,6 +374,8 @@ impl ProtocolRequest for TopicNameOffsetCommit {
     const MIN_VERSION: i16 = offset_commit_request::MIN_VERSION;
     /// The last `OffsetCommit` version that carries topic names.
     const MAX_VERSION: i16 = 9;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = offset_commit_request::FLEXIBLE_MIN;
     type Response = OffsetCommitResponse;
 }
@@ -332,11 +386,11 @@ impl ProtocolRequest for TopicNameOffsetCommit {
 /// `ConsumerCoordinator.sendOffsetCommitRequest`. `offsets` maps `(topic,
 /// partition)` to `(committed_offset, committed_leader_epoch)`.
 pub(crate) fn build_commit_topics(
-    offsets: HashMap<(String, i32), (i64, i32)>,
+    offsets: HashMap<(String, i32), OffsetAndMetadata>,
 ) -> Vec<OffsetCommitRequestTopic> {
-    let mut by_topic: HashMap<String, Vec<(i32, i64, i32)>> = HashMap::new();
-    for ((t, p), (off, epoch)) in offsets {
-        by_topic.entry(t).or_default().push((p, off, epoch));
+    let mut by_topic: HashMap<String, Vec<(i32, OffsetAndMetadata)>> = HashMap::new();
+    for ((t, p), offset) in offsets {
+        by_topic.entry(t).or_default().push((p, offset));
     }
     by_topic
         .into_iter()
@@ -344,11 +398,11 @@ pub(crate) fn build_commit_topics(
             name,
             partitions: parts
                 .into_iter()
-                .map(|(p, off, epoch)| OffsetCommitRequestPartition {
+                .map(|(p, offset)| OffsetCommitRequestPartition {
                     partition_index: p,
-                    committed_offset: off,
-                    committed_leader_epoch: epoch,
-                    committed_metadata: Some(String::new()),
+                    committed_offset: offset.offset,
+                    committed_leader_epoch: offset.leader_epoch.unwrap_or(-1),
+                    committed_metadata: Some(offset.metadata),
                     ..Default::default()
                 })
                 .collect(),
@@ -638,7 +692,14 @@ mod tests {
     #[test]
     fn build_commit_topics_names_each_topic() {
         let mut offsets = HashMap::new();
-        offsets.insert(("t".to_string(), 3), (100, 5));
+        offsets.insert(
+            ("t".to_string(), 3),
+            OffsetAndMetadata {
+                offset: 100,
+                leader_epoch: Some(5),
+                metadata: "note".into(),
+            },
+        );
         let topics = build_commit_topics(offsets);
         assert2::assert!(
             topics
@@ -649,7 +710,7 @@ mod tests {
                         partition_index: 3,
                         committed_offset: 100,
                         committed_leader_epoch: 5,
-                        committed_metadata: Some(String::new()),
+                        committed_metadata: Some("note".into()),
                         unknown_tagged_fields: UnknownTaggedFields(vec![]),
                     }],
                     unknown_tagged_fields: UnknownTaggedFields(vec![]),

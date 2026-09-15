@@ -38,6 +38,7 @@ use krabka_protocol::{
         share_fetch_request::{
             AcknowledgementBatch as FetchAckBatch, FetchPartition, FetchTopic, ShareFetchRequest,
         },
+        share_fetch_response::PartitionData,
     },
     primitives::uuid::Uuid as WireUuid,
 };
@@ -50,7 +51,7 @@ use super::{
     consumer::ShareConsumer,
     types::{ShareAckMode, ShareAckType, ShareAcquireMode, ShareConsumerRecord},
 };
-use crate::error::ConsumerError;
+use crate::{error::ConsumerError, poll::record_timestamp};
 
 fn build_share_fetch_topics(
     assignment: &[(WireUuid, String, i32)],
@@ -153,8 +154,49 @@ fn record_offset(base_offset: i64, offset_delta: i32) -> i64 {
     base_offset + i64::from(offset_delta)
 }
 
-fn record_timestamp(base_timestamp: i64, timestamp_delta: i64) -> i64 {
-    base_timestamp + timestamp_delta
+/// The records of one `ShareFetch` partition row.
+///
+/// The function skips control batches. It pairs each record with the
+/// `delivery_count` of the acquired range that holds its offset, or 0 when no
+/// range holds it. Kafka's `ShareCompletedFetch` reads the timestamp and the
+/// timestamp type from the record batch, as the classic consumer does.
+fn share_partition_records(topic_name: &str, part: &PartitionData) -> Vec<ShareConsumerRecord> {
+    let Some(batches) = part.records.as_ref().and_then(|payload| payload.as_v2()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for batch in batches {
+        if batch.attributes.is_control_batch() {
+            continue;
+        }
+        for r in &batch.records {
+            let offset = record_offset(batch.base_offset, r.offset_delta);
+            // Pair the record with the acquired range that contains it to
+            // read the broker's delivery_count for this offset.
+            let delivery_count = part
+                .acquired_records
+                .iter()
+                .find(|ar| offset_in_range(ar.first_offset, offset, ar.last_offset))
+                .map_or(0, |ar| ar.delivery_count);
+            let (timestamp, timestamp_type) = record_timestamp(batch, r);
+            out.push(ShareConsumerRecord {
+                topic: topic_name.to_string(),
+                partition: part.partition_index,
+                offset,
+                timestamp,
+                timestamp_type,
+                key: r.key.clone(),
+                value: r.value.clone(),
+                headers: r
+                    .headers
+                    .iter()
+                    .map(|header| (header.key.clone(), header.value.clone()))
+                    .collect(),
+                delivery_count,
+            });
+        }
+    }
+    out
 }
 
 impl ShareConsumer {
@@ -270,41 +312,7 @@ impl ShareConsumer {
                     ));
                 }
 
-                let Some(payload) = &part.records else {
-                    continue;
-                };
-                let Some(batches) = payload.as_v2() else {
-                    continue;
-                };
-                for batch in batches {
-                    if batch.attributes.is_control_batch() {
-                        continue;
-                    }
-                    for r in &batch.records {
-                        let offset = record_offset(batch.base_offset, r.offset_delta);
-                        // Pair the record with the acquired range that contains
-                        // it to read the broker's delivery_count for this offset.
-                        let delivery_count = part
-                            .acquired_records
-                            .iter()
-                            .find(|ar| offset_in_range(ar.first_offset, offset, ar.last_offset))
-                            .map_or(0, |ar| ar.delivery_count);
-                        out.push(ShareConsumerRecord {
-                            topic: topic_name.clone(),
-                            partition: part.partition_index,
-                            offset,
-                            timestamp: record_timestamp(batch.base_timestamp, r.timestamp_delta),
-                            key: r.key.clone(),
-                            value: r.value.clone(),
-                            headers: r
-                                .headers
-                                .iter()
-                                .map(|header| (header.key.clone(), header.value.clone()))
-                                .collect(),
-                            delivery_count,
-                        });
-                    }
-                }
+                out.extend(share_partition_records(&topic_name, part));
             }
         }
 
@@ -587,6 +595,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::consumer::TimestampType;
 
     fn id(n: u8) -> WireUuid {
         let mut b = [0u8; 16];
@@ -834,7 +843,6 @@ mod tests {
             );
         }
         check!(record_offset(100, 7) == 107);
-        check!(record_timestamp(1000, 33) == 1033);
     }
 
     #[tokio::test]
@@ -844,6 +852,7 @@ mod tests {
             partition: 2,
             offset: 10,
             timestamp: 0,
+            timestamp_type: TimestampType::CreateTime,
             key: None,
             value: None,
             headers: Vec::new(),
@@ -875,6 +884,7 @@ mod tests {
             partition: 2,
             offset: 10,
             timestamp: 0,
+            timestamp_type: TimestampType::CreateTime,
             key: None,
             value: None,
             headers: Vec::new(),
@@ -993,5 +1003,53 @@ mod tests {
                     unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
                 }
         );
+    }
+
+    /// Kafka's `ShareCompletedFetch` gives each record the timestamp and the
+    /// timestamp type of its record batch, as the classic consumer does.
+    #[test]
+    fn share_records_take_the_batch_timestamp_type() {
+        use krabka_protocol::owned::share_fetch_response::AcquiredRecords;
+
+        use crate::poll::timestamp_cases;
+
+        for case in &timestamp_cases::CASES {
+            let part = PartitionData {
+                partition_index: 2,
+                records: Some(timestamp_cases::batch(case).into()),
+                acquired_records: vec![AcquiredRecords {
+                    first_offset: timestamp_cases::BASE_OFFSET,
+                    last_offset: timestamp_cases::BASE_OFFSET + 1,
+                    delivery_count: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            let expected: Vec<ShareConsumerRecord> = case
+                .expected
+                .iter()
+                .zip(timestamp_cases::BASE_OFFSET..)
+                .zip(timestamp_cases::VALUES)
+                .map(
+                    |(((timestamp, timestamp_type), offset), value)| ShareConsumerRecord {
+                        topic: "topic-a".into(),
+                        partition: 2,
+                        offset,
+                        timestamp: *timestamp,
+                        timestamp_type: *timestamp_type,
+                        key: None,
+                        value: Some(bytes::Bytes::from_static(value)),
+                        headers: Vec::new(),
+                        delivery_count: 1,
+                    },
+                )
+                .collect();
+            check!(
+                share_partition_records("topic-a", &part) == expected,
+                "case {}",
+                case.name
+            );
+        }
     }
 }

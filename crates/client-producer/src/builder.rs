@@ -33,12 +33,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     buffer_pool::BufferPool,
-    compression::Compression,
+    compression::{
+        Compression, CompressionLevels, DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL,
+        DEFAULT_PRODUCER_COMPRESSION_LZ4_LEVEL, DEFAULT_PRODUCER_COMPRESSION_ZSTD_LEVEL,
+    },
     error::ProducerError,
+    metadata_age::{
+        DEFAULT_PRODUCER_METADATA_MAX_AGE, DEFAULT_PRODUCER_METADATA_MAX_IDLE, MetadataAge,
+    },
     partitioner::{BuiltInPartitioner, PartitionerConfig},
     producer::{Acks, Producer, ProducerIdentity},
     sender,
-    transactional::{AbortableErrorSlot, TxnState},
+    transactional::{TxnErrorSlot, TxnState},
     transport::ClientTransport,
     txn_retry::{self, CoordinatorAttempt, TxnRequestDecision},
 };
@@ -75,6 +81,36 @@ impl ProtocolRequest for StableInitProducerId {
     const API_KEY: i16 = init_producer_id_request::API_KEY;
     const MIN_VERSION: i16 = init_producer_id_request::MIN_VERSION;
     const MAX_VERSION: i16 = INIT_PRODUCER_ID_STABLE_MAX_VERSION;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
+    const FLEXIBLE_MIN: i16 = init_producer_id_request::FLEXIBLE_MIN;
+    type Response = InitProducerIdResponse;
+}
+
+/// An `InitProducerId` request with the two-phase commit fields, which only
+/// v6 carries.
+///
+/// Kafka marks v6 `latestVersionUnstable`, so version negotiation leaves it
+/// out of the generated `InitProducerIdRequest`. A two-phase commit request
+/// has no stable version, and this type keeps v6 negotiable for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TwoPhaseCommitInitProducerId(InitProducerIdRequest);
+
+impl Encode for TwoPhaseCommitInitProducerId {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl ProtocolRequest for TwoPhaseCommitInitProducerId {
+    const API_KEY: i16 = init_producer_id_request::API_KEY;
+    const MIN_VERSION: i16 = INIT_PRODUCER_ID_2PC_MIN_VERSION;
+    const MAX_VERSION: i16 = init_producer_id_request::MAX_VERSION;
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = init_producer_id_request::FLEXIBLE_MIN;
     type Response = InitProducerIdResponse;
 }
@@ -279,6 +315,12 @@ pub struct ProducerRetryPolicy {
 }
 
 impl ProducerRetryPolicy {
+    /// The first backoff of the policy: `retry_backoff`, and never more than
+    /// `retry_backoff_max`. A coordinator retry starts at it.
+    fn first_backoff(&self) -> Time {
+        self.retry_backoff().min(self.retry_backoff_max()).as_time()
+    }
+
     /// Validate producer retry and transaction timing.
     ///
     /// # Errors
@@ -569,7 +611,10 @@ pub(crate) async fn send_init_producer_id(
 ) -> Result<InitProducerIdResponse, ClientError> {
     if request.enable2_pc || request.keep_prepared_txn {
         client
-            .send_at_least(request.clone(), INIT_PRODUCER_ID_2PC_MIN_VERSION)
+            .send_at_least(
+                TwoPhaseCommitInitProducerId(request.clone()),
+                INIT_PRODUCER_ID_2PC_MIN_VERSION,
+            )
             .await
     } else {
         client.send(StableInitProducerId(request.clone())).await
@@ -688,6 +733,14 @@ impl Producer {
     /// larger than `buffer_memory` with [`ProducerError::RecordTooLarge`], and
     /// sends no request for it.
     ///
+    /// `compression_gzip_level`, `compression_lz4_level` and
+    /// `compression_zstd_level` take Kafka's defaults (-1, 9 and 3) and ranges
+    /// (KIP-390), and `build` fails with [`ProducerError::InvalidConfig`] for a
+    /// level out of range. Each batch of a gzip, lz4 or zstd producer is
+    /// compressed at the level of its codec. The lz4 codec has no high
+    /// compression mode, so every lz4 level gives the same output
+    /// (krabka-io/krabka-protocol#27).
+    ///
     /// When `client_id` is not set, the client id is
     /// `producer-<transactional_id>`, or `producer-<n>` with a process-wide
     /// sequence number.
@@ -711,6 +764,9 @@ impl Producer {
         #[builder(into)] bootstrap: String,
         #[builder(into)] client_id: Option<String>,
         #[builder(default = DEFAULT_PRODUCER_COMPRESSION)] compression: Compression,
+        #[builder(default = DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL)] compression_gzip_level: i32,
+        #[builder(default = DEFAULT_PRODUCER_COMPRESSION_LZ4_LEVEL)] compression_lz4_level: i32,
+        #[builder(default = DEFAULT_PRODUCER_COMPRESSION_ZSTD_LEVEL)] compression_zstd_level: i32,
         enable_idempotence: Option<bool>,
         #[builder(default = DEFAULT_PRODUCER_ACKS)] acks: Acks,
         #[builder(default = DEFAULT_PRODUCER_LINGER)] linger: Duration,
@@ -734,6 +790,8 @@ impl Producer {
         #[builder(default = DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT)] init_retry_timeout: Duration,
         #[builder(default = DEFAULT_PRODUCER_MAX_IN_FLIGHT)] max_in_flight_per_connection: usize,
         #[builder(default = DEFAULT_PRODUCER_MAX_BLOCK)] max_block: Duration,
+        #[builder(default = DEFAULT_PRODUCER_METADATA_MAX_AGE)] metadata_max_age: Duration,
+        #[builder(default = DEFAULT_PRODUCER_METADATA_MAX_IDLE)] metadata_max_idle: Duration,
         #[builder(default = DEFAULT_PRODUCER_BUFFER_MEMORY)] buffer_memory: usize,
         #[builder(default = DEFAULT_PRODUCER_MAX_REQUEST_SIZE)] max_request_size: usize,
         #[builder(default)]
@@ -753,6 +811,7 @@ impl Producer {
             transactional_id.as_deref(),
         )?;
         let client_id = resolve_client_id(client_id, transactional_id.as_deref());
+        crate::metadata_age::validate_metadata_max_idle(metadata_max_idle)?;
         let transaction_timeout = resolve_transaction_timeout(
             transaction_two_phase_commit_enable,
             transaction_timeout,
@@ -777,6 +836,12 @@ impl Producer {
         )
         .map_err(ProducerError::InvalidConfig)?;
         let compression = throughput_policy.compression();
+        let compression_levels = CompressionLevels::new(
+            compression_gzip_level,
+            compression_lz4_level,
+            compression_zstd_level,
+        )
+        .map_err(ProducerError::InvalidConfig)?;
         let linger = throughput_policy.linger().as_time();
         let batch_size = throughput_policy.batch_bytes();
         let max_in_flight_per_connection = throughput_policy.max_in_flight();
@@ -807,11 +872,7 @@ impl Producer {
             retry_policy.retry_backoff(),
             retry_policy.retry_backoff_max(),
         );
-        // A coordinator retry starts at the first backoff of the same policy.
-        let first_backoff = retry_policy
-            .retry_backoff()
-            .min(retry_policy.retry_backoff_max())
-            .as_time();
+        let first_backoff = retry_policy.first_backoff();
         let flush_timeout =
             ProducerFlushTimeout::new(flush_timeout).map_err(ProducerError::InvalidConfig)?;
 
@@ -881,14 +942,21 @@ impl Producer {
         let txn_guard_generation = Arc::new(AtomicU64::new(0));
         let txn_pid_epoch = Arc::new(Mutex::new(initial_txn_pid_epoch()));
         let prepared_transaction_state = Arc::new(Mutex::new(None));
-        let txn_abortable_error = Arc::new(AbortableErrorSlot::default());
+        let txn_error = Arc::new(TxnErrorSlot::default());
 
+        let metadata_refresh = Arc::new(crate::metadata_wait::MetadataRefresh::default());
+        MetadataAge::new(&client, &retry_policy)
+            .with_ages(metadata_max_age, metadata_max_idle)
+            .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
+            .with_queues((&accumulators, &in_flight))
+            .spawn(shutdown.clone());
         let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
             transport: Box::new(ClientTransport::new(client.clone())),
             producer_id,
             producer_epoch: Arc::clone(&producer_epoch),
             acks,
             compression,
+            compression_level: compression_levels.level(compression),
             linger,
             request_timeout_ms: retry_policy.request_timeout_ms(),
             retries,
@@ -910,7 +978,7 @@ impl Producer {
             txn_pid_epoch: Arc::clone(&txn_pid_epoch),
             txn_recovery_required: Arc::clone(&txn_recovery_required),
             txn_recovery_generation: Arc::clone(&txn_recovery_generation),
-            txn_abortable_error: Arc::clone(&txn_abortable_error),
+            txn_error: Arc::clone(&txn_error),
         }));
 
         Ok(Producer {
@@ -925,6 +993,7 @@ impl Producer {
             },
             acks,
             compression,
+            compression_levels,
             batch_size,
             linger,
             request_timeout,
@@ -934,7 +1003,7 @@ impl Producer {
             max_request_size,
             max_in_flight: max_in_flight_per_connection,
             metadata_cache,
-            metadata_refresh: crate::metadata_wait::MetadataRefresh::default(),
+            metadata_refresh,
             partition_leaders,
             accumulators,
             next_seq,
@@ -957,7 +1026,7 @@ impl Producer {
             txn_guard_generation,
             txn_coord_client: Mutex::new(None),
             txn_pid_epoch,
-            txn_abortable_error,
+            txn_error,
             prepared_transaction_state,
         })
     }
@@ -2115,6 +2184,18 @@ mod security_arg_tests {
             (
                 invalid!(max_request_size, i32::MAX as usize + 1),
                 "producer max request size",
+            ),
+            (
+                invalid!(compression_gzip_level, 0),
+                "Invalid value 0 for configuration compression_gzip_level",
+            ),
+            (
+                invalid!(compression_lz4_level, 18),
+                "Invalid value 18 for configuration compression_lz4_level",
+            ),
+            (
+                invalid!(compression_zstd_level, 23),
+                "Invalid value 23 for configuration compression_zstd_level",
             ),
         ] {
             assert!(

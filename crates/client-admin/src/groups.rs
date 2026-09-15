@@ -868,7 +868,7 @@ async fn list_groups_attempt(
 /// `UnsupportedSaslMechanismException` to 33, `IllegalSaslStateException` to
 /// 34, `SaslAuthenticationException` to 58, and `SslAuthenticationException`
 /// to 40, the code of its superclass `InvalidConfigurationException`.
-fn list_groups_kafka_error(error: &AdminError) -> KafkaError {
+pub(crate) fn list_groups_kafka_error(error: &AdminError) -> KafkaError {
     const UNKNOWN_SERVER_ERROR: i16 = -1;
     const REQUEST_TIMED_OUT: i16 = 7;
     const NETWORK_EXCEPTION: i16 = 13;
@@ -936,6 +936,8 @@ impl ProtocolRequest for TopicNameOffsetCommit {
     const MIN_VERSION: i16 = offset_commit_request::MIN_VERSION;
     /// The last `OffsetCommit` version that carries topic names.
     const MAX_VERSION: i16 = 9;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = offset_commit_request::FLEXIBLE_MIN;
     type Response = OffsetCommitResponse;
 }
@@ -967,6 +969,8 @@ impl ProtocolRequest for TopicNameOffsetFetch {
     const MIN_VERSION: i16 = 2;
     /// The last `OffsetFetch` version that carries topic names.
     const MAX_VERSION: i16 = 9;
+    /// The cap is a released version, so it is also the stable maximum.
+    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
     const FLEXIBLE_MIN: i16 = offset_fetch_request::FLEXIBLE_MIN;
     type Response = OffsetFetchResponse;
 }

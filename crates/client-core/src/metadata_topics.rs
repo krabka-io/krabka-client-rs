@@ -32,6 +32,8 @@ pub enum MetadataScope {
 pub struct MetadataTopics {
     scope: MetadataScope,
     topics: Mutex<BTreeMap<String, Instant>>,
+    /// When a request of this scope last succeeded.
+    refreshed: Mutex<Option<Instant>>,
 }
 
 impl MetadataTopics {
@@ -41,7 +43,27 @@ impl MetadataTopics {
         Self {
             scope,
             topics: Mutex::default(),
+            refreshed: Mutex::default(),
         }
+    }
+
+    /// Record a successful response to [`Self::request`], as Kafka's
+    /// `Metadata.update` sets `lastSuccessfulRefreshMs` for a full update.
+    pub fn mark_refreshed(&self) {
+        *self
+            .refreshed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// When a response to [`Self::request`] last succeeded, or `None` before
+    /// the first one.
+    #[must_use]
+    pub fn last_refreshed(&self) -> Option<Instant> {
+        *self
+            .refreshed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn topics(&self) -> MutexGuard<'_, BTreeMap<String, Instant>> {
