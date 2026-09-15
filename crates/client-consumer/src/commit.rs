@@ -1262,7 +1262,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Assignor, AutoOffsetReset, IsolationLevel, consumer::ConsumerRetryPolicy,
+        AutoOffsetReset, IsolationLevel, consumer::ConsumerRetryPolicy,
         coordinator::CoordinatorRetryPolicy,
     };
 
@@ -1512,13 +1512,17 @@ mod tests {
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
             session_timeout: secs(45),
             heartbeat_interval: secs(3),
-            assignor: Assignor::Range,
+            rebalance_protocol: crate::assignor::RebalanceProtocol::Eager,
             coordinator_shutdown: CancellationToken::new(),
             coordinator_handle: None,
             isolation_level: IsolationLevel::ReadUncommitted,
             fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
             fetch_max: crate::poll::DEFAULT_FETCH_MAX,
             fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
+            fetch_max_wait: crate::consumer::DEFAULT_CONSUMER_FETCH_MAX_WAIT,
+            fetches: crate::poll::Fetches::default(),
+            client_rack: None,
+            metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
