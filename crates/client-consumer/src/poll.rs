@@ -3,11 +3,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use bytes::BufMut;
 use krabka_ids::LeaderEpoch;
-use krabka_protocol::owned::{
-    fetch_request::{FetchPartition, FetchRequest, FetchTopic},
-    list_offsets_request::{ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
-    list_offsets_response::ListOffsetsResponse,
+use krabka_protocol::{
+    Encode, ProtocolError, ProtocolRequest,
+    owned::{
+        fetch_request::{FetchPartition, FetchRequest, FetchTopic},
+        list_offsets_request::{self, ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
+        list_offsets_response::ListOffsetsResponse,
+    },
 };
 use krabka_units::{
     ByteSize, Time,
@@ -202,11 +206,10 @@ type ListOffsetsSpecs = BTreeMap<String, Vec<(i32, LeaderEpoch)>>;
 /// Kafka's `ListOffsetsRequest.Builder.forConsumer` sends the consumer's own
 /// isolation level, so a `read_committed` consumer that asks for the latest
 /// offset gets the last stable offset and not the high watermark. The broker
-/// reads `isolation_level` from version 2. The client negotiates the highest
-/// version that both sides support (up to 11), and every broker since Kafka
-/// 0.11 supports version 2. `current_leader_epoch` (KIP-320, version 4) comes
-/// from metadata and is `-1` when the epoch is unknown, as in
-/// `OffsetFetcher.groupListOffsetRequests`.
+/// reads `isolation_level` from version 2, so a `read_committed` consumer
+/// sends [`ReadCommittedListOffsets`], which negotiates version 2 or higher.
+/// `current_leader_epoch` (KIP-320, version 4) comes from metadata and is `-1`
+/// when the epoch is unknown, as in `OffsetFetcher.groupListOffsetRequests`.
 fn build_offsets_request(
     by_topic: ListOffsetsSpecs,
     timestamp: i64,
@@ -235,6 +238,38 @@ fn build_offsets_request(
         topics,
         ..Default::default()
     }
+}
+
+/// A `ListOffsets` request from a `read_committed` consumer, from version 2.
+///
+/// `isolation_level` exists from version 2. At version 0 or 1 the codec
+/// leaves it out, and the broker answers with `read_uncommitted` semantics:
+/// the high watermark and not the last stable offset. Kafka's
+/// `ListOffsetsRequest.Builder.forConsumer` sets the oldest allowed version
+/// to 2 for `READ_COMMITTED`. This type gives the same range to version
+/// negotiation. When the broker supports only version 0 or 1, the send fails
+/// with `ClientError::IncompatibleVersion` before the request goes out.
+/// Kafka fails with `UnsupportedVersionException` in that case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadCommittedListOffsets(ListOffsetsRequest);
+
+impl Encode for ReadCommittedListOffsets {
+    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl ProtocolRequest for ReadCommittedListOffsets {
+    const API_KEY: i16 = list_offsets_request::API_KEY;
+    /// The first `ListOffsets` version that carries `isolation_level`.
+    const MIN_VERSION: i16 = 2;
+    const MAX_VERSION: i16 = list_offsets_request::MAX_VERSION;
+    const FLEXIBLE_MIN: i16 = list_offsets_request::FLEXIBLE_MIN;
+    type Response = ListOffsetsResponse;
 }
 
 /// Group `ListOffsets` partitions by the broker that gets the request.
@@ -690,14 +725,19 @@ impl Consumer {
             return Err(error);
         }
         self.apply_pending_seeks().await;
-        if let Err(error) = self.resolve_latest_sentinels().await {
+        // Metadata comes first. A partition that has no position yet (a new
+        // assignment without a committed offset) gets its leader id and
+        // epoch here, so its first `ListOffsets` goes to the leader and not
+        // to the bootstrap broker. Kafka's `OffsetFetcher.groupListOffsetRequests`
+        // routes with `metadata.currentLeader(tp)` in the same way.
+        if let Err(error) = self.refresh_leader_epochs().await {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
                 return Ok(false);
             }
             return Err(error);
         }
-        if let Err(error) = self.refresh_leader_epochs().await {
+        if let Err(error) = self.resolve_latest_sentinels().await {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
                 return Ok(false);
@@ -883,9 +923,10 @@ impl Consumer {
     ///
     /// `auto_offset_reset = Latest` plants those sentinels at build time, and
     /// the `OFFSET_OUT_OF_RANGE` arm of the poll loop plants them again. This
-    /// runs in `prepare_poll`. A partition whose row has an error keeps its
-    /// sentinel. `group_fetches` skips it, and the metadata refresh that
-    /// `prepare_poll` does next lets the next poll try again.
+    /// runs in `prepare_poll`, after the metadata refresh. A partition whose
+    /// row has an error keeps its sentinel. `group_fetches` skips it, and the
+    /// metadata refresh at the start of the next `prepare_poll` lets that
+    /// poll try again.
     ///
     /// # Errors
     ///
@@ -944,10 +985,11 @@ impl Consumer {
         let mut answers = Vec::with_capacity(by_leader.len());
         for (leader, by_topic) in by_leader {
             let request = build_offsets_request(by_topic, timestamp, self.isolation_level);
-            let answer = if should_use_bootstrap_leader(leader) {
-                self.client.send(request).await
+            let answer = if is_read_committed(self.isolation_level) {
+                self.send_list_offsets(leader, ReadCommittedListOffsets(request))
+                    .await
             } else {
-                self.client.broker(leader).send(request).await
+                self.send_list_offsets(leader, request).await
             };
             match answer {
                 Ok(answer) => answers.push(answer),
@@ -962,6 +1004,23 @@ impl Consumer {
             }
         }
         Ok(ListOffsetsResult::collect(keys, &answers))
+    }
+
+    /// Send one `ListOffsets` request to `leader`, or to the bootstrap
+    /// connection when the leader is not known.
+    async fn send_list_offsets<R>(
+        &self,
+        leader: i32,
+        request: R,
+    ) -> Result<ListOffsetsResponse, krabka_client_core::ClientError>
+    where
+        R: ProtocolRequest<Response = ListOffsetsResponse>,
+    {
+        if should_use_bootstrap_leader(leader) {
+            self.client.send(request).await
+        } else {
+            self.client.broker(leader).send(request).await
+        }
     }
 
     /// Recover the partitions that answered `OFFSET_OUT_OF_RANGE`.
@@ -1941,8 +2000,8 @@ mod partition_error_tests {
     const LEADER_EPOCH: i32 = 7;
 
     /// The `ListOffsets` requests that the mock brokers decoded, with the
-    /// name of the broker that received each one.
-    type SentListOffsets = Arc<std::sync::Mutex<Vec<(&'static str, ListOffsetsRequest)>>>;
+    /// name of the broker that received each one and the request version.
+    type SentListOffsets = Arc<std::sync::Mutex<Vec<(&'static str, i16, ListOffsetsRequest)>>>;
 
     /// The response bytes for a `ListOffsets` request at `version` with one
     /// `orders-0` row.
@@ -1983,6 +2042,7 @@ mod partition_error_tests {
         name: &'static str,
         leader_port: Arc<AtomicU16>,
         row: (i16, i64),
+        list_offsets_max_version: i16,
         sent: SentListOffsets,
         metadata_requests: Arc<AtomicUsize>,
     ) -> MockBroker {
@@ -2002,10 +2062,7 @@ mod partition_error_tests {
                     api_keys: [
                         (api_versions_request::API_KEY, 3),
                         (metadata_request::API_KEY, 8),
-                        (
-                            list_offsets_request::API_KEY,
-                            list_offsets_request::MAX_VERSION,
-                        ),
+                        (list_offsets_request::API_KEY, list_offsets_max_version),
                     ]
                     .into_iter()
                     .map(|(api_key, max_version)| ApiVersion {
@@ -2051,7 +2108,9 @@ mod partition_error_tests {
                 }
                 let request =
                     ListOffsetsRequest::decode(&mut body, version).expect("ListOffsets decodes");
-                sent.lock().expect("sent lock").push((name, request));
+                sent.lock()
+                    .expect("sent lock")
+                    .push((name, version, request));
                 return Some(list_offsets_answer_bytes(version, row.0, row.1));
             }
             None
@@ -2078,15 +2137,46 @@ mod partition_error_tests {
         }
     }
 
+    /// Why a poll step failed, in a form that tests can compare.
+    #[derive(Debug, PartialEq)]
+    enum PollFailure {
+        /// `ConsumerError::TopicAuthorizationFailed` with its topics.
+        TopicAuthorizationFailed(std::collections::BTreeSet<String>),
+        /// `ClientError::IncompatibleVersion` as
+        /// `(api_key, broker_min, broker_max, client_min, client_max)`.
+        IncompatibleVersion(i16, i16, i16, i16, i16),
+        /// Any other error.
+        Other,
+    }
+
+    impl From<ConsumerError> for PollFailure {
+        fn from(error: ConsumerError) -> Self {
+            match error {
+                ConsumerError::TopicAuthorizationFailed(topics) => {
+                    Self::TopicAuthorizationFailed(topics)
+                }
+                ConsumerError::Client(krabka_client_core::ClientError::IncompatibleVersion {
+                    api_key,
+                    broker_min,
+                    broker_max,
+                    client_min,
+                    client_max,
+                }) => Self::IncompatibleVersion(
+                    api_key, broker_min, broker_max, client_min, client_max,
+                ),
+                _ => Self::Other,
+            }
+        }
+    }
+
     /// How the consumer handled one `ListOffsets` exchange.
     #[derive(Debug, PartialEq)]
     struct ListOffsetsOutcome {
-        /// Each decoded request, with the name of the broker that received it.
-        requests: Vec<(&'static str, ListOffsetsRequest)>,
-        /// `Ok(())`, `Err(Some(topics))` for `TopicAuthorizationFailed`, or
-        /// `Err(None)` for any other error.
-        result: Result<(), Option<std::collections::BTreeSet<String>>>,
-        /// The `Metadata` requests after the setup refresh.
+        /// Each decoded request, with the name of the broker that received it
+        /// and the version.
+        requests: Vec<(&'static str, i16, ListOffsetsRequest)>,
+        result: Result<(), PollFailure>,
+        /// The `Metadata` requests after the setup.
         metadata_requests: usize,
         next_offset: Option<i64>,
     }
@@ -2101,6 +2191,96 @@ mod partition_error_tests {
         EarliestOutOfRange,
     }
 
+    /// One `ListOffsets` scenario on two mock brokers.
+    #[derive(Clone, Copy, Debug)]
+    struct Exchange {
+        isolation: IsolationLevel,
+        reset: Reset,
+        /// The `(error_code, offset)` row that the leader answers.
+        row: (i16, i64),
+        /// The highest `ListOffsets` version that both brokers advertise.
+        list_offsets_max_version: i16,
+        /// `true` when a metadata refresh fills the positions map before the
+        /// exchange, as after an earlier poll. `false` is a new assignment
+        /// without a committed offset, whose position has no leader yet.
+        primed: bool,
+    }
+
+    /// Run `exchange` with a consumer that bootstraps from a broker that is
+    /// not the leader of `orders-0`.
+    ///
+    /// The bootstrap broker answers each `ListOffsets` with
+    /// `NOT_LEADER_OR_FOLLOWER`.
+    async fn run_list_offsets_exchange(exchange: Exchange) -> ListOffsetsOutcome {
+        let sent: SentListOffsets = Arc::default();
+        let metadata_requests = Arc::new(AtomicUsize::new(0));
+        let leader_port = Arc::new(AtomicU16::new(0));
+        let leader = list_offsets_broker(
+            "leader",
+            Arc::clone(&leader_port),
+            exchange.row,
+            exchange.list_offsets_max_version,
+            Arc::clone(&sent),
+            Arc::clone(&metadata_requests),
+        )
+        .await;
+        leader_port.store(leader.addr.port(), Ordering::SeqCst);
+        let bootstrap = list_offsets_broker(
+            "bootstrap",
+            Arc::clone(&leader_port),
+            (6, -1),
+            exchange.list_offsets_max_version,
+            Arc::clone(&sent),
+            Arc::clone(&metadata_requests),
+        )
+        .await;
+        let mut consumer = consumer_on(&bootstrap).await;
+        consumer.isolation_level = exchange.isolation;
+        if exchange.primed {
+            consumer
+                .refresh_leader_epochs()
+                .await
+                .expect("setup metadata");
+            metadata_requests.store(0, Ordering::SeqCst);
+        }
+
+        let result = match exchange.reset {
+            Reset::Latest => {
+                consumer.auto_offset_reset = AutoOffsetReset::Latest;
+                consumer
+                    .next_offsets
+                    .lock()
+                    .await
+                    .insert(("orders".into(), 0), LATEST_SENTINEL);
+                consumer.prepare_poll().await.map(|_| ())
+            }
+            Reset::EarliestOutOfRange => {
+                consumer.auto_offset_reset = AutoOffsetReset::Earliest;
+                let topic_ids = consumer.topic_ids.lock().await.clone();
+                consumer
+                    .process_fetch_responses(vec![fetch_response(1)], &topic_ids)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        let requests = sent.lock().expect("sent lock").clone();
+        let outcome = ListOffsetsOutcome {
+            requests,
+            result: result.map_err(PollFailure::from),
+            metadata_requests: metadata_requests.load(Ordering::SeqCst),
+            next_offset: consumer
+                .next_offsets
+                .lock()
+                .await
+                .get(&("orders".to_string(), 0))
+                .copied(),
+        };
+
+        bootstrap.stop();
+        leader.stop();
+        outcome
+    }
+
     /// Kafka's consumer sends `ListOffsets` to the partition leader with its
     /// own isolation level and the leader epoch from metadata
     /// (`OffsetFetcher.groupListOffsetRequests` and
@@ -2112,13 +2292,24 @@ mod partition_error_tests {
     async fn list_offsets_goes_to_the_leader_with_the_isolation_level_and_honours_row_errors() {
         use std::collections::BTreeSet;
 
-        let latest_request = |isolation| vec![("leader", expected_list_offsets(isolation, -1))];
-        for (name, isolation, reset, row, expected) in [
+        let max = list_offsets_request::MAX_VERSION;
+        let latest_request =
+            |isolation| vec![("leader", max, expected_list_offsets(isolation, -1))];
+        let latest = |isolation, row| Exchange {
+            isolation,
+            reset: Reset::Latest,
+            row,
+            list_offsets_max_version: max,
+            primed: true,
+        };
+        let earliest = |isolation, row| Exchange {
+            reset: Reset::EarliestOutOfRange,
+            ..latest(isolation, row)
+        };
+        for (name, exchange, expected) in [
             (
                 "read committed latest reads the last stable offset",
-                IsolationLevel::ReadCommitted,
-                Reset::Latest,
-                (0, 40),
+                latest(IsolationLevel::ReadCommitted, (0, 40)),
                 ListOffsetsOutcome {
                     requests: latest_request(1),
                     result: Ok(()),
@@ -2128,9 +2319,7 @@ mod partition_error_tests {
             ),
             (
                 "read uncommitted latest reads the high watermark",
-                IsolationLevel::ReadUncommitted,
-                Reset::Latest,
-                (0, 50),
+                latest(IsolationLevel::ReadUncommitted, (0, 50)),
                 ListOffsetsOutcome {
                     requests: latest_request(0),
                     result: Ok(()),
@@ -2140,9 +2329,7 @@ mod partition_error_tests {
             ),
             (
                 "not leader or follower keeps the sentinel and refreshes metadata",
-                IsolationLevel::ReadCommitted,
-                Reset::Latest,
-                (6, -1),
+                latest(IsolationLevel::ReadCommitted, (6, -1)),
                 ListOffsetsOutcome {
                     requests: latest_request(1),
                     result: Ok(()),
@@ -2152,23 +2339,21 @@ mod partition_error_tests {
             ),
             (
                 "topic authorization failed fails the poll",
-                IsolationLevel::ReadCommitted,
-                Reset::Latest,
-                (29, -1),
+                latest(IsolationLevel::ReadCommitted, (29, -1)),
                 ListOffsetsOutcome {
                     requests: latest_request(1),
-                    result: Err(Some(BTreeSet::from(["orders".to_string()]))),
-                    metadata_requests: 0,
+                    result: Err(PollFailure::TopicAuthorizationFailed(BTreeSet::from([
+                        "orders".to_string(),
+                    ]))),
+                    metadata_requests: 1,
                     next_offset: Some(LATEST_SENTINEL),
                 },
             ),
             (
                 "earliest after out of range reads the log start",
-                IsolationLevel::ReadUncommitted,
-                Reset::EarliestOutOfRange,
-                (0, 7),
+                earliest(IsolationLevel::ReadUncommitted, (0, 7)),
                 ListOffsetsOutcome {
-                    requests: vec![("leader", expected_list_offsets(0, -2))],
+                    requests: vec![("leader", max, expected_list_offsets(0, -2))],
                     result: Ok(()),
                     metadata_requests: 0,
                     next_offset: Some(7),
@@ -2176,82 +2361,112 @@ mod partition_error_tests {
             ),
             (
                 "earliest with a retriable row keeps the position and refreshes metadata",
-                IsolationLevel::ReadCommitted,
-                Reset::EarliestOutOfRange,
-                (74, -1),
+                earliest(IsolationLevel::ReadCommitted, (74, -1)),
                 ListOffsetsOutcome {
-                    requests: vec![("leader", expected_list_offsets(1, -2))],
+                    requests: vec![("leader", max, expected_list_offsets(1, -2))],
                     result: Ok(()),
                     metadata_requests: 1,
                     next_offset: Some(5),
                 },
             ),
         ] {
-            let sent: SentListOffsets = Arc::default();
-            let metadata_requests = Arc::new(AtomicUsize::new(0));
-            let leader_port = Arc::new(AtomicU16::new(0));
-            let leader = list_offsets_broker(
-                "leader",
-                Arc::clone(&leader_port),
-                row,
-                Arc::clone(&sent),
-                Arc::clone(&metadata_requests),
-            )
-            .await;
-            leader_port.store(leader.addr.port(), Ordering::SeqCst);
-            let bootstrap = list_offsets_broker(
-                "bootstrap",
-                Arc::clone(&leader_port),
-                (6, -1),
-                Arc::clone(&sent),
-                Arc::clone(&metadata_requests),
-            )
-            .await;
-            let mut consumer = consumer_on(&bootstrap).await;
-            consumer.isolation_level = isolation;
-            consumer
-                .refresh_leader_epochs()
-                .await
-                .expect("setup metadata");
-            metadata_requests.store(0, Ordering::SeqCst);
+            let outcome = run_list_offsets_exchange(exchange).await;
+            check!(outcome == expected, "case {name}");
+        }
+    }
 
-            let result = match reset {
-                Reset::Latest => {
-                    consumer.auto_offset_reset = AutoOffsetReset::Latest;
-                    consumer
-                        .next_offsets
-                        .lock()
-                        .await
-                        .insert(("orders".into(), 0), LATEST_SENTINEL);
-                    consumer.prepare_poll().await.map(|_| ())
-                }
-                Reset::EarliestOutOfRange => {
-                    consumer.auto_offset_reset = AutoOffsetReset::Earliest;
-                    let topic_ids = consumer.topic_ids.lock().await.clone();
-                    consumer
-                        .process_fetch_responses(vec![fetch_response(1)], &topic_ids)
-                        .await
-                        .map(|_| ())
-                }
-            };
-            let requests = sent.lock().expect("sent lock").clone();
-            let outcome = ListOffsetsOutcome {
-                requests,
-                result: result.map_err(|error| match error {
-                    ConsumerError::TopicAuthorizationFailed(topics) => Some(topics),
-                    _ => None,
-                }),
-                metadata_requests: metadata_requests.load(Ordering::SeqCst),
-                next_offset: consumer
-                    .next_offsets
-                    .lock()
-                    .await
-                    .get(&("orders".to_string(), 0))
-                    .copied(),
-            };
+    /// A new assignment without a committed offset has no leader in the
+    /// positions map yet. Kafka's `OffsetFetcher.groupListOffsetRequests`
+    /// routes with `metadata.currentLeader(tp)`, so the first `ListOffsets`
+    /// of the first poll goes to the leader and not to the bootstrap broker.
+    #[tokio::test]
+    async fn first_poll_sends_list_offsets_to_the_leader_of_a_new_partition() {
+        let outcome = run_list_offsets_exchange(Exchange {
+            isolation: IsolationLevel::ReadCommitted,
+            reset: Reset::Latest,
+            row: (0, 40),
+            list_offsets_max_version: list_offsets_request::MAX_VERSION,
+            primed: false,
+        })
+        .await;
 
-            bootstrap.stop();
-            leader.stop();
+        assert2::assert!(
+            outcome
+                == ListOffsetsOutcome {
+                    requests: vec![(
+                        "leader",
+                        list_offsets_request::MAX_VERSION,
+                        expected_list_offsets(1, -1),
+                    )],
+                    result: Ok(()),
+                    metadata_requests: 1,
+                    next_offset: Some(40),
+                }
+        );
+    }
+
+    /// `isolation_level` exists from `ListOffsets` version 2. Kafka's
+    /// `ListOffsetsRequest.Builder.forConsumer` sets the oldest allowed
+    /// version to 2 for `READ_COMMITTED`, and to 1 (the oldest version) for
+    /// `READ_UNCOMMITTED`. A `read_committed` consumer on a broker that
+    /// supports only version 1 fails the poll with an unsupported version. It
+    /// does not reset to the high watermark.
+    #[tokio::test]
+    async fn read_committed_list_offsets_needs_version_2() {
+        let at = |isolation, list_offsets_max_version| Exchange {
+            isolation,
+            reset: Reset::Latest,
+            row: (0, 40),
+            list_offsets_max_version,
+            primed: true,
+        };
+        // Below version 4 the request has no `current_leader_epoch`, and the
+        // decoder gives the default.
+        let without_epoch = |isolation_level| {
+            let mut request = expected_list_offsets(isolation_level, -1);
+            request.topics[0].partitions[0].current_leader_epoch =
+                ListOffsetsPartition::default().current_leader_epoch;
+            request
+        };
+        for (name, exchange, expected) in [
+            (
+                "read committed on a version 1 broker fails the poll",
+                at(IsolationLevel::ReadCommitted, 1),
+                ListOffsetsOutcome {
+                    requests: vec![],
+                    result: Err(PollFailure::IncompatibleVersion(
+                        list_offsets_request::API_KEY,
+                        0,
+                        1,
+                        2,
+                        list_offsets_request::MAX_VERSION,
+                    )),
+                    metadata_requests: 1,
+                    next_offset: Some(LATEST_SENTINEL),
+                },
+            ),
+            (
+                "read committed on a version 2 broker sends version 2",
+                at(IsolationLevel::ReadCommitted, 2),
+                ListOffsetsOutcome {
+                    requests: vec![("leader", 2, without_epoch(1))],
+                    result: Ok(()),
+                    metadata_requests: 1,
+                    next_offset: Some(40),
+                },
+            ),
+            (
+                "read uncommitted on a version 1 broker sends version 1",
+                at(IsolationLevel::ReadUncommitted, 1),
+                ListOffsetsOutcome {
+                    requests: vec![("leader", 1, without_epoch(0))],
+                    result: Ok(()),
+                    metadata_requests: 1,
+                    next_offset: Some(40),
+                },
+            ),
+        ] {
+            let outcome = run_list_offsets_exchange(exchange).await;
             check!(outcome == expected, "case {name}");
         }
     }

@@ -51,12 +51,12 @@
 //! - `apply_pending_seeks` (seek.rs): PS fast-path probe (released) → A
 //!   `assigned.clone()` (released) → **PS → N → P** held together, all released
 //!   at scope end. Region edges: PS→N, N→P.
+//! - `refresh_leader_epochs` (validate.rs): **P alone** (after the metadata
+//!   `.await`), released; then **T alone** (the tracked `topic_ids` update).
 //! - `resolve_latest_sentinels` (poll.rs): **N alone** for the sentinel
 //!   snapshot, released; then **P alone** in `list_offsets` for the leader
 //!   routes, released before the `ListOffsets` `.await`; then **N alone** to
 //!   apply the offsets. No region takes a second lock.
-//! - `refresh_leader_epochs` (validate.rs): **P alone** (after the metadata
-//!   `.await`), released; then **T alone** (the tracked `topic_ids` update).
 //! - `validate_positions` (validate.rs): **N→P** snapshot held together,
 //!   released before the RPC; then **P alone** in the post-RPC apply.
 //! - `poll` fetch-build (poll.rs, the `by_leader` snapshot): **N→P** held
@@ -185,8 +185,8 @@ struct Step {
 /// function. So are the RPC `.await`s between them, where all guards are
 /// already dropped:
 ///   1. `apply_pending_seeks` (seek.rs)   : PS, N, P  (PS→N→P held)
-///   2. `resolve_latest_sentinels` (poll.rs): N       [across await, alone]
-///   3. `refresh_leader_epochs` (validate.rs): P  then  T  (each alone)
+///   2. `refresh_leader_epochs` (validate.rs): P  then  T  (each alone)
+///   3. `resolve_latest_sentinels` (poll.rs): N, P, N  (each alone)
 ///   4. `validate_positions` (validate.rs): N, P  then  P  (N→P snapshot, then P alone)
 ///   5. `poll` fetch-build (poll.rs)      : N, P      (N→P snapshot)
 ///   6. `poll` post-fetch loop (poll.rs)  : N  then (N,P)…  (N held, P second)
@@ -206,6 +206,12 @@ fn poll_program() -> Vec<Op> {
         Release(P),
         Release(N),
         Release(PS),
+        // --- refresh_leader_epochs (validate.rs): P alone, then T alone
+        //     (`topic_ids` update after `positions` is dropped). ---
+        Acquire(P),
+        Release(P),
+        Acquire(T),
+        Release(T),
         // --- resolve_latest_sentinels (poll.rs): N alone (sentinel
         //     snapshot), P alone (`list_offsets` routes), N alone (apply). ---
         Acquire(N),
@@ -214,12 +220,6 @@ fn poll_program() -> Vec<Op> {
         Release(P),
         Acquire(N),
         Release(N),
-        // --- refresh_leader_epochs (validate.rs): P alone, then T alone
-        //     (`topic_ids` update after `positions` is dropped). ---
-        Acquire(P),
-        Release(P),
-        Acquire(T),
-        Release(T),
         // --- validate_positions (validate.rs): N→P snapshot … ---
         Acquire(N),
         Acquire(P),
