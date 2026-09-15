@@ -7,8 +7,10 @@
 //! adds a random jitter of 20 percent (`CommonClientConfigs.RETRY_BACKOFF_EXP_BASE`
 //! and `RETRY_BACKOFF_JITTER`).
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
+use krabka_client_core::ClientError;
+use krabka_units::{Time, convert::TimeExt as _};
 use tokio::time::Instant;
 
 use crate::AdminError;
@@ -102,6 +104,23 @@ impl RetryDeadline {
         Instant::now() >= self.deadline
     }
 
+    /// Run one attempt, but not past the call deadline. An attempt that is
+    /// still running at the deadline stops and gives
+    /// [`ClientError::Timeout`], as Kafka's `KafkaAdminClient` times out a
+    /// call in flight at its deadline (`TimeoutProcessor`).
+    pub(crate) async fn run<T>(
+        &self,
+        attempt: impl Future<Output = RetryAction<T>>,
+    ) -> RetryAction<T> {
+        tokio::time::timeout_at(self.deadline, attempt)
+            .await
+            .unwrap_or_else(|_| {
+                RetryAction::Done(Err(AdminError::Transport(ClientError::Timeout(
+                    Time::from_std(self.policy.timeout),
+                ))))
+            })
+    }
+
     /// The number of retries that the call has started.
     pub(crate) const fn retries(&self) -> u32 {
         self.retries
@@ -112,6 +131,37 @@ impl RetryDeadline {
         let wait = self.policy.backoff_with(self.retries, jitter_random());
         self.retries = self.retries.saturating_add(1);
         tokio::time::sleep_until(self.deadline.min(Instant::now() + wait)).await;
+    }
+}
+
+/// Whether `error` is a failed or lost connection with no verdict from the
+/// peer: a TCP connection failure, a timeout, a disconnect, an I/O error, or a
+/// TLS or SASL handshake that stopped before the peer answered. Kafka's
+/// `NetworkClient` reports each as a disconnect, and `AdminApiDriver.onFailure`
+/// finds the coordinator again after a disconnect. A rejected authentication
+/// is not such an error.
+pub(crate) fn is_connection_failure(error: &AdminError) -> bool {
+    matches!(
+        error,
+        AdminError::Transport(
+            ClientError::Connect { .. }
+                | ClientError::Tls { .. }
+                | ClientError::Sasl { .. }
+                | ClientError::Timeout(_)
+                | ClientError::Disconnected
+                | ClientError::Io(_)
+        )
+    )
+}
+
+/// The retry action after `error` on a connection to, or a request on, a
+/// coordinator: find the coordinator again after a connection failure, and
+/// stop after every other error.
+pub(crate) fn connection_failure_action<T>(error: AdminError) -> RetryAction<T> {
+    if is_connection_failure(&error) {
+        RetryAction::FindCoordinator(Err(error))
+    } else {
+        RetryAction::Done(Err(error))
     }
 }
 
@@ -156,6 +206,15 @@ impl CoordinatorRetry {
     /// Whether the next attempt must find the coordinator first.
     pub(crate) const fn find_coordinator(&self) -> bool {
         self.find_coordinator
+    }
+
+    /// Run one attempt, but not past the call deadline. See
+    /// [`RetryDeadline::run`].
+    pub(crate) async fn run<T>(
+        &self,
+        attempt: impl Future<Output = RetryAction<T>>,
+    ) -> RetryAction<T> {
+        self.deadline.run(attempt).await
     }
 
     /// Handle the result of one attempt. Returns the result of the call when
@@ -229,6 +288,99 @@ mod tests {
             [0, 3, 9].map(|attempts| policy.backoff_with(attempts, 0.9))
                 == [Duration::from_millis(200); 3]
         );
+    }
+
+    /// Kafka's `NetworkClient` reports a failed connection, a request
+    /// timeout, and a TLS or SASL handshake that stops without a verdict as a
+    /// disconnect, and `AdminApiDriver.onFailure` looks the coordinator up
+    /// again. An `AuthenticationException` and a broker answer are final.
+    #[test]
+    fn connection_failures_find_the_coordinator_again() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Action {
+            Done,
+            SameCoordinator,
+            FindCoordinator,
+        }
+        let addr: std::net::SocketAddr = "127.0.0.1:9092".parse().unwrap();
+        let io = || std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        let cases = [
+            (
+                "connect",
+                AdminError::Transport(ClientError::Connect { addr, source: io() }),
+                Action::FindCoordinator,
+            ),
+            (
+                "TLS handshake without a verdict",
+                AdminError::Transport(ClientError::Tls { addr, source: io() }),
+                Action::FindCoordinator,
+            ),
+            (
+                "SASL exchange without a verdict",
+                AdminError::Transport(ClientError::Sasl {
+                    addr,
+                    source: krabka_client_core::OutboundSaslError::Io(io()),
+                }),
+                Action::FindCoordinator,
+            ),
+            (
+                "timeout",
+                AdminError::Transport(ClientError::Timeout(krabka_units::secs(1))),
+                Action::FindCoordinator,
+            ),
+            (
+                "disconnect",
+                AdminError::Transport(ClientError::Disconnected),
+                Action::FindCoordinator,
+            ),
+            (
+                "I/O",
+                AdminError::Transport(ClientError::Io(io())),
+                Action::FindCoordinator,
+            ),
+            (
+                "rejected authentication",
+                AdminError::Transport(ClientError::Authentication {
+                    addr,
+                    source: krabka_client_core::AuthenticationError::Tls(io()),
+                }),
+                Action::Done,
+            ),
+            (
+                "server error",
+                AdminError::Transport(ClientError::Server { error_code: 30 }),
+                Action::Done,
+            ),
+            (
+                "protocol",
+                AdminError::Protocol("bad".to_owned()),
+                Action::Done,
+            ),
+        ];
+        for (name, error, expected) in cases {
+            let action = match connection_failure_action::<()>(error) {
+                RetryAction::Done(_) => Action::Done,
+                RetryAction::SameCoordinator(_) => Action::SameCoordinator,
+                RetryAction::FindCoordinator(_) => Action::FindCoordinator,
+            };
+            assert!(action == expected, "{name}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_stops_at_the_call_deadline() {
+        let retry = CoordinatorRetry::new(RetryPolicy {
+            timeout: Duration::from_millis(50),
+            ..KAFKA_ADMIN_RETRY
+        });
+        let started = Instant::now();
+        let action = retry.run(std::future::pending::<RetryAction<()>>()).await;
+        assert!(started.elapsed() == Duration::from_millis(50));
+        assert!(matches!(
+            action,
+            RetryAction::Done(Err(AdminError::Transport(ClientError::Timeout(timeout))))
+                if timeout == krabka_units::millis(50)
+        ));
     }
 
     #[tokio::test(start_paused = true)]

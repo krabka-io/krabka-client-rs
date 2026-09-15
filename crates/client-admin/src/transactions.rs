@@ -1,7 +1,7 @@
 //! Transaction administration.
 
 use bytes::BufMut;
-use krabka_client_core::{ClientError, Connection, CoordinatorKeyType, build_find_coordinator};
+use krabka_client_core::{Connection, CoordinatorKeyType, build_find_coordinator};
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
     owned::{
@@ -16,7 +16,9 @@ use krabka_units::{Time, convert::TimeExt as _};
 
 use crate::{
     AdminClient, AdminError, kafka_error_name,
-    retry::{CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy},
+    retry::{
+        CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, connection_failure_action,
+    },
 };
 
 /// `COORDINATOR_LOAD_IN_PROGRESS`: the coordinator is loading its state.
@@ -27,22 +29,6 @@ const COORDINATOR_NOT_AVAILABLE: i16 = 15;
 const NOT_COORDINATOR: i16 = 16;
 /// `CONCURRENT_TRANSACTIONS`: the coordinator is completing a transaction.
 const CONCURRENT_TRANSACTIONS: i16 = 51;
-
-/// The retry action after a failed connection to, or request on, the
-/// coordinator. A lost or failed connection makes Kafka's
-/// `AdminApiDriver.onFailure` find the coordinator again. A rejected
-/// authentication and every other error are final.
-fn coordinator_transport_action<T>(error: AdminError) -> RetryAction<T> {
-    match &error {
-        AdminError::Transport(
-            ClientError::Connect { .. }
-            | ClientError::Timeout(_)
-            | ClientError::Disconnected
-            | ClientError::Io(_),
-        ) => RetryAction::FindCoordinator(Err(error)),
-        _ => RetryAction::Done(Err(error)),
-    }
-}
 
 /// Map the result of one `DescribeTransactions` attempt to a retry action, as
 /// Kafka's `DescribeTransactionsHandler.handleError` does. 14 retries on the
@@ -261,10 +247,12 @@ impl AdminClient {
     ///   coordinator again, then send the request again.
     ///
     /// A `FindCoordinator` answer of 14 or 15, and a failed or lost connection
-    /// to the coordinator, also make the call find the coordinator again. The
-    /// call waits between attempts with Kafka's backoff, and it stops when
-    /// Kafka's default `default.api.timeout.ms` (60 s) elapses. At that time
-    /// it returns the last error.
+    /// to the coordinator (including a TLS or SASL handshake that stops
+    /// before the broker gives a verdict), also make the call find the
+    /// coordinator again. The call waits between attempts with Kafka's
+    /// backoff, and it stops when Kafka's default `default.api.timeout.ms`
+    /// (60 s) elapses. At that time it returns the last error. An attempt that
+    /// is still running at the deadline stops with a timeout error.
     ///
     /// # Errors
     ///
@@ -296,12 +284,12 @@ impl AdminClient {
         let mut coordinator = None;
         let mut retry = CoordinatorRetry::new(retry);
         loop {
-            let action = self
-                .force_terminate_attempt(
+            let action = retry
+                .run(self.force_terminate_attempt(
                     transactional_id,
                     &mut coordinator,
                     retry.find_coordinator(),
-                )
+                ))
                 .await;
             if let Some(result) = retry.next(action).await {
                 return result;
@@ -327,7 +315,7 @@ impl AdminClient {
             force_terminate_request(transactional_id, self.options.request_timeout.millis_i32());
         match connection.send(request).await {
             Ok(response) => fence_retry_action(response.error_code),
-            Err(error) => coordinator_transport_action(error.into()),
+            Err(error) => connection_failure_action(error.into()),
         }
     }
 
@@ -348,10 +336,12 @@ impl AdminClient {
     ///   coordinator again, then send the request again.
     ///
     /// A `FindCoordinator` answer of 14 or 15, and a failed or lost connection
-    /// to the coordinator, also make the call find the coordinator again. The
-    /// call waits between attempts with Kafka's backoff, and it stops when
-    /// Kafka's default `default.api.timeout.ms` (60 s) elapses. At that time
-    /// it returns the last error.
+    /// to the coordinator (including a TLS or SASL handshake that stops
+    /// before the broker gives a verdict), also make the call find the
+    /// coordinator again. The call waits between attempts with Kafka's
+    /// backoff, and it stops when Kafka's default `default.api.timeout.ms`
+    /// (60 s) elapses. At that time it returns the last error. An attempt that
+    /// is still running at the deadline stops with a timeout error.
     ///
     /// # Errors
     ///
@@ -384,12 +374,12 @@ impl AdminClient {
         let mut coordinator = None;
         let mut retry = CoordinatorRetry::new(retry);
         loop {
-            let action = self
-                .describe_transaction_attempt(
+            let action = retry
+                .run(self.describe_transaction_attempt(
                     transactional_id,
                     &mut coordinator,
                     retry.find_coordinator(),
-                )
+                ))
                 .await;
             if let Some(result) = retry.next(action).await {
                 return result;
@@ -418,7 +408,7 @@ impl AdminClient {
             Ok(response) => {
                 describe_retry_action(transaction_description(transactional_id, response))
             }
-            Err(error) => coordinator_transport_action(error.into()),
+            Err(error) => connection_failure_action(error.into()),
         }
     }
 
@@ -450,7 +440,7 @@ impl AdminClient {
                 CoordinatorKeyType::Transaction,
             ))
             .await
-            .map_err(|error| RetryAction::Done(Err(error)))?;
+            .map_err(connection_failure_action)?;
         let address = match coordinator_address(transactional_id, response) {
             Ok(address) => address,
             Err(
@@ -463,7 +453,7 @@ impl AdminClient {
         };
         match Self::connect_one(&address, self.options.clone()).await {
             Ok(connection) => Ok(coordinator.insert(connection)),
-            Err(error) => Err(coordinator_transport_action(error)),
+            Err(error) => Err(connection_failure_action(error)),
         }
     }
 
@@ -834,6 +824,32 @@ mod tests {
         coordinator: Vec<i16>,
         find_coordinator_requests: usize,
         coordinator_requests: usize,
+        /// The first `unreachable_answers` `FindCoordinator` answers name
+        /// `unreachable`, an address that refuses connections.
+        unreachable_answers: usize,
+        unreachable: Option<std::net::SocketAddr>,
+        /// The coordinator does not answer the transaction request.
+        silent: bool,
+    }
+
+    /// How the coordinator of a retry case behaves.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CoordinatorBehavior {
+        /// It answers from the script.
+        Normal,
+        /// The first `FindCoordinator` answer names an address that refuses
+        /// connections.
+        UnreachableOnce,
+        /// It does not answer the transaction request.
+        Silent,
+    }
+
+    /// An address on which no listener accepts connections.
+    async fn refused_address() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port");
+        listener.local_addr().expect("local address")
     }
 
     fn next_code(codes: &[i16], requests: &mut usize) -> i16 {
@@ -882,10 +898,17 @@ mod tests {
                         &script.find_coordinator,
                         &mut script.find_coordinator_requests,
                     );
-                    let addr = coordinator
-                        .lock()
-                        .expect("coordinator lock")
-                        .expect("coordinator address");
+                    let addr = match script.unreachable {
+                        Some(unreachable)
+                            if script.find_coordinator_requests <= script.unreachable_answers =>
+                        {
+                            unreachable
+                        }
+                        _ => coordinator
+                            .lock()
+                            .expect("coordinator lock")
+                            .expect("coordinator address"),
+                    };
                     Some(encode_response(
                         &FindCoordinatorResponse {
                             error_code,
@@ -901,6 +924,9 @@ mod tests {
                 describe_transactions_request::API_KEY => {
                     let error_code =
                         next_code(&script.coordinator, &mut script.coordinator_requests);
+                    if script.silent {
+                        return None;
+                    }
                     Some(encode_response(
                         &DescribeTransactionsResponse {
                             transaction_states: vec![TransactionState {
@@ -920,6 +946,9 @@ mod tests {
                 init_producer_id_request::API_KEY => {
                     let error_code =
                         next_code(&script.coordinator, &mut script.coordinator_requests);
+                    if script.silent {
+                        return None;
+                    }
                     Some(encode_response(
                         &InitProducerIdResponse {
                             error_code,
@@ -937,6 +966,103 @@ mod tests {
         .await
     }
 
+    /// A call that stops at its deadline gives a timeout. The retry tests give
+    /// it Kafka's `REQUEST_TIMED_OUT` code.
+    const TIMED_OUT: i16 = 7;
+    /// A deadline that several attempts fit in.
+    const LONG: Duration = Duration::from_secs(5);
+    /// One attempt fits in `NOW`, and the backoff after it reaches the
+    /// deadline, so the call makes no second attempt.
+    const NOW: Duration = Duration::from_millis(500);
+    /// A deadline shorter than the request timeout.
+    const SHORT: Duration = Duration::from_millis(300);
+
+    type TransactionOutcome = Result<(), (&'static str, i16)>;
+
+    type TransactionCase = (
+        &'static str,
+        TransactionCall,
+        Vec<i16>,
+        Vec<i16>,
+        (Duration, CoordinatorBehavior),
+        (TransactionOutcome, usize, usize),
+    );
+
+    const OK: TransactionOutcome = Ok(());
+
+    fn failed(api: &'static str, code: i16) -> TransactionOutcome {
+        Err((api, code))
+    }
+
+    /// Run one retry case against a scripted bootstrap broker and
+    /// coordinator.
+    async fn run_transaction_case(case: TransactionCase) {
+        use TransactionCall::{Describe, ForceTerminate};
+
+        let (name, call, find_coordinator, coordinator, (timeout, behavior), expected) = case;
+        let backoff = if timeout == LONG {
+            Duration::from_millis(1)
+        } else {
+            timeout
+        };
+        let script = Arc::new(Mutex::new(CoordinatorScript {
+            find_coordinator,
+            coordinator,
+            unreachable_answers: usize::from(behavior == CoordinatorBehavior::UnreachableOnce),
+            unreachable: Some(refused_address().await),
+            silent: behavior == CoordinatorBehavior::Silent,
+            ..CoordinatorScript::default()
+        }));
+        let coordinator_addr = Arc::new(Mutex::new(None));
+        let coordinator =
+            scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr)).await;
+        *coordinator_addr.lock().expect("coordinator lock") = Some(coordinator.addr);
+        let bootstrap =
+            scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr)).await;
+        let admin = AdminClient::connect(&[bootstrap.addr.to_string()])
+            .await
+            .expect("admin connects");
+        let retry = RetryPolicy {
+            timeout,
+            initial_backoff: backoff,
+            max_backoff: backoff,
+            jitter: 0.0,
+        };
+
+        let started = tokio::time::Instant::now();
+        let result = match call {
+            Describe => admin
+                .describe_transaction_with_retry("payments", retry)
+                .await
+                .map(|_| ()),
+            ForceTerminate => {
+                admin
+                    .force_terminate_transaction_with_retry("payments", retry)
+                    .await
+            }
+        }
+        .map_err(|error| match error {
+            AdminError::Broker { api, code, .. } => (api, code),
+            AdminError::Transport(ClientError::Timeout(_)) => ("timeout", TIMED_OUT),
+            other => panic!("case {name}: unexpected error {other:?}"),
+        });
+
+        bootstrap.stop();
+        coordinator.stop();
+        let script = script.lock().expect("script lock");
+        // A call never runs far past its deadline.
+        let within_deadline = started.elapsed() < timeout + Duration::from_secs(2);
+        assert2::assert!(
+            (
+                result,
+                script.find_coordinator_requests,
+                script.coordinator_requests,
+                within_deadline
+            ) == (expected.0, expected.1, expected.2, true),
+            "case {name}"
+        );
+    }
+
     /// Apache Kafka's `DescribeTransactionsHandler.handleError` retries
     /// `COORDINATOR_LOAD_IN_PROGRESS` (14) on the same coordinator.
     /// `FenceProducersHandler.handleError` retries 14 and
@@ -950,49 +1076,45 @@ mod tests {
     async fn transaction_calls_retry_coordinator_errors_as_kafka_does() {
         use TransactionCall::{Describe, ForceTerminate};
 
-        const LONG: Duration = Duration::from_secs(5);
-        const NOW: Duration = Duration::ZERO;
-        let ok = || Ok(());
-        let failed = |api, code| Err((api, code));
-        for (name, call, find_coordinator, coordinator, timeout, expected) in [
+        for case in [
             (
                 "describe: no error",
                 Describe,
                 vec![0],
                 vec![0],
-                LONG,
-                (ok(), 1, 1),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 1, 1),
             ),
             (
                 "describe: coordinator load in progress retries on the same coordinator",
                 Describe,
                 vec![0],
                 vec![14, 14, 0],
-                LONG,
-                (ok(), 1, 3),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 1, 3),
             ),
             (
                 "describe: not coordinator finds the coordinator again",
                 Describe,
                 vec![0],
                 vec![16, 0],
-                LONG,
-                (ok(), 2, 2),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 2, 2),
             ),
             (
                 "describe: coordinator not available finds the coordinator again",
                 Describe,
                 vec![0],
                 vec![15, 0],
-                LONG,
-                (ok(), 2, 2),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 2, 2),
             ),
             (
                 "describe: concurrent transactions is final",
                 Describe,
                 vec![0],
                 vec![51],
-                LONG,
+                (LONG, CoordinatorBehavior::Normal),
                 (failed("DescribeTransactions", 51), 1, 1),
             ),
             (
@@ -1000,7 +1122,7 @@ mod tests {
                 Describe,
                 vec![0],
                 vec![105],
-                LONG,
+                (LONG, CoordinatorBehavior::Normal),
                 (failed("DescribeTransactions", 105), 1, 1),
             ),
             (
@@ -1008,7 +1130,7 @@ mod tests {
                 Describe,
                 vec![0],
                 vec![14],
-                NOW,
+                (NOW, CoordinatorBehavior::Normal),
                 (failed("DescribeTransactions", 14), 1, 1),
             ),
             (
@@ -1016,15 +1138,15 @@ mod tests {
                 Describe,
                 vec![15, 0],
                 vec![0],
-                LONG,
-                (ok(), 2, 1),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 2, 1),
             ),
             (
                 "describe: find coordinator authorization failed is final",
                 Describe,
                 vec![53],
                 vec![0],
-                LONG,
+                (LONG, CoordinatorBehavior::Normal),
                 (failed("FindCoordinator", 53), 1, 0),
             ),
             (
@@ -1032,39 +1154,39 @@ mod tests {
                 ForceTerminate,
                 vec![0],
                 vec![0],
-                LONG,
-                (ok(), 1, 1),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 1, 1),
             ),
             (
                 "fence: coordinator load in progress retries on the same coordinator",
                 ForceTerminate,
                 vec![0],
                 vec![14, 0],
-                LONG,
-                (ok(), 1, 2),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 1, 2),
             ),
             (
                 "fence: concurrent transactions retries on the same coordinator",
                 ForceTerminate,
                 vec![0],
                 vec![51, 51, 0],
-                LONG,
-                (ok(), 1, 3),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 1, 3),
             ),
             (
                 "fence: not coordinator finds the coordinator again",
                 ForceTerminate,
                 vec![0],
                 vec![16, 0],
-                LONG,
-                (ok(), 2, 2),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 2, 2),
             ),
             (
                 "fence: cluster authorization failed is final",
                 ForceTerminate,
                 vec![0],
                 vec![31],
-                LONG,
+                (LONG, CoordinatorBehavior::Normal),
                 (failed("InitProducerId", 31), 1, 1),
             ),
             (
@@ -1072,7 +1194,7 @@ mod tests {
                 ForceTerminate,
                 vec![0],
                 vec![51],
-                NOW,
+                (NOW, CoordinatorBehavior::Normal),
                 (failed("InitProducerId", 51), 1, 1),
             ),
             (
@@ -1080,60 +1202,56 @@ mod tests {
                 ForceTerminate,
                 vec![14, 0],
                 vec![0],
-                LONG,
-                (ok(), 2, 1),
+                (LONG, CoordinatorBehavior::Normal),
+                (OK, 2, 1),
             ),
         ] {
-            let script = Arc::new(Mutex::new(CoordinatorScript {
-                find_coordinator,
-                coordinator,
-                ..CoordinatorScript::default()
-            }));
-            let coordinator_addr = Arc::new(Mutex::new(None));
-            let coordinator =
-                scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr))
-                    .await;
-            *coordinator_addr.lock().expect("coordinator lock") = Some(coordinator.addr);
-            let bootstrap =
-                scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr))
-                    .await;
-            let admin = AdminClient::connect(&[bootstrap.addr.to_string()])
-                .await
-                .expect("admin connects");
-            let retry = RetryPolicy {
-                timeout,
-                initial_backoff: Duration::from_millis(1),
-                max_backoff: Duration::from_millis(1),
-                jitter: 0.0,
-            };
+            run_transaction_case(case).await;
+        }
+    }
 
-            let result = match call {
-                Describe => admin
-                    .describe_transaction_with_retry("payments", retry)
-                    .await
-                    .map(|_| ()),
-                ForceTerminate => {
-                    admin
-                        .force_terminate_transaction_with_retry("payments", retry)
-                        .await
-                }
-            }
-            .map_err(|error| match error {
-                AdminError::Broker { api, code, .. } => (api, code),
-                other => panic!("case {name}: unexpected error {other:?}"),
-            });
+    /// Kafka's `AdminApiDriver.onFailure` looks the coordinator up again
+    /// after a disconnect, and `KafkaAdminClient` times out a call in flight
+    /// at its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transaction_calls_find_the_coordinator_again_after_connection_failures() {
+        use TransactionCall::{Describe, ForceTerminate};
 
-            bootstrap.stop();
-            coordinator.stop();
-            let script = script.lock().expect("script lock");
-            assert2::assert!(
-                (
-                    result,
-                    script.find_coordinator_requests,
-                    script.coordinator_requests
-                ) == expected,
-                "case {name}"
-            );
+        for case in [
+            (
+                "describe: an unreachable coordinator finds the coordinator again",
+                Describe,
+                vec![0],
+                vec![0],
+                (LONG, CoordinatorBehavior::UnreachableOnce),
+                (OK, 2, 1),
+            ),
+            (
+                "describe: a silent coordinator stops the attempt at the deadline",
+                Describe,
+                vec![0],
+                vec![0],
+                (SHORT, CoordinatorBehavior::Silent),
+                (failed("timeout", TIMED_OUT), 1, 1),
+            ),
+            (
+                "fence: an unreachable coordinator finds the coordinator again",
+                ForceTerminate,
+                vec![0],
+                vec![0],
+                (LONG, CoordinatorBehavior::UnreachableOnce),
+                (OK, 2, 1),
+            ),
+            (
+                "fence: a silent coordinator stops the attempt at the deadline",
+                ForceTerminate,
+                vec![0],
+                vec![0],
+                (SHORT, CoordinatorBehavior::Silent),
+                (failed("timeout", TIMED_OUT), 1, 1),
+            ),
+        ] {
+            run_transaction_case(case).await;
         }
     }
 

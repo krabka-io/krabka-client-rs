@@ -56,7 +56,9 @@ use krabka_protocol::{
 
 use crate::{
     AdminClient, AdminError, KafkaError, format_host_port, kafka_error_if, kafka_error_name,
-    retry::{CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy},
+    retry::{
+        CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, connection_failure_action,
+    },
     send_connection_at_least,
 };
 
@@ -323,11 +325,14 @@ impl AdminClient {
     ///   coordinator again, then send the request again.
     ///
     /// A `FindCoordinator` answer of 14 or 15 also makes the call find the
-    /// coordinator again. A lost connection to the coordinator makes the call
-    /// find the coordinator again, as Kafka's `AdminApiDriver.onFailure` does.
-    /// The call waits between attempts with Kafka's backoff, and it stops when
-    /// Kafka's default `default.api.timeout.ms` (60 s) elapses. At that time
-    /// it returns the outcomes of the last response.
+    /// coordinator again. A failed or lost connection to the coordinator,
+    /// including a TLS or SASL handshake that stops before the broker gives a
+    /// verdict, makes the call find the coordinator again, as Kafka's
+    /// `AdminApiDriver.onFailure` does. The call waits between attempts with
+    /// Kafka's backoff, and it stops when Kafka's default
+    /// `default.api.timeout.ms` (60 s) elapses. At that time it returns the
+    /// outcomes of the last response. An attempt that is still running at the
+    /// deadline stops with [`ClientError::Timeout`].
     ///
     /// # Errors
     /// Returns an error when encoding, transport, or response handling fails.
@@ -338,6 +343,7 @@ impl AdminClient {
     ///
     /// [`ClientError::IncompatibleVersion`]: krabka_client_core::ClientError::IncompatibleVersion
     /// [`ClientError::Server`]: krabka_client_core::ClientError::Server
+    /// [`ClientError::Timeout`]: krabka_client_core::ClientError::Timeout
     pub async fn alter_consumer_group_offsets(
         &mut self,
         group: &str,
@@ -355,8 +361,8 @@ impl AdminClient {
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
         let mut retry = CoordinatorRetry::new(retry);
         loop {
-            let action = self
-                .offset_commit_attempt(group, offsets, retry.find_coordinator())
+            let action = retry
+                .run(self.offset_commit_attempt(group, offsets, retry.find_coordinator()))
                 .await;
             if let Some(result) = retry.next(action).await {
                 return result;
@@ -378,12 +384,7 @@ impl AdminClient {
         }
         match self.conn.send(offset_commit_request(group, offsets)).await {
             Ok(response) => offset_commit_retry_action(response),
-            Err(AdminError::Transport(error))
-                if AdminClient::is_retriable_transport_error(&error) =>
-            {
-                RetryAction::FindCoordinator(Err(error.into()))
-            }
-            Err(error) => RetryAction::Done(Err(error)),
+            Err(error) => connection_failure_action(error),
         }
     }
 
@@ -542,9 +543,12 @@ impl AdminClient {
     ///   coordinator again, then send the request again.
     ///
     /// A `FindCoordinator` answer of 14 or 15 also makes the call find the
-    /// coordinator again, as Kafka's `CoordinatorStrategy.handleError` does.
-    /// The call waits between attempts, and it stops when Kafka's default
-    /// `default.api.timeout.ms` (60 s) elapses.
+    /// coordinator again, as Kafka's `CoordinatorStrategy.handleError` does. A
+    /// failed or lost connection to the coordinator does the same, as
+    /// `AdminApiDriver.onFailure` does. The call waits between attempts, and
+    /// it stops when Kafka's default `default.api.timeout.ms` (60 s) elapses.
+    /// An attempt that is still running at the deadline stops with
+    /// [`ClientError::Timeout`].
     ///
     /// # Errors
     /// Returns an error when encoding, transport, or response handling fails.
@@ -558,6 +562,7 @@ impl AdminClient {
     ///
     /// [`ClientError::IncompatibleVersion`]: krabka_client_core::ClientError::IncompatibleVersion
     /// [`ClientError::Server`]: krabka_client_core::ClientError::Server
+    /// [`ClientError::Timeout`]: krabka_client_core::ClientError::Timeout
     pub async fn list_consumer_group_offsets(
         &mut self,
         group: &str,
@@ -573,8 +578,8 @@ impl AdminClient {
     ) -> Result<BTreeMap<(String, i32), i64>, AdminError> {
         let mut retry = CoordinatorRetry::new(retry);
         loop {
-            let action = self
-                .offset_fetch_attempt(group, retry.find_coordinator())
+            let action = retry
+                .run(self.offset_fetch_attempt(group, retry.find_coordinator()))
                 .await;
             if let Some(result) = retry.next(action).await {
                 return result;
@@ -595,13 +600,15 @@ impl AdminClient {
         }
         match self.conn.send(offset_fetch_request(group)).await {
             Ok(response) => offset_fetch_retry_action(committed_offsets(group, response)),
-            Err(error) => RetryAction::Done(Err(error)),
+            Err(error) => connection_failure_action(error),
         }
     }
 
     /// Finds the group coordinator and connects to it. A `FindCoordinator`
-    /// answer that Kafka's `CoordinatorStrategy.handleError` retries gives
-    /// [`RetryAction::FindCoordinator`]. Another failure gives
+    /// answer that Kafka's `CoordinatorStrategy.handleError` retries, and a
+    /// connection failure to the coordinator that it names, give
+    /// [`RetryAction::FindCoordinator`], as `AdminApiDriver.onFailure` looks
+    /// the coordinator up again after a disconnect. Another failure gives
     /// [`RetryAction::Done`].
     async fn find_group_coordinator_attempt<T>(
         &mut self,
@@ -616,7 +623,7 @@ impl AdminClient {
                     ClientError::Server { error_code },
                 ))))
             }
-            Err(error) => Err(RetryAction::Done(Err(error))),
+            Err(error) => Err(connection_failure_action(error)),
         }
     }
 
@@ -1658,6 +1665,20 @@ mod tests {
         find_coordinator_requests: usize,
         offset_fetch_requests: usize,
         offset_commit_requests: usize,
+        /// The first `unreachable_answers` `FindCoordinator` answers name
+        /// `unreachable`, an address that refuses connections.
+        unreachable_answers: usize,
+        unreachable: Option<std::net::SocketAddr>,
+        /// The coordinator does not answer `OffsetCommit`.
+        silent_offset_commit: bool,
+    }
+
+    /// An address on which no listener accepts connections.
+    async fn refused_address() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port");
+        listener.local_addr().expect("local address")
     }
 
     impl RetryScript {
@@ -1688,6 +1709,9 @@ mod tests {
                 let script = &mut *script;
                 let error_code =
                     RetryScript::next(&script.offset_commit, &mut script.offset_commit_requests);
+                if script.silent_offset_commit {
+                    return None;
+                }
                 let response = OffsetCommitResponse {
                     topics: request
                         .topics
@@ -1721,10 +1745,17 @@ mod tests {
                     &script.find_coordinator,
                     &mut script.find_coordinator_requests,
                 );
-                let addr = coordinator
-                    .lock()
-                    .expect("coordinator lock")
-                    .expect("coordinator address");
+                let addr = match script.unreachable {
+                    Some(unreachable)
+                        if script.find_coordinator_requests <= script.unreachable_answers =>
+                    {
+                        unreachable
+                    }
+                    _ => coordinator
+                        .lock()
+                        .expect("coordinator lock")
+                        .expect("coordinator address"),
+                };
                 Some(encode(
                     &FindCoordinatorResponse {
                         error_code,
@@ -1771,7 +1802,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_consumer_group_offsets_retries_coordinator_errors_as_kafka_does() {
         const LONG: Duration = Duration::from_secs(5);
-        const NOW: Duration = Duration::ZERO;
+        // One attempt fits in `NOW`, and the backoff after it reaches the
+        // deadline, so the call makes no second attempt.
+        const NOW: Duration = Duration::from_millis(500);
+        let backoff = |timeout| {
+            if timeout == LONG {
+                Duration::from_millis(1)
+            } else {
+                timeout
+            }
+        };
         let offsets = || Ok(BTreeMap::from([(("orders".into(), 2), 41)]));
         let fetch_error = |code| Err(ListOffsetsError::OffsetFetch(code));
         let find_error = |code| Err(ListOffsetsError::FindCoordinator(code));
@@ -1875,8 +1915,8 @@ mod tests {
                     "workers",
                     RetryPolicy {
                         timeout,
-                        initial_backoff: Duration::from_millis(1),
-                        max_backoff: Duration::from_millis(1),
+                        initial_backoff: backoff(timeout),
+                        max_backoff: backoff(timeout),
                         jitter: 0.0,
                     },
                 )
@@ -1907,6 +1947,22 @@ mod tests {
         }
     }
 
+    /// The admin client reports a call that stops at its deadline with a
+    /// timeout. The retry tests give it Kafka's `REQUEST_TIMED_OUT` code.
+    const TIMED_OUT: i16 = 7;
+
+    /// How the coordinator of a retry case behaves.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Coordinator {
+        /// It answers from the script.
+        Normal,
+        /// The first `FindCoordinator` answer names an address that refuses
+        /// connections.
+        UnreachableOnce,
+        /// It does not answer the group request.
+        Silent,
+    }
+
     /// Apache Kafka's `AlterConsumerGroupOffsetsHandler.handleError` retries
     /// `COORDINATOR_LOAD_IN_PROGRESS` (14) and `REBALANCE_IN_PROGRESS` (27) on
     /// the same coordinator, unmaps the group on `COORDINATOR_NOT_AVAILABLE`
@@ -1917,7 +1973,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn alter_consumer_group_offsets_retries_coordinator_errors_as_kafka_does() {
         const LONG: Duration = Duration::from_secs(5);
-        const NOW: Duration = Duration::ZERO;
+        // One attempt fits in `NOW`, and the backoff after it reaches the
+        // deadline, so the call makes no second attempt.
+        const NOW: Duration = Duration::from_millis(500);
+        let backoff = |timeout| {
+            if timeout == LONG {
+                Duration::from_millis(1)
+            } else {
+                timeout
+            }
+        };
         let outcome = |code| {
             Ok(vec![ConsumerGroupOffsetOutcome {
                 topic: "orders".into(),
@@ -1926,75 +1991,99 @@ mod tests {
             }])
         };
         let find_error = |code| Err(code);
-        for (name, find_coordinator, offset_commit, timeout, expected) in [
-            ("no error", vec![0], vec![0], LONG, (outcome(0), 1, 1)),
+        let normal = Coordinator::Normal;
+        for (name, find_coordinator, offset_commit, (timeout, coordinator), expected) in [
+            (
+                "no error",
+                vec![0],
+                vec![0],
+                (LONG, normal),
+                (outcome(0), 1, 1),
+            ),
+            (
+                "an unreachable coordinator finds the coordinator again",
+                vec![0],
+                vec![0],
+                (LONG, Coordinator::UnreachableOnce),
+                (outcome(0), 2, 1),
+            ),
+            (
+                "a silent coordinator stops the attempt at the deadline",
+                vec![0],
+                vec![0],
+                (Duration::from_millis(300), Coordinator::Silent),
+                (find_error(TIMED_OUT), 1, 1),
+            ),
             (
                 "coordinator load in progress retries on the same coordinator",
                 vec![0],
                 vec![14, 14, 0],
-                LONG,
+                (LONG, normal),
                 (outcome(0), 1, 3),
             ),
             (
                 "rebalance in progress retries on the same coordinator",
                 vec![0],
                 vec![27, 0],
-                LONG,
+                (LONG, normal),
                 (outcome(0), 1, 2),
             ),
             (
                 "coordinator not available finds the coordinator again",
                 vec![0],
                 vec![15, 0],
-                LONG,
+                (LONG, normal),
                 (outcome(0), 2, 2),
             ),
             (
                 "not coordinator finds the coordinator again",
                 vec![0],
                 vec![16, 0],
-                LONG,
+                (LONG, normal),
                 (outcome(0), 2, 2),
             ),
             (
                 "rebalance in progress past the timeout gives the last outcome",
                 vec![0],
                 vec![27],
-                NOW,
+                (NOW, normal),
                 (outcome(27), 1, 1),
             ),
             (
                 "not coordinator past the timeout gives the last outcome",
                 vec![0],
                 vec![16],
-                NOW,
+                (NOW, normal),
                 (outcome(16), 1, 1),
             ),
             (
                 "unknown member id is a final outcome",
                 vec![0],
                 vec![25],
-                LONG,
+                (LONG, normal),
                 (outcome(25), 1, 1),
             ),
             (
                 "find coordinator answers coordinator not available, then the coordinator",
                 vec![15, 0],
                 vec![0],
-                LONG,
+                (LONG, normal),
                 (outcome(0), 2, 1),
             ),
             (
                 "find coordinator group authorization failed is final",
                 vec![30],
                 vec![0],
-                LONG,
+                (LONG, normal),
                 (find_error(30), 1, 0),
             ),
         ] {
             let script = Arc::new(Mutex::new(RetryScript {
                 find_coordinator,
                 offset_commit,
+                unreachable_answers: usize::from(coordinator == Coordinator::UnreachableOnce),
+                unreachable: Some(refused_address().await),
+                silent_offset_commit: coordinator == Coordinator::Silent,
                 ..RetryScript::default()
             }));
             let coordinator_addr = Arc::new(Mutex::new(None));
@@ -2007,32 +2096,37 @@ mod tests {
                 .await
                 .expect("admin connects");
 
+            let started = tokio::time::Instant::now();
             let result = admin
                 .alter_consumer_group_offsets_with_retry(
                     "workers",
                     &BTreeMap::from([(("orders".into(), 2), 41)]),
                     RetryPolicy {
                         timeout,
-                        initial_backoff: Duration::from_millis(1),
-                        max_backoff: Duration::from_millis(1),
+                        initial_backoff: backoff(timeout),
+                        max_backoff: backoff(timeout),
                         jitter: 0.0,
                     },
                 )
                 .await
                 .map_err(|error| match error {
                     AdminError::Transport(ClientError::Server { error_code }) => error_code,
+                    AdminError::Transport(ClientError::Timeout(_)) => TIMED_OUT,
                     other => panic!("case {name}: unexpected error {other:?}"),
                 });
 
             bootstrap.stop();
             coordinator.stop();
             let script = script.lock().expect("script lock");
+            // A call never runs far past its deadline.
+            let within_deadline = started.elapsed() < timeout + Duration::from_secs(2);
             assert!(
                 (
                     result,
                     script.find_coordinator_requests,
-                    script.offset_commit_requests
-                ) == expected,
+                    script.offset_commit_requests,
+                    within_deadline
+                ) == (expected.0, expected.1, expected.2, true),
                 "case {name}"
             );
         }
