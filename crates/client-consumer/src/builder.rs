@@ -52,13 +52,24 @@ fn duration_component(part: &str, unit: char) -> (Option<&str>, &str) {
     }
 }
 
-/// A decimal integer with an optional sign.
+/// A decimal integer with an optional sign that fits `i64`, as Java's
+/// `Long.parseLong` in `Duration.parse` requires.
 fn duration_integer(number: &str) -> Option<i128> {
     let digits = number.strip_prefix(['-', '+']).unwrap_or(number);
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    number.parse::<i128>().ok()
+    number.parse::<i64>().ok().map(i128::from)
+}
+
+/// `value * unit_seconds` seconds in nanoseconds, added to `nanos`, or `None`
+/// on overflow.
+fn add_duration_part(nanos: i128, value: i128, unit_seconds: i128) -> Option<i128> {
+    const NANOS_PER_SECOND: i128 = 1_000_000_000;
+    value
+        .checked_mul(unit_seconds)?
+        .checked_mul(NANOS_PER_SECOND)
+        .and_then(|part| nanos.checked_add(part))
 }
 
 /// Parse an ISO-8601 duration as Java's `Duration.parse` does:
@@ -86,7 +97,8 @@ fn parse_iso_duration(text: &str) -> Result<std::time::Duration, String> {
         return Err(invalid());
     }
     if let Some(days) = days {
-        nanos += duration_integer(days).ok_or_else(invalid)? * 86_400 * NANOS_PER_SECOND;
+        nanos = add_duration_part(nanos, duration_integer(days).ok_or_else(invalid)?, 86_400)
+            .ok_or_else(invalid)?;
         components += 1;
     }
     if let Some(time) = time {
@@ -97,10 +109,12 @@ fn parse_iso_duration(text: &str) -> Result<std::time::Duration, String> {
             return Err(invalid());
         }
         if let Some(hours) = hours {
-            nanos += duration_integer(hours).ok_or_else(invalid)? * 3_600 * NANOS_PER_SECOND;
+            nanos = add_duration_part(nanos, duration_integer(hours).ok_or_else(invalid)?, 3_600)
+                .ok_or_else(invalid)?;
         }
         if let Some(minutes) = minutes {
-            nanos += duration_integer(minutes).ok_or_else(invalid)? * 60 * NANOS_PER_SECOND;
+            nanos = add_duration_part(nanos, duration_integer(minutes).ok_or_else(invalid)?, 60)
+                .ok_or_else(invalid)?;
         }
         if let Some(seconds) = seconds {
             let (whole, fraction) = match seconds.split_once(['.', ',']) {
@@ -119,7 +133,9 @@ fn parse_iso_duration(text: &str) -> Result<std::time::Duration, String> {
                     .map_err(|_| invalid())?
             };
             let sign = if whole.starts_with('-') { -1 } else { 1 };
-            nanos += whole_value * NANOS_PER_SECOND + sign * fraction_value;
+            nanos = add_duration_part(nanos, whole_value, 1)
+                .and_then(|nanos| nanos.checked_add(sign * fraction_value))
+                .ok_or_else(invalid)?;
         }
         components += 1;
     }
@@ -134,7 +150,9 @@ fn parse_iso_duration(text: &str) -> Result<std::time::Duration, String> {
             "Negative duration is not supported in by_duration offset reset strategy.".into(),
         );
     }
-    let seconds = u64::try_from(nanos / NANOS_PER_SECOND).map_err(|_| invalid())?;
+    // Java's `Duration` holds the seconds in a `long`.
+    let seconds = i64::try_from(nanos / NANOS_PER_SECOND).map_err(|_| invalid())?;
+    let seconds = u64::try_from(seconds).map_err(|_| invalid())?;
     let subsec = u32::try_from(nanos % NANOS_PER_SECOND).map_err(|_| invalid())?;
     Ok(std::time::Duration::new(seconds, subsec))
 }
@@ -353,6 +371,9 @@ mod tests {
                 reset("by_duration:P"),
                 reset("by_duration:1H"),
                 reset("by_duration:PT1.0000000001S"),
+                reset("by_duration:P9223372036854775807D"),
+                reset("by_duration:PT9223372036854775808H"),
+                reset("by_duration:P106751991167300DT24H"),
                 reset("EARLIEST"),
                 reset("unknown"),
             ],
@@ -385,6 +406,9 @@ mod tests {
                     "Negative duration is not supported in by_duration offset reset strategy."
                         .to_owned(),
                 ),
+                unparsable.clone(),
+                unparsable.clone(),
+                unparsable.clone(),
                 unparsable.clone(),
                 unparsable.clone(),
                 unparsable.clone(),

@@ -2852,7 +2852,7 @@ mod auto_commit_tests {
             self.requests.lock().expect("requests lock").clone()
         }
 
-        fn sync_groups(&self) -> usize {
+        pub(super) fn sync_groups(&self) -> usize {
             self.requests()
                 .iter()
                 .filter(|request| **request == GroupRequest::SyncGroup)
@@ -4115,7 +4115,7 @@ mod poll_interval_tests {
 
     /// The poll timeout clears the assignment before the `LeaveGroup` goes out.
     /// A `poll` while the coordinator does not answer the `LeaveGroup` fetches
-    /// nothing, and it starts the join at once.
+    /// nothing, and it starts the join after the leave request ends.
     #[tokio::test]
     async fn a_poll_during_the_poll_timeout_leave_fetches_nothing_and_starts_the_join() {
         let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
@@ -4129,7 +4129,7 @@ mod poll_interval_tests {
         .await;
         let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, millis(300));
         config.heartbeat_interval = millis(50);
-        config.leave_group_timeout = secs(10);
+        config.leave_group_timeout = secs(1);
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
             .build()
@@ -4299,7 +4299,9 @@ mod group_membership_tests {
     };
 
     use super::{
-        auto_commit_tests::{MEMBER, MockCoordinator, TOPIC, partition, start_config},
+        auto_commit_tests::{
+            GroupRequest, MEMBER, MockCoordinator, TOPIC, partition, start_config,
+        },
         *,
     };
 
@@ -4426,6 +4428,103 @@ mod group_membership_tests {
         drop(consumer);
         mock.stop();
         assert2::assert!((joined, within_timeout, joins) == (true, true, 1));
+    }
+
+    /// Kafka's heartbeat thread sends heartbeats whatever the rate of `poll`.
+    /// An application that polls without a pause keeps the member in the
+    /// group.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continuous_polls_do_not_stop_the_heartbeats() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let consumer = started_consumer(&mock, None).await;
+        let first_heartbeat = *coordinator
+            .last_heartbeat
+            .lock()
+            .expect("last heartbeat lock");
+        // An application thread that polls without a pause.
+        let poll_signal = consumer.poll_signal.clone();
+        tokio::task::spawn_blocking(move || {
+            let end = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < end {
+                crate::coordinator::note_poll(&poll_signal);
+            }
+        })
+        .await
+        .expect("poller");
+        let heartbeat_during_polls = *coordinator
+            .last_heartbeat
+            .lock()
+            .expect("last heartbeat lock")
+            > first_heartbeat + Duration::from_millis(200);
+        drop(consumer);
+        mock.stop();
+        assert2::assert!(heartbeat_during_polls);
+    }
+
+    /// Kafka's `maybeLeaveGroup` sends the `LeaveGroup` of a poll timeout
+    /// before the next `poll` can start the join. The coordinator never sees
+    /// the new member before the old one leaves.
+    #[tokio::test]
+    async fn the_poll_timeout_leave_goes_out_before_the_join_of_the_next_poll() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, millis(200));
+        config.heartbeat_interval = millis(50);
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let consumer = spawn_consumer(
+            config,
+            client,
+            Arc::new(AtomicI32::new(0)),
+            MEMBER.into(),
+            StartupState {
+                generation_id: 1,
+                assigned_partitions: vec![partition(0)],
+                next_offsets: HashMap::from([(partition(0), 12)]),
+                positions: HashMap::new(),
+                topic_ids: HashMap::new(),
+                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
+            },
+        )
+        .await
+        .expect("spawn consumer");
+        // The application polls again as soon as the member leaves the group.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !*consumer.rebalance_pending.borrow() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the poll timeout expires");
+        crate::coordinator::note_poll(&consumer.poll_signal);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while coordinator.sync_groups() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the member joins again");
+        let order: Vec<GroupRequest> = coordinator
+            .requests()
+            .into_iter()
+            .filter(|request| matches!(request, GroupRequest::LeaveGroup | GroupRequest::JoinGroup))
+            .take(2)
+            .collect();
+        drop(consumer);
+        mock.stop();
+        assert2::assert!(order == vec![GroupRequest::LeaveGroup, GroupRequest::JoinGroup]);
     }
 
     /// Kafka's `JoinGroup` carries `AbstractCoordinator.rejoinReason`

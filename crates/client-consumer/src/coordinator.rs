@@ -790,10 +790,12 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
 
     loop {
         let event = tokio::select! {
-            // A `poll` that came while an RPC was in flight goes before a tick
-            // or the poll deadline, so it resets the timer first.
+            // The ticker goes before a `poll`, so frequent polls cannot starve
+            // the heartbeats. The ticker fires once per heartbeat interval, so
+            // it cannot starve the polls either.
             biased;
             () = shutdown.cancelled() => break,
+            _ = ticker.tick() => TaskEvent::Tick,
             changed = state.polls.changed(), if polls_open => {
                 if changed.is_ok() {
                     TaskEvent::Poll
@@ -802,7 +804,6 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     continue;
                 }
             }
-            _ = ticker.tick() => TaskEvent::Tick,
             // Kafka's heartbeat thread checks `pollTimeoutExpired` each retry
             // backoff. The task wakes at the deadline of the poll timer.
             () = tokio::time::sleep_until(poll_timer.deadline), if !state.member_id.is_empty() => {
@@ -814,6 +815,11 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
             if !rejoin.due(&state.polls) {
                 continue;
             }
+        } else if state.polls.has_changed().unwrap_or(false) {
+            // A `poll` that came while an RPC was in flight resets the timer
+            // before the expiry check.
+            state.polls.borrow_and_update();
+            poll_timer.reset();
         }
 
         if event != TaskEvent::Poll && !state.member_id.is_empty() && poll_timer.expired() {
@@ -1036,9 +1042,9 @@ const POLL_TIMEOUT_LEAVE_REASON: &str = "consumer poll timeout has expired.";
 /// `rejoin_on_poll`, so a commit fails with `CommitFailed` until the join.
 ///
 /// The function clears the member and the assignment before it sends the
-/// `LeaveGroup`, so a `poll` fetches nothing. It does not wait for the
-/// response, as `maybeLeaveGroup` only sends the request: a `poll` can start
-/// the join while the request is in flight.
+/// `LeaveGroup`, so a `poll` during the request fetches nothing. The task
+/// sends the join that such a `poll` requests after the `LeaveGroup`, so the
+/// coordinator never sees the new member before the old one leaves.
 async fn leave_on_poll_timeout(state: &mut CoordinatorState) {
     tracing::warn!(
         group = %state.group_id,
@@ -1054,17 +1060,13 @@ async fn leave_on_poll_timeout(state: &mut CoordinatorState) {
         state.group_instance_id.as_deref(),
         GroupMembershipOperation::Default,
     ) {
-        let request = build_leave_group_request(
-            state.group_id.clone(),
-            member_id,
-            Some(POLL_TIMEOUT_LEAVE_REASON),
-        );
-        let client = state.client.clone();
-        let coordinator = state.coordinator_id.load(Ordering::Relaxed);
-        let timeout = state.leave_group_timeout.to_std();
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(timeout, client.broker(coordinator).send(request)).await;
-        });
+        leave_group(
+            state,
+            &member_id,
+            GroupMembershipOperation::Default,
+            POLL_TIMEOUT_LEAVE_REASON,
+        )
+        .await;
     }
 }
 

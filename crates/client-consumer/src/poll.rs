@@ -529,17 +529,27 @@ impl Consumer {
 
     /// Return up to `max_poll_records` buffered records, and move the consumed
     /// positions past them.
+    ///
+    /// The `assigned` guard lives until the positions move, so the coordinator
+    /// cannot revoke a partition between the ownership check and the drain.
+    /// The lock order is `assigned`, then `next_offsets`, then `positions`, as
+    /// in the coordinator task.
     async fn drain_fetch_buffer(&mut self) -> Vec<ConsumerRecord> {
+        let assigned_guard = self.assigned.lock().await;
         let assigned: std::collections::HashSet<(String, i32)> =
-            self.assigned.lock().await.iter().cloned().collect();
+            assigned_guard.iter().cloned().collect();
         let mut offsets = self.next_offsets.lock().await;
         let mut positions = self.positions.lock().await;
-        self.fetch_buffer.drain(
+        let records = self.fetch_buffer.drain(
             self.max_poll_records,
             &assigned,
             &mut offsets,
             &mut positions,
-        )
+        );
+        drop(positions);
+        drop(offsets);
+        drop(assigned_guard);
+        records
     }
     /// Decode the fetch responses into the fetch buffer, and act on the
     /// partition errors.
@@ -2085,6 +2095,56 @@ mod partition_error_tests {
 
         broker.stop();
         assert2::assert!((first, second) == (Err(Some(topics)), Ok(true)));
+    }
+
+    /// A partition that the coordinator revokes while `poll` drains the fetch
+    /// buffer is either still owned for the whole drain, or not drained at
+    /// all. The drain never returns records of a partition that left the
+    /// assignment before the drain completed.
+    #[tokio::test]
+    async fn drain_never_returns_records_of_a_partition_revoked_during_the_drain() {
+        let broker = metadata_counting_broker(Arc::default()).await;
+        let mut consumer = consumer_on(&broker).await;
+        consumer
+            .fetch_buffer
+            .push(crate::fetch_buffer::BufferedPartition {
+                key: ("orders".into(), 0),
+                position: 5,
+                records: std::collections::VecDeque::from([ConsumerRecord {
+                    topic: "orders".into(),
+                    partition: 0,
+                    offset: 5,
+                    leader_epoch: 0,
+                    timestamp: 0,
+                    key: None,
+                    value: None,
+                    headers: Vec::new(),
+                }]),
+                next_offset: 6,
+                last_epoch: None,
+            });
+        let assigned = Arc::clone(&consumer.assigned);
+        let next_offsets = Arc::clone(&consumer.next_offsets);
+        // Block the drain between the ownership check and the position update.
+        let offsets_guard = next_offsets.lock().await;
+        let drain = tokio::spawn(async move {
+            let records = consumer.drain_fetch_buffer().await;
+            (consumer, records)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The coordinator revokes the partition, if it can take the lock.
+        let revoked = match tokio::time::timeout(Duration::from_millis(50), assigned.lock()).await {
+            Ok(mut owned) => {
+                owned.clear();
+                true
+            }
+            Err(_) => false,
+        };
+        drop(offsets_guard);
+        let (consumer, records) = drain.await.expect("drain task");
+        drop(consumer);
+        broker.stop();
+        assert2::assert!(!(revoked && !records.is_empty()));
     }
 
     /// While a join runs, Kafka's eager `onJoinPrepare` has revoked every
