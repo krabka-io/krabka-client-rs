@@ -29,7 +29,7 @@ use krabka_units::{
     convert::{ByteSizeExt as _, StdDurationExt as _, TimeExt as _},
     millis, minutes, secs,
 };
-use refined_type::rule::{GreaterI32, GreaterI64, MinMaxU128};
+use refined_type::rule::{GreaterI32, GreaterI64, MinMaxI64, MinMaxU128};
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -658,7 +658,8 @@ pub(crate) fn reset_starting_offset(auto_offset_reset: AutoOffsetReset) -> i64 {
 /// The auto commit interval, or `None` when auto commit is off.
 ///
 /// Kafka's `ConsumerConfig` defines `auto.commit.interval.ms` as an `int` of at
-/// least 0.
+/// least 0. The interval must therefore be a whole number of milliseconds from
+/// 0 to `i32::MAX`.
 fn validated_auto_commit_interval(
     enable_auto_commit: bool,
     interval: Time,
@@ -666,8 +667,13 @@ fn validated_auto_commit_interval(
     if !enable_auto_commit {
         return Ok(None);
     }
-    if !(0..=i64::from(i32::MAX)).contains(&interval.millis_i64_trunc()) {
-        return Err("consumer auto commit interval must be 0 to i32::MAX milliseconds".to_owned());
+    let milliseconds = MinMaxI64::<0, { i32::MAX as i64 }>::new(interval.millis_i64())
+        .map_err(|error| format!("consumer auto commit interval: {error}"))?
+        .into_value();
+    if !interval.secs_f64().is_finite() || Time::from_millis(milliseconds) != interval {
+        return Err(
+            "consumer auto commit interval must be a whole number of milliseconds".to_owned(),
+        );
     }
     Ok(Some(interval.to_std()))
 }
@@ -2959,6 +2965,8 @@ mod auto_commit_tests {
 
     #[test]
     fn auto_commit_interval_follows_kafka_config_bounds() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
         for (name, enable, interval, expected) in [
             ("off", false, Time::from_millis(-1), Ok(None)),
             ("default", true, secs(5), Ok(Some(Duration::from_secs(5)))),
@@ -2978,9 +2986,30 @@ mod auto_commit_tests {
                 Time::from_millis(i64::from(i32::MAX) + 1),
                 Err(()),
             ),
+            (
+                "half a millisecond",
+                true,
+                Time::from_secs_f64(0.0005),
+                Err(()),
+            ),
+            (
+                "i32::MAX milliseconds and a fraction",
+                true,
+                Time::from_secs_f64((f64::from(i32::MAX) + 0.25) / 1e3),
+                Err(()),
+            ),
+            ("not a number", true, Time::from_secs_f64(f64::NAN), Err(())),
+            (
+                "infinite",
+                true,
+                Time::from_secs_f64(f64::INFINITY),
+                Err(()),
+            ),
         ] {
             let result = validated_auto_commit_interval(enable, interval).map_err(|_| ());
-            assert2::check!(result == expected, "case {name}");
+            actual.push((name, result));
+            wanted.push((name, expected));
         }
+        assert2::assert!(actual == wanted);
     }
 }
