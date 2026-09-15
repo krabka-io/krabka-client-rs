@@ -104,6 +104,12 @@ pub struct Consumer {
     pub(crate) client_rack: Option<String>,
     /// Kafka's `metadata.max.age.ms`. A preferred read replica expires after it.
     pub(crate) metadata_max_age: Time,
+    /// Kafka's `request.timeout.ms`. It bounds the requests of `close`.
+    pub(crate) request_timeout: Time,
+    /// Wakes a `poll` from another task.
+    pub(crate) wakeup: crate::control::WakeupHandle,
+    /// Rebalances that the application asks for, with their reasons.
+    pub(crate) enforced_rebalances: tokio::sync::mpsc::UnboundedSender<(String, u64)>,
     /// Kafka's `default.api.timeout.ms`, the timeout of `position` and
     /// `committed`.
     pub(crate) default_api_timeout: Time,
@@ -131,7 +137,7 @@ pub struct Consumer {
     pub(crate) fetch_buffer: crate::fetch_buffer::FetchBuffer,
     /// The membership operation of `close`. The coordinator task reads it
     /// when it stops.
-    pub(crate) close_operation: tokio::sync::watch::Sender<GroupMembershipOperation>,
+    pub(crate) close_operation: tokio::sync::watch::Sender<crate::control::CloseRequest>,
     /// The rebalance listener, Kafka's `ConsumerRebalanceListener`.
     pub(crate) rebalance_listener: Option<crate::rebalance_listener::SharedListener>,
     /// The listener calls that the coordinator task asks `poll` to run.
@@ -1014,12 +1020,12 @@ impl Consumer {
             validated_max_poll_records(max_poll_records).map_err(ConsumerError::InvalidConfig)?;
         let fetch_max_wait =
             validated_fetch_max_wait(fetch_max_wait).map_err(ConsumerError::InvalidConfig)?;
-        if metadata_max_age.millis_i64() < 0 || !metadata_max_age.secs_f64().is_finite() {
+        if metadata_max_age.secs_f64() < 0.0 || !metadata_max_age.secs_f64().is_finite() {
             return Err(ConsumerError::InvalidConfig(
                 "consumer metadata max age must not be negative".to_owned(),
             ));
         }
-        if default_api_timeout.millis_i64() < 0 || !default_api_timeout.secs_f64().is_finite() {
+        if default_api_timeout.secs_f64() < 0.0 || !default_api_timeout.secs_f64().is_finite() {
             return Err(ConsumerError::InvalidConfig(
                 "consumer default api timeout must not be negative".to_owned(),
             ));
@@ -1580,8 +1586,9 @@ async fn spawn_consumer(
     let poll_signal = crate::coordinator::PollSignal::default();
     let rebalance_pending = tokio::sync::watch::Sender::new(false);
     let rebalance_pending_receiver = rebalance_pending.subscribe();
-    let close_operation = tokio::sync::watch::Sender::new(GroupMembershipOperation::Default);
+    let close_operation = tokio::sync::watch::Sender::new(crate::control::CloseRequest::default());
     let (listener_sender, listener_calls) = tokio::sync::mpsc::unbounded_channel();
+    let (enforced_rebalances, enforced_rebalance_reasons) = tokio::sync::mpsc::unbounded_channel();
     let assigned_callback_pending = crate::rebalance_listener::AssignedCallbackPending::default();
     if has_rebalance_listener {
         // Kafka's first `poll` completes the first join and calls
@@ -1642,6 +1649,7 @@ async fn spawn_consumer(
         close_operation: close_operation.subscribe(),
         rejoin_reason: String::new(),
         listener_calls: has_rebalance_listener.then_some(listener_sender),
+        enforced_rebalances: enforced_rebalance_reasons,
         lost_partitions: Vec::new(),
         assigned_callback_pending: Arc::clone(&assigned_callback_pending),
         poll_timer: crate::coordinator::PollTimer::new(max_poll_interval),
@@ -1684,6 +1692,9 @@ async fn spawn_consumer(
         fetches: crate::poll::Fetches::default(),
         client_rack,
         metadata_max_age,
+        request_timeout,
+        wakeup: crate::control::WakeupHandle::default(),
+        enforced_rebalances,
         default_api_timeout,
         paused: std::sync::Mutex::default(),
         auto_offset_reset,
@@ -1806,11 +1817,23 @@ impl Consumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn close(self) -> Result<(), ConsumerError> {
-        self.close_with(GroupMembershipOperation::Default).await
+        self.close_with(crate::CloseOptions::default()).await
     }
 
-    /// Close the consumer, and leave the group or stay in it as `operation`
-    /// says. Kafka's `KafkaConsumer.close(CloseOptions)`.
+    /// Close the consumer, and leave the group or stay in it as
+    /// `options.group_membership_operation` says. Kafka's
+    /// `KafkaConsumer.close(CloseOptions)`.
+    ///
+    /// `options.timeout` (default 30 s) bounds the auto commit (at most
+    /// `request_timeout`) and then the close of the fetch sessions, as Kafka's
+    /// `ClassicKafkaConsumer.close` bounds the coordinator close and the
+    /// fetcher close. The consumer always sends the `LeaveGroup` and waits
+    /// for it for at most `leave_group_timeout`: Kafka's `maybeLeaveGroup`
+    /// transmits the request (`pollNoWakeup`) before `awaitPendingRequests`
+    /// checks the close timer. The rebalance listener call before the
+    /// `LeaveGroup` is not bounded. A negative timeout gives
+    /// [`ConsumerError::InvalidArgument`]; the consumer then stops without a
+    /// commit and without `LeaveGroup`.
     ///
     /// The coordinator itself sends the best-effort `LeaveGroup` as the last
     /// thing it does on shutdown. See `crate::coordinator::run`. It uses its
@@ -1822,29 +1845,42 @@ impl Consumer {
         name = "consumer.close",
         level = "info",
         skip_all,
-        fields(group_id = %self.group_id, member_id = %self.member_id(), ?operation),
+        fields(group_id = %self.group_id, member_id = %self.member_id(), ?options),
         err
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
-    pub async fn close_with(
-        mut self,
-        operation: GroupMembershipOperation,
-    ) -> Result<(), ConsumerError> {
+    pub async fn close_with(mut self, options: crate::CloseOptions) -> Result<(), ConsumerError> {
+        let timeout = crate::control::close_timeout(options)?.to_std();
+        let started = tokio::time::Instant::now();
+        let request_timeout = self.request_timeout.to_std();
+        // Kafka's `createTimerForRequest`: the coordinator close gets at most
+        // `request.timeout.ms`.
+        let coordinator_deadline = started + timeout.min(request_timeout);
         // Kafka's `ConsumerCoordinator.close` runs `maybeAutoCommitOffsetsSync`
         // before the coordinator leaves the group.
-        self.auto_commit_on_close().await;
+        self.auto_commit_on_close(coordinator_deadline).await;
+        // Kafka's `ConsumerCoordinator.close` then waits for the pending
+        // asynchronous commits and runs their callbacks, within the timer.
+        self.wait_for_async_commits(coordinator_deadline).await;
         // Kafka's `ConsumerCoordinator.onLeavePrepare` runs the listener before
         // `LeaveGroup`: lost when the member has no generation or a rebalance
         // runs, revoked otherwise.
         let listener_result = self.leave_prepare().await;
-        self.close_operation.send_replace(operation);
+        self.close_operation
+            .send_replace(crate::control::CloseRequest {
+                operation: options.group_membership_operation,
+            });
         self.coordinator_shutdown.cancel();
         if let Some(h) = self.coordinator_handle.take() {
             let _ = h.await;
         }
-        // Kafka's `AbstractFetch.close` closes the fetch session of each broker.
-        self.close_fetch_sessions().await;
+        // Kafka's `AbstractFetch.close` closes the fetch session of each
+        // broker, within the time left and at most `request.timeout.ms`.
+        let left = timeout
+            .saturating_sub(started.elapsed())
+            .min(request_timeout);
+        self.close_fetch_sessions(left).await;
         listener_result
     }
 
@@ -2143,6 +2179,51 @@ mod security_arg_tests {
             error
                 .to_string()
                 .contains("consumer subscription metadata refresh interval")
+        );
+    }
+
+    /// A negative time below one millisecond is still negative, and fails the
+    /// build before any request.
+    #[tokio::test]
+    async fn negative_sub_millisecond_times_fail_before_broker_lookup() {
+        let negative = Time::from_secs_f64(-0.0001);
+        let mut actual = Vec::new();
+        for (name, default_api_timeout, metadata_max_age) in [
+            (
+                "default api timeout",
+                negative,
+                DEFAULT_CONSUMER_METADATA_MAX_AGE,
+            ),
+            (
+                "metadata max age",
+                DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
+                negative,
+            ),
+        ] {
+            let build = Consumer::builder()
+                .bootstrap("invalid.invalid:9092")
+                .group_id("negative-times")
+                .subscribe(["topic".to_owned()])
+                .default_api_timeout(default_api_timeout)
+                .metadata_max_age(metadata_max_age)
+                .build();
+            let error = tokio::time::timeout(Duration::from_secs(5), build)
+                .await
+                .map(|result| result.err().map(|error| error.to_string()));
+            actual.push((name, error.ok().flatten()));
+        }
+        assert2::assert!(
+            actual
+                == vec![
+                    (
+                        "default api timeout",
+                        Some("invalid configuration: consumer default api timeout must not be negative".to_owned())
+                    ),
+                    (
+                        "metadata max age",
+                        Some("invalid configuration: consumer metadata max age must not be negative".to_owned())
+                    ),
+                ]
         );
     }
 
@@ -2622,6 +2703,9 @@ mod security_arg_tests {
             fetches: crate::poll::Fetches::default(),
             client_rack: None,
             metadata_max_age: DEFAULT_CONSUMER_METADATA_MAX_AGE,
+            request_timeout: krabka_units::secs(30),
+            wakeup: crate::control::WakeupHandle::default(),
+            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().0,
             default_api_timeout: DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
             paused: std::sync::Mutex::default(),
             auto_offset_reset: AutoOffsetReset::Latest,
@@ -2631,7 +2715,9 @@ mod security_arg_tests {
             rebalance_pending: tokio::sync::watch::channel(false).1,
             max_poll_records: DEFAULT_CONSUMER_MAX_POLL_RECORDS,
             fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
-            close_operation: tokio::sync::watch::Sender::new(GroupMembershipOperation::Default),
+            close_operation: tokio::sync::watch::Sender::new(
+                crate::control::CloseRequest::default(),
+            ),
             rebalance_listener: None,
             listener_calls: tokio::sync::mpsc::unbounded_channel().1,
             assigned_callback_pending: Arc::default(),
@@ -4545,7 +4631,10 @@ mod group_membership_tests {
             })
             .await;
             let consumer = started_consumer(&mock, group_instance_id).await;
-            consumer.close_with(operation).await.expect("close");
+            consumer
+                .close_with(crate::CloseOptions::group_membership_operation(operation))
+                .await
+                .expect("close");
             mock.stop();
             actual.push((
                 name,
@@ -4635,6 +4724,138 @@ mod group_membership_tests {
         drop(consumer);
         mock.stop();
         assert2::assert!(subscriptions.first() == Some(&(Vec::new(), -1)));
+    }
+
+    /// Kafka's `close(CloseOptions.timeout(d))` bounds the synchronous auto
+    /// commit by `d`, and still sends `LeaveGroup` (`maybeLeaveGroup` transmits
+    /// it before `awaitPendingRequests` checks the timer).
+    #[tokio::test]
+    async fn close_timeout_bounds_the_auto_commit() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, timeout, expected) in [("300 ms", millis(300), (Ok(()), true, 1))] {
+            let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+            let in_mock = Arc::clone(&coordinator);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+                in_mock.respond(api_key, version, body)
+            })
+            .await;
+            let mut config = start_config(mock.addr.to_string(), Assignor::Range, true, minutes(1));
+            config.heartbeat_interval = millis(50);
+            let client = Client::builder()
+                .bootstrap(mock.addr.to_string())
+                .build()
+                .await
+                .expect("client");
+            let consumer = spawn_consumer(
+                config,
+                client,
+                Arc::new(AtomicI32::new(0)),
+                MEMBER.into(),
+                StartupState {
+                    generation_id: 1,
+                    assigned_partitions: vec![partition(0)],
+                    next_offsets: HashMap::from([(partition(0), 12)]),
+                    positions: HashMap::new(),
+                    topic_ids: HashMap::new(),
+                    topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
+                },
+            )
+            .await
+            .expect("spawn consumer");
+            // Another commit holds the commit lock, so the auto commit of
+            // `close` waits.
+            let held = Arc::clone(&consumer.commit_serialization)
+                .lock_owned()
+                .await;
+            let started = tokio::time::Instant::now();
+            let closed = tokio::time::timeout(
+                Duration::from_secs(10),
+                consumer.close_with(crate::CloseOptions::timeout(timeout)),
+            )
+            .await
+            .expect("close returns")
+            .map_err(|error| error.to_string());
+            let fast = started.elapsed() < Duration::from_secs(3);
+            drop(held);
+            mock.stop();
+            let leaves = coordinator.leaves.lock().expect("leaves lock").len();
+            actual.push((name, (closed, fast, leaves)));
+            wanted.push((name, expected));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `ConsumerCoordinator.close` waits for the pending asynchronous
+    /// commits and runs their callbacks before the consumer leaves the group.
+    #[tokio::test]
+    async fn close_waits_for_a_pending_asynchronous_commit() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let consumer = started_consumer(&mock, None).await;
+        // Another commit holds the commit lock for a while, so the
+        // asynchronous commit is still pending when `close` starts.
+        let held = Arc::clone(&consumer.commit_serialization)
+            .lock_owned()
+            .await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+        });
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_in_callback = Arc::clone(&called);
+        consumer.commit_async_with_callback(move |_, _| {
+            called_in_callback.store(true, Ordering::SeqCst);
+        });
+        consumer.close().await.expect("close");
+        let called_before_close_returned = called.load(Ordering::SeqCst);
+        release.await.expect("release");
+        mock.stop();
+        assert2::assert!(called_before_close_returned);
+    }
+
+    /// Kafka's `enforceRebalance(reason)` makes the next `poll` join the group
+    /// with the reason, or with `rebalance enforced by user`.
+    #[tokio::test]
+    async fn enforce_rebalance_joins_on_the_next_poll_with_the_reason() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, reason, expected) in [
+            ("no reason", None, "rebalance enforced by user"),
+            ("empty reason", Some(""), "rebalance enforced by user"),
+            ("reason", Some("scale out"), "scale out"),
+        ] {
+            let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+            let in_mock = Arc::clone(&coordinator);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+                in_mock.respond(api_key, version, body)
+            })
+            .await;
+            let mut consumer = started_consumer(&mock, None).await;
+            consumer.enforce_rebalance(reason);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while coordinator.joins.lock().expect("joins lock").is_empty()
+                && tokio::time::Instant::now() < deadline
+            {
+                consumer.poll(millis(20)).await.expect("poll");
+            }
+            let reasons: Vec<Option<String>> = coordinator
+                .joins
+                .lock()
+                .expect("joins lock")
+                .iter()
+                .map(|join| join.reason.clone())
+                .collect();
+            drop(consumer);
+            mock.stop();
+            actual.push((name, reasons));
+            wanted.push((name, vec![Some(expected.to_owned())]));
+        }
+        assert2::assert!(actual == wanted);
     }
 
     /// A heartbeat can request a rebalance after the start of `poll` signalled

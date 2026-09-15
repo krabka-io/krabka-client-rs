@@ -491,13 +491,16 @@ pub(crate) struct CoordinatorState {
     pub rebalance_pending: tokio::sync::watch::Sender<bool>,
     /// What the member does with its group membership when the task stops.
     /// `close_with` writes it before it stops the task.
-    pub close_operation: tokio::sync::watch::Receiver<GroupMembershipOperation>,
+    pub close_operation: tokio::sync::watch::Receiver<crate::control::CloseRequest>,
     /// The reason of the next `JoinGroup` (KIP-800). Kafka's
     /// `AbstractCoordinator.rejoinReason`: empty for the first join, set by
     /// each request to join again, and cleared after a completed sync.
     pub rejoin_reason: String,
     /// The calls of the rebalance listener, or `None` without a listener.
     pub listener_calls: Option<crate::rebalance_listener::ListenerCalls>,
+    /// The reasons of the rebalances that `Consumer::enforce_rebalance` asks
+    /// for.
+    pub enforced_rebalances: tokio::sync::mpsc::UnboundedReceiver<(String, u64)>,
     /// The partitions that the member lost with its generation. The next join
     /// gives them to `on_partitions_lost`, as Kafka's `onJoinPrepare` does.
     pub lost_partitions: Vec<(String, i32)>,
@@ -1013,6 +1016,13 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     continue;
                 }
             }
+            // Kafka's `enforceRebalance` calls `requestRejoin`: the next `poll`
+            // joins the group again with the reason.
+            Some((reason, polls)) = state.enforced_rebalances.recv() => {
+                state.rejoin_reason = reason;
+                rejoin.request_after_poll(polls, &state.rebalance_pending);
+                continue;
+            }
             // Kafka's heartbeat thread checks `pollTimeoutExpired` each retry
             // backoff. The task wakes at the deadline of the poll timer.
             () = tokio::time::sleep_until(state.poll_timer.deadline), if !state.member_id.is_empty() => {
@@ -1151,8 +1161,14 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
     // with a stale id is a silent no-op that orphans the real member until
     // its session expires, stalling the rest of the group's rebalance.
     // Best-effort and bounded: a hung broker must not block `close()`.
-    let operation = *state.close_operation.borrow();
-    leave_group(&state, &state.member_id, operation, CLOSE_LEAVE_REASON).await;
+    let close = *state.close_operation.borrow();
+    leave_group(
+        &state,
+        &state.member_id,
+        close.operation,
+        CLOSE_LEAVE_REASON,
+    )
+    .await;
 }
 
 /// What woke the coordinator task.
@@ -1215,10 +1231,20 @@ impl RejoinRequest {
 
     /// Request a rejoin that starts when the application polls again.
     fn request_after_next_poll(&mut self, state: &CoordinatorState) {
+        self.request_after_poll(*state.polls.borrow(), &state.rebalance_pending);
+    }
+
+    /// Request a rejoin that starts with the first `poll` after the `poll`
+    /// count `polls`.
+    fn request_after_poll(
+        &mut self,
+        polls: u64,
+        rebalance_pending: &tokio::sync::watch::Sender<bool>,
+    ) {
         if *self == Self::None {
-            *self = Self::AfterPoll(*state.polls.borrow());
+            *self = Self::AfterPoll(polls);
         }
-        state.rebalance_pending.send_replace(true);
+        rebalance_pending.send_replace(true);
     }
 
     /// Request a rejoin that starts at once, because a `poll` already came.
@@ -3063,6 +3089,20 @@ mod retry_tests {
 
     /// A rejoin keeps only the errors that Kafka's consumer raises from
     /// `poll()`, and `poll()` takes each one once.
+    /// Kafka's `enforceRebalance` sets `rejoinNeeded` at the call, so the
+    /// first `poll` after the call joins. The task can see the request after
+    /// that `poll`, so the request keeps the `poll` count of the call.
+    #[test]
+    fn an_enforced_rebalance_is_due_after_a_poll_that_came_before_the_task_saw_it() {
+        let (pending, _pending_rx) = tokio::sync::watch::channel(false);
+        let (polls, polls_rx) = tokio::sync::watch::channel(5_u64);
+        let mut request = RejoinRequest::None;
+        // The application polled after `enforce_rebalance` at count 5.
+        polls.send_replace(6);
+        request.request_after_poll(5, &pending);
+        assert2::assert!((request.due(&polls_rx), *pending.borrow()) == (true, true));
+    }
+
     #[test]
     fn rejoin_errors_reach_poll_only_when_fatal() {
         for (name, error, expected) in [
@@ -3218,9 +3258,10 @@ mod retry_tests {
             join_prepared: false,
             polls: PollSignal::default().subscribe(),
             rebalance_pending: tokio::sync::watch::Sender::new(false),
-            close_operation: tokio::sync::watch::channel(GroupMembershipOperation::Default).1,
+            close_operation: tokio::sync::watch::channel(crate::control::CloseRequest::default()).1,
             rejoin_reason: String::new(),
             listener_calls: None,
+            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().1,
             lost_partitions: Vec::new(),
             assigned_callback_pending: Arc::default(),
             poll_timer: PollTimer::new(secs(300)),
@@ -3824,9 +3865,10 @@ mod retry_tests {
             join_prepared: false,
             polls: poll_signal.subscribe(),
             rebalance_pending: tokio::sync::watch::Sender::new(false),
-            close_operation: tokio::sync::watch::channel(GroupMembershipOperation::Default).1,
+            close_operation: tokio::sync::watch::channel(crate::control::CloseRequest::default()).1,
             rejoin_reason: String::new(),
             listener_calls: None,
+            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().1,
             lost_partitions: Vec::new(),
             assigned_callback_pending: Arc::default(),
             poll_timer: PollTimer::new(secs(300)),
