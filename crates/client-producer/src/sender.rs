@@ -1024,6 +1024,9 @@ enum BatchVerdict {
     /// `DUPLICATE_SEQUENCE_NUMBER`.
     Acked {
         base_offset: i64,
+        /// The log append time of the batch, or -1 when the topic uses the
+        /// create time.
+        log_append_time_ms: i64,
     },
     /// Resend verbatim on the next cycle, after a transport failure, a
     /// retriable code, or a routing error.
@@ -1127,6 +1130,7 @@ enum Classification {
 struct PartitionAnswer {
     error_code: i16,
     base_offset: i64,
+    log_append_time_ms: i64,
     log_start_offset: i64,
 }
 
@@ -1158,6 +1162,7 @@ fn classify_verdict(
         // (DUPLICATE_SEQUENCE_NUMBER). `Sender.completeBatch` completes both.
         (codes::NONE | codes::DUPLICATE_SEQUENCE_NUMBER, _) => BatchVerdict::Acked {
             base_offset: answer.base_offset,
+            log_append_time_ms: answer.log_append_time_ms,
         },
         (
             codes::CLUSTER_AUTHORIZATION_FAILED
@@ -1353,7 +1358,10 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
 
         if let Some(to_fail) = &mut fenced {
             match verdict {
-                BatchVerdict::Acked { base_offset } => ack_batch(cfg, pb, base_offset),
+                BatchVerdict::Acked {
+                    base_offset,
+                    log_append_time_ms,
+                } => ack_batch(cfg, pb, base_offset, log_append_time_ms),
                 BatchVerdict::Terminal { code, .. } => {
                     terminal_fail_batch(cfg, pb, ProducerError::Server(code));
                 }
@@ -1375,9 +1383,12 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
 
         match verdict {
             // Durable: resolve the records with their offsets, free the slot.
-            BatchVerdict::Acked { base_offset } => {
+            BatchVerdict::Acked {
+                base_offset,
+                log_append_time_ms,
+            } => {
                 state.record_ack(&pb, base_offset);
-                ack_batch(cfg, pb, base_offset);
+                ack_batch(cfg, pb, base_offset, log_append_time_ms);
             }
             // Terminal server error: fail the records, free the slot, and
             // repair the partition sequence after the cycle.
@@ -1561,18 +1572,55 @@ fn take_retry(batch: &mut PreparedBatch, retries: i32) -> bool {
 }
 
 /// Ack a batch's records with their broker-assigned offsets, and release its
-/// in-flight slot. The per-record offset is `base_offset + offset_delta`.
-fn ack_batch(cfg: &SenderConfig, pb: PreparedBatch, base_offset: i64) {
-    let partition = pb.partition;
-    for r in pb.records {
+/// in-flight slot.
+///
+/// The per-record offset is `base_offset + offset_delta`, and -1 when the base
+/// offset is -1 (Kafka's `RecordMetadata` constructor). The timestamp is
+/// `log_append_time_ms` when it is not -1, and else the create time of the
+/// record (Kafka's `FutureRecordMetadata.timestamp`).
+fn ack_batch(cfg: &SenderConfig, pb: PreparedBatch, base_offset: i64, log_append_time_ms: i64) {
+    let PreparedBatch {
+        topic,
+        partition,
+        records,
+        ..
+    } = pb;
+    for r in records {
         let _ = r.ack.send(Ok(RecordMetadata {
-            topic_index: 0,
+            topic: topic.clone(),
             partition,
-            offset: base_offset + i64::from(r.offset_delta),
-            timestamp_ms: r.timestamp_ms,
+            offset: record_offset(base_offset, r.offset_delta),
+            timestamp_ms: if log_append_time_ms == NO_TIMESTAMP {
+                r.timestamp_ms
+            } else {
+                log_append_time_ms
+            },
+            serialized_key_size: serialized_size(r.key.as_ref()),
+            serialized_value_size: serialized_size(r.value.as_ref()),
         }));
     }
     finish_in_flight(cfg);
+}
+
+/// Kafka's `ProduceResponse.INVALID_OFFSET`: the broker gave no offset.
+const INVALID_OFFSET: i64 = -1;
+
+/// Kafka's `RecordBatch.NO_TIMESTAMP`: the partition answer has no log append
+/// time.
+const NO_TIMESTAMP: i64 = -1;
+
+/// The offset of the record at `offset_delta` in a batch at `base_offset`.
+fn record_offset(base_offset: i64, offset_delta: i32) -> i64 {
+    if base_offset == INVALID_OFFSET {
+        INVALID_OFFSET
+    } else {
+        base_offset + i64::from(offset_delta)
+    }
+}
+
+/// The serialized size of a key or a value, and -1 for a null one.
+fn serialized_size(bytes: Option<&bytes::Bytes>) -> i32 {
+    bytes.map_or(-1, |bytes| i32::try_from(bytes.len()).unwrap_or(i32::MAX))
 }
 
 /// Terminally fail a batch. It resolves the batch's records with `error` and
@@ -1785,7 +1833,12 @@ async fn send_one_batch(
         return match cfg.transport.send_produce_no_response(route, req).await {
             Ok(()) => BatchSendResult {
                 pb,
-                verdict: BatchVerdict::Acked { base_offset: -1 },
+                // Kafka's `Sender` completes an `acks=0` batch with an empty
+                // `PartitionResponse`: no offset and no log append time.
+                verdict: BatchVerdict::Acked {
+                    base_offset: INVALID_OFFSET,
+                    log_append_time_ms: NO_TIMESTAMP,
+                },
                 refresh_needed: false,
             },
             Err(error) => {
@@ -1900,6 +1953,7 @@ fn interpret_response(
     let answer = PartitionAnswer {
         error_code: part_resp.error_code,
         base_offset: part_resp.base_offset,
+        log_append_time_ms: part_resp.log_append_time_ms,
         log_start_offset: part_resp.log_start_offset,
     };
     match classify_verdict(
@@ -2301,7 +2355,8 @@ mod tests {
     /// The classification of each code that has a rule of its own, in each
     /// batch mode: `(Plain, Idempotent, Transactional)`.
     ///
-    /// The answer carries `base_offset` 7 and `log_start_offset` 5, and the
+    /// The answer carries `base_offset` 7, `log_append_time_ms` 9 and
+    /// `log_start_offset` 5, and the
     /// partition has no acked offset.
     fn special_code_rows() -> Vec<(&'static str, i16, [Classification; 3])> {
         use BatchVerdict::{Acked, BumpEpochAndRetry, Fatal, RestartSequenceAndRetry, Terminal};
@@ -2327,7 +2382,10 @@ mod tests {
                 }),
             ]
         };
-        let acked = Verdict(Acked { base_offset: 7 });
+        let acked = Verdict(Acked {
+            base_offset: 7,
+            log_append_time_ms: 9,
+        });
         vec![
             ("NONE", codes::NONE, [acked; 3]),
             (
@@ -2401,6 +2459,7 @@ mod tests {
         let answer = |error_code| PartitionAnswer {
             error_code,
             base_offset: 7,
+            log_append_time_ms: 9,
             log_start_offset: 5,
         };
         for (code, name, class) in crate::error_class::tests::KAFKA_ERRORS {
@@ -2435,6 +2494,7 @@ mod tests {
         let answer = PartitionAnswer {
             error_code: codes::MESSAGE_TOO_LARGE,
             base_offset: 7,
+            log_append_time_ms: 9,
             log_start_offset: 5,
         };
         for (name, records_in_batch, expected) in [
@@ -2518,6 +2578,7 @@ mod tests {
             let answer = PartitionAnswer {
                 error_code: codes::UNKNOWN_PRODUCER_ID,
                 base_offset: -1,
+                log_append_time_ms: -1,
                 log_start_offset,
             };
             let actual = MODES.map(|mode| classify_verdict(answer, mode, last_acked_offset, 1));
@@ -2898,6 +2959,8 @@ mod harness {
         leader_hint: i32,
         /// `log_start_offset` of the partition answer. Kafka's default is -1.
         log_start_offset: i64,
+        /// `log_append_time_ms` of the partition answer. Kafka's default is -1.
+        log_append_time_ms: i64,
         /// Drop the producer state of the partition before the answer, as a
         /// broker does when it answers `UNKNOWN_PRODUCER_ID`.
         forget_producer_state: bool,
@@ -2975,6 +3038,7 @@ mod harness {
                 base_offset: -1,
                 leader_hint: -1,
                 log_start_offset: -1,
+                log_append_time_ms: -1,
                 forget_producer_state: false,
             });
         }
@@ -3237,6 +3301,7 @@ mod harness {
                                 error_code: inj.error_code,
                                 base_offset: inj.base_offset,
                                 log_start_offset: inj.log_start_offset,
+                                log_append_time_ms: inj.log_append_time_ms,
                                 current_leader,
                                 ..Default::default()
                             }],
@@ -4571,6 +4636,105 @@ mod harness {
         shutdown(h).await;
     }
 
+    /// Kafka's `RecordMetadata` keeps a base offset of -1 and does not add the
+    /// index of the record in its batch, and `FutureRecordMetadata.timestamp`
+    /// gives the log append time when the answer has one, and else the create
+    /// time. `ProducerBatch.tryAppend` gives -1 as the size of a null key or
+    /// value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_metadata_follows_the_produce_answer() {
+        type Appended = (Option<&'static [u8]>, Option<&'static [u8]>, i64);
+        let metadata = |offset, timestamp_ms, serialized_key_size, serialized_value_size| {
+            Ok(RecordMetadata {
+                topic: "t".to_owned(),
+                partition: 0,
+                offset,
+                timestamp_ms,
+                serialized_key_size,
+                serialized_value_size,
+            })
+        };
+        let two: [Appended; 2] = [(Some(b"ab"), Some(b"xyz"), 5), (None, None, 6)];
+        let cases = [
+            (
+                "acks all, create time",
+                Acks::All,
+                (100, -1),
+                two.to_vec(),
+                vec![metadata(100, 5, 2, 3), metadata(101, 6, -1, -1)],
+            ),
+            (
+                "acks all, log append time",
+                Acks::All,
+                (100, 9_000),
+                two.to_vec(),
+                vec![metadata(100, 9_000, 2, 3), metadata(101, 9_000, -1, -1)],
+            ),
+            (
+                "acks zero",
+                Acks::Zero,
+                (100, 9_000),
+                vec![
+                    (None, Some(b"a".as_slice()), 7),
+                    (None, Some(b"b".as_slice()), 8),
+                    (None, Some(b"c".as_slice()), 9),
+                ],
+                vec![
+                    metadata(-1, 7, -1, 1),
+                    metadata(-1, 8, -1, 1),
+                    metadata(-1, 9, -1, 1),
+                ],
+            ),
+        ];
+        for (name, acks, (base_offset, log_append_time_ms), appended, expected) in cases {
+            let transport = MockTransport::new(Duration::ZERO);
+            transport.inject(Inject {
+                seq: 0,
+                name: None,
+                topic_id: None,
+                error_code: codes::NONE,
+                base_offset,
+                leader_hint: -1,
+                log_start_offset: -1,
+                log_append_time_ms,
+                forget_producer_state: false,
+            });
+            let h = spawn_sender_with_acks(transport, 5, millis(1), i32::MAX, secs(30), acks);
+            let accumulator = Arc::new(Mutex::new(Accumulator::new(16 * 1024)));
+            h.accumulators
+                .insert(("t".to_string(), 0), Arc::clone(&accumulator));
+            let receivers = {
+                let mut accumulator = accumulator.lock().await;
+                appended
+                    .iter()
+                    .map(|(key, value, timestamp_ms)| {
+                        accumulator
+                            .try_append(
+                                key.map(bytes::Bytes::from_static),
+                                value.map(bytes::Bytes::from_static),
+                                vec![],
+                                *timestamp_ms,
+                                None,
+                            )
+                            .receiver
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let _ = h.wake_tx.try_send(DrainIntent::Force);
+            let mut actual = Vec::new();
+            for receiver in receivers {
+                let answer = tokio::time::timeout(Duration::from_secs(5), receiver)
+                    .await
+                    .expect("record resolves")
+                    .expect("sender remains")
+                    .map_err(|error| error.to_string());
+                actual.push(answer);
+            }
+            shutdown(h).await;
+            assert2::assert!(actual == expected, "{name}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn acks_zero_uses_one_way_transport_and_returns_unknown_offset() {
         let transport = MockTransport::new(Duration::ZERO);
@@ -4931,6 +5095,7 @@ mod harness {
             base_offset: -1,
             leader_hint: -1,
             log_start_offset,
+            log_append_time_ms: -1,
             forget_producer_state: false,
         }
     }
@@ -5116,6 +5281,7 @@ mod harness {
             base_offset: -1,
             leader_hint: -1,
             log_start_offset: -1,
+            log_append_time_ms: -1,
             forget_producer_state: false,
         });
         transport.set_refresh_response(MetadataResponse {
@@ -5652,6 +5818,7 @@ mod harness {
             base_offset: -1,
             leader_hint: 8,
             log_start_offset: -1,
+            log_append_time_ms: -1,
             forget_producer_state: false,
         });
         let h = spawn_sender(transport.clone(), 5);
@@ -5696,6 +5863,7 @@ mod harness {
             base_offset: 42,
             leader_hint: -1,
             log_start_offset: -1,
+            log_append_time_ms: -1,
             forget_producer_state: false,
         });
         let h = spawn_sender(transport.clone(), 5);
@@ -5736,6 +5904,7 @@ mod harness {
             base_offset: 99, // a bogus offset that must NOT be adopted
             leader_hint: -1,
             log_start_offset: -1,
+            log_append_time_ms: -1,
             forget_producer_state: false,
         });
         let h = spawn_sender(transport.clone(), 5);
