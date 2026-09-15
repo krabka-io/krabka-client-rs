@@ -2474,6 +2474,7 @@ mod tests {
             generation: 7,
             member_id: "member-a".into(),
             ownership_ids: HashMap::from([(("orders".into(), 0), 1), (("payments".into(), 0), 2)]),
+            rejoin_on_poll: false,
         }));
         let assignment_changed = Arc::new(tokio::sync::Notify::new());
         let offset_commits = Arc::new(AtomicUsize::new(0));
