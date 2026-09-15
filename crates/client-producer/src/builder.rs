@@ -35,7 +35,7 @@ use crate::{
     buffer_pool::BufferPool,
     compression::Compression,
     error::ProducerError,
-    partitioner::UniformStickyPartitioner,
+    partitioner::{BuiltInPartitioner, PartitionerConfig},
     producer::{Acks, Producer, ProducerIdentity},
     sender,
     transactional::{AbortableErrorSlot, TxnState},
@@ -98,6 +98,16 @@ const MAX_IN_FLIGHT_FOR_IDEMPOTENCE: usize = 5;
 static PRODUCER_CLIENT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Default producer batch size in bytes.
 pub const DEFAULT_PRODUCER_BATCH_BYTES: usize = 16 * 1024;
+/// Default of `partitioner_ignore_keys`. Kafka's `partitioner.ignore.keys`
+/// default is `false`.
+pub const DEFAULT_PRODUCER_PARTITIONER_IGNORE_KEYS: bool = false;
+/// Default of `partitioner_adaptive_partitioning_enable`. Kafka's
+/// `partitioner.adaptive.partitioning.enable` default is `true`.
+pub const DEFAULT_PRODUCER_PARTITIONER_ADAPTIVE_PARTITIONING_ENABLE: bool = true;
+/// Default of `partitioner_availability_timeout`. Kafka's
+/// `partitioner.availability.timeout.ms` default is 0, which turns the check
+/// off.
+pub const DEFAULT_PRODUCER_PARTITIONER_AVAILABILITY_TIMEOUT: Duration = Duration::ZERO;
 /// Default cross-partition in-flight request limit.
 pub const DEFAULT_PRODUCER_MAX_IN_FLIGHT: usize = 5;
 /// Default producer request timeout.
@@ -651,6 +661,12 @@ impl Producer {
         #[builder(default = DEFAULT_PRODUCER_ACKS)] acks: Acks,
         #[builder(default = DEFAULT_PRODUCER_LINGER)] linger: Duration,
         #[builder(default = DEFAULT_PRODUCER_BATCH_BYTES)] batch_size: usize,
+        #[builder(default = DEFAULT_PRODUCER_PARTITIONER_IGNORE_KEYS)]
+        partitioner_ignore_keys: bool,
+        #[builder(default = DEFAULT_PRODUCER_PARTITIONER_ADAPTIVE_PARTITIONING_ENABLE)]
+        partitioner_adaptive_partitioning_enable: bool,
+        #[builder(default = DEFAULT_PRODUCER_PARTITIONER_AVAILABILITY_TIMEOUT)]
+        partitioner_availability_timeout: Duration,
         #[builder(default = DEFAULT_CLIENT_DNS_TIMEOUT)] dns_timeout: Time,
         #[builder(default = DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
@@ -800,7 +816,12 @@ impl Producer {
         let partition_leaders = Arc::new(DashMap::new());
         let accumulators = Arc::new(DashMap::new());
         let next_seq = Arc::new(DashMap::new());
-        let partitioner = Arc::new(UniformStickyPartitioner::new());
+        let partitioner = Arc::new(BuiltInPartitioner::new(PartitionerConfig {
+            sticky_batch_size: batch_size,
+            ignore_keys: partitioner_ignore_keys,
+            adaptive_partitioning: partitioner_adaptive_partitioning_enable,
+            availability_timeout: partitioner_availability_timeout,
+        }));
         let flush_notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicUsize::new(0));
         let producer_epoch = Arc::new(AtomicI16::new(producer_epoch));

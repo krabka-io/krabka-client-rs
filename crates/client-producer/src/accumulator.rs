@@ -211,6 +211,25 @@ impl Accumulator {
         }
     }
 
+    /// Tell if no batch of the partition can take more records.
+    ///
+    /// Only the in-progress batch can be open. A sealed batch is closed. A
+    /// batch is full when its records reach `batch_size`. Kafka's
+    /// `RecordAccumulator.allBatchesFull` checks the last batch of the queue
+    /// in the same way, and the built-in partitioner switches only when it
+    /// gives `true`.
+    pub fn all_batches_full(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_none_or(|batch| batch.size_bytes >= self.batch_size)
+    }
+
+    /// The number of batches that wait in the accumulator: the sealed batches,
+    /// and the in-progress batch when it holds a record.
+    pub fn queue_size(&self) -> usize {
+        self.ready.len() + usize::from(self.current.as_ref().is_some_and(|batch| !batch.is_empty()))
+    }
+
     /// Move the current in-progress batch into `ready`. The sender calls this
     /// at flush time: on linger expiry, on an explicit flush, or when the batch
     /// is full.

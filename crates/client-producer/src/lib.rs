@@ -47,7 +47,8 @@
 //! This crate owns producer-facing semantics: batching, compression,
 //! idempotence, retries, per-record partition overrides, transactional RPCs,
 //! and `send_offsets_to_transaction` for consume-process-produce flows. The
-//! built-in partitioner is sticky and hash based. Set
+//! built-in partitioner follows Kafka's: keyed records hash to a partition,
+//! and keyless records use an adaptive sticky partition (KIP-480, KIP-794). Set
 //! `ProducerRecord::partition` to pin an individual record. Serialization is
 //! deliberately owned by the caller: `key` and `value` are raw `Bytes`, so a
 //! schema-registry or serde integration can sit on top without constraining the
@@ -76,10 +77,12 @@ pub use builder::{
     DEFAULT_PRODUCER_ACKS, DEFAULT_PRODUCER_BATCH_BYTES, DEFAULT_PRODUCER_BUFFER_MEMORY,
     DEFAULT_PRODUCER_COMPRESSION, DEFAULT_PRODUCER_DELIVERY_TIMEOUT,
     DEFAULT_PRODUCER_FLUSH_TIMEOUT, DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT, DEFAULT_PRODUCER_LINGER,
-    DEFAULT_PRODUCER_MAX_BLOCK, DEFAULT_PRODUCER_MAX_IN_FLIGHT, DEFAULT_PRODUCER_REQUEST_TIMEOUT,
-    DEFAULT_PRODUCER_RETRIES, DEFAULT_PRODUCER_RETRY_BACKOFF, DEFAULT_PRODUCER_RETRY_BACKOFF_MAX,
-    DEFAULT_PRODUCER_TRANSACTION_TIMEOUT, ProducerFlushTimeout, ProducerRetryPolicy,
-    ProducerThroughputPolicy,
+    DEFAULT_PRODUCER_MAX_BLOCK, DEFAULT_PRODUCER_MAX_IN_FLIGHT,
+    DEFAULT_PRODUCER_PARTITIONER_ADAPTIVE_PARTITIONING_ENABLE,
+    DEFAULT_PRODUCER_PARTITIONER_AVAILABILITY_TIMEOUT, DEFAULT_PRODUCER_PARTITIONER_IGNORE_KEYS,
+    DEFAULT_PRODUCER_REQUEST_TIMEOUT, DEFAULT_PRODUCER_RETRIES, DEFAULT_PRODUCER_RETRY_BACKOFF,
+    DEFAULT_PRODUCER_RETRY_BACKOFF_MAX, DEFAULT_PRODUCER_TRANSACTION_TIMEOUT, ProducerFlushTimeout,
+    ProducerRetryPolicy, ProducerThroughputPolicy,
 };
 pub use compression::Compression;
 pub use error::ProducerError;
