@@ -29,7 +29,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{error::ClientError, request::ProtocolRequest, version::ApiVersionTable};
+use crate::{
+    error::ClientError,
+    request::ProtocolRequest,
+    version::{ApiVersionTable, FinalizedFeatures},
+};
 
 /// Trait alias for the duplex stream types `Connection::from_stream` accepts,
 /// such as `TcpStream` and `tokio_rustls::client::TlsStream`.
@@ -1005,32 +1009,109 @@ fn build_request_header(
     buf
 }
 
-/// Send an `ApiVersionsRequest` at version 0 and return the negotiated table.
+/// The `ClientSoftwareName` that `ApiVersions` v3 and later carry. A Kafka
+/// broker checks it against
+/// `[a-zA-Z0-9](?:[a-zA-Z0-9\-.]*[a-zA-Z0-9])?` (`ApiVersionsRequest.isValid`).
+const CLIENT_SOFTWARE_NAME: &str = "krabka-client-rs";
+
+/// The `ClientSoftwareVersion` that `ApiVersions` v3 and later carry.
+const CLIENT_SOFTWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `UNSUPPORTED_VERSION`.
+const UNSUPPORTED_VERSION: i16 = 35;
+
+/// Negotiate the API versions of a new connection, and return the table.
 ///
 /// This is the bootstrap step inside `connect`. No version table exists yet,
-/// so this function cannot use `Connection::send`. Every broker supports
-/// version 0.
+/// so this function cannot use `Connection::send`. It follows Kafka's
+/// `NetworkClient`:
+///
+/// - The first request uses the latest `ApiVersions` version of the client
+///   (`ApiVersionsRequest.Builder()`), with the client software name and
+///   version.
+/// - A broker that does not support that version answers
+///   `UNSUPPORTED_VERSION` in a version 0 body, with its own `ApiVersions`
+///   range in `api_keys`. The client sends the request again at the maximum
+///   version of that range, or at version 0 when the range is missing
+///   (`handleApiVersionsResponse`).
+/// - Any other error code fails the connection.
+///
+/// The table keeps the finalized features of the answer, as Kafka's
+/// `NodeApiVersions` does.
 #[tracing::instrument(level = "debug", skip_all, err)]
 async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, ClientError> {
+    use krabka_protocol::owned::api_versions_request::ApiVersionsRequest;
+
+    let mut version = ApiVersionsRequest::MAX_VERSION;
+    loop {
+        let response = request_api_versions(conn, version).await?;
+        match response.error_code {
+            0 => return Ok(api_version_table(&response)),
+            UNSUPPORTED_VERSION if version > 0 => {
+                let broker_max = response
+                    .api_keys
+                    .iter()
+                    .find(|key| key.api_key == ApiVersionsRequest::API_KEY)
+                    .map_or(0, |key| key.max_version);
+                // A broker that names a version at or above the refused one
+                // would make the client loop, so the negotiation stops there.
+                if !(0..version).contains(&broker_max) {
+                    return Err(ClientError::Server {
+                        error_code: UNSUPPORTED_VERSION,
+                    });
+                }
+                version = broker_max;
+            }
+            error_code => return Err(ClientError::Server { error_code }),
+        }
+    }
+}
+
+/// Build the version table of a successful `ApiVersions` answer.
+fn api_version_table(
+    response: &krabka_protocol::owned::api_versions_response::ApiVersionsResponse,
+) -> ApiVersionTable {
+    let entries = response
+        .api_keys
+        .iter()
+        .map(|k| (k.api_key, k.min_version, k.max_version));
+    let finalized_features = FinalizedFeatures::new(
+        response.finalized_features_epoch,
+        response
+            .finalized_features
+            .iter()
+            .map(|feature| (feature.name.clone(), feature.max_version_level)),
+    );
+    ApiVersionTable::from_entries(entries).with_finalized_features(finalized_features)
+}
+
+/// Send one `ApiVersionsRequest` at `version` and decode the answer.
+async fn request_api_versions(
+    conn: &Connection,
+    version: i16,
+) -> Result<krabka_protocol::owned::api_versions_response::ApiVersionsResponse, ClientError> {
     use krabka_protocol::{
         Encode,
-        owned::{
-            api_versions_request::ApiVersionsRequest, api_versions_response::ApiVersionsResponse,
-        },
+        owned::api_versions_request::{self, ApiVersionsRequest},
     };
 
-    let req = ApiVersionsRequest::default();
+    let req = ApiVersionsRequest {
+        client_software_name: CLIENT_SOFTWARE_NAME.to_owned(),
+        client_software_version: CLIENT_SOFTWARE_VERSION.to_owned(),
+        ..ApiVersionsRequest::default()
+    };
     let corr_id = conn.inner.next_corr_id.fetch_add(1, Ordering::Relaxed);
 
-    // v0 is non-flexible: header v1, no tagged-fields byte.
+    // Versions 0 to 2 use request header v1, and the flexible versions 3 and
+    // later use request header v2, which ends with a tagged-fields byte.
     let mut frame = build_request_header(
         ApiKey(ApiVersionsRequest::API_KEY),
-        ApiVersion(0),
+        ApiVersion(version),
         corr_id,
         &conn.inner.options.client_id,
-        false,
+        version >= api_versions_request::FLEXIBLE_MIN,
     );
-    req.encode(&mut frame, 0)?;
+    req.encode(&mut frame, version)?;
 
     let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
     conn.inner.pending.insert(corr_id, tx);
@@ -1050,19 +1131,32 @@ async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, Client
     // ResponseHeader v0: only correlation_id (already stripped by the reader).
     // No tagged-fields byte — this holds for all ApiVersionsResponse versions,
     // including flexible ones (the Kafka asymmetry documented in `send`).
-    let mut cursor: &[u8] = &body_bytes;
-    let resp = <ApiVersionsResponse as krabka_protocol::Decode>::decode(&mut cursor, 0)?;
-    if resp.error_code != 0 {
-        return Err(ClientError::Server {
-            error_code: resp.error_code,
-        });
-    }
+    Ok(decode_api_versions_response(&body_bytes, version)?)
+}
 
-    let entries = resp
-        .api_keys
-        .iter()
-        .map(|k| (k.api_key, k.min_version, k.max_version));
-    Ok(ApiVersionTable::from_entries(entries))
+/// Decode an `ApiVersions` answer to a request at `version`.
+///
+/// A broker that does not support `version` answers in a version 0 body, so a
+/// body that does not decode at `version` is decoded again at version 0. Kafka's
+/// `ApiVersionsResponse.parse` does the same.
+fn decode_api_versions_response(
+    body: &[u8],
+    version: i16,
+) -> Result<
+    krabka_protocol::owned::api_versions_response::ApiVersionsResponse,
+    krabka_protocol::ProtocolError,
+> {
+    use krabka_protocol::{Decode, owned::api_versions_response::ApiVersionsResponse};
+
+    let mut cursor = body;
+    match ApiVersionsResponse::decode(&mut cursor, version) {
+        Ok(response) => Ok(response),
+        Err(_) if version != 0 => {
+            let mut cursor = body;
+            ApiVersionsResponse::decode(&mut cursor, 0)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

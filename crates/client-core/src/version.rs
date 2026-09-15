@@ -1,13 +1,62 @@
-//! `ApiVersionTable`: broker-advertised version ranges per API key,
-//! plus client-side negotiation.
+//! `ApiVersionTable`: broker-advertised version ranges per API key, the
+//! finalized features of the cluster, plus client-side negotiation.
 
 use std::collections::HashMap;
 
 use crate::{error::ClientError, request::ProtocolRequest};
 
+/// The finalized features that a broker reported in its `ApiVersions` answer
+/// (version 3 and later).
+///
+/// Kafka's `NodeApiVersions` keeps the same data: the epoch of the finalized
+/// features, and the `max_version_level` of each finalized feature. A broker
+/// that answers an older `ApiVersions` version reports no features and the
+/// epoch -1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedFeatures {
+    epoch: i64,
+    max_version_levels: HashMap<String, i16>,
+}
+
+impl Default for FinalizedFeatures {
+    fn default() -> Self {
+        Self {
+            epoch: -1,
+            max_version_levels: HashMap::new(),
+        }
+    }
+}
+
+impl FinalizedFeatures {
+    /// Build from the finalized features epoch and a sequence of
+    /// `(name, max_version_level)` pairs.
+    #[must_use]
+    pub fn new(epoch: i64, levels: impl IntoIterator<Item = (String, i16)>) -> Self {
+        Self {
+            epoch,
+            max_version_levels: levels.into_iter().collect(),
+        }
+    }
+
+    /// The epoch of the finalized features, or -1 when the broker reported
+    /// none.
+    #[must_use]
+    pub const fn epoch(&self) -> i64 {
+        self.epoch
+    }
+
+    /// The finalized `max_version_level` of the feature `name`, for example
+    /// `transaction.version`, or `None` when the feature is not finalized.
+    #[must_use]
+    pub fn max_version_level(&self, name: &str) -> Option<i16> {
+        self.max_version_levels.get(name).copied()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ApiVersionTable {
     by_key: HashMap<i16, (i16, i16)>,
+    finalized_features: FinalizedFeatures,
 }
 
 impl ApiVersionTable {
@@ -19,7 +68,23 @@ impl ApiVersionTable {
         for (k, lo, hi) in entries {
             by_key.insert(k, (lo, hi));
         }
-        Self { by_key }
+        Self {
+            by_key,
+            finalized_features: FinalizedFeatures::default(),
+        }
+    }
+
+    /// Give the table the finalized features that the broker reported.
+    #[must_use]
+    pub fn with_finalized_features(mut self, finalized_features: FinalizedFeatures) -> Self {
+        self.finalized_features = finalized_features;
+        self
+    }
+
+    /// The finalized features that the broker reported.
+    #[must_use]
+    pub const fn finalized_features(&self) -> &FinalizedFeatures {
+        &self.finalized_features
     }
 
     /// Highest version both sides support for `R`, or
@@ -67,6 +132,31 @@ mod tests {
 
     // `ApiVersionsRequest` acts as a sample `ProtocolRequest`. We only
     // need the trait's constants here; the impl comes from codegen.
+
+    /// A table without features reports the epoch -1 and no feature, as a
+    /// broker that answers `ApiVersions` below v3.
+    #[test]
+    fn finalized_features_report_the_epoch_and_levels_of_the_answer() {
+        let features = FinalizedFeatures::new(
+            9,
+            [
+                ("transaction.version".to_owned(), 2),
+                ("group.version".to_owned(), 1),
+            ],
+        );
+        let table = ApiVersionTable::from_entries([]).with_finalized_features(features.clone());
+        let read = |features: &FinalizedFeatures| {
+            (
+                features.epoch(),
+                features.max_version_level("transaction.version"),
+                features.max_version_level("group.version"),
+                features.max_version_level("metadata.version"),
+            )
+        };
+        assert!(read(table.finalized_features()) == (9, Some(2), Some(1), None));
+        assert!(*table.finalized_features() == features);
+        assert!(read(ApiVersionTable::default().finalized_features()) == (-1, None, None, None));
+    }
 
     #[test]
     fn negotiate_takes_min_of_max() {

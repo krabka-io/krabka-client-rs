@@ -263,6 +263,20 @@ impl Client {
         conn.send(req).await
     }
 
+    /// Give the finalized features that the bootstrap broker reported in its
+    /// `ApiVersions` answer.
+    ///
+    /// Kafka's producer reads `transaction.version` from the finalized
+    /// features of `ApiVersions` (`TransactionManager.maybeUpdateTransactionV2Enabled`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bootstrap connection cannot be opened.
+    pub async fn finalized_features(&self) -> Result<crate::FinalizedFeatures, ClientError> {
+        let conn = self.pool.bootstrap_connection().await?;
+        Ok(conn.versions().finalized_features().clone())
+    }
+
     /// Send a request, as [`send`](Self::send) routes it, only when the
     /// broker and client share a version at or above `min_version`.
     ///
@@ -833,6 +847,60 @@ mod bootstrap_failover_tests {
 
     use super::*;
     use crate::mock::MockBroker;
+
+    /// `Client::finalized_features` gives the finalized features of the
+    /// `ApiVersions` answer of the bootstrap broker, and an error when no
+    /// connection opens.
+    #[tokio::test]
+    async fn finalized_features_come_from_the_bootstrap_api_versions_answer() {
+        use krabka_protocol::owned::api_versions_response::FinalizedFeatureKey;
+
+        let mock = MockBroker::start(|api_key, version, _corr_id, _body| {
+            (api_key == api_versions_request::API_KEY).then(|| {
+                let mut buf = BytesMut::new();
+                ApiVersionsResponse {
+                    finalized_features_epoch: 4,
+                    finalized_features: vec![FinalizedFeatureKey {
+                        name: "transaction.version".into(),
+                        max_version_level: 2,
+                        min_version_level: 0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode(&mut buf, version)
+                .expect("encode ApiVersions");
+                buf.to_vec()
+            })
+        })
+        .await;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let features = client.finalized_features().await;
+        mock.stop();
+
+        let closed = Client::builder()
+            .bootstrap("127.0.0.1:1")
+            .socket_connection_setup_timeout(millis(200))
+            .socket_connection_setup_timeout_max(millis(200))
+            .build()
+            .await
+            .expect("client")
+            .finalized_features()
+            .await;
+
+        assert2::assert!(
+            features.map_err(|error| error.to_string())
+                == Ok(crate::FinalizedFeatures::new(
+                    4,
+                    [("transaction.version".to_owned(), 2)]
+                ))
+        );
+        assert2::assert!(closed.is_err());
+    }
 
     #[tokio::test]
     async fn zero_dns_timeout_is_rejected_before_resolution() {

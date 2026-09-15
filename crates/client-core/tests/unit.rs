@@ -8,7 +8,9 @@
 
 use assert2::{assert, check};
 use bytes::BytesMut;
-use krabka_client_core::{ClientError, Connection, ConnectionOptions, MockBroker};
+use krabka_client_core::{
+    ClientError, Connection, ConnectionOptions, FinalizedFeatures, MockBroker,
+};
 // Use the raw constants so we don't need `ProtocolRequest` in scope.
 use krabka_protocol::owned::api_versions_request;
 use krabka_protocol::{
@@ -110,6 +112,223 @@ async fn connect_negotiates_api_versions() {
 
     conn.close();
     mock.stop();
+}
+
+/// How the broker of one negotiation row answers `ApiVersions`.
+#[derive(Debug, Clone, Copy)]
+enum ApiVersionsBroker {
+    /// Answers every version up to this one with transaction.version 2, and
+    /// `UNSUPPORTED_VERSION` in a v0 body above it, naming this maximum.
+    Supports(i16),
+    /// Answers `UNSUPPORTED_VERSION` in a v0 body with no `api_keys` above
+    /// version 0, as a broker before Kafka 2.4 does.
+    SupportsOnlyV0,
+    /// Answers every request with this error code in a v0 body.
+    Fails(i16),
+    /// Answers `UNSUPPORTED_VERSION` in a v0 body that names this maximum,
+    /// whatever the request version is.
+    RefusesNaming(i16),
+}
+
+/// The request that the mock broker got.
+#[derive(Debug, PartialEq, Eq)]
+struct SeenApiVersions {
+    version: i16,
+    client_software_name: String,
+}
+
+/// What one negotiation gave.
+#[derive(Debug, PartialEq, Eq)]
+struct Negotiated {
+    requests: Vec<SeenApiVersions>,
+    /// The advertised metadata range and the finalized features, or the error.
+    outcome: Result<(Option<(i16, i16)>, FinalizedFeatures), String>,
+}
+
+fn api_versions_answer(broker: ApiVersionsBroker, version: i16) -> Vec<u8> {
+    use krabka_protocol::owned::api_versions_response::FinalizedFeatureKey;
+    let metadata = ApiVersion {
+        api_key: metadata_request_mod::API_KEY,
+        min_version: 0,
+        max_version: 12,
+        ..Default::default()
+    };
+    let (response, encode_at) = match broker {
+        ApiVersionsBroker::Supports(max) if version <= max => (
+            ApiVersionsResponse {
+                api_keys: vec![metadata],
+                finalized_features_epoch: 7,
+                finalized_features: vec![FinalizedFeatureKey {
+                    name: "transaction.version".into(),
+                    max_version_level: 2,
+                    min_version_level: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            version,
+        ),
+        ApiVersionsBroker::Supports(max) | ApiVersionsBroker::RefusesNaming(max) => (
+            ApiVersionsResponse {
+                error_code: 35,
+                api_keys: vec![ApiVersion {
+                    api_key: api_versions_request::API_KEY,
+                    min_version: 0,
+                    max_version: max,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            0,
+        ),
+        ApiVersionsBroker::SupportsOnlyV0 if version == 0 => (
+            ApiVersionsResponse {
+                api_keys: vec![metadata],
+                ..Default::default()
+            },
+            0,
+        ),
+        ApiVersionsBroker::SupportsOnlyV0 => (
+            ApiVersionsResponse {
+                error_code: 35,
+                ..Default::default()
+            },
+            0,
+        ),
+        ApiVersionsBroker::Fails(error_code) => (
+            ApiVersionsResponse {
+                error_code,
+                ..Default::default()
+            },
+            0,
+        ),
+    };
+    let mut buf = BytesMut::new();
+    response.encode(&mut buf, encode_at).unwrap();
+    buf.to_vec()
+}
+
+/// Kafka's `NetworkClient` sends `ApiVersions` at the latest version. A broker
+/// that does not support it answers `UNSUPPORTED_VERSION` in a v0 body with
+/// its own range, and the client asks again at the maximum of that range, or
+/// at version 0 without a range (`handleApiVersionsResponse`). Kafka's
+/// `NodeApiVersions` keeps the finalized features of the answer.
+#[tokio::test]
+async fn connect_negotiates_the_api_versions_version_and_keeps_finalized_features() {
+    use std::sync::{Arc, Mutex};
+
+    use krabka_protocol::{Decode, owned::api_versions_request::ApiVersionsRequest};
+
+    let features = FinalizedFeatures::new(7, [("transaction.version".to_owned(), 2)]);
+    let seen = |versions: &[i16]| {
+        versions
+            .iter()
+            .map(|&version| SeenApiVersions {
+                version,
+                client_software_name: if version >= 3 {
+                    "krabka-client-rs".to_owned()
+                } else {
+                    String::new()
+                },
+            })
+            .collect::<Vec<_>>()
+    };
+    let cases = [
+        (
+            "broker supports v5",
+            ApiVersionsBroker::Supports(5),
+            Negotiated {
+                requests: seen(&[5]),
+                outcome: Ok((Some((0, 12)), features.clone())),
+            },
+        ),
+        (
+            "broker supports up to v3",
+            ApiVersionsBroker::Supports(3),
+            Negotiated {
+                requests: seen(&[5, 3]),
+                outcome: Ok((Some((0, 12)), features.clone())),
+            },
+        ),
+        (
+            "broker supports up to v2",
+            ApiVersionsBroker::Supports(2),
+            Negotiated {
+                requests: seen(&[5, 2]),
+                outcome: Ok((Some((0, 12)), FinalizedFeatures::default())),
+            },
+        ),
+        (
+            "broker names no range",
+            ApiVersionsBroker::SupportsOnlyV0,
+            Negotiated {
+                requests: seen(&[5, 0]),
+                outcome: Ok((Some((0, 12)), FinalizedFeatures::default())),
+            },
+        ),
+        (
+            "unsupported at every version",
+            ApiVersionsBroker::Fails(35),
+            Negotiated {
+                requests: seen(&[5, 0]),
+                outcome: Err("protocol error from server: 35".to_owned()),
+            },
+        ),
+        (
+            "unsupported naming the refused version",
+            ApiVersionsBroker::RefusesNaming(5),
+            Negotiated {
+                requests: seen(&[5]),
+                outcome: Err("protocol error from server: 35".to_owned()),
+            },
+        ),
+        (
+            "other error code",
+            ApiVersionsBroker::Fails(58),
+            Negotiated {
+                requests: seen(&[5]),
+                outcome: Err("protocol error from server: 58".to_owned()),
+            },
+        ),
+    ];
+    for (name, broker, expected) in cases {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let handler_requests = Arc::clone(&requests);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            assert!(api_key == api_versions_request::API_KEY);
+            // The body starts with the client id of the request header, and a
+            // flexible version adds a tagged-fields byte after it.
+            let client_id_len = usize::try_from(i16::from_be_bytes([body[0], body[1]])).unwrap();
+            let flexible = usize::from(version >= api_versions_request::FLEXIBLE_MIN);
+            let mut request = &body[2 + client_id_len + flexible..];
+            let request = ApiVersionsRequest::decode(&mut request, version).unwrap();
+            handler_requests.lock().unwrap().push(SeenApiVersions {
+                version,
+                client_software_name: request.client_software_name,
+            });
+            Some(api_versions_answer(broker, version))
+        })
+        .await;
+
+        let outcome = Connection::connect(mock.addr, ConnectionOptions::default())
+            .await
+            .map(|conn| {
+                let versions = conn.versions();
+                let answer = (
+                    versions.broker_range(metadata_request_mod::API_KEY),
+                    versions.finalized_features().clone(),
+                );
+                conn.close();
+                answer
+            })
+            .map_err(|error| error.to_string());
+        mock.stop();
+        let actual = Negotiated {
+            requests: std::mem::take(&mut *requests.lock().unwrap()),
+            outcome,
+        };
+        check!(actual == expected, "{name}");
+    }
 }
 
 /// When the mock never responds to `ApiVersions`, `Connection::connect` returns

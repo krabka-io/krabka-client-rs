@@ -105,4 +105,4 @@ pub use security::{
     ClientSecurity, KeyStore, Password, TlsConfigError, TlsConnectorConfig, TlsVersion, TrustStore,
     connection_target_host,
 };
-pub use version::ApiVersionTable;
+pub use version::{ApiVersionTable, FinalizedFeatures};
