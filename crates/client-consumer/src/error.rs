@@ -17,6 +17,11 @@ pub enum ConsumerError {
     #[error("rebalance failed: {0}")]
     RebalanceFailed(String),
 
+    /// A rebalance listener callback failed. Kafka's `poll` throws a
+    /// `KafkaException` with the cause.
+    #[error("rebalance listener failed: {0}")]
+    RebalanceListenerFailed(String),
+
     /// A builder setting is not valid. Kafka's `ConfigException`.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),

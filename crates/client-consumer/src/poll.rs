@@ -595,7 +595,7 @@ impl Consumer {
         if !self.prepare_poll().await? {
             return Ok(Vec::new());
         }
-        if !self.wait_for_rebalance(deadline).await {
+        if !self.wait_for_rebalance(deadline).await? {
             return Ok(Vec::new());
         }
 
@@ -636,26 +636,67 @@ impl Consumer {
     /// `poll` fetches nothing until the join completes. The cooperative
     /// protocol keeps the owned partitions, and `poll` fetches them while the
     /// join runs. A member without partitions has nothing to fetch either.
-    pub(crate) async fn wait_for_rebalance(&mut self, deadline: tokio::time::Instant) -> bool {
+    ///
+    /// The rebalance listener calls that the join asks for run here, inside
+    /// `poll`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::RebalanceListenerFailed`] when a listener
+    /// callback failed.
+    pub(crate) async fn wait_for_rebalance(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ConsumerError> {
+        self.run_pending_listener_calls().await?;
         if !*self.rebalance_pending.borrow() {
-            return true;
+            return Ok(true);
         }
         let eager = self.rebalance_protocol == crate::assignor::RebalanceProtocol::Eager;
         if !eager && !self.assigned.lock().await.is_empty() {
-            return true;
+            return Ok(true);
         }
         // The coordinator task can request the rejoin after the start of this
         // `poll` signalled it. Signal again, so that this `poll` starts the
         // join that it waits for, as Kafka's `ensureActiveGroup` does.
         crate::coordinator::note_poll(&self.poll_signal);
-        let joined = tokio::time::timeout_at(
-            deadline,
-            self.rebalance_pending.wait_for(|pending| !*pending),
-        )
-        .await;
-        // A closed channel means that the coordinator task stopped. `poll`
-        // then continues with the assignment that it has.
-        joined.is_ok()
+        let mut first_error = None;
+        let joined = loop {
+            let call = tokio::select! {
+                biased;
+                call = self.listener_calls.recv() => call,
+                joined = self.rebalance_pending.wait_for(|pending| !*pending) => {
+                    // A closed channel means that the coordinator task
+                    // stopped. `poll` then continues with the assignment that
+                    // it has.
+                    let _ = joined;
+                    break true;
+                }
+                () = tokio::time::sleep_until(deadline) => break false,
+            };
+            match call {
+                Some(call) => {
+                    if let Err(error) = self.complete_listener_call(call).await {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                // No listener calls can come: wait for the join alone.
+                None => {
+                    break tokio::time::timeout_at(
+                        deadline,
+                        self.rebalance_pending.wait_for(|pending| !*pending),
+                    )
+                    .await
+                    .is_ok();
+                }
+            }
+        };
+        // The join can end with calls that are still waiting, for example the
+        // assign callback.
+        if let Err(error) = self.run_pending_listener_calls().await {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(joined), Err)
     }
 
     /// Return up to `max_poll_records` buffered records, and move the consumed
@@ -2446,6 +2487,8 @@ pub(crate) mod partition_error_tests {
             close_operation: tokio::sync::watch::Sender::new(
                 crate::GroupMembershipOperation::Default,
             ),
+            rebalance_listener: None,
+            listener_calls: tokio::sync::mpsc::unbounded_channel().1,
         }
     }
 
@@ -2629,7 +2672,8 @@ pub(crate) mod partition_error_tests {
             let start = tokio::time::Instant::now();
             let joined = consumer
                 .wait_for_rebalance(start + Duration::from_millis(500))
-                .await;
+                .await
+                .expect("no listener");
             let elapsed_ms = u64::try_from(start.elapsed().as_millis()).expect("millis");
             if let Some(completion) = completion {
                 completion.abort();

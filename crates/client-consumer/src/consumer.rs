@@ -131,6 +131,11 @@ pub struct Consumer {
     /// The membership operation of `close`. The coordinator task reads it
     /// when it stops.
     pub(crate) close_operation: tokio::sync::watch::Sender<GroupMembershipOperation>,
+    /// The rebalance listener, Kafka's `ConsumerRebalanceListener`.
+    pub(crate) rebalance_listener: Option<Box<dyn crate::ConsumerRebalanceListener>>,
+    /// The listener calls that the coordinator task asks `poll` to run.
+    pub(crate) listener_calls:
+        tokio::sync::mpsc::UnboundedReceiver<crate::rebalance_listener::ListenerCall>,
 }
 
 /// What a closing consumer does with its group membership. Kafka's
@@ -192,6 +197,8 @@ struct StartConfig {
     leave_group_timeout: Time,
     client_rack: Option<String>,
     security: Option<krabka_client_core::security::ClientSecurity>,
+    /// Whether the application set a rebalance listener.
+    has_rebalance_listener: bool,
     retry_policy: ConsumerRetryPolicy,
     /// Kafka's `auto.commit.interval.ms`, or `None` when
     /// `enable.auto.commit` is off.
@@ -928,6 +935,7 @@ impl Consumer {
         #[builder(default = DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT)] leave_group_timeout: Time,
         #[builder(into)] client_rack: Option<String>,
         security: Option<krabka_client_core::security::ClientSecurity>,
+        rebalance_listener: Option<Box<dyn crate::ConsumerRebalanceListener>>,
         #[builder(default = ConsumerRetryPolicy::default())] retry_policy: ConsumerRetryPolicy,
         #[builder(default = true)] enable_auto_commit: bool,
         #[builder(default = secs(5))] auto_commit_interval: Time,
@@ -1033,6 +1041,7 @@ impl Consumer {
             leave_group_timeout: Time::from_std(leave_group_timeout.duration()),
             client_rack,
             security,
+            has_rebalance_listener: rebalance_listener.is_some(),
             retry_policy,
             auto_commit_interval,
             allow_auto_create_topics,
@@ -1047,7 +1056,10 @@ impl Consumer {
             )
             .await
             {
-                Ok(Ok(consumer)) => return Ok(consumer),
+                Ok(Ok(mut consumer)) => {
+                    consumer.rebalance_listener = rebalance_listener;
+                    return Ok(consumer);
+                }
                 Ok(Err(error)) => {
                     if started.elapsed().as_time() < config.retry_policy.startup_deadline()
                         && is_retriable_consumer_start_error(&error)
@@ -1475,6 +1487,7 @@ async fn spawn_consumer(
         leave_group_timeout,
         client_rack,
         security,
+        has_rebalance_listener,
         retry_policy,
         auto_commit_interval,
         allow_auto_create_topics,
@@ -1524,6 +1537,7 @@ async fn spawn_consumer(
         .map(|(index, partition)| (partition, index as u64 + 1))
         .collect();
     let next_ownership_id = assigned_partitions.len() as u64 + 1;
+    let initial_assignment = assigned_partitions.clone();
     let assigned = Arc::new(Mutex::new(assigned_partitions));
     let assignment_changed = Arc::new(Notify::new());
     let commit_identity = Arc::new(Mutex::new(CommitIdentity {
@@ -1548,6 +1562,18 @@ async fn spawn_consumer(
     let rebalance_pending = tokio::sync::watch::Sender::new(false);
     let rebalance_pending_receiver = rebalance_pending.subscribe();
     let close_operation = tokio::sync::watch::Sender::new(GroupMembershipOperation::Default);
+    let (listener_sender, listener_calls) = tokio::sync::mpsc::unbounded_channel();
+    if has_rebalance_listener {
+        // Kafka's first `poll` completes the first join and calls
+        // `on_partitions_assigned`. Here the build joined, so the first `poll`
+        // runs this call.
+        let (done, _) = tokio::sync::oneshot::channel();
+        let _ = listener_sender.send(crate::rebalance_listener::ListenerCall {
+            kind: crate::rebalance_listener::ListenerCallKind::Assigned,
+            partitions: initial_assignment,
+            done,
+        });
+    }
     let auto_commit = auto_commit_interval.map(crate::commit::AutoCommit::new);
 
     let shutdown = CancellationToken::new();
@@ -1595,6 +1621,8 @@ async fn spawn_consumer(
         rebalance_pending,
         close_operation: close_operation.subscribe(),
         rejoin_reason: String::new(),
+        listener_calls: has_rebalance_listener.then_some(listener_sender),
+        lost_partitions: Vec::new(),
     };
     // IMPORTANT: `tokio::spawn` is the very last operation — no `.await`
     // follows it.  Dropping a timed-out `start_once` future before this
@@ -1641,6 +1669,8 @@ async fn spawn_consumer(
         max_poll_records,
         fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
         close_operation,
+        rebalance_listener: None,
+        listener_calls,
     })
 }
 
@@ -1777,6 +1807,10 @@ impl Consumer {
         // Kafka's `ConsumerCoordinator.close` runs `maybeAutoCommitOffsetsSync`
         // before the coordinator leaves the group.
         self.auto_commit_on_close().await;
+        // Kafka's `ConsumerCoordinator.onLeavePrepare` runs the listener before
+        // `LeaveGroup`: lost when the member has no generation or a rebalance
+        // runs, revoked otherwise.
+        let listener_result = self.leave_prepare().await;
         self.close_operation.send_replace(operation);
         self.coordinator_shutdown.cancel();
         if let Some(h) = self.coordinator_handle.take() {
@@ -1784,7 +1818,27 @@ impl Consumer {
         }
         // Kafka's `AbstractFetch.close` closes the fetch session of each broker.
         self.close_fetch_sessions().await;
-        Ok(())
+        listener_result
+    }
+
+    /// Run the listener calls that wait, then give the owned partitions to the
+    /// listener before the consumer leaves the group.
+    async fn leave_prepare(&mut self) -> Result<(), ConsumerError> {
+        if self.rebalance_listener.is_none() {
+            return Ok(());
+        }
+        let pending = self.run_pending_listener_calls().await;
+        let owned = self.assigned.lock().await.clone();
+        if owned.is_empty() {
+            return pending;
+        }
+        let kind = if self.member_id.borrow().is_empty() || *self.rebalance_pending.borrow() {
+            crate::rebalance_listener::ListenerCallKind::Lost
+        } else {
+            crate::rebalance_listener::ListenerCallKind::Revoked
+        };
+        let result = self.run_listener(kind, &owned).await;
+        pending.and(result)
     }
 }
 
@@ -2549,6 +2603,8 @@ mod security_arg_tests {
             max_poll_records: DEFAULT_CONSUMER_MAX_POLL_RECORDS,
             fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
             close_operation: tokio::sync::watch::Sender::new(GroupMembershipOperation::Default),
+            rebalance_listener: None,
+            listener_calls: tokio::sync::mpsc::unbounded_channel().1,
         }
     }
 
@@ -3247,6 +3303,7 @@ mod auto_commit_tests {
             leave_group_timeout: secs(5),
             client_rack: None,
             security: None,
+            has_rebalance_listener: false,
             retry_policy: ConsumerRetryPolicy::default(),
             auto_commit_interval: auto_commit.then_some(AUTO_COMMIT_INTERVAL),
             allow_auto_create_topics: true,
@@ -4163,7 +4220,7 @@ mod poll_interval_tests {
             actual.push((name, run_poll_timeout_case(group_instance_id, polls).await));
             wanted.push((name, expected));
         }
-        assert2::assert!(actual == wanted, "{actual:#?}");
+        assert2::assert!(actual == wanted);
     }
 
     /// The poll timeout clears the assignment before the `LeaveGroup` goes out.
@@ -4486,7 +4543,8 @@ mod group_membership_tests {
         let started = tokio::time::Instant::now();
         let joined = consumer
             .wait_for_rebalance(started + Duration::from_secs(5))
-            .await;
+            .await
+            .expect("no listener");
         let within_timeout = started.elapsed() < Duration::from_secs(4);
         let joins = coordinator.joins.lock().expect("joins lock").len();
         drop(consumer);
@@ -4734,6 +4792,273 @@ mod group_membership_tests {
             mock.stop();
             actual.push((name, join));
             wanted.push((name, (expected.0.to_owned(), Some(expected.1.to_owned()))));
+        }
+        assert2::assert!(actual == wanted);
+    }
+}
+
+#[cfg(test)]
+mod rebalance_listener_tests {
+    use std::sync::atomic::Ordering;
+
+    use krabka_client_core::MockBroker;
+
+    use super::{
+        auto_commit_tests::{
+            GroupRequest, MEMBER, MockCoordinator, TOPIC, partition, start_config,
+        },
+        *,
+    };
+    use crate::{ConsumerRebalanceListener, RebalanceListenerError};
+
+    /// One listener callback, or the result of a commit inside a callback.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Call {
+        Revoked(Vec<(String, i32)>),
+        Assigned(Vec<(String, i32)>),
+        Lost(Vec<(String, i32)>),
+        CommitInRevoke(Result<(), String>),
+    }
+
+    struct Recorder {
+        calls: Arc<std::sync::Mutex<Vec<Call>>>,
+        commit_on_revoke: bool,
+    }
+
+    impl Recorder {
+        fn record(&self, call: Call) {
+            self.calls.lock().expect("calls lock").push(call);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConsumerRebalanceListener for Recorder {
+        async fn on_partitions_revoked(
+            &mut self,
+            consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), RebalanceListenerError> {
+            self.record(Call::Revoked(partitions.to_vec()));
+            if self.commit_on_revoke {
+                let result = consumer
+                    .commit_sync()
+                    .await
+                    .map_err(|error| error.to_string());
+                self.record(Call::CommitInRevoke(result));
+            }
+            Ok(())
+        }
+
+        async fn on_partitions_assigned(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), RebalanceListenerError> {
+            self.record(Call::Assigned(partitions.to_vec()));
+            Ok(())
+        }
+
+        async fn on_partitions_lost(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), RebalanceListenerError> {
+            self.record(Call::Lost(partitions.to_vec()));
+            Ok(())
+        }
+    }
+
+    /// The group event of a listener case.
+    #[derive(Clone, Copy, Debug)]
+    enum Event {
+        /// A heartbeat answers this error code.
+        Heartbeat(i16),
+        /// The application closes the consumer.
+        Close,
+    }
+
+    struct Case {
+        assignor: Assignor,
+        owned: Vec<(String, i32)>,
+        /// The assignments of the `SyncGroup` responses.
+        assignments: Vec<Vec<(String, i32)>>,
+        event: Event,
+        commit_on_revoke: bool,
+        /// The number of calls after which the case stops polling.
+        calls: usize,
+    }
+
+    async fn run_case(case: Case) -> (Vec<Call>, Vec<GroupRequest>) {
+        let coordinator = MockCoordinator::new(case.assignor, case.assignments);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut config = start_config(mock.addr.to_string(), case.assignor, false, minutes(1));
+        config.heartbeat_interval = millis(50);
+        config.has_rebalance_listener = true;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = spawn_consumer(
+            config,
+            client,
+            Arc::new(AtomicI32::new(0)),
+            MEMBER.into(),
+            StartupState {
+                generation_id: 1,
+                assigned_partitions: case.owned.clone(),
+                next_offsets: case.owned.iter().map(|key| (key.clone(), 12)).collect(),
+                positions: HashMap::new(),
+                topic_ids: HashMap::new(),
+                topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
+            },
+        )
+        .await
+        .expect("spawn consumer");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        consumer.rebalance_listener = Some(Box::new(Recorder {
+            calls: Arc::clone(&calls),
+            commit_on_revoke: case.commit_on_revoke,
+        }));
+
+        // The first poll runs the assign callback of the build.
+        consumer.poll(millis(20)).await.expect("first poll");
+        match case.event {
+            Event::Heartbeat(error_code) => {
+                coordinator
+                    .heartbeat_error
+                    .store(error_code, Ordering::SeqCst);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while calls.lock().expect("calls lock").len() < case.calls
+                    && tokio::time::Instant::now() < deadline
+                {
+                    consumer.poll(millis(20)).await.expect("poll");
+                }
+                // Polls after the last expected call show any extra call.
+                for _ in 0..10 {
+                    consumer.poll(millis(20)).await.expect("poll");
+                }
+                drop(consumer);
+            }
+            Event::Close => consumer.close().await.expect("close"),
+        }
+        let requests = coordinator
+            .requests()
+            .into_iter()
+            .filter(|request| matches!(request, GroupRequest::OffsetCommit(_)))
+            .collect();
+        mock.stop();
+        let calls = calls.lock().expect("calls lock").clone();
+        (calls, requests)
+    }
+
+    /// The order and the partitions of Kafka's `ConsumerRebalanceListener`
+    /// calls (`ConsumerCoordinator.onJoinPrepare`, `onJoinComplete` and
+    /// `onLeavePrepare`).
+    #[tokio::test]
+    async fn listener_calls_follow_kafkas_order() {
+        let p = partition;
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, case, expected) in [
+            (
+                "eager rebalance",
+                Case {
+                    assignor: Assignor::Range,
+                    owned: vec![p(0), p(1)],
+                    assignments: vec![vec![p(0)]],
+                    event: Event::Heartbeat(27),
+                    commit_on_revoke: false,
+                    calls: 3,
+                },
+                vec![
+                    Call::Assigned(vec![p(0), p(1)]),
+                    Call::Revoked(vec![p(0), p(1)]),
+                    Call::Assigned(vec![p(0)]),
+                ],
+            ),
+            (
+                "cooperative rebalance that revokes",
+                Case {
+                    assignor: Assignor::CooperativeSticky,
+                    owned: vec![p(0), p(1)],
+                    assignments: vec![vec![p(0)]],
+                    event: Event::Heartbeat(27),
+                    commit_on_revoke: false,
+                    calls: 4,
+                },
+                vec![
+                    Call::Assigned(vec![p(0), p(1)]),
+                    Call::Revoked(vec![p(1)]),
+                    Call::Assigned(Vec::new()),
+                    Call::Assigned(Vec::new()),
+                ],
+            ),
+            (
+                "cooperative rebalance that adds",
+                Case {
+                    assignor: Assignor::CooperativeSticky,
+                    owned: vec![p(0)],
+                    assignments: vec![vec![p(0), p(1)]],
+                    event: Event::Heartbeat(27),
+                    commit_on_revoke: false,
+                    calls: 2,
+                },
+                vec![Call::Assigned(vec![p(0)]), Call::Assigned(vec![p(1)])],
+            ),
+            (
+                "unknown member id",
+                Case {
+                    assignor: Assignor::Range,
+                    owned: vec![p(0)],
+                    assignments: vec![vec![p(0)]],
+                    event: Event::Heartbeat(25),
+                    commit_on_revoke: false,
+                    calls: 3,
+                },
+                vec![
+                    Call::Assigned(vec![p(0)]),
+                    Call::Lost(vec![p(0)]),
+                    Call::Assigned(vec![p(0)]),
+                ],
+            ),
+            (
+                "close",
+                Case {
+                    assignor: Assignor::Range,
+                    owned: vec![p(0)],
+                    assignments: vec![vec![p(0)]],
+                    event: Event::Close,
+                    commit_on_revoke: false,
+                    calls: 2,
+                },
+                vec![Call::Assigned(vec![p(0)]), Call::Revoked(vec![p(0)])],
+            ),
+            (
+                "a commit in the eager revoke callback",
+                Case {
+                    assignor: Assignor::Range,
+                    owned: vec![p(0)],
+                    assignments: vec![vec![p(0)]],
+                    event: Event::Heartbeat(27),
+                    commit_on_revoke: true,
+                    calls: 4,
+                },
+                vec![
+                    Call::Assigned(vec![p(0)]),
+                    Call::Revoked(vec![p(0)]),
+                    Call::CommitInRevoke(Ok(())),
+                    Call::Assigned(vec![p(0)]),
+                ],
+            ),
+        ] {
+            let (calls, _) = run_case(case).await;
+            actual.push((name, calls));
+            wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted);
     }

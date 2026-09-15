@@ -1533,6 +1533,8 @@ mod tests {
             close_operation: tokio::sync::watch::Sender::new(
                 crate::GroupMembershipOperation::Default,
             ),
+            rebalance_listener: None,
+            listener_calls: tokio::sync::mpsc::unbounded_channel().1,
         }
     }
 
