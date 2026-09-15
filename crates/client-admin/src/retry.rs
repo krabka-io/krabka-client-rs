@@ -13,7 +13,7 @@ use krabka_client_core::ClientError;
 use krabka_units::{Time, convert::TimeExt as _};
 use tokio::time::Instant;
 
-use crate::AdminError;
+use crate::{AdminClient, AdminError, KafkaError, kafka_error_name};
 
 /// The retry limits of one admin call.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -133,6 +133,24 @@ impl RetryDeadline {
             })
     }
 
+    /// Run `attempt`, but not past the call deadline. Returns `None` when the
+    /// deadline passes first.
+    pub(crate) async fn bounded<F: Future>(&self, attempt: F) -> Option<F::Output> {
+        tokio::time::timeout_at(self.deadline, attempt).await.ok()
+    }
+
+    /// The time that remains until the deadline, in whole milliseconds, as
+    /// Kafka's `Call.calcTimeoutMsRemainingAsInt` gives it to a request.
+    pub(crate) fn remaining_millis(&self) -> i32 {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX)
+    }
+
+    /// Wait until `wait` elapses, but not past the deadline.
+    pub(crate) async fn sleep(&self, wait: Duration) {
+        tokio::time::sleep_until(self.deadline.min(Instant::now() + wait)).await;
+    }
+
     /// The number of retries that the call has started.
     pub(crate) const fn retries(&self) -> u32 {
         self.retries
@@ -174,6 +192,121 @@ pub(crate) fn connection_failure_action<T>(error: AdminError) -> RetryAction<T> 
         RetryAction::FindCoordinator(Err(error))
     } else {
         RetryAction::Done(Err(error))
+    }
+}
+
+/// `REQUEST_TIMED_OUT`: Kafka's `TimeoutException`.
+pub(crate) const REQUEST_TIMED_OUT: i16 = 7;
+
+/// The error of a call past its deadline, as Kafka's
+/// `Call.handleTimeoutFailure` gives a `TimeoutException` that names the
+/// attempts and the last retriable error.
+pub(crate) fn call_timeout_error(api: &str, attempts: u32, last: &str) -> KafkaError {
+    KafkaError {
+        code: REQUEST_TIMED_OUT,
+        name: kafka_error_name(REQUEST_TIMED_OUT),
+        message: Some(format!(
+            "{api} timed out after {attempts} attempt(s); last error: {last}"
+        )),
+    }
+}
+
+/// The retry state of one controller call.
+///
+/// On `NOT_CONTROLLER` Kafka's `KafkaAdminClient.handleNotControllerError`
+/// clears the controller and throws a retriable `NotControllerException`. The
+/// call then waits for the backoff and sends the request again to the
+/// refreshed controller until its deadline. Past the deadline the call fails
+/// with `REQUEST_TIMED_OUT` (7).
+#[derive(Debug)]
+pub(crate) struct ControllerRetry {
+    api: &'static str,
+    deadline: RetryDeadline,
+    attempts: u32,
+}
+
+impl ControllerRetry {
+    /// The retry state of a call that starts now.
+    pub(crate) fn new(api: &'static str, policy: RetryPolicy) -> Self {
+        Self {
+            api,
+            deadline: policy.start(),
+            attempts: 1,
+        }
+    }
+
+    /// Run one request of the call, but not past the call deadline. A request
+    /// still in flight at the deadline gives `REQUEST_TIMED_OUT` (7), as
+    /// Kafka's `KafkaAdminClient` times out a call in flight.
+    pub(crate) async fn bounded<T>(
+        &self,
+        attempt: impl Future<Output = Result<T, AdminError>>,
+    ) -> Result<T, AdminError> {
+        match self.deadline.bounded(attempt).await {
+            Some(result) => result,
+            None => Err(self.timeout_error("the request was in flight at the deadline")),
+        }
+    }
+
+    /// Handle a `NOT_CONTROLLER` answer: find the controller again and wait
+    /// for the backoff. Returns the `REQUEST_TIMED_OUT` error when the
+    /// deadline has passed, and a rejected authentication of the refresh.
+    pub(crate) async fn after_not_controller(
+        &mut self,
+        admin: &mut AdminClient,
+    ) -> Result<(), AdminError> {
+        self.bounded(admin.refresh_controller_after_not_controller())
+            .await?;
+        if !self.deadline.expired() {
+            self.deadline.backoff().await;
+        }
+        if self.deadline.expired() {
+            return Err(self.timeout_error("NOT_CONTROLLER"));
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        Ok(())
+    }
+
+    /// Handle a retriable answer that needs no controller refresh: wait for
+    /// the backoff. Returns the `REQUEST_TIMED_OUT` error when the deadline
+    /// has passed.
+    pub(crate) async fn after_retriable(&mut self, last: &str) -> Result<(), AdminError> {
+        if !self.deadline.expired() {
+            self.deadline.backoff().await;
+        }
+        if self.deadline.expired() {
+            return Err(self.timeout_error(last));
+        }
+        self.attempts = self.attempts.saturating_add(1);
+        Ok(())
+    }
+
+    fn timeout_error(&self, last: &str) -> AdminError {
+        let error = call_timeout_error(self.api, self.attempts, last);
+        AdminError::Broker {
+            api: self.api,
+            code: error.code,
+            name: error.name,
+            message: error.message,
+        }
+    }
+}
+
+impl AdminClient {
+    /// Find the active controller after a `NOT_CONTROLLER` answer. Only a
+    /// rejected authentication is an error. Kafka's `ControllerNodeProvider`
+    /// keeps the call pending while the metadata names no controller.
+    pub(crate) async fn refresh_controller_after_not_controller(
+        &mut self,
+    ) -> Result<(), AdminError> {
+        match self.refresh_controller_connection().await {
+            Err(error) if error.is_authentication_failure() => Err(error),
+            Err(error) => {
+                tracing::debug!(error = %error, "controller refresh failed; retrying");
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
     }
 }
 

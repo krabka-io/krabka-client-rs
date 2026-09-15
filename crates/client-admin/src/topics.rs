@@ -1,6 +1,9 @@
 //! Topic CRUD wrappers.
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    time::Duration,
+};
 
 use krabka_protocol::{
     owned::{
@@ -25,9 +28,13 @@ use krabka_protocol::{
     primitives::uuid::Uuid as ProtoUuid,
 };
 use krabka_units::{Time, convert::TimeExt as _};
+use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::{AdminClient, AdminError, KafkaError, NOT_CONTROLLER, kafka_error_if};
+use crate::{
+    AdminClient, AdminError, KafkaError, NOT_CONTROLLER, kafka_error_if,
+    retry::{ControllerRetry, KAFKA_ADMIN_RETRY, RetryPolicy, call_timeout_error},
+};
 
 #[derive(Debug, Clone)]
 pub struct CreateTopicSpec {
@@ -37,17 +44,68 @@ pub struct CreateTopicSpec {
     pub configs: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateTopicOutcome {
     pub name: String,
     pub topic_id: Option<Uuid>,
     pub error: Option<KafkaError>,
+    /// The throttle time of a `THROTTLING_QUOTA_EXCEEDED` (89) error, as
+    /// Kafka's `ThrottlingQuotaExceededException.throttleTimeMs` gives it.
+    /// `None` for every other outcome.
+    pub throttle_time: Option<Time>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeleteTopicOutcome {
     pub name: String,
     pub error: Option<KafkaError>,
+    /// The throttle time of a `THROTTLING_QUOTA_EXCEEDED` (89) error.
+    /// `None` for every other outcome.
+    pub throttle_time: Option<Time>,
+}
+
+/// Options of [`AdminClient::create_topics`], [`AdminClient::delete_topics`]
+/// and [`AdminClient::create_partitions`], as Kafka's `CreateTopicsOptions`,
+/// `DeleteTopicsOptions` and `CreatePartitionsOptions`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TopicMutationOptions {
+    /// The deadline of the call, including retries. Each request carries the
+    /// time that remains as its `timeout_ms`. `None` uses Kafka's
+    /// `default.api.timeout.ms` (60 s).
+    pub timeout: Option<Time>,
+    /// Retry the topics that fail with `THROTTLING_QUOTA_EXCEEDED` (89) until
+    /// the deadline. Kafka's default is `true`.
+    pub retry_on_quota_violation: bool,
+}
+
+impl Default for TopicMutationOptions {
+    fn default() -> Self {
+        Self {
+            timeout: None,
+            retry_on_quota_violation: true,
+        }
+    }
+}
+
+impl TopicMutationOptions {
+    /// The default options with a call deadline of `timeout`.
+    #[must_use]
+    pub fn with_timeout(timeout: Time) -> Self {
+        Self {
+            timeout: Some(timeout),
+            ..Self::default()
+        }
+    }
+
+    fn retry_policy(self) -> RetryPolicy {
+        match self.timeout {
+            Some(timeout) => RetryPolicy {
+                timeout: Duration::from_millis(u64::try_from(timeout.millis_i64()).unwrap_or(0)),
+                ..KAFKA_ADMIN_RETRY
+            },
+            None => KAFKA_ADMIN_RETRY,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,10 +129,13 @@ pub struct CreatePartitionsOp {
     pub new_total_count: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreatePartitionsOutcome {
     pub name: String,
     pub error: Option<KafkaError>,
+    /// The throttle time of a `THROTTLING_QUOTA_EXCEEDED` (89) error.
+    /// `None` for every other outcome.
+    pub throttle_time: Option<Time>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -213,16 +274,14 @@ impl AdminClient {
         timeout: Time,
     ) -> Result<Vec<PartitionAssignmentOutcome>, AdminError> {
         let request = build_partition_assignment_request(assignments, timeout);
-        let first = self.conn.send(request.clone()).await?;
-        if first.error_code == NOT_CONTROLLER {
-            self.refresh_controller_connection().await?;
-            let second = self.conn.send(request).await?;
-            if second.error_code == NOT_CONTROLLER {
-                return Err(AdminError::NotControllerExhausted);
+        let mut retry = ControllerRetry::new("AlterPartitionReassignments", KAFKA_ADMIN_RETRY);
+        loop {
+            let response = retry.bounded(self.conn.send(request.clone())).await?;
+            if response.error_code != NOT_CONTROLLER {
+                return parse_partition_assignment_response(response);
             }
-            return parse_partition_assignment_response(second);
+            retry.after_not_controller(self).await?;
         }
-        parse_partition_assignment_response(first)
     }
 
     /// Metadata for the named topics. Pass an empty slice to fetch all
@@ -267,29 +326,22 @@ impl AdminClient {
         // heartbeat registry. Connect to the active controller before reading
         // Metadata so dead-but-still-registered brokers are not candidates.
         self.refresh_controller_connection().await?;
-        let first = self
-            .reconcile_topic_replication_factor_once(topic, replication_factor, timeout)
-            .await;
-        if !matches!(
-            first,
-            Err(AdminError::Broker {
-                code: NOT_CONTROLLER,
-                ..
-            })
-        ) {
-            return first;
-        }
-
-        self.refresh_controller_connection().await?;
-        match self
-            .reconcile_topic_replication_factor_once(topic, replication_factor, timeout)
-            .await
-        {
-            Err(AdminError::Broker {
-                code: NOT_CONTROLLER,
-                ..
-            }) => Err(AdminError::NotControllerExhausted),
-            result => result,
+        let mut retry = ControllerRetry::new("AlterPartitionReassignments", KAFKA_ADMIN_RETRY);
+        loop {
+            match retry
+                .bounded(self.reconcile_topic_replication_factor_once(
+                    topic,
+                    replication_factor,
+                    timeout,
+                ))
+                .await
+            {
+                Err(AdminError::Broker {
+                    code: NOT_CONTROLLER,
+                    ..
+                }) => retry.after_not_controller(self).await?,
+                result => return result,
+            }
         }
     }
 
@@ -366,101 +418,260 @@ impl AdminClient {
         Ok(TopicReplicationStatus::ReassignmentSubmitted)
     }
 
+    /// Creates topics through the active controller, as Kafka's
+    /// `KafkaAdminClient.createTopics` does.
+    ///
+    /// The call retries until the deadline of `options`:
+    ///
+    /// - `NOT_CONTROLLER` (41) for any topic: find the controller again, wait
+    ///   for the backoff, and send every topic that has no outcome again
+    ///   (`handleNotControllerError`). With controller bootstrap,
+    ///   `NOT_LEADER_OR_FOLLOWER` (6) does the same.
+    /// - `THROTTLING_QUOTA_EXCEEDED` (89): when
+    ///   [`TopicMutationOptions::retry_on_quota_violation`] is set, wait for the
+    ///   throttle time of the response and send only the throttled topics
+    ///   again. A topic that has an outcome is not sent again.
+    ///
+    /// At the deadline a throttled topic keeps code 89, with the throttle time
+    /// that remains. Another topic without an outcome gets
+    /// `REQUEST_TIMED_OUT` (7). The outcomes keep the order of `specs`.
+    ///
     /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
+    /// Returns an error when configuration is invalid, protocol encoding fails, or transport I/O fails.
     pub async fn create_topics(
         &mut self,
         specs: &[CreateTopicSpec],
-        timeout: Time,
+        options: TopicMutationOptions,
     ) -> Result<Vec<CreateTopicOutcome>, AdminError> {
-        let first = {
-            let req = build_create_topics(specs, timeout);
-            let resp = self.conn.send(req).await?;
-            parse_create_topics(resp)
-        };
-        if !any_not_controller(&first, |o| o.error.as_ref()) {
-            return Ok(first);
-        }
-        self.refresh_controller_connection().await?;
-        let second = {
-            let req = build_create_topics(specs, timeout);
-            let resp = self.conn.send(req).await?;
-            parse_create_topics(resp)
-        };
-        if any_not_controller(&second, |o| o.error.as_ref()) {
-            return Err(AdminError::NotControllerExhausted);
-        }
-        Ok(second)
+        self.create_topics_with_retry(specs, options, options.retry_policy())
+            .await
     }
 
+    async fn create_topics_with_retry(
+        &mut self,
+        specs: &[CreateTopicSpec],
+        options: TopicMutationOptions,
+        policy: RetryPolicy,
+    ) -> Result<Vec<CreateTopicOutcome>, AdminError> {
+        let names = specs.iter().map(|spec| spec.name.clone()).collect();
+        self.mutate_topics(
+            "CreateTopics",
+            names,
+            options.retry_on_quota_violation,
+            policy,
+            |pending, timeout_ms| {
+                let specs = specs
+                    .iter()
+                    .filter(|spec| pending.contains(&spec.name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                build_create_topics(&specs, timeout_ms)
+            },
+            parse_create_topics,
+        )
+        .await
+    }
+
+    /// Deletes topics through the active controller, as Kafka's
+    /// `KafkaAdminClient.deleteTopics` does. The call retries
+    /// `NOT_CONTROLLER` (41) and `THROTTLING_QUOTA_EXCEEDED` (89) as
+    /// [`AdminClient::create_topics`] does.
+    ///
     /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
+    /// Returns an error when configuration is invalid, protocol encoding fails, or transport I/O fails.
     pub async fn delete_topics(
         &mut self,
         names: &[&str],
-        timeout: Time,
+        options: TopicMutationOptions,
     ) -> Result<Vec<DeleteTopicOutcome>, AdminError> {
-        // Populate BOTH fields so the request works regardless of the
-        // negotiated protocol version: `topic_names` is the legacy field
-        // (v0-v5) and `topics` is the v6+ replacement. The
-        // `ApiVersionTable`-driven encoder picks the version-relevant
-        // field and ignores the other.
-        let build = || DeleteTopicsRequest {
-            topic_names: names.iter().map(|s| (*s).to_string()).collect(),
-            topics: names
-                .iter()
-                .map(|s| DeleteTopicState {
-                    name: Some((*s).to_string()),
-                    topic_id: ProtoUuid::ZERO,
-                    ..Default::default()
-                })
-                .collect(),
-            timeout_ms: timeout.millis_i32(),
-            ..Default::default()
-        };
-        let first = parse_delete_topics(self.conn.send(build()).await?);
-        if !any_not_controller(&first, |o| o.error.as_ref()) {
-            return Ok(first);
-        }
-        self.refresh_controller_connection().await?;
-        let second = parse_delete_topics(self.conn.send(build()).await?);
-        if any_not_controller(&second, |o| o.error.as_ref()) {
-            return Err(AdminError::NotControllerExhausted);
-        }
-        Ok(second)
+        self.delete_topics_with_retry(names, options, options.retry_policy())
+            .await
     }
 
+    async fn delete_topics_with_retry(
+        &mut self,
+        names: &[&str],
+        options: TopicMutationOptions,
+        policy: RetryPolicy,
+    ) -> Result<Vec<DeleteTopicOutcome>, AdminError> {
+        let names = names.iter().map(|name| (*name).to_owned()).collect();
+        self.mutate_topics(
+            "DeleteTopics",
+            names,
+            options.retry_on_quota_violation,
+            policy,
+            build_delete_topics,
+            parse_delete_topics,
+        )
+        .await
+    }
+
+    /// Adds partitions through the active controller, as Kafka's
+    /// `KafkaAdminClient.createPartitions` does. The call retries
+    /// `NOT_CONTROLLER` (41) and `THROTTLING_QUOTA_EXCEEDED` (89) as
+    /// [`AdminClient::create_topics`] does.
+    ///
     /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
+    /// Returns an error when configuration is invalid, protocol encoding fails, or transport I/O fails.
     pub async fn create_partitions(
         &mut self,
         ops: &[CreatePartitionsOp],
-        timeout: Time,
+        options: TopicMutationOptions,
     ) -> Result<Vec<CreatePartitionsOutcome>, AdminError> {
-        let build = || CreatePartitionsRequest {
-            topics: ops
+        self.create_partitions_with_retry(ops, options, options.retry_policy())
+            .await
+    }
+
+    async fn create_partitions_with_retry(
+        &mut self,
+        ops: &[CreatePartitionsOp],
+        options: TopicMutationOptions,
+        policy: RetryPolicy,
+    ) -> Result<Vec<CreatePartitionsOutcome>, AdminError> {
+        let names = ops.iter().map(|op| op.name.clone()).collect();
+        self.mutate_topics(
+            "CreatePartitions",
+            names,
+            options.retry_on_quota_violation,
+            policy,
+            |pending, timeout_ms| {
+                let ops = ops
+                    .iter()
+                    .filter(|op| pending.contains(&op.name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                build_create_partitions(&ops, timeout_ms)
+            },
+            parse_create_partitions,
+        )
+        .await
+    }
+
+    /// Sends one topic mutation until every topic has an outcome or the
+    /// deadline passes. See [`AdminClient::create_topics`] for the rules.
+    async fn mutate_topics<R, T>(
+        &mut self,
+        api: &'static str,
+        topics: Vec<String>,
+        retry_on_quota_violation: bool,
+        policy: RetryPolicy,
+        build: impl Fn(&[String], i32) -> R,
+        parse: impl Fn(R::Response) -> Vec<T>,
+    ) -> Result<Vec<T>, AdminError>
+    where
+        R: krabka_protocol::ProtocolRequest + Clone,
+        R::Response: 'static,
+        T: TopicMutationOutcome,
+    {
+        let mut order = Vec::new();
+        for topic in topics {
+            if !order.contains(&topic) {
+                order.push(topic);
+            }
+        }
+        let mut pending = order.clone();
+        let mut done = HashMap::<String, T>::new();
+        let mut throttled = HashMap::<String, (T, Instant)>::new();
+        let mut deadline = policy.start();
+        let mut attempts = 0_u32;
+        let mut last_error = "none";
+        while !pending.is_empty() {
+            attempts = attempts.saturating_add(1);
+            let request = build(&pending, deadline.remaining_millis());
+            // A request still in flight at the deadline stops the call, as
+            // Kafka's `KafkaAdminClient` times out a call in flight.
+            let Some(response) = deadline.bounded(self.conn.send(request)).await else {
+                last_error = "the request was in flight at the deadline";
+                break;
+            };
+            let outcomes = parse(response?);
+            let controller_bootstrap = self.conn.uses_controller_bootstrap();
+            if outcomes
                 .iter()
-                .map(|o| CreatePartitionsTopic {
-                    name: o.name.clone(),
-                    count: o.new_total_count,
-                    assignments: None,
-                    ..Default::default()
-                })
-                .collect(),
-            timeout_ms: timeout.millis_i32(),
-            validate_only: false,
-            ..Default::default()
-        };
-        let first = parse_create_partitions(self.conn.send(build()).await?);
-        if !any_not_controller(&first, |o| o.error.as_ref()) {
-            return Ok(first);
+                .any(|outcome| is_not_controller(outcome.error_code(), controller_bootstrap))
+            {
+                last_error = "NOT_CONTROLLER";
+                if deadline
+                    .bounded(self.refresh_controller_after_not_controller())
+                    .await
+                    .transpose()?
+                    .is_none()
+                {
+                    break;
+                }
+                if !deadline.expired() {
+                    deadline.backoff().await;
+                }
+                if deadline.expired() {
+                    break;
+                }
+                continue;
+            }
+
+            let received = Instant::now();
+            let mut retry = Vec::new();
+            let mut throttle = Duration::ZERO;
+            for outcome in outcomes {
+                let topic = outcome.topic().to_owned();
+                if !pending.contains(&topic) || done.contains_key(&topic) {
+                    tracing::warn!(api, topic, "server response mentioned an unknown topic");
+                    continue;
+                }
+                if retry_on_quota_violation && outcome.error_code() == THROTTLING_QUOTA_EXCEEDED {
+                    throttle = throttle.max(outcome.throttle_duration());
+                    retry.push(topic.clone());
+                    throttled.insert(topic, (outcome, received));
+                } else {
+                    throttled.remove(&topic);
+                    done.insert(topic, outcome);
+                }
+            }
+            for topic in &pending {
+                if !done.contains_key(topic) && !retry.contains(topic) {
+                    let error = KafkaError {
+                        code: UNKNOWN_SERVER_ERROR,
+                        name: crate::kafka_error_name(UNKNOWN_SERVER_ERROR),
+                        message: Some(format!(
+                            "The controller response did not contain a result for topic {topic}"
+                        )),
+                    };
+                    done.insert(topic.clone(), T::failed(topic, error));
+                }
+            }
+            pending = retry;
+            if pending.is_empty() {
+                break;
+            }
+            last_error = "THROTTLING_QUOTA_EXCEEDED";
+            // Kafka's `NetworkClient` mutes the connection for the throttle
+            // time of the response (KIP-219) before the retry goes out. A
+            // zero throttle time falls back to the retry backoff, so a broken
+            // broker cannot make the call spin.
+            if throttle.is_zero() {
+                deadline.backoff().await;
+            } else {
+                deadline.sleep(throttle).await;
+            }
+            if deadline.expired() {
+                break;
+            }
         }
-        self.refresh_controller_connection().await?;
-        let second = parse_create_partitions(self.conn.send(build()).await?);
-        if any_not_controller(&second, |o| o.error.as_ref()) {
-            return Err(AdminError::NotControllerExhausted);
+        for topic in pending {
+            let outcome = match throttled.remove(&topic) {
+                Some((outcome, received)) => {
+                    let remaining = outcome
+                        .throttle_duration()
+                        .saturating_sub(received.elapsed());
+                    outcome.with_throttle_duration(remaining)
+                }
+                None => T::failed(&topic, call_timeout_error(api, attempts, last_error)),
+            };
+            done.insert(topic, outcome);
         }
-        Ok(second)
+        Ok(order
+            .into_iter()
+            .filter_map(|topic| done.remove(&topic))
+            .collect())
     }
 
     /// Deletes records below each requested partition offset.
@@ -511,7 +722,10 @@ impl AdminClient {
             if controller_requires_bootstrap_fallback(&md_resp) {
                 return self.conn.rebootstrap().await;
             }
-            return Err(AdminError::NotControllerExhausted);
+            return Err(AdminError::Protocol(format!(
+                "metadata names no endpoint for controller {}",
+                md_resp.controller_id
+            )));
         };
         self.reconnect(&controller_addr).await
     }
@@ -585,10 +799,126 @@ impl AdminClient {
     }
 }
 
-fn any_not_controller<T, F: Fn(&T) -> Option<&KafkaError>>(items: &[T], get_err: F) -> bool {
-    items
-        .iter()
-        .any(|o| matches!(get_err(o), Some(e) if e.code == NOT_CONTROLLER))
+/// `UNKNOWN_SERVER_ERROR`.
+const UNKNOWN_SERVER_ERROR: i16 = -1;
+/// `NOT_LEADER_OR_FOLLOWER`: a controller that is not the active controller
+/// answers with it through controller bootstrap.
+const NOT_LEADER_OR_FOLLOWER: i16 = 6;
+/// `THROTTLING_QUOTA_EXCEEDED`: the controller mutation quota (KIP-599).
+const THROTTLING_QUOTA_EXCEEDED: i16 = 89;
+
+/// Whether a topic code makes Kafka's `handleNotControllerError` find the
+/// controller again. `NOT_LEADER_OR_FOLLOWER` counts only with controller
+/// bootstrap.
+fn is_not_controller(code: i16, controller_bootstrap: bool) -> bool {
+    code == NOT_CONTROLLER || (controller_bootstrap && code == NOT_LEADER_OR_FOLLOWER)
+}
+
+/// One per-topic outcome of a topic mutation.
+trait TopicMutationOutcome {
+    /// The topic name.
+    fn topic(&self) -> &str;
+    /// The error code, 0 for success.
+    fn error_code(&self) -> i16;
+    /// The throttle time of the outcome, zero when it has none.
+    fn throttle_duration(&self) -> Duration;
+    /// This outcome with the throttle time `remaining`.
+    #[must_use]
+    fn with_throttle_duration(self, remaining: Duration) -> Self;
+    /// A failed outcome for `topic`.
+    fn failed(topic: &str, error: KafkaError) -> Self;
+}
+
+fn throttle_duration(throttle_time: Option<Time>) -> Duration {
+    throttle_time.map_or(Duration::ZERO, |time| {
+        Duration::from_millis(u64::try_from(time.millis_i64()).unwrap_or(0))
+    })
+}
+
+fn throttle_time(remaining: Duration) -> Time {
+    Time::from_millis(i64::try_from(remaining.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// The throttle time of an outcome with `code`: the response throttle time
+/// for `THROTTLING_QUOTA_EXCEEDED`, `None` otherwise.
+fn quota_throttle_time(code: i16, throttle_time_ms: i32) -> Option<Time> {
+    (code == THROTTLING_QUOTA_EXCEEDED).then(|| Time::from_millis(i64::from(throttle_time_ms)))
+}
+
+impl TopicMutationOutcome for CreateTopicOutcome {
+    fn topic(&self) -> &str {
+        &self.name
+    }
+    fn error_code(&self) -> i16 {
+        self.error.as_ref().map_or(0, |error| error.code)
+    }
+    fn throttle_duration(&self) -> Duration {
+        throttle_duration(self.throttle_time)
+    }
+    fn with_throttle_duration(self, remaining: Duration) -> Self {
+        Self {
+            throttle_time: Some(throttle_time(remaining)),
+            ..self
+        }
+    }
+    fn failed(topic: &str, error: KafkaError) -> Self {
+        Self {
+            name: topic.to_owned(),
+            topic_id: None,
+            error: Some(error),
+            throttle_time: None,
+        }
+    }
+}
+
+impl TopicMutationOutcome for DeleteTopicOutcome {
+    fn topic(&self) -> &str {
+        &self.name
+    }
+    fn error_code(&self) -> i16 {
+        self.error.as_ref().map_or(0, |error| error.code)
+    }
+    fn throttle_duration(&self) -> Duration {
+        throttle_duration(self.throttle_time)
+    }
+    fn with_throttle_duration(self, remaining: Duration) -> Self {
+        Self {
+            throttle_time: Some(throttle_time(remaining)),
+            ..self
+        }
+    }
+    fn failed(topic: &str, error: KafkaError) -> Self {
+        Self {
+            name: topic.to_owned(),
+            error: Some(error),
+            throttle_time: None,
+        }
+    }
+}
+
+impl TopicMutationOutcome for CreatePartitionsOutcome {
+    fn topic(&self) -> &str {
+        &self.name
+    }
+    fn error_code(&self) -> i16 {
+        self.error.as_ref().map_or(0, |error| error.code)
+    }
+    fn throttle_duration(&self) -> Duration {
+        throttle_duration(self.throttle_time)
+    }
+    fn with_throttle_duration(self, remaining: Duration) -> Self {
+        Self {
+            throttle_time: Some(throttle_time(remaining)),
+            ..self
+        }
+    }
+    fn failed(topic: &str, error: KafkaError) -> Self {
+        Self {
+            name: topic.to_owned(),
+            error: Some(error),
+            throttle_time: None,
+        }
+    }
 }
 
 fn build_partition_assignment_request(
@@ -769,7 +1099,7 @@ fn build_replication_factor_reassignment(
     }))
 }
 
-fn build_create_topics(specs: &[CreateTopicSpec], timeout: Time) -> CreateTopicsRequest {
+fn build_create_topics(specs: &[CreateTopicSpec], timeout_ms: i32) -> CreateTopicsRequest {
     CreateTopicsRequest {
         topics: specs
             .iter()
@@ -790,7 +1120,43 @@ fn build_create_topics(specs: &[CreateTopicSpec], timeout: Time) -> CreateTopics
                 ..Default::default()
             })
             .collect(),
-        timeout_ms: timeout.millis_i32(),
+        timeout_ms,
+        validate_only: false,
+        ..Default::default()
+    }
+}
+
+/// A `DeleteTopicsRequest` that names `names`. It fills both the v0-v5
+/// `topic_names` field and the v6+ `topics` field, and the encoder uses the
+/// field of the negotiated version.
+fn build_delete_topics(names: &[String], timeout_ms: i32) -> DeleteTopicsRequest {
+    DeleteTopicsRequest {
+        topic_names: names.to_vec(),
+        topics: names
+            .iter()
+            .map(|name| DeleteTopicState {
+                name: Some(name.clone()),
+                topic_id: ProtoUuid::ZERO,
+                ..Default::default()
+            })
+            .collect(),
+        timeout_ms,
+        ..Default::default()
+    }
+}
+
+fn build_create_partitions(ops: &[CreatePartitionsOp], timeout_ms: i32) -> CreatePartitionsRequest {
+    CreatePartitionsRequest {
+        topics: ops
+            .iter()
+            .map(|op| CreatePartitionsTopic {
+                name: op.name.clone(),
+                count: op.new_total_count,
+                assignments: None,
+                ..Default::default()
+            })
+            .collect(),
+        timeout_ms,
         validate_only: false,
         ..Default::default()
     }
@@ -826,11 +1192,13 @@ fn build_delete_records(ops: &[DeleteRecordsOp], timeout: Time) -> DeleteRecords
 fn parse_create_topics(
     resp: <CreateTopicsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Vec<CreateTopicOutcome> {
+    let throttle_time_ms = resp.throttle_time_ms;
     resp.topics
         .into_iter()
         .map(|t| CreateTopicOutcome {
             name: t.name,
             topic_id: proto_uuid_to_opt(t.topic_id),
+            throttle_time: quota_throttle_time(t.error_code, throttle_time_ms),
             error: kafka_error_if(t.error_code, t.error_message),
         })
         .collect()
@@ -839,10 +1207,12 @@ fn parse_create_topics(
 fn parse_delete_topics(
     resp: <DeleteTopicsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Vec<DeleteTopicOutcome> {
+    let throttle_time_ms = resp.throttle_time_ms;
     resp.responses
         .into_iter()
         .map(|t| DeleteTopicOutcome {
             name: t.name.unwrap_or_default(),
+            throttle_time: quota_throttle_time(t.error_code, throttle_time_ms),
             error: kafka_error_if(t.error_code, t.error_message),
         })
         .collect()
@@ -851,10 +1221,12 @@ fn parse_delete_topics(
 fn parse_create_partitions(
     resp: <CreatePartitionsRequest as krabka_protocol::ProtocolRequest>::Response,
 ) -> Vec<CreatePartitionsOutcome> {
+    let throttle_time_ms = resp.throttle_time_ms;
     resp.results
         .into_iter()
         .map(|t| CreatePartitionsOutcome {
             name: t.name,
+            throttle_time: quota_throttle_time(t.error_code, throttle_time_ms),
             error: kafka_error_if(t.error_code, t.error_message),
         })
         .collect()
@@ -1096,7 +1468,7 @@ mod tests {
                 replicas: 1,
                 configs: BTreeMap::from([("retention.ms".to_string(), "60000".to_string())]),
             }],
-            krabka_units::secs(5),
+            5_000,
         );
         assert2::assert!(
             req == CreateTopicsRequest {
@@ -1234,55 +1606,22 @@ mod tests {
     // decides whether to retry, and the metadata-response → host:port
     // resolver — so a refactor can't silently flip either one.
 
-    /// Spec test name: `not_controller_triggers_one_retry`, the predicate
-    /// half. It verifies that `any_not_controller` returns `true` iff at least
-    /// one outcome carries the `NOT_CONTROLLER (41)` error code.
+    /// Kafka's `handleNotControllerError` retries `NOT_CONTROLLER` (41),
+    /// and `NOT_LEADER_OR_FOLLOWER` (6) only with bootstrap controllers.
     #[test]
-    fn any_not_controller_predicate_matches_code_41() {
-        let outcomes = vec![
-            CreateTopicOutcome {
-                name: "a".into(),
-                topic_id: None,
-                error: None,
-            },
-            CreateTopicOutcome {
-                name: "b".into(),
-                topic_id: None,
-                error: Some(KafkaError {
-                    code: NOT_CONTROLLER,
-                    name: "NOT_CONTROLLER",
-                    message: None,
-                }),
-            },
+    fn not_controller_codes_match_kafka() {
+        let cases = [
+            ((NOT_CONTROLLER, false), true),
+            ((NOT_CONTROLLER, true), true),
+            ((NOT_LEADER_OR_FOLLOWER, false), false),
+            ((NOT_LEADER_OR_FOLLOWER, true), true),
+            ((36, true), false),
+            ((THROTTLING_QUOTA_EXCEEDED, false), false),
+            ((0, false), false),
         ];
-        assert2::assert!(any_not_controller(&outcomes, |o| o.error.as_ref()));
-
-        let all_ok = vec![CreateTopicOutcome {
-            name: "a".into(),
-            topic_id: None,
-            error: None,
-        }];
-        assert2::assert!(!any_not_controller(&all_ok, |o| o.error.as_ref()));
-    }
-
-    /// Spec test name: `repeated_not_controller_errors_return_exhausted`, the
-    /// predicate half. Non-`NOT_CONTROLLER` errors must NOT trigger the retry
-    /// path. Only code 41 does. With the integration test, this locks the
-    /// retry-eligibility check. If the predicate fired on, for example,
-    /// `TOPIC_ALREADY_EXISTS`, callers would see spurious reconnects and
-    /// `NotControllerExhausted` returns on real failures.
-    #[test]
-    fn any_not_controller_ignores_other_errors() {
-        let outcomes = vec![CreateTopicOutcome {
-            name: "b".into(),
-            topic_id: None,
-            error: Some(KafkaError {
-                code: 36, // TOPIC_ALREADY_EXISTS
-                name: "TOPIC_ALREADY_EXISTS",
-                message: None,
-            }),
-        }];
-        assert2::assert!(!any_not_controller(&outcomes, |o| o.error.as_ref()));
+        let actual = cases
+            .map(|((code, bootstrap), _)| ((code, bootstrap), is_not_controller(code, bootstrap)));
+        assert2::assert!(actual == cases);
     }
 
     // ── controller_endpoint resolver ───────────────────────────────
@@ -1475,7 +1814,13 @@ mod tests {
                     error_message: Some("already there".into()),
                     ..Default::default()
                 },
+                CreatableTopicResult {
+                    name: "throttled".into(),
+                    error_code: THROTTLING_QUOTA_EXCEEDED,
+                    ..Default::default()
+                },
             ],
+            throttle_time_ms: 250,
             ..Default::default()
         };
         let outcomes = parse_create_topics(resp);
@@ -1487,6 +1832,7 @@ mod tests {
                         // Non-zero uuid maps to Some.
                         topic_id: Some(Uuid::from_bytes([7; 16])),
                         error: None,
+                        throttle_time: None,
                     },
                     CreateTopicOutcome {
                         name: "dup".to_string(),
@@ -1496,6 +1842,17 @@ mod tests {
                             name: "TOPIC_ALREADY_EXISTS",
                             message: Some("already there".to_string()),
                         }),
+                        throttle_time: None,
+                    },
+                    CreateTopicOutcome {
+                        name: "throttled".to_string(),
+                        topic_id: None,
+                        error: Some(KafkaError {
+                            code: THROTTLING_QUOTA_EXCEEDED,
+                            name: "THROTTLING_QUOTA_EXCEEDED",
+                            message: None,
+                        }),
+                        throttle_time: Some(Time::from_millis(250)),
                     },
                 ]
         );
@@ -1532,6 +1889,7 @@ mod tests {
                     // → empty string.
                     name: String::new(),
                     error: None,
+                    throttle_time: None,
                 },
                 DeleteTopicOutcome {
                     name: "named".to_string(),
@@ -1540,6 +1898,7 @@ mod tests {
                         name: "UNKNOWN_TOPIC_OR_PARTITION",
                         message: Some("nope".to_string()),
                     }),
+                    throttle_time: None,
                 },
             ]
         );
@@ -1575,6 +1934,7 @@ mod tests {
                 CreatePartitionsOutcome {
                     name: "ok".to_string(),
                     error: None,
+                    throttle_time: None,
                 },
                 CreatePartitionsOutcome {
                     name: "bad".to_string(),
@@ -1583,8 +1943,540 @@ mod tests {
                         name: "INVALID_PARTITIONS",
                         message: Some("bad count".to_string()),
                     }),
+                    throttle_time: None,
                 },
             ]
         );
+    }
+
+    // ── topic mutation retries against a scripted controller ──────────
+
+    use std::sync::{Arc, Mutex};
+
+    use bytes::{Buf, BytesMut};
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
+        Decode, Encode,
+        owned::{
+            api_versions_request,
+            api_versions_response::{ApiVersion, ApiVersionsResponse},
+            create_partitions_request,
+            create_partitions_response::{CreatePartitionsResponse, CreatePartitionsTopicResult},
+            create_topics_request,
+            create_topics_response::{CreatableTopicResult, CreateTopicsResponse},
+            delete_topics_request,
+            delete_topics_response::{DeletableTopicResult, DeleteTopicsResponse},
+            metadata_request,
+        },
+    };
+
+    /// The topic mutation call of a retry case.
+    #[derive(Clone, Copy, Debug)]
+    enum Mutation {
+        CreateTopics,
+        DeleteTopics,
+        CreatePartitions,
+    }
+
+    /// One scripted controller answer: the code of each topic that it names,
+    /// and the response throttle time. A topic that is not in the list gets
+    /// no result.
+    #[derive(Clone, Debug)]
+    struct Answer {
+        codes: Vec<(&'static str, i16)>,
+        throttle_time_ms: i32,
+        /// The controller does not answer the request.
+        silent: bool,
+    }
+
+    fn answer(codes: &[(&'static str, i16)]) -> Answer {
+        Answer {
+            codes: codes.to_vec(),
+            throttle_time_ms: 0,
+            silent: false,
+        }
+    }
+
+    fn throttled(codes: &[(&'static str, i16)], throttle_time_ms: i32) -> Answer {
+        Answer {
+            codes: codes.to_vec(),
+            throttle_time_ms,
+            silent: false,
+        }
+    }
+
+    fn silent() -> Answer {
+        Answer {
+            codes: Vec::new(),
+            throttle_time_ms: 0,
+            silent: true,
+        }
+    }
+
+    /// The topic names and the `timeout_ms` of one request.
+    type SentRequest = (Vec<String>, i32);
+
+    /// One topic mutation retry case: name, controller script, deadline,
+    /// options, expected requests, expected outcomes.
+    type MutationCase = (
+        &'static str,
+        Vec<Answer>,
+        Duration,
+        TopicMutationOptions,
+        Vec<Vec<String>>,
+        Vec<Observed>,
+    );
+
+    /// An outcome in a form that tests compare: the topic, the code, and
+    /// whether the outcome has a throttle time.
+    type Observed = (String, i16, bool);
+
+    fn body(response: &impl Encode, version: i16, flexible: bool) -> Vec<u8> {
+        let mut bytes = BytesMut::new();
+        if flexible {
+            bytes.extend_from_slice(&[0]);
+        }
+        response
+            .encode(&mut bytes, version)
+            .expect("response encodes");
+        bytes.to_vec()
+    }
+
+    fn decode_body<R: for<'de> Decode<'de>>(mut body: &[u8], version: i16, flexible: bool) -> R {
+        let client_id_len = body.get_i16();
+        body.advance(usize::try_from(client_id_len).expect("client id length"));
+        if flexible {
+            body.advance(1);
+        }
+        R::decode(&mut body, version).expect("request decodes")
+    }
+
+    /// A broker that is its own controller. It answers each topic mutation
+    /// with the next entry of `script` (the last entry repeats), and records
+    /// the topic names and the `timeout_ms` of each request.
+    async fn scripted_controller(
+        script: Vec<Answer>,
+        requests: Arc<Mutex<Vec<SentRequest>>>,
+    ) -> MockBroker {
+        let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let handler_port = Arc::clone(&port);
+        let mut next = 0_usize;
+        let broker = MockBroker::start(move |api_key, version, _, request| {
+            let api_version = |api_key, max_version| ApiVersion {
+                api_key,
+                min_version: 0,
+                max_version,
+                ..Default::default()
+            };
+            let mut take = |names: Vec<String>, timeout_ms: i32| {
+                requests
+                    .lock()
+                    .expect("requests lock")
+                    .push((names, timeout_ms));
+                let entry = script[next.min(script.len() - 1)].clone();
+                next += 1;
+                entry
+            };
+            match api_key {
+                api_versions_request::API_KEY => Some(body(
+                    &ApiVersionsResponse {
+                        api_keys: vec![
+                            api_version(api_versions_request::API_KEY, 0),
+                            api_version(metadata_request::API_KEY, 12),
+                            api_version(create_topics_request::API_KEY, 7),
+                            api_version(delete_topics_request::API_KEY, 6),
+                            api_version(create_partitions_request::API_KEY, 3),
+                        ],
+                        ..Default::default()
+                    },
+                    0,
+                    false,
+                )),
+                metadata_request::API_KEY => Some(body(
+                    &MetadataResponse {
+                        controller_id: 1,
+                        brokers: vec![MetadataResponseBroker {
+                            node_id: 1,
+                            host: "127.0.0.1".into(),
+                            port: i32::from(handler_port.load(std::sync::atomic::Ordering::SeqCst)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    version,
+                    version >= metadata_request::FLEXIBLE_MIN,
+                )),
+                create_topics_request::API_KEY => {
+                    let flexible = version >= create_topics_request::FLEXIBLE_MIN;
+                    let request: CreateTopicsRequest = decode_body(request, version, flexible);
+                    let entry = take(
+                        request
+                            .topics
+                            .iter()
+                            .map(|topic| topic.name.clone())
+                            .collect(),
+                        request.timeout_ms,
+                    );
+                    if entry.silent {
+                        return None;
+                    }
+                    Some(body(
+                        &CreateTopicsResponse {
+                            throttle_time_ms: entry.throttle_time_ms,
+                            topics: entry
+                                .codes
+                                .iter()
+                                .map(|(name, code)| CreatableTopicResult {
+                                    name: (*name).to_owned(),
+                                    error_code: *code,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        version,
+                        flexible,
+                    ))
+                }
+                delete_topics_request::API_KEY => {
+                    let flexible = version >= delete_topics_request::FLEXIBLE_MIN;
+                    let request: DeleteTopicsRequest = decode_body(request, version, flexible);
+                    let entry = take(
+                        request
+                            .topics
+                            .iter()
+                            .map(|topic| topic.name.clone().unwrap_or_default())
+                            .collect(),
+                        request.timeout_ms,
+                    );
+                    if entry.silent {
+                        return None;
+                    }
+                    Some(body(
+                        &DeleteTopicsResponse {
+                            throttle_time_ms: entry.throttle_time_ms,
+                            responses: entry
+                                .codes
+                                .iter()
+                                .map(|(name, code)| DeletableTopicResult {
+                                    name: Some((*name).to_owned()),
+                                    error_code: *code,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        version,
+                        flexible,
+                    ))
+                }
+                create_partitions_request::API_KEY => {
+                    let flexible = version >= create_partitions_request::FLEXIBLE_MIN;
+                    let request: CreatePartitionsRequest = decode_body(request, version, flexible);
+                    let entry = take(
+                        request
+                            .topics
+                            .iter()
+                            .map(|topic| topic.name.clone())
+                            .collect(),
+                        request.timeout_ms,
+                    );
+                    if entry.silent {
+                        return None;
+                    }
+                    Some(body(
+                        &CreatePartitionsResponse {
+                            throttle_time_ms: entry.throttle_time_ms,
+                            results: entry
+                                .codes
+                                .iter()
+                                .map(|(name, code)| CreatePartitionsTopicResult {
+                                    name: (*name).to_owned(),
+                                    error_code: *code,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        version,
+                        flexible,
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .await;
+        port.store(broker.addr.port(), std::sync::atomic::Ordering::SeqCst);
+        broker
+    }
+
+    fn observe<T: TopicMutationOutcome>(outcomes: Vec<T>) -> Vec<Observed> {
+        outcomes
+            .into_iter()
+            .map(|outcome| {
+                (
+                    outcome.topic().to_owned(),
+                    outcome.error_code(),
+                    !outcome.throttle_duration().is_zero(),
+                )
+            })
+            .collect()
+    }
+
+    async fn run_mutation(
+        admin: &mut AdminClient,
+        mutation: Mutation,
+        topics: &[&str],
+        options: TopicMutationOptions,
+        policy: RetryPolicy,
+    ) -> Vec<Observed> {
+        match mutation {
+            Mutation::CreateTopics => {
+                let specs = topics
+                    .iter()
+                    .map(|name| CreateTopicSpec {
+                        name: (*name).to_owned(),
+                        partitions: 1,
+                        replicas: 1,
+                        configs: BTreeMap::new(),
+                    })
+                    .collect::<Vec<_>>();
+                observe(
+                    admin
+                        .create_topics_with_retry(&specs, options, policy)
+                        .await
+                        .expect("create_topics"),
+                )
+            }
+            Mutation::DeleteTopics => observe(
+                admin
+                    .delete_topics_with_retry(topics, options, policy)
+                    .await
+                    .expect("delete_topics"),
+            ),
+            Mutation::CreatePartitions => {
+                let ops = topics
+                    .iter()
+                    .map(|name| CreatePartitionsOp {
+                        name: (*name).to_owned(),
+                        new_total_count: 2,
+                    })
+                    .collect::<Vec<_>>();
+                observe(
+                    admin
+                        .create_partitions_with_retry(&ops, options, policy)
+                        .await
+                        .expect("create_partitions"),
+                )
+            }
+        }
+    }
+
+    /// Kafka's `getCreateTopicsCall`, `getDeleteTopicsCall` and
+    /// `getCreatePartitionsCall` retry `NOT_CONTROLLER` (41) for the whole
+    /// call through `handleNotControllerError`, and retry
+    /// `THROTTLING_QUOTA_EXCEEDED` (89) for the throttled topics only when
+    /// `retryOnQuotaViolation` is set. At the deadline a throttled topic keeps
+    /// 89 with its throttle time, and another topic gets a `TimeoutException`
+    /// (7).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn topic_mutations_retry_not_controller_and_quota_as_kafka_does() {
+        const LONG: Duration = Duration::from_secs(5);
+        // One request fits in `NOW`, and the backoff after it reaches the
+        // deadline, so the call sends no second request.
+        const NOW: Duration = Duration::from_millis(500);
+        let ok = |name: &str| (name.to_owned(), 0, false);
+        let failed = |name: &str, code| (name.to_owned(), code, false);
+        let quota = |name: &str| (name.to_owned(), THROTTLING_QUOTA_EXCEEDED, true);
+        let names = |lists: &[&[&str]]| {
+            lists
+                .iter()
+                .map(|list| {
+                    list.iter()
+                        .map(|name| (*name).to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let retry_quota = TopicMutationOptions::default();
+        let no_quota_retry = TopicMutationOptions {
+            retry_on_quota_violation: false,
+            ..TopicMutationOptions::default()
+        };
+        let cases: Vec<MutationCase> = vec![
+            (
+                "no error",
+                vec![answer(&[("a", 0), ("b", 0)])],
+                LONG,
+                retry_quota,
+                names(&[&["a", "b"]]),
+                vec![ok("a"), ok("b")],
+            ),
+            (
+                "not controller twice, then success",
+                vec![
+                    answer(&[("a", 41), ("b", 41)]),
+                    answer(&[("a", 41), ("b", 41)]),
+                    answer(&[("a", 0), ("b", 0)]),
+                ],
+                LONG,
+                retry_quota,
+                names(&[&["a", "b"], &["a", "b"], &["a", "b"]]),
+                vec![ok("a"), ok("b")],
+            ),
+            (
+                "not controller for one topic sends every topic again",
+                vec![
+                    answer(&[("a", 0), ("b", 41)]),
+                    answer(&[("a", 0), ("b", 0)]),
+                ],
+                LONG,
+                retry_quota,
+                names(&[&["a", "b"], &["a", "b"]]),
+                vec![ok("a"), ok("b")],
+            ),
+            (
+                "quota for one topic sends only that topic again",
+                vec![answer(&[("a", 0), ("b", 89)]), answer(&[("b", 0)])],
+                LONG,
+                retry_quota,
+                names(&[&["a", "b"], &["b"]]),
+                vec![ok("a"), ok("b")],
+            ),
+            (
+                "quota with retry off is final",
+                vec![throttled(&[("a", 89), ("b", 0)], 250)],
+                LONG,
+                no_quota_retry,
+                names(&[&["a", "b"]]),
+                vec![quota("a"), ok("b")],
+            ),
+            (
+                "not controller past the deadline times out",
+                vec![answer(&[("a", 41), ("b", 41)])],
+                NOW,
+                retry_quota,
+                names(&[&["a", "b"]]),
+                vec![failed("a", 7), failed("b", 7)],
+            ),
+            (
+                "quota past the deadline keeps the quota error",
+                vec![throttled(&[("a", 89), ("b", 36)], 60_000)],
+                Duration::from_millis(100),
+                retry_quota,
+                names(&[&["a", "b"]]),
+                vec![quota("a"), failed("b", 36)],
+            ),
+            (
+                "a silent controller stops the call at the deadline",
+                vec![silent()],
+                Duration::from_millis(300),
+                retry_quota,
+                names(&[&["a", "b"]]),
+                vec![failed("a", 7), failed("b", 7)],
+            ),
+            (
+                "a topic with no result fails",
+                vec![answer(&[("a", 0)])],
+                LONG,
+                retry_quota,
+                names(&[&["a", "b"]]),
+                vec![ok("a"), failed("b", -1)],
+            ),
+        ];
+        for mutation in [
+            Mutation::CreateTopics,
+            Mutation::DeleteTopics,
+            Mutation::CreatePartitions,
+        ] {
+            for (name, script, timeout, options, expected_requests, expected) in cases.clone() {
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let controller = scripted_controller(script, Arc::clone(&requests)).await;
+                let mut admin = AdminClient::connect(&[controller.addr.to_string()])
+                    .await
+                    .expect("admin connects");
+                let backoff = if timeout == LONG {
+                    Duration::from_millis(1)
+                } else {
+                    timeout
+                };
+                let policy = RetryPolicy {
+                    timeout,
+                    initial_backoff: backoff,
+                    max_backoff: backoff,
+                    jitter: 0.0,
+                };
+
+                let started = tokio::time::Instant::now();
+                let observed =
+                    run_mutation(&mut admin, mutation, &["a", "b"], options, policy).await;
+                let within_deadline = started.elapsed() < timeout + Duration::from_secs(2);
+
+                controller.stop();
+                let requests = requests.lock().expect("requests lock").clone();
+                let timeouts_within_deadline = requests.iter().all(|(_, timeout_ms)| {
+                    u128::try_from(*timeout_ms).is_ok_and(|ms| ms <= timeout.as_millis())
+                });
+                let sent = requests
+                    .into_iter()
+                    .map(|(names, _)| names)
+                    .collect::<Vec<_>>();
+                assert2::assert!(
+                    (sent, observed, timeouts_within_deadline, within_deadline)
+                        == (expected_requests, expected, true, true),
+                    "{mutation:?}: {name}"
+                );
+            }
+        }
+    }
+
+    /// Kafka completes a throttled topic at the deadline with the throttle
+    /// time that remains (`maybeCompleteQuotaExceededException`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quota_error_at_the_deadline_carries_the_remaining_throttle_time() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let controller =
+            scripted_controller(vec![throttled(&[("a", 89)], 60_000)], Arc::clone(&requests)).await;
+        let mut admin = AdminClient::connect(&[controller.addr.to_string()])
+            .await
+            .expect("admin connects");
+        let policy = RetryPolicy {
+            timeout: Duration::from_millis(100),
+            ..KAFKA_ADMIN_RETRY
+        };
+
+        let outcomes = admin
+            .delete_topics_with_retry(&["a"], TopicMutationOptions::default(), policy)
+            .await
+            .expect("delete_topics");
+
+        controller.stop();
+        let [outcome] = outcomes.as_slice() else {
+            panic!("one outcome expected, got {outcomes:?}");
+        };
+        let remaining = outcome.throttle_duration();
+        assert2::assert!(
+            (
+                outcome.error.as_ref().map(|error| error.code),
+                remaining > Duration::from_secs(59),
+                remaining < Duration::from_mins(1),
+            ) == (Some(THROTTLING_QUOTA_EXCEEDED), true, true)
+        );
+    }
+
+    fn assert_send<T: Send>(_: T) {}
+
+    /// A caller can spawn every controller call on a multi-thread runtime.
+    #[test]
+    fn controller_call_futures_are_send() {
+        let _ = |admin: &mut AdminClient, specs: &[CreateTopicSpec], names: &[&str]| {
+            assert_send(admin.create_topics(specs, TopicMutationOptions::default()));
+            assert_send(admin.delete_topics(names, TopicMutationOptions::default()));
+            assert_send(admin.create_partitions(&[], TopicMutationOptions::default()));
+            assert_send(admin.unregister_broker(1));
+            assert_send(admin.update_features(&[], krabka_units::secs(1)));
+            assert_send(admin.alter_partition_assignments(&BTreeMap::new(), krabka_units::secs(1)));
+            assert_send(admin.reconcile_topic_replication_factor("t", 1, krabka_units::secs(1)));
+        };
     }
 }

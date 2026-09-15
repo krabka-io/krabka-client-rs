@@ -43,7 +43,7 @@ use assert2::assert;
 use krabka_client_admin::{
     AdminClient, AlterConfigsOutcome, CreatePartitionsOp, CreatePartitionsOutcome,
     CreateTopicOutcome, CreateTopicSpec, DeleteTopicOutcome, IncrementalAlterOp,
-    TopicConfigOverrides, TopicMetadataEntry,
+    TopicConfigOverrides, TopicMetadataEntry, TopicMutationOptions,
 };
 
 /// Bound on every read-back loop. The broker applies a change and then makes
@@ -96,7 +96,7 @@ async fn create_topic_with_override(admin: &mut AdminClient, topic: &str) {
                 replicas: 1,
                 configs,
             }],
-            krabka_units::secs(RPC_TIMEOUT_SECS),
+            TopicMutationOptions::with_timeout(krabka_units::secs(RPC_TIMEOUT_SECS)),
         )
         .await
         .expect("create_topics");
@@ -106,6 +106,7 @@ async fn create_topic_with_override(admin: &mut AdminClient, topic: &str) {
                 name: topic.to_owned(),
                 topic_id: None,
                 error: None,
+                throttle_time: None,
             }]
     );
 
@@ -133,7 +134,7 @@ async fn expand_partitions(admin: &mut AdminClient, topic: &str) {
                 name: topic.to_owned(),
                 new_total_count: 5,
             }],
-            krabka_units::secs(RPC_TIMEOUT_SECS),
+            TopicMutationOptions::with_timeout(krabka_units::secs(RPC_TIMEOUT_SECS)),
         )
         .await
         .expect("create_partitions");
@@ -142,6 +143,7 @@ async fn expand_partitions(admin: &mut AdminClient, topic: &str) {
             == vec![CreatePartitionsOutcome {
                 name: topic.to_owned(),
                 error: None,
+                throttle_time: None,
             }]
     );
 
@@ -220,7 +222,10 @@ async fn delete_override(admin: &mut AdminClient, topic: &str) {
 /// as error-marked.
 async fn delete_topic(admin: &mut AdminClient, topic: &str) {
     let outcomes = admin
-        .delete_topics(&[topic], krabka_units::secs(RPC_TIMEOUT_SECS))
+        .delete_topics(
+            &[topic],
+            TopicMutationOptions::with_timeout(krabka_units::secs(RPC_TIMEOUT_SECS)),
+        )
         .await
         .expect("delete_topics");
     assert!(
@@ -228,6 +233,7 @@ async fn delete_topic(admin: &mut AdminClient, topic: &str) {
             == vec![DeleteTopicOutcome {
                 name: topic.to_owned(),
                 error: None,
+                throttle_time: None,
             }]
     );
 

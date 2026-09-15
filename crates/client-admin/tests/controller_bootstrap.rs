@@ -22,7 +22,9 @@ use std::{
 
 use assert2::assert;
 use bytes::BytesMut;
-use krabka_client_admin::{AdminClient, AdminError, CreateTopicSpec, TopicConfigOverrides};
+use krabka_client_admin::{
+    AdminClient, AdminError, CreateTopicSpec, TopicConfigOverrides, TopicMutationOptions,
+};
 use krabka_client_core::MockBroker;
 use krabka_protocol::{
     Encode,
@@ -248,7 +250,7 @@ async fn controller_bootstrap_rejects_unadvertised_api_locally() {
                 replicas: 1,
                 configs: BTreeMap::new(),
             }],
-            krabka_units::secs(5),
+            TopicMutationOptions::with_timeout(krabka_units::secs(5)),
         )
         .await;
 
@@ -305,7 +307,7 @@ async fn controller_connection_stays_usable_after_rejection() {
                     replicas: 1,
                     configs: BTreeMap::new(),
                 }],
-                krabka_units::secs(5),
+                TopicMutationOptions::with_timeout(krabka_units::secs(5)),
             )
             .await,
     );

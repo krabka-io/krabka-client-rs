@@ -12,7 +12,7 @@ use std::sync::{
 
 use assert2::check;
 use bytes::BytesMut;
-use krabka_client_admin::{AdminClient, AdminError, CreateTopicSpec};
+use krabka_client_admin::{AdminClient, AdminError, CreateTopicSpec, TopicMutationOptions};
 use krabka_client_core::{
     AuthenticationError, ClientError, MockBroker, MockReply, MockSaslAnswer,
     SaslAuthenticationError,
@@ -180,7 +180,9 @@ async fn create_topics_raises_a_sasl_rejection_on_reconnect() {
                 .await
                 .unwrap();
 
-        let result = admin.create_topics(&[topic()], secs(5)).await;
+        let result = admin
+            .create_topics(&[topic()], TopicMutationOptions::with_timeout(secs(5)))
+            .await;
         let observed = Observed {
             outcome: classify(&result),
             handshakes: handshakes.load(Ordering::SeqCst),
