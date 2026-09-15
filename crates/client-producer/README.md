@@ -33,8 +33,12 @@ consume-process-produce transactions.
 
 ## Kafka Scope
 
-Idempotence is enabled by default. While idempotence is enabled, the producer
-raises `acks=One` to `acks=All` and rejects `acks=Zero`. Transaction APIs cover
+The builder uses the defaults of Kafka's `ProducerConfig`: `acks=All`, a linger
+of 5 ms, idempotence on, and a generated `producer-<n>` client id. It also
+applies Kafka's idempotence rules. If you do not set `enable_idempotence`, an
+`acks` other than `All` or `retries=0` turns idempotence off. If you set it to
+`true`, these settings make `build` fail. A `transactional_id` needs
+idempotence. Transaction APIs cover
 exactly-once production. They also cover the KIP-447 path that commits consumed
 offsets as part of a producer transaction.
 
