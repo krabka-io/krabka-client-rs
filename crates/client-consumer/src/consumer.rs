@@ -541,14 +541,44 @@ pub struct Header {
     pub value: Option<Bytes>,
 }
 
+/// The meaning of a record timestamp, as bit 3 of the v2 record batch
+/// attributes gives it.
+///
+/// Kafka's `TimestampType` also has `NoTimestampType` for v0 messages. This
+/// consumer reads only v2 record batches, so that value cannot occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimestampType {
+    /// The producer set the timestamp when it created the record.
+    CreateTime,
+    /// The broker set the timestamp when it appended the batch to the log.
+    LogAppendTime,
+}
+
+impl From<krabka_protocol::records::TimestampType> for TimestampType {
+    fn from(value: krabka_protocol::records::TimestampType) -> Self {
+        match value {
+            krabka_protocol::records::TimestampType::CreateTime => Self::CreateTime,
+            krabka_protocol::records::TimestampType::LogAppendTime => Self::LogAppendTime,
+        }
+    }
+}
+
 /// One record returned by `Consumer::poll`.
-#[derive(Debug, Clone)]
+///
+/// The key and the value are the raw record bytes. Kafka's
+/// `serializedKeySize` and `serializedValueSize` are their lengths, or -1 for
+/// `None`, so this type does not keep them as separate fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerRecord {
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
     pub leader_epoch: i32,
+    /// The create time, or for a `LogAppendTime` batch the broker append
+    /// time (the batch `max_timestamp`).
     pub timestamp: i64,
+    /// The timestamp type from the attributes of the record batch.
+    pub timestamp_type: TimestampType,
     pub key: Option<Bytes>,
     pub value: Option<Bytes>,
     pub headers: Vec<Header>,

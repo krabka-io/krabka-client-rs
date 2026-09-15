@@ -116,6 +116,7 @@ mod tests {
             offset,
             leader_epoch,
             timestamp: 0,
+            timestamp_type: crate::TimestampType::CreateTime,
             key: None,
             value: Some(Bytes::from(offset.to_string())),
             headers: Vec::new(),

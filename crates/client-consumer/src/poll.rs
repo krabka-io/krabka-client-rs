@@ -12,6 +12,7 @@ use krabka_protocol::{
         list_offsets_request::{self, ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
         list_offsets_response::ListOffsetsResponse,
     },
+    records::{Record, RecordBatch},
 };
 use krabka_units::{
     ByteSize, Time,
@@ -21,7 +22,7 @@ use krabka_units::{
 
 use crate::{
     builder::{AutoOffsetReset, IsolationLevel},
-    consumer::{Consumer, ConsumerRecord, Header},
+    consumer::{Consumer, ConsumerRecord, Header, TimestampType},
     error::ConsumerError,
     fetch_buffer::BufferedPartition,
     position::PartitionPosition,
@@ -141,8 +142,18 @@ fn record_offset(base_offset: i64, offset_delta: i32) -> i64 {
     base_offset + i64::from(offset_delta)
 }
 
-fn record_timestamp(base_timestamp: i64, timestamp_delta: i64) -> i64 {
-    base_timestamp + timestamp_delta
+/// The timestamp and timestamp type of `record` in `batch`.
+///
+/// Kafka's `DefaultRecordBatch` reads `max_timestamp` as the log append time
+/// when the batch attributes say `LogAppendTime`. `DefaultRecord.readFrom`
+/// then gives that time to every record and ignores the record delta.
+pub(crate) fn record_timestamp(batch: &RecordBatch, record: &Record) -> (i64, TimestampType) {
+    let timestamp_type = TimestampType::from(batch.attributes.timestamp_type());
+    let timestamp = match timestamp_type {
+        TimestampType::CreateTime => batch.base_timestamp + record.timestamp_delta,
+        TimestampType::LogAppendTime => batch.max_timestamp,
+    };
+    (timestamp, timestamp_type)
 }
 
 fn build_fetch_topic(
@@ -931,12 +942,14 @@ impl Consumer {
                 if offset < fetch_floor {
                     continue;
                 }
+                let (timestamp, timestamp_type) = record_timestamp(batch, r);
                 records.push_back(ConsumerRecord {
                     topic: topic_name.to_string(),
                     partition: part.partition_index,
                     offset,
                     leader_epoch: batch.partition_leader_epoch,
-                    timestamp: record_timestamp(batch.base_timestamp, r.timestamp_delta),
+                    timestamp,
+                    timestamp_type,
                     key: r.key.clone(),
                     value: r.value.clone(),
                     headers: r
@@ -1420,7 +1433,6 @@ mod offset_advance_tests {
             );
         }
         check!(record_offset(100, 7) == 107);
-        check!(record_timestamp(1000, 33) == 1033);
     }
 
     #[test]
@@ -2903,6 +2915,137 @@ mod partition_error_tests {
         ] {
             let outcome = run_list_offsets_exchange(exchange).await;
             check!(outcome == expected, "case {name}");
+        }
+    }
+
+    /// Kafka's consumer gives each record the timestamp and the timestamp type
+    /// of its record batch. A `LogAppendTime` batch gives every record the
+    /// batch `max_timestamp`.
+    #[tokio::test]
+    async fn fetched_records_take_the_batch_timestamp_type() {
+        let broker = metadata_counting_broker(Arc::default()).await;
+        let consumer = consumer_on(&broker).await;
+        let key: (String, i32) = ("orders".into(), 0);
+
+        for case in &timestamp_cases::CASES {
+            let part = PartitionData {
+                partition_index: 0,
+                records: Some(timestamp_cases::batch(case).into()),
+                ..Default::default()
+            };
+            let offsets = HashMap::from([(key.clone(), timestamp_cases::BASE_OFFSET)]);
+
+            let records: Vec<ConsumerRecord> = consumer
+                .process_partition_records(&offsets, &key, "orders", &part)
+                .map(|partition| partition.records.into_iter().collect())
+                .unwrap_or_default();
+
+            let expected: Vec<ConsumerRecord> = case
+                .expected
+                .iter()
+                .zip(timestamp_cases::BASE_OFFSET..)
+                .zip(timestamp_cases::VALUES)
+                .map(
+                    |(((timestamp, timestamp_type), offset), value)| ConsumerRecord {
+                        topic: "orders".into(),
+                        partition: 0,
+                        offset,
+                        leader_epoch: timestamp_cases::LEADER_EPOCH,
+                        timestamp: *timestamp,
+                        timestamp_type: *timestamp_type,
+                        key: None,
+                        value: Some(bytes::Bytes::from_static(value)),
+                        headers: Vec::new(),
+                    },
+                )
+                .collect();
+            check!(records == expected, "case {}", case.name);
+        }
+    }
+}
+
+/// Record batch timestamp cases that the classic and the share consumer tests
+/// share.
+#[cfg(test)]
+pub(crate) mod timestamp_cases {
+    use bytes::Bytes;
+    use krabka_protocol::records::{Attributes, Record, RecordBatch};
+
+    use crate::consumer::TimestampType;
+
+    pub(crate) const BASE_OFFSET: i64 = 5;
+    pub(crate) const LEADER_EPOCH: i32 = 3;
+    pub(crate) const VALUES: [&[u8]; 2] = [b"v0", b"v1"];
+
+    /// One batch with two records and the timestamps Kafka gives them.
+    pub(crate) struct TimestampCase {
+        pub(crate) name: &'static str,
+        pub(crate) attributes: Attributes,
+        pub(crate) base_timestamp: i64,
+        pub(crate) max_timestamp: i64,
+        pub(crate) timestamp_deltas: [i64; 2],
+        pub(crate) expected: [(i64, TimestampType); 2],
+    }
+
+    pub(crate) const CASES: [TimestampCase; 3] = [
+        TimestampCase {
+            name: "create time adds the delta to the base timestamp",
+            attributes: Attributes(0),
+            base_timestamp: 1000,
+            max_timestamp: 1005,
+            timestamp_deltas: [0, 5],
+            expected: [
+                (1000, TimestampType::CreateTime),
+                (1005, TimestampType::CreateTime),
+            ],
+        },
+        TimestampCase {
+            name: "log append time uses the max timestamp",
+            attributes: Attributes(Attributes::TIMESTAMP_TYPE_BIT),
+            base_timestamp: 1000,
+            max_timestamp: 9000,
+            timestamp_deltas: [0, 5],
+            expected: [
+                (9000, TimestampType::LogAppendTime),
+                (9000, TimestampType::LogAppendTime),
+            ],
+        },
+        TimestampCase {
+            name: "log append time in a transactional batch uses the max timestamp",
+            attributes: Attributes(Attributes::TIMESTAMP_TYPE_BIT | Attributes::TRANSACTIONAL_BIT),
+            base_timestamp: 1000,
+            max_timestamp: 9000,
+            timestamp_deltas: [0, 5],
+            expected: [
+                (9000, TimestampType::LogAppendTime),
+                (9000, TimestampType::LogAppendTime),
+            ],
+        },
+    ];
+
+    pub(crate) fn batch(case: &TimestampCase) -> RecordBatch {
+        RecordBatch {
+            base_offset: BASE_OFFSET,
+            partition_leader_epoch: LEADER_EPOCH,
+            attributes: case.attributes,
+            last_offset_delta: 1,
+            base_timestamp: case.base_timestamp,
+            max_timestamp: case.max_timestamp,
+            records: case
+                .timestamp_deltas
+                .iter()
+                .zip(0..)
+                .zip(VALUES)
+                .map(|((timestamp_delta, offset_delta), value)| Record {
+                    attributes: 0,
+                    timestamp_delta: *timestamp_delta,
+                    offset_delta,
+                    key: None,
+                    value: Some(Bytes::from_static(value)),
+                    headers: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
         }
     }
 }
