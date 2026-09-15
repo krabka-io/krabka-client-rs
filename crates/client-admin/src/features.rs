@@ -111,22 +111,25 @@ impl AdminClient {
     ///
     /// # Errors
     /// Returns a transport, protocol, or top-level broker error. Per-feature
-    /// broker errors remain attached to their outcomes.
+    /// broker errors remain attached to their outcomes. A `NOT_CONTROLLER`
+    /// answer is retried after controller discovery until Kafka's default
+    /// `default.api.timeout.ms` (60 s), then gives `REQUEST_TIMED_OUT` (7).
     pub async fn update_features(
         &mut self,
         updates: &[FeatureUpdate],
         timeout: Time,
     ) -> Result<Vec<FeatureUpdateOutcome>, AdminError> {
-        let first = self.conn.send(update_request(updates, timeout)).await?;
-        if first.error_code != crate::NOT_CONTROLLER {
-            return parse_update_features(first);
+        let mut retry =
+            crate::retry::ControllerRetry::new("UpdateFeatures", crate::retry::KAFKA_ADMIN_RETRY);
+        loop {
+            let response = retry
+                .bounded(self.conn.send(update_request(updates, timeout)))
+                .await?;
+            if response.error_code != crate::NOT_CONTROLLER {
+                return parse_update_features(response);
+            }
+            retry.after_not_controller(self).await?;
         }
-        self.refresh_controller_connection().await?;
-        let second = self.conn.send(update_request(updates, timeout)).await?;
-        if second.error_code == crate::NOT_CONTROLLER {
-            return Err(AdminError::NotControllerExhausted);
-        }
-        parse_update_features(second)
     }
 
     /// Finalize `metadata.version` through `UpdateFeatures`.

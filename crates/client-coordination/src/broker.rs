@@ -72,7 +72,8 @@ use std::{
 
 use async_trait::async_trait;
 use krabka_client_admin::{
-    AdminClient, AdminError, CreateTopicOutcome, CreateTopicSpec, TransactionDescription,
+    AdminClient, AdminError, CreateTopicOutcome, CreateTopicSpec, TopicMutationOptions,
+    TransactionDescription,
 };
 use krabka_client_core::{
     BrokerInfo, BrokerPool, ClientDnsTimeout, ClientError, ClientSecurity, Connection,
@@ -377,7 +378,10 @@ impl BrokerTransport {
             .admin
             .lock()
             .await
-            .create_topics(&[spec], self.request_timeout)
+            .create_topics(
+                &[spec],
+                TopicMutationOptions::with_timeout(self.request_timeout),
+            )
             .await?;
         accept_topic_creation(&outcomes)
     }
@@ -1390,6 +1394,7 @@ mod tests {
                 name: "TEST",
                 message: None,
             }),
+            throttle_time: None,
         };
         check!(accept_topic_creation(&[]).is_ok());
         check!(accept_topic_creation(&[outcome(None)]).is_ok());

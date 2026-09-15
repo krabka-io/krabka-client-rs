@@ -28,6 +28,7 @@ pub mod groups;
 pub mod log_dirs;
 pub mod quorum;
 pub mod quotas;
+mod retry;
 pub mod topics;
 pub mod transactions;
 pub mod users;
@@ -47,7 +48,8 @@ pub use quotas::{QuotaOp, UserQuotaConfig, diff_user_quotas};
 pub use topics::{
     CreatePartitionsOp, CreatePartitionsOutcome, CreateTopicOutcome, CreateTopicSpec,
     DeleteRecordsOp, DeleteRecordsOutcome, DeleteTopicOutcome, PartitionAssignment,
-    PartitionAssignmentOutcome, TopicMetadata, TopicMetadataEntry, TopicReplicationStatus,
+    PartitionAssignmentOutcome, TopicMetadata, TopicMetadataEntry, TopicMutationOptions,
+    TopicReplicationStatus,
 };
 pub use transactions::TransactionDescription;
 pub use users::{
@@ -142,17 +144,17 @@ pub trait AdminClientLike: Send {
     async fn create_topics(
         &mut self,
         specs: &[CreateTopicSpec],
-        timeout: Time,
+        options: TopicMutationOptions,
     ) -> Result<Vec<CreateTopicOutcome>, AdminError>;
     async fn delete_topics(
         &mut self,
         names: &[&str],
-        timeout: Time,
+        options: TopicMutationOptions,
     ) -> Result<Vec<DeleteTopicOutcome>, AdminError>;
     async fn create_partitions(
         &mut self,
         ops: &[CreatePartitionsOp],
-        timeout: Time,
+        options: TopicMutationOptions,
     ) -> Result<Vec<CreatePartitionsOutcome>, AdminError>;
     async fn delete_records(
         &mut self,
@@ -287,23 +289,23 @@ impl AdminClientLike for AdminClient {
     async fn create_topics(
         &mut self,
         specs: &[CreateTopicSpec],
-        timeout: Time,
+        options: TopicMutationOptions,
     ) -> Result<Vec<CreateTopicOutcome>, AdminError> {
-        AdminClient::create_topics(self, specs, timeout).await
+        AdminClient::create_topics(self, specs, options).await
     }
     async fn delete_topics(
         &mut self,
         names: &[&str],
-        timeout: Time,
+        options: TopicMutationOptions,
     ) -> Result<Vec<DeleteTopicOutcome>, AdminError> {
-        AdminClient::delete_topics(self, names, timeout).await
+        AdminClient::delete_topics(self, names, options).await
     }
     async fn create_partitions(
         &mut self,
         ops: &[CreatePartitionsOp],
-        timeout: Time,
+        options: TopicMutationOptions,
     ) -> Result<Vec<CreatePartitionsOutcome>, AdminError> {
-        AdminClient::create_partitions(self, ops, timeout).await
+        AdminClient::create_partitions(self, ops, options).await
     }
     async fn delete_records(
         &mut self,
@@ -516,8 +518,6 @@ pub enum AdminError {
         #[source]
         source: Option<Box<AdminError>>,
     },
-    #[error("controller routing failed after retry")]
-    NotControllerExhausted,
     #[error("broker returned error: api={api} code={code} ({name}){detail}",
             detail = .message.as_deref().map(|m| format!(" {m:?}")).unwrap_or_default())]
     Broker {
@@ -1350,7 +1350,8 @@ impl AdminClient {
 }
 
 /// Kafka error code: the broker is not the controller (KIP-129). The
-/// admin client refreshes its controller endpoint and retries once.
+/// admin client refreshes its controller endpoint and retries until the call
+/// deadline.
 pub(crate) const NOT_CONTROLLER: i16 = 41;
 
 /// Maps a Kafka error code into a static name string for human-friendly
@@ -1361,6 +1362,7 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         -1 => "UNKNOWN_SERVER_ERROR",
         0 => "NONE",
         3 => "UNKNOWN_TOPIC_OR_PARTITION",
+        6 => "NOT_LEADER_OR_FOLLOWER",
         7 => "REQUEST_TIMED_OUT",
         13 => "NETWORK_EXCEPTION",
         14 => "COORDINATOR_LOAD_IN_PROGRESS",
@@ -1368,6 +1370,7 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         16 => "NOT_COORDINATOR",
         17 => "INVALID_TOPIC_EXCEPTION",
         19 => "NOT_ENOUGH_REPLICAS",
+        27 => "REBALANCE_IN_PROGRESS",
         31 => "CLUSTER_AUTHORIZATION_FAILED",
         33 => "UNSUPPORTED_SASL_MECHANISM",
         34 => "ILLEGAL_SASL_STATE",
@@ -1390,6 +1393,7 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         83 => "ELIGIBLE_LEADERS_NOT_AVAILABLE",
         84 => "ELECTION_NOT_NEEDED",
         87 => "INVALID_RECORD",
+        89 => "THROTTLING_QUOTA_EXCEEDED",
         90 => "PRODUCER_FENCED",
         91 => "RESOURCE_NOT_FOUND",
         92 => "DUPLICATE_RESOURCE",

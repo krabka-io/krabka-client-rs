@@ -57,7 +57,7 @@ Create a topic and fetch its metadata:
 ```rust,no_run
 use std::collections::BTreeMap;
 
-use krabka_client_admin::{AdminClient, CreateTopicSpec};
+use krabka_client_admin::{AdminClient, CreateTopicSpec, TopicMutationOptions};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let mut admin = AdminClient::connect(&["127.0.0.1:9092".to_string()]).await?;
@@ -70,7 +70,7 @@ admin
             replicas: 1,
             configs: BTreeMap::new(),
         }],
-        30_000,
+        TopicMutationOptions::default(),
     )
     .await?;
 

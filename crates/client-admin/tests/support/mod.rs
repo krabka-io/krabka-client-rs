@@ -192,7 +192,7 @@ pub async fn create_topic(admin: &mut AdminClient, name: &str, partitions: i32) 
                 replicas: 1,
                 configs: std::collections::BTreeMap::new(),
             }],
-            krabka_units::secs(30),
+            krabka_client_admin::TopicMutationOptions::with_timeout(krabka_units::secs(30)),
         )
         .await
         .expect("create_topics");

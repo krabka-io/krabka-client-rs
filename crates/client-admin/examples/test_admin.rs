@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use krabka_client_admin::{AdminClient, CreateTopicSpec};
+use krabka_client_admin::{AdminClient, CreateTopicSpec, TopicMutationOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 replicas: 1,
                 configs: BTreeMap::new(),
             }],
-            krabka_units::secs(30),
+            TopicMutationOptions::with_timeout(krabka_units::secs(30)),
         )
         .await?;
     println!("Topic 'test-topic' created successfully! Fetching metadata...");
