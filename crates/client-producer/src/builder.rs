@@ -140,6 +140,11 @@ pub const DEFAULT_PRODUCER_MAX_BLOCK: Duration = Duration::from_mins(1);
 /// Kafka's `buffer.memory` default is 33554432 (32 MiB).
 pub const DEFAULT_PRODUCER_BUFFER_MEMORY: usize = 32 * 1024 * 1024;
 
+/// Default largest serialized record that `send` accepts, in bytes.
+///
+/// Kafka's `max.request.size` default is 1048576 (1 MiB).
+pub const DEFAULT_PRODUCER_MAX_REQUEST_SIZE: usize = 1024 * 1024;
+
 /// Bounded backlog for coalescing internal sender wakeups.
 const SENDER_WAKE_CHANNEL_CAPACITY: usize = 16;
 
@@ -368,6 +373,18 @@ impl Default for ProducerRetryPolicy {
         )
         .expect("default producer retry policy is valid")
     }
+}
+
+/// Validate `max_request_size`. Kafka defines `max.request.size` as an `INT`
+/// with `atLeast(0)`, so the value must fit an `i32`.
+fn validated_max_request_size(max_request_size: usize) -> Result<usize, ProducerError> {
+    Ok(
+        MinMaxUsize::<0, { i32::MAX as usize }>::new(max_request_size)
+            .map_err(|error| {
+                ProducerError::InvalidConfig(format!("producer max request size: {error}"))
+            })?
+            .into_value(),
+    )
 }
 
 fn validated_duration(value: Duration, name: &str) -> Result<Duration, String> {
@@ -634,6 +651,11 @@ impl Producer {
     /// `GetTelemetrySubscriptions` or `PushTelemetry`. Kafka's
     /// `enable.metrics.push` is `true` by default.
     ///
+    /// `send` fails a record whose serialized size is larger than
+    /// `max_request_size` (default 1 MiB, Kafka's `max.request.size`) or
+    /// larger than `buffer_memory` with [`ProducerError::RecordTooLarge`], and
+    /// sends no request for it.
+    ///
     /// When `client_id` is not set, the client id is
     /// `producer-<transactional_id>`, or `producer-<n>` with a process-wide
     /// sequence number.
@@ -681,6 +703,7 @@ impl Producer {
         #[builder(default = DEFAULT_PRODUCER_MAX_IN_FLIGHT)] max_in_flight_per_connection: usize,
         #[builder(default = DEFAULT_PRODUCER_MAX_BLOCK)] max_block: Duration,
         #[builder(default = DEFAULT_PRODUCER_BUFFER_MEMORY)] buffer_memory: usize,
+        #[builder(default = DEFAULT_PRODUCER_MAX_REQUEST_SIZE)] max_request_size: usize,
         #[builder(default)]
         metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
         #[builder(default = krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
@@ -735,6 +758,7 @@ impl Producer {
         let max_in_flight_per_connection = throughput_policy.max_in_flight();
         let buffer_pool =
             BufferPool::new(buffer_memory, batch_size).map_err(ProducerError::InvalidConfig)?;
+        let max_request_size = validated_max_request_size(max_request_size)?;
 
         let retry_policy = ProducerRetryPolicy::new(
             request_timeout,
@@ -882,6 +906,7 @@ impl Producer {
             flush_timeout,
             max_block,
             buffer_pool,
+            max_request_size,
             max_in_flight: max_in_flight_per_connection,
             metadata_cache,
             metadata_refresh: crate::metadata_wait::MetadataRefresh::default(),
@@ -2061,6 +2086,10 @@ mod security_arg_tests {
             (
                 invalid!(max_in_flight_per_connection, 0),
                 "producer max in flight",
+            ),
+            (
+                invalid!(max_request_size, i32::MAX as usize + 1),
+                "producer max request size",
             ),
         ] {
             assert!(

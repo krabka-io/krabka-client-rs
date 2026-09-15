@@ -258,6 +258,53 @@ pub(crate) fn approx_record_size(
     n
 }
 
+/// The size of the header of a v2 `RecordBatch`. Kafka's
+/// `DefaultRecordBatch.RECORD_BATCH_OVERHEAD`.
+const RECORD_BATCH_OVERHEAD: usize = 61;
+
+/// The largest size of the fixed fields of a v2 record: the length, the
+/// attributes, the offset delta and the timestamp delta. Kafka's
+/// `DefaultRecord.MAX_RECORD_OVERHEAD`.
+const MAX_RECORD_OVERHEAD: usize = 21;
+
+/// Kafka's upper bound of the size of a batch that holds only this record.
+///
+/// Kafka's `KafkaProducer.doSend` compares this value with `max.request.size`
+/// and `buffer.memory` (`ensureValidRecordSize`). It is
+/// `AbstractRecords.estimateSizeInBytesUpperBound` for magic v2, which is
+/// `DefaultRecordBatch.estimateBatchSizeUpperBound`: the batch header, the
+/// largest record overhead, and `DefaultRecord.sizeOf` of the key, the value
+/// and the headers. A null key, value or header value takes one varint byte.
+pub(crate) fn record_size_upper_bound(
+    key: Option<&[u8]>,
+    value: Option<&[u8]>,
+    headers: &[Header],
+) -> usize {
+    let mut size = RECORD_BATCH_OVERHEAD + MAX_RECORD_OVERHEAD;
+    size += nullable_bytes_size(key.map(<[u8]>::len));
+    size += nullable_bytes_size(value.map(<[u8]>::len));
+    size += varint_size(headers.len());
+    for header in headers {
+        size += varint_size(header.key.len()) + header.key.len();
+        size += nullable_bytes_size(header.value.as_ref().map(Bytes::len));
+    }
+    size
+}
+
+/// The size of a length-prefixed byte field. A null field is the varint -1,
+/// which takes one byte.
+fn nullable_bytes_size(len: Option<usize>) -> usize {
+    len.map_or(1, |len| varint_size(len) + len)
+}
+
+/// The size of the zig-zag varint of the non-negative `value`. Kafka's
+/// `ByteUtils.sizeOfVarint`.
+fn varint_size(value: usize) -> usize {
+    let zigzag = u64::try_from(value).unwrap_or(u64::MAX >> 1) << 1;
+    let bits = u64::BITS - (zigzag | 1).leading_zeros();
+    usize::try_from(bits.div_ceil(7)).unwrap_or(usize::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use assert2::check;
@@ -334,6 +381,78 @@ mod tests {
         a.seal_current();
 
         assert2::assert!((a.current.is_none(), a.ready.is_empty()) == (true, true));
+    }
+
+    /// Each row is Kafka's `AbstractRecords.estimateSizeInBytesUpperBound`
+    /// for magic v2: 61 bytes of batch header and 21 bytes of record
+    /// overhead, then each field. A varint takes one byte up to 63, two bytes
+    /// up to 8191, and so on, because the zig-zag form doubles the value.
+    #[test]
+    fn record_size_upper_bound_matches_kafka_estimate() {
+        let header = |key: &str, value: Option<&'static [u8]>| Header {
+            key: key.to_owned(),
+            value: value.map(Bytes::from_static),
+        };
+        let value_63 = [0u8; 63];
+        let value_64 = [0u8; 64];
+        let value_8192 = [0u8; 8192];
+        for (name, key, value, headers, expected) in [
+            ("null key and value", None, None, vec![], 82 + 1 + 1 + 1),
+            (
+                "empty key and value",
+                Some(&b""[..]),
+                Some(&b""[..]),
+                vec![],
+                85,
+            ),
+            (
+                "key and value",
+                Some(&b"key"[..]),
+                Some(&b"value"[..]),
+                vec![],
+                82 + (1 + 3) + (1 + 5) + 1,
+            ),
+            (
+                "63 value bytes",
+                None,
+                Some(&value_63[..]),
+                vec![],
+                82 + 1 + 64 + 1,
+            ),
+            (
+                "64 value bytes",
+                None,
+                Some(&value_64[..]),
+                vec![],
+                82 + 1 + 66 + 1,
+            ),
+            (
+                "8192 value bytes",
+                None,
+                Some(&value_8192[..]),
+                vec![],
+                82 + 1 + 8195 + 1,
+            ),
+            (
+                "headers with and without a value",
+                None,
+                None,
+                vec![header("h1", Some(b"abc")), header("empty", None)],
+                82 + 1 + 1 + 1 + (1 + 2 + 1 + 3) + (1 + 5 + 1),
+            ),
+            (
+                "multi-byte header key counts UTF-8 bytes",
+                None,
+                None,
+                vec![header("é", None)],
+                82 + 1 + 1 + 1 + (1 + 2 + 1),
+            ),
+        ] {
+            assert2::assert!(
+                record_size_upper_bound(key, value, &headers) == expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]

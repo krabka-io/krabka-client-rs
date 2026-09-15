@@ -31,13 +31,16 @@ pub enum ProducerError {
     #[error("batch too large: {batch_size} > max")]
     BatchTooLarge { batch_size: usize },
 
-    /// The record is larger than the whole buffer memory. Kafka's
+    /// The record is larger than a limit of the producer. Kafka's
     /// `KafkaProducer.ensureValidRecordSize` throws `RecordTooLargeException`
-    /// with the same message.
-    #[error(
-        "The message is {record_size} bytes when serialized which is larger than the total memory buffer you have configured with the buffer_memory configuration."
-    )]
-    RecordTooLarge { record_size: usize },
+    /// with the same message for each limit.
+    #[error("{}", record_too_large_message(*record_size, *limit))]
+    RecordTooLarge {
+        /// Kafka's upper bound of the serialized size of the record, in bytes.
+        record_size: usize,
+        /// The limit that the record is larger than.
+        limit: RecordSizeLimit,
+    },
 
     /// `send` waited `max_block` (the part of `max_block` that the metadata
     /// wait left) for buffer memory, and the memory did not become free.
@@ -98,6 +101,27 @@ pub enum ProducerError {
         "transaction outcome is unknown; call init_transactions before sending or beginning another transaction"
     )]
     RecoveryRequired,
+}
+
+/// The producer limit that a record is larger than.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordSizeLimit {
+    /// The `max_request_size` setting, in bytes. Kafka's `max.request.size`.
+    MaxRequestSize(usize),
+    /// The `buffer_memory` setting. Kafka's `buffer.memory`.
+    BufferMemory,
+}
+
+/// Kafka's `KafkaProducer.ensureValidRecordSize` messages.
+fn record_too_large_message(record_size: usize, limit: RecordSizeLimit) -> String {
+    match limit {
+        RecordSizeLimit::MaxRequestSize(max_request_size) => format!(
+            "The message is {record_size} bytes when serialized which is larger than {max_request_size}, which is the value of the max_request_size configuration."
+        ),
+        RecordSizeLimit::BufferMemory => format!(
+            "The message is {record_size} bytes when serialized which is larger than the total memory buffer you have configured with the buffer_memory configuration."
+        ),
+    }
 }
 
 /// Kafka's `KafkaProducer.getErrorMessage`.

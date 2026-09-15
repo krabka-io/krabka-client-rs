@@ -42,11 +42,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::{
-    accumulator::{Accumulator, AccumulatorMap, AppendResult, approx_record_size},
+    accumulator::{
+        Accumulator, AccumulatorMap, AppendResult, approx_record_size, record_size_upper_bound,
+    },
     buffer_pool::BufferPool,
     builder::{ProducerFlushTimeout, send_init_producer_id},
     compression::Compression,
-    error::ProducerError,
+    error::{ProducerError, RecordSizeLimit},
     metadata_wait::{MetadataRefresh, MetadataWait, metadata_request},
     partitioner::{BuiltInPartitioner, StickyPartition, TopicPartitions},
     record::{ProducerRecord, RecordMetadata},
@@ -251,6 +253,9 @@ pub struct Producer {
     /// The buffer memory of the batches. `send` waits for it, as Kafka's
     /// `RecordAccumulator.append` waits for its `BufferPool`.
     pub(crate) buffer_pool: BufferPool,
+    /// The largest serialized record that `send` accepts, in bytes. Kafka's
+    /// `max.request.size`.
+    pub(crate) max_request_size: usize,
     #[allow(dead_code)]
     pub(crate) max_in_flight: usize,
     pub(crate) metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
@@ -1577,15 +1582,25 @@ impl Producer {
         );
         let remaining_block = self.max_block.saturating_sub(waited_on_metadata);
 
-        // Kafka's `KafkaProducer.ensureValidRecordSize`.
+        // Kafka's `KafkaProducer.ensureValidRecordSize`. It compares its
+        // upper bound of the serialized size with `max.request.size` first,
+        // and then with `buffer.memory`.
+        let serialized_size = record_size_upper_bound(
+            record.key.as_deref(),
+            record.value.as_deref(),
+            &record.headers,
+        );
+        if let Some(limit) = self.record_size_limit(serialized_size) {
+            return failed(ProducerError::RecordTooLarge {
+                record_size: serialized_size,
+                limit,
+            });
+        }
         let record_size = approx_record_size(
             record.key.as_deref(),
             record.value.as_deref(),
             &record.headers,
         );
-        if record_size > self.buffer_pool.total() {
-            return failed(ProducerError::RecordTooLarge { record_size });
-        }
 
         let timestamp = record.timestamp_ms.unwrap_or_else(current_millis);
         let mut memory = None;
@@ -1739,6 +1754,18 @@ impl Producer {
             return self.partitioner.is_changed(topic, sticky);
         }
         false
+    }
+
+    /// The limit that a record of `serialized_size` bytes is larger than, in
+    /// the order of Kafka's `KafkaProducer.ensureValidRecordSize`.
+    fn record_size_limit(&self, serialized_size: usize) -> Option<RecordSizeLimit> {
+        if serialized_size > self.max_request_size {
+            Some(RecordSizeLimit::MaxRequestSize(self.max_request_size))
+        } else if serialized_size > self.buffer_pool.total() {
+            Some(RecordSizeLimit::BufferMemory)
+        } else {
+            None
+        }
     }
 
     /// The transaction generation that a send takes in `state`: the recovery
@@ -2777,7 +2804,10 @@ mod tests {
             .client_id(CLIENT_ID)
             .enable_idempotence(false)
             .batch_size(64)
-            .buffer_memory(64)
+            // Kafka's size check counts a record of 40 value bytes as 125
+            // bytes, so the memory must hold that. Two batches of 64 bytes
+            // do not fit in it, so the second record still waits for memory.
+            .buffer_memory(125)
             .linger(Duration::from_secs(30))
             .max_block(Duration::from_secs(2))
             .build()
@@ -2810,58 +2840,167 @@ mod tests {
         assert2::assert!(delivered == Ok((Ok(()), Ok(()))));
     }
 
-    /// Kafka's `KafkaProducer.ensureValidRecordSize` fails a record that is
-    /// larger than `buffer.memory` before it takes any memory.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn send_fails_a_record_larger_than_buffer_memory() {
-        let (mock, _) = three_partition_broker(Arc::new(AtomicBool::new(true))).await;
-        let producer = Producer::builder()
-            .bootstrap(mock.addr.to_string())
-            .client_id(CLIENT_ID)
-            .enable_idempotence(false)
-            .batch_size(64)
-            .buffer_memory(1024)
-            .build()
-            .await
-            .expect("producer connects to mock broker");
-        let record = |bytes: usize| ProducerRecord {
-            topic: METADATA_TOPIC.into(),
-            partition: Some(0),
-            value: Some(Bytes::from(vec![0; bytes])),
-            ..Default::default()
-        };
+    /// The limits of one row of
+    /// `send_fails_a_record_larger_than_max_request_size_or_buffer_memory`.
+    struct SizeLimits {
+        max_request_size: Option<usize>,
+        buffer_memory: usize,
+    }
 
-        let mut outcomes = Vec::new();
-        for bytes in [1_008, 1_009] {
+    /// What one send of a large record gave.
+    #[derive(Debug, PartialEq, Eq)]
+    struct LargeRecordOutcome {
+        /// The value bytes of the record.
+        value_bytes: usize,
+        /// Delivered, or the error text.
+        delivered: Result<(), String>,
+        /// The Produce requests that the broker got for the record.
+        produce_requests: usize,
+    }
+
+    /// Kafka's `KafkaProducer.ensureValidRecordSize` fails a record whose
+    /// serialized size is larger than `max.request.size`, and then one that
+    /// is larger than `buffer.memory`, before the accumulator. The size is
+    /// Kafka's upper bound: 61 bytes of batch header, 21 bytes of record
+    /// overhead, one byte for the null key, the varint length and the value,
+    /// and one byte for the header count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_fails_a_record_larger_than_max_request_size_or_buffer_memory() {
+        const MIB: usize = 1024 * 1024;
+        let max_request_error = |size: usize, limit: usize| {
+            format!(
+                "The message is {size} bytes when serialized which is larger than {limit}, \
+                 which is the value of the max_request_size configuration."
+            )
+        };
+        let buffer_memory_error = |size: usize| {
+            format!(
+                "The message is {size} bytes when serialized which is larger than the total \
+                 memory buffer you have configured with the buffer_memory configuration."
+            )
+        };
+        let default_limits = || SizeLimits {
+            max_request_size: None,
+            buffer_memory: 32 * MIB,
+        };
+        // A value of 1048489 bytes has a 3-byte varint length, so the record
+        // is 87 + 1048489 = 1048576 bytes. A value of 938 bytes has a 2-byte
+        // varint length, so the record is 86 + 938 = 1024 bytes.
+        let cases = [
+            (
+                "record of max_request_size bytes, default limit",
+                default_limits(),
+                1_048_489,
+                LargeRecordOutcome {
+                    value_bytes: 1_048_489,
+                    delivered: Ok(()),
+                    produce_requests: 1,
+                },
+            ),
+            (
+                "one byte over max_request_size, default limit",
+                default_limits(),
+                1_048_490,
+                LargeRecordOutcome {
+                    value_bytes: 1_048_490,
+                    delivered: Err(max_request_error(1_048_577, MIB)),
+                    produce_requests: 0,
+                },
+            ),
+            (
+                "record of buffer_memory bytes",
+                SizeLimits {
+                    max_request_size: None,
+                    buffer_memory: 1024,
+                },
+                938,
+                LargeRecordOutcome {
+                    value_bytes: 938,
+                    delivered: Ok(()),
+                    produce_requests: 1,
+                },
+            ),
+            (
+                "one byte over buffer_memory",
+                SizeLimits {
+                    max_request_size: None,
+                    buffer_memory: 1024,
+                },
+                939,
+                LargeRecordOutcome {
+                    value_bytes: 939,
+                    delivered: Err(buffer_memory_error(1025)),
+                    produce_requests: 0,
+                },
+            ),
+            (
+                "over both limits reports max_request_size first",
+                SizeLimits {
+                    max_request_size: Some(500),
+                    buffer_memory: 400,
+                },
+                939,
+                LargeRecordOutcome {
+                    value_bytes: 939,
+                    delivered: Err(max_request_error(1025, 500)),
+                    produce_requests: 0,
+                },
+            ),
+            (
+                "a larger max_request_size accepts a larger record",
+                SizeLimits {
+                    max_request_size: Some(2 * MIB),
+                    buffer_memory: 32 * MIB,
+                },
+                1_048_490,
+                LargeRecordOutcome {
+                    value_bytes: 1_048_490,
+                    delivered: Ok(()),
+                    produce_requests: 1,
+                },
+            ),
+        ];
+
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, limits, value_bytes, expected) in cases {
+            let (mock, produce_count) =
+                three_partition_broker(Arc::new(AtomicBool::new(true))).await;
+            let producer = Producer::builder()
+                .bootstrap(mock.addr.to_string())
+                .client_id(CLIENT_ID)
+                .enable_idempotence(false)
+                .batch_size(64)
+                .buffer_memory(limits.buffer_memory)
+                .maybe_max_request_size(limits.max_request_size)
+                .build()
+                .await
+                .expect("producer connects to mock broker");
             let delivered = producer
-                .send(record(bytes))
+                .send(ProducerRecord {
+                    topic: METADATA_TOPIC.into(),
+                    partition: Some(0),
+                    value: Some(Bytes::from(vec![0; value_bytes])),
+                    ..Default::default()
+                })
                 .await
                 .await
                 .expect("the producer answers the send")
                 .map(drop)
                 .map_err(|error| error.to_string());
-            outcomes.push((bytes, delivered));
+            mock.stop();
+            drop(producer);
+            actual.push((
+                name,
+                LargeRecordOutcome {
+                    value_bytes,
+                    delivered,
+                    produce_requests: produce_count.load(Ordering::SeqCst),
+                },
+            ));
+            wanted.push((name, expected));
         }
-        mock.stop();
-        drop(producer);
-
-        // A record of 1008 value bytes is 1024 bytes in the estimate: 8 bytes
-        // of overhead and 4 bytes each for the key and the value length.
-        assert2::assert!(
-            outcomes
-                == vec![
-                    (1_008, Ok(())),
-                    (
-                        1_009,
-                        Err(
-                            "The message is 1025 bytes when serialized which is larger than \
-                             the total memory buffer you have configured with the \
-                             buffer_memory configuration."
-                                .to_owned()
-                        )
-                    ),
-                ]
-        );
+        assert2::assert!(actual == wanted);
     }
 
     /// Fill the buffer memory with two batches of 16 MiB for partitions 0 and
