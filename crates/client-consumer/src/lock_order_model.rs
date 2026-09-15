@@ -74,6 +74,8 @@
 //!   apply the offsets. No region takes a second lock.
 //! - `validate_positions` (validate.rs): **N→P** snapshot held together,
 //!   released before the RPC; then **P alone** in the post-RPC apply.
+//!   `apply_truncation` (poll.rs) then holds N and takes AP
+//!   (`AutoCommit::reset_polled`): **N→AP**.
 //! - `poll` fetch-build (poll.rs, the `by_leader` snapshot): **N→P** held
 //!   together, released before the Fetch `.await`.
 //! - `poll` post-fetch loop (poll.rs): A `assigned.clone()` (released) → **N
@@ -82,8 +84,9 @@
 //!   is already locked, positions acquired second"). VERIFIED: there is **no
 //!   P→N inversion** on the post-fetch path. N released before the metadata
 //!   refresh `.await`. Updating the fetched high watermark adds **N→E**.
+//!   Before N is released, `AutoCommit::reset_polled` adds **N→AP**.
 //!   After N is released, `recover_out_of_range` takes **P alone** for the
-//!   leader routes, and then **N alone** to apply the log starts.
+//!   leader routes, and then **N→AP** to apply the log starts.
 //! - `at_log_end` (consumer.rs): **A→N→E**.
 //!
 //! ### coordinator task (`coordinator.rs`)
@@ -115,9 +118,10 @@
 //!
 //! Collecting every "hold L1 while acquiring L2" edge actually observed:
 //!   PS → N, N → P, N → E, A → N, A → CI, CS → CI, CI → N, CS → N, CS → P,
-//!   CS → T, CS → ND, CS → AP.
+//!   CS → T, CS → ND, CS → AP, N → AP.
 //! The resulting partial order is acyclic: `A < CI < N < P`,
-//! `CS < CI < N < P`, `PS < N < P`, `CS < T`, `CS < ND`, and `CS < AP`.
+//! `CS < CI < N < P`, `PS < N < P`, `CS < T`, `CS < ND`, `CS < AP`, and
+//! `N < AP`. No region takes a lock while it holds AP.
 //! This is acyclic ⇒ the prediction is **deadlock-free**, and the model proves
 //! it exhaustively across all task interleavings.
 
@@ -267,6 +271,12 @@ fn poll_program() -> Vec<Op> {
         // … then P alone post-RPC (validate_positions apply).
         Acquire(P),
         Release(P),
+        // apply_truncation (poll.rs): N, and under it AP
+        // (AutoCommit::reset_polled).
+        Acquire(N),
+        Acquire(AP),
+        Release(AP),
+        Release(N),
         // --- poll fetch-build (poll.rs `by_leader` snapshot): N→P, dropped
         //     before the Fetch. ---
         Acquire(N),
@@ -285,12 +295,18 @@ fn poll_program() -> Vec<Op> {
         Release(P),
         Acquire(E),
         Release(E),
+        // AutoCommit::reset_polled before the offsets guard drops.
+        Acquire(AP),
+        Release(AP),
         Release(N),
         // recover_out_of_range (poll.rs), after N is released: P alone
-        // (`list_offsets` routes), then N alone (apply the log starts).
+        // (`list_offsets` routes), then N and under it AP (apply the log
+        // starts, AutoCommit::reset_polled).
         Acquire(P),
         Release(P),
         Acquire(N),
+        Acquire(AP),
+        Release(AP),
         Release(N),
     ]
 }

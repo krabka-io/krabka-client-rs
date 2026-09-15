@@ -480,6 +480,36 @@ impl AutoCommit {
         self.commit_parked.subscribe()
     }
 
+    /// Move the positions for the commit before a `JoinGroup` after `poll`
+    /// resets fetch positions.
+    ///
+    /// Kafka's `allConsumed` reads the current position, so a reset in `poll`
+    /// changes what `onJoinPrepare` commits. `Some(offset)` is a truncation or
+    /// an out-of-range reset: the commit sends that offset. The position of a
+    /// reset has no known leader epoch here, so the commit sends none (`-1`).
+    /// `None` is a reset that waits for `ListOffsets`: the partition has no
+    /// valid position, and the commit skips it, as `allConsumed` does. A
+    /// partition without a position of the latest `poll` stays without one.
+    pub(crate) async fn reset_polled(
+        &self,
+        resets: impl IntoIterator<Item = ((String, i32), Option<i64>)>,
+    ) {
+        let mut polled = self.polled.lock().await;
+        for (partition, offset) in resets {
+            match offset {
+                Some(offset) => {
+                    if let Some(position) = polled.get_mut(&partition) {
+                        position.offset = offset;
+                        position.leader_epoch = -1;
+                    }
+                }
+                None => {
+                    polled.remove(&partition);
+                }
+            }
+        }
+    }
+
     /// Raise the positions for the commit before a `JoinGroup` to the offsets
     /// that a commit sends. Call it while you hold `commit_serialization`,
     /// before the commit sends its request.
