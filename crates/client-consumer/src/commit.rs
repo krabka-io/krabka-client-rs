@@ -410,10 +410,6 @@ fn retain_continuously_owned(
     pending.retain(|partition, (_, ownership_id)| current.get(partition) == Some(ownership_id));
 }
 
-/// Kafka's `ConsumerUtils.DEFAULT_CLOSE_TIMEOUT_MS`. It bounds the synchronous
-/// auto commit in [`Consumer::close`].
-const AUTO_COMMIT_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// The committable position of one owned partition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ConsumedPosition {
@@ -932,7 +928,7 @@ impl Consumer {
     /// This method commits the current positions and waits for the result, up
     /// to Kafka's default close timeout. A failure goes to the log, and `close`
     /// continues.
-    pub(crate) async fn auto_commit_on_close(&self) {
+    pub(crate) async fn auto_commit_on_close(&self, deadline: tokio::time::Instant) {
         if self.auto_commit.is_none() {
             return;
         }
@@ -959,7 +955,7 @@ impl Consumer {
             self.commit_pending_offsets(pending, RecordSent::BeforeSend)
                 .await
         };
-        match tokio::time::timeout(AUTO_COMMIT_CLOSE_TIMEOUT, commit).await {
+        match tokio::time::timeout_at(deadline, commit).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(group = %self.group_id, %error, "synchronous auto commit on close failed");
@@ -1783,6 +1779,9 @@ mod tests {
             fetches: crate::poll::Fetches::default(),
             client_rack: None,
             metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
+            request_timeout: krabka_units::secs(30),
+            wakeup: crate::control::WakeupHandle::default(),
+            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().0,
             default_api_timeout: crate::consumer::DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
             paused: std::sync::Mutex::default(),
             auto_offset_reset: AutoOffsetReset::Latest,
@@ -1793,7 +1792,7 @@ mod tests {
             max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
             fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
             close_operation: tokio::sync::watch::Sender::new(
-                crate::GroupMembershipOperation::Default,
+                crate::control::CloseRequest::default(),
             ),
             rebalance_listener: None,
             listener_calls: tokio::sync::mpsc::unbounded_channel().1,

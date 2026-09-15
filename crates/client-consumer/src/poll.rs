@@ -328,9 +328,6 @@ impl Drop for Fetches {
     }
 }
 
-/// The time to wait for the fetch sessions to close in `close`.
-const FETCH_SESSION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// `ListOffsets` timestamp that asks for the log end offset.
 pub(crate) const LATEST_TIMESTAMP: i64 = -1;
 /// `ListOffsets` timestamp that asks for the log start offset.
@@ -607,12 +604,18 @@ impl Consumer {
             + std::time::Duration::from_millis(
                 u64::try_from(timeout.millis_i64_trunc()).unwrap_or(0),
             );
+        // Kafka's `ConsumerNetworkClient.maybeTriggerWakeup`: a pending
+        // wakeup fails the `poll` before it blocks.
+        if self.wakeup.take() {
+            return Err(ConsumerError::Wakeup);
+        }
         if !self.prepare_poll().await? {
             return Ok(Vec::new());
         }
         if !self.wait_for_rebalance(deadline).await? {
             return Ok(Vec::new());
         }
+        let wakeup = self.wakeup.clone();
 
         // Records of an earlier fetch come first, without a new Fetch.
         let buffered = self.drain_fetch_buffer().await;
@@ -625,8 +628,10 @@ impl Consumer {
         let assigned = self.assigned.lock().await.clone();
         tracing::Span::current().record("assigned_partitions", assigned.len());
         if assigned.is_empty() {
-            tokio::time::sleep_until(deadline).await;
-            return Ok(Vec::new());
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => return Ok(Vec::new()),
+                () = wakeup.woken() => return Err(ConsumerError::Wakeup),
+            }
         }
 
         let by_leader = self.group_fetches(&assigned).await;
@@ -635,10 +640,18 @@ impl Consumer {
         self.send_fetches(by_leader, &topic_ids);
         self.fetches.collect_ready();
         if self.fetches.in_flight.is_empty() && self.fetches.ready.is_empty() {
-            self.wait_without_fetches(&assigned, deadline).await;
-            return Ok(Vec::new());
+            tokio::select! {
+                () = self.wait_without_fetches(&assigned, deadline) => return Ok(Vec::new()),
+                () = wakeup.woken() => return Err(ConsumerError::Wakeup),
+            }
         }
-        self.wait_for_fetches(deadline).await;
+        tokio::select! {
+            biased;
+            () = self.wait_for_fetches(deadline) => {}
+            // The Fetch requests stay in flight. The next `poll` takes their
+            // results.
+            () = wakeup.woken() => return Err(ConsumerError::Wakeup),
+        }
         let responses = self.take_completed_fetches(&topic_ids).await?;
 
         self.process_fetch_responses(responses, &topic_ids).await?;
@@ -683,6 +696,7 @@ impl Consumer {
         // `poll` signalled it. Signal again, so that this `poll` starts the
         // join that it waits for, as Kafka's `ensureActiveGroup` does.
         crate::coordinator::note_poll(&self.poll_signal);
+        let wakeup = self.wakeup.clone();
         let joined = loop {
             // A slow callback must not keep this `poll` past its timeout. The
             // next `poll` runs the calls that come later.
@@ -700,6 +714,12 @@ impl Consumer {
                     break true;
                 }
                 () = tokio::time::sleep_until(deadline) => break false,
+                // A wakeup ends the wait between two callbacks, never inside
+                // one.
+                () = wakeup.woken() => {
+                    first_error.get_or_insert(ConsumerError::Wakeup);
+                    break false;
+                }
             };
             match call {
                 Some(call) => {
@@ -709,12 +729,18 @@ impl Consumer {
                 }
                 // No listener calls can come: wait for the join alone.
                 None => {
-                    break tokio::time::timeout_at(
-                        deadline,
-                        self.rebalance_pending.wait_for(|pending| !*pending),
-                    )
-                    .await
-                    .is_ok();
+                    break tokio::select! {
+                        biased;
+                        joined = self.rebalance_pending.wait_for(|pending| !*pending) => {
+                            let _ = joined;
+                            true
+                        }
+                        () = tokio::time::sleep_until(deadline) => false,
+                        () = wakeup.woken() => {
+                            first_error.get_or_insert(ConsumerError::Wakeup);
+                            false
+                        }
+                    };
                 }
             }
         };
@@ -1219,7 +1245,7 @@ impl Consumer {
     /// Close the fetch session of each broker. Kafka's `AbstractFetch.close`
     /// sends a Fetch with the session id, epoch `-1` and no partitions to each
     /// broker that holds a session.
-    pub(crate) async fn close_fetch_sessions(&mut self) {
+    pub(crate) async fn close_fetch_sessions(&mut self, timeout: std::time::Duration) {
         let max_wait_ms = crate::consumer::protocol_millis_i32(self.fetch_max_wait);
         let closes: Vec<_> = self
             .fetches
@@ -1251,11 +1277,7 @@ impl Consumer {
                 }
             })
             .collect();
-        let _ = tokio::time::timeout(
-            FETCH_SESSION_CLOSE_TIMEOUT,
-            futures_util::future::join_all(closes),
-        )
-        .await;
+        let _ = tokio::time::timeout(timeout, futures_util::future::join_all(closes)).await;
     }
 
     async fn group_fetches(&mut self, assigned: &[(String, i32)]) -> FetchByLeader {
@@ -2588,6 +2610,9 @@ pub(crate) mod partition_error_tests {
             fetches: crate::poll::Fetches::default(),
             client_rack: None,
             metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
+            request_timeout: krabka_units::secs(30),
+            wakeup: crate::control::WakeupHandle::default(),
+            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().0,
             default_api_timeout: crate::consumer::DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
             paused: std::sync::Mutex::default(),
             auto_offset_reset: AutoOffsetReset::Latest,
@@ -2598,7 +2623,7 @@ pub(crate) mod partition_error_tests {
             max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
             fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
             close_operation: tokio::sync::watch::Sender::new(
-                crate::GroupMembershipOperation::Default,
+                crate::control::CloseRequest::default(),
             ),
             rebalance_listener: None,
             listener_calls: tokio::sync::mpsc::unbounded_channel().1,
@@ -4276,6 +4301,47 @@ mod fetch_path_tests {
         drop(consumer);
         stop(brokers);
         assert2::assert!((records, waited, fetches) == (0, true, 0));
+    }
+
+    /// Kafka's `wakeup` makes the blocked `poll`, or the next one, throw
+    /// `WakeupException` once.
+    #[tokio::test]
+    async fn wakeup_ends_the_poll_that_waits_or_the_next_one() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(&[vec![FetchAnswer::Silent]], &sent).await;
+        let mut consumer = consumer_on(&brokers).await;
+        consumer.wakeup();
+        let pending = consumer
+            .poll(millis(100))
+            .await
+            .map_err(|error| error.to_string());
+        let handle = consumer.wakeup_handle();
+        let waker = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            handle.wakeup();
+        });
+        let started = tokio::time::Instant::now();
+        let blocked = consumer
+            .poll(secs(10))
+            .await
+            .map_err(|error| error.to_string());
+        let woken_fast = started.elapsed() < Duration::from_secs(5);
+        waker.await.expect("waker");
+        let next = consumer
+            .poll(millis(100))
+            .await
+            .map(|records| records.len());
+        drop(consumer);
+        stop(brokers);
+        let wakeup = Err("the consumer was woken up".to_owned());
+        assert2::assert!(
+            (
+                pending,
+                blocked,
+                woken_fast,
+                next.map_err(|error| error.to_string())
+            ) == (wakeup.clone(), wakeup, true, Ok(0))
+        );
     }
 
     /// One step of a read replica case.
