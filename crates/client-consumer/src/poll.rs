@@ -1426,8 +1426,25 @@ impl Consumer {
         // epoch here, so its first `ListOffsets` goes to the leader and not
         // to the bootstrap broker. Kafka's `OffsetFetcher.groupListOffsetRequests`
         // routes with `metadata.currentLeader(tp)` in the same way.
+        self.sync_metadata_topics();
         let wakeup = self.wakeup.clone();
         self.update_fetch_positions(Some(&wakeup)).await
+    }
+
+    /// Name the subscribed topics in the metadata requests of this consumer.
+    /// The coordinator task changes the topics of a pattern subscription on
+    /// its own client, so `poll` learns the leaders of a topic that a pattern
+    /// adds. Kafka's `ConsumerMetadata` reads the subscription of each update.
+    fn sync_metadata_topics(&self) {
+        let topics = {
+            let subscription = self.subscription.borrow();
+            (!subscription.is_none()).then(|| subscription.topics.clone())
+        };
+        if let Some(topics) = topics
+            && self.client.metadata_topics().names() != topics
+        {
+            self.client.metadata_topics().set(topics);
+        }
     }
 
     /// Refresh the leader epochs, resolve the offset resets and validate the
@@ -4482,6 +4499,26 @@ mod fetch_path_tests {
         drop(consumer);
         stop(brokers);
         assert2::assert!(ended_early);
+    }
+
+    /// Kafka's `ConsumerMetadata` names the current subscription, so the
+    /// metadata of `poll` covers a topic that a pattern added in the
+    /// coordinator task.
+    #[tokio::test]
+    async fn poll_names_the_topics_that_a_pattern_added() {
+        let sent = SentFetches::default();
+        let brokers = start_brokers(&[vec![FetchAnswer::Silent]], &sent).await;
+        let consumer = consumer_on(&brokers).await;
+        consumer.client.metadata_topics().set(["orders".to_owned()]);
+        consumer.subscription.send_modify(|subscription| {
+            subscription.pattern = Some(crate::TopicPattern::new(|_| true));
+            subscription.topics = vec!["orders".to_owned(), "payments".to_owned()];
+        });
+        consumer.sync_metadata_topics();
+        let names = consumer.client.metadata_topics().names();
+        drop(consumer);
+        stop(brokers);
+        assert2::assert!(names == vec!["orders".to_owned(), "payments".to_owned()]);
     }
 
     /// One step of a read replica case.

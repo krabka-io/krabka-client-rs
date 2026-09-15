@@ -1408,9 +1408,13 @@ const UNSUBSCRIBE_LEAVE_REASON: &str = "the consumer unsubscribed from all topic
 /// Match the pattern of a pattern subscription against all topics of the
 /// cluster, and store the matched topics. Return whether they changed.
 async fn refresh_pattern_topics(state: &mut CoordinatorState) -> bool {
-    if state.subscription.borrow().pattern.is_none() {
-        return false;
-    }
+    let (pattern, version) = {
+        let subscription = state.subscription.borrow();
+        let Some(pattern) = subscription.pattern.clone() else {
+            return false;
+        };
+        (pattern, subscription.version)
+    };
     let Ok(metadata) = state
         .client
         .refresh_metadata_with(krabka_protocol::owned::metadata_request::MetadataRequest::default())
@@ -1418,19 +1422,29 @@ async fn refresh_pattern_topics(state: &mut CoordinatorState) -> bool {
     else {
         return false;
     };
-    let Some(topics) = state.subscription.borrow().matching_topics(&metadata) else {
-        return false;
-    };
-    state.client.metadata_topics().set(topics.iter().cloned());
-    let changed = state.subscription.borrow().topics != topics;
-    if changed {
-        state
-            .subscription
-            .send_modify(|subscription| subscription.topics = topics);
+    let matched = crate::subscription::Subscription {
+        pattern: Some(pattern),
+        ..crate::subscription::Subscription::topics(
+            Vec::new(),
+            state.subscription.borrow().exclude_internal_topics,
+        )
     }
-    // The task made this change itself.
-    state.subscription_changes.borrow_and_update();
-    changed
+    .matching_topics(&metadata)
+    .unwrap_or_default();
+    // Store the topics only for the subscription that the request matched. A
+    // `subscribe`, `subscribe_pattern` or `unsubscribe` of the application
+    // during the request stays a change that the task handles.
+    let stored = state
+        .subscription
+        .send_if_modified(|subscription| subscription.store_pattern_topics(version, &matched));
+    if state.subscription.borrow().version == version {
+        state.client.metadata_topics().set(matched.iter().cloned());
+        if stored {
+            // The task made this change itself.
+            state.subscription_changes.borrow_and_update();
+        }
+    }
+    stored
 }
 
 /// Forget the member id, the generation and the partition ownership after

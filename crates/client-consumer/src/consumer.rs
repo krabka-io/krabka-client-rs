@@ -685,6 +685,10 @@ async fn pattern_topics(config: &StartConfig) -> Result<Vec<String>, ConsumerErr
         .bootstrap(&config.bootstrap)
         .client_id(config.client_id.clone())
         .request_timeout(config.request_timeout)
+        .dispatch_queue_capacity(config.dispatch_queue_capacity.get())
+        .frame_max(config.frame_max.size())
+        .metadata_recovery_strategy(config.metadata_recovery_strategy)
+        .metadata_recovery_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger)
         .maybe_security(config.security.clone())
         .build()
         .await?;
@@ -5061,6 +5065,32 @@ mod group_membership_tests {
             wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `unsubscribe` clears the assignment before it returns, so
+    /// `assignment` and a commit see no partition right after it.
+    #[tokio::test]
+    async fn unsubscribe_gives_up_the_assignment_before_it_returns() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut consumer = started_consumer(&mock, None).await;
+        let before = consumer.assignment().await;
+        // A coordinator task that is busy, here a stopped one, handles the
+        // change late. The consumer must not wait for it.
+        consumer.coordinator_shutdown.cancel();
+        if let Some(handle) = consumer.coordinator_handle.take() {
+            handle.await.expect("coordinator task");
+        }
+        consumer.unsubscribe().await.expect("unsubscribe");
+        let after = consumer.assignment().await;
+        let owned = consumer.commit_identity.lock().await.ownership_ids.len();
+        drop(consumer);
+        mock.stop();
+        assert2::assert!((before, after, owned) == (vec![partition(0)], vec![], 0));
     }
 
     /// Kafka's `enforceRebalance(reason)` makes the next `poll` join the group
