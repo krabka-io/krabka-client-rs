@@ -206,7 +206,7 @@ async fn cooperative_consumer(
         .bootstrap(bootstrap)
         .client_id(client_id)
         .group_id(group_id)
-        .assignor(Assignor::CooperativeSticky)
+        .assignors(vec![Assignor::CooperativeSticky])
         .session_timeout(secs(30))
         .max_poll_interval(secs(2))
         .heartbeat_interval(millis(500))

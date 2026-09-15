@@ -510,7 +510,7 @@ impl Consumer {
         if !*self.rebalance_pending.borrow() {
             return true;
         }
-        let eager = self.assignor.rebalance_protocol() == crate::assignor::RebalanceProtocol::Eager;
+        let eager = self.rebalance_protocol == crate::assignor::RebalanceProtocol::Eager;
         if !eager && !self.assigned.lock().await.is_empty() {
             return true;
         }
@@ -2011,7 +2011,7 @@ mod partition_error_tests {
             topic_ids: Arc::new(Mutex::new(HashMap::from([("orders".into(), TOPIC_ID)]))),
             session_timeout: secs(45),
             heartbeat_interval: secs(3),
-            assignor: Assignor::Range,
+            rebalance_protocol: crate::assignor::RebalanceProtocol::Eager,
             coordinator_shutdown: CancellationToken::new(),
             coordinator_handle: None,
             isolation_level: IsolationLevel::ReadUncommitted,
@@ -2194,7 +2194,8 @@ mod partition_error_tests {
             ),
         ] {
             let mut consumer = consumer_on(&broker).await;
-            consumer.assignor = assignor;
+            consumer.rebalance_protocol =
+                crate::assignor::rebalance_protocol_of(&[assignor]).expect("assignor protocol");
             if !owns_partitions {
                 consumer.assigned.lock().await.clear();
             }

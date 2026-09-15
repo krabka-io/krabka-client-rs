@@ -215,16 +215,16 @@ use krabka_protocol::{
 const SUBSCRIPTION_WIRE_VERSION: i16 = 3;
 const ASSIGNMENT_WIRE_VERSION: i16 = 3;
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct DecodedSubscription {
     pub topics: Vec<String>,
     pub owned: Vec<(String, i32)>,
     pub generation_id: i32,
-    // Part of the ConsumerProtocolSubscription v3 wire surface; kept here
-    // for symmetry with the wire form and round-trip tests, even though
-    // the coordinator does not currently consult it for assignment.
-    #[allow(dead_code)]
+    /// Part of the `ConsumerProtocolSubscription` v3 wire surface. No built-in
+    /// assignor reads it yet: rack-aware assignment needs replica racks.
     pub rack_id: Option<String>,
+    /// The assignor-specific `userData`.
+    pub user_data: Option<Bytes>,
 }
 
 fn group_by_topic(pairs: &[(String, i32)]) -> std::collections::BTreeMap<&str, Vec<i32>> {
@@ -249,27 +249,37 @@ fn empty_subscription() -> DecodedSubscription {
         owned: Vec::new(),
         generation_id: -1,
         rack_id: None,
+        user_data: None,
     }
 }
 
+/// Encode a `ConsumerProtocolSubscription` v3 as Kafka's
+/// `ConsumerProtocol.serializeSubscription` does: sorted topics, and owned
+/// partitions sorted by topic and partition.
 pub(crate) fn encode_subscription(
     topics: &[String],
     owned: &[(String, i32)],
     generation_id: i32,
     rack_id: Option<&str>,
+    user_data: Option<Bytes>,
 ) -> Bytes {
     use bytes::BufMut;
     let owned_partitions: Vec<SubTopicPartition> = group_by_topic(owned)
         .into_iter()
-        .map(|(topic, partitions)| SubTopicPartition {
-            topic: topic.to_string(),
-            partitions,
-            unknown_tagged_fields: UnknownTaggedFields::default(),
+        .map(|(topic, mut partitions)| {
+            partitions.sort_unstable();
+            SubTopicPartition {
+                topic: topic.to_string(),
+                partitions,
+                unknown_tagged_fields: UnknownTaggedFields::default(),
+            }
         })
         .collect();
+    let mut sorted_topics = topics.to_vec();
+    sorted_topics.sort();
     let msg = ConsumerProtocolSubscription {
-        topics: topics.to_vec(),
-        user_data: None,
+        topics: sorted_topics,
+        user_data,
         owned_partitions,
         generation_id,
         rack_id: rack_id.map(str::to_string),
@@ -302,6 +312,7 @@ pub(crate) fn decode_subscription(bytes: &[u8]) -> DecodedSubscription {
         owned,
         generation_id: msg.generation_id,
         rack_id: msg.rack_id,
+        user_data: msg.user_data,
     }
 }
 
@@ -462,6 +473,7 @@ mod tests {
                         owned: Vec::new(),
                         generation_id: -1,
                         rack_id: None,
+                        user_data: None,
                     }
             );
         }
@@ -478,16 +490,39 @@ mod tests {
         }
     }
 
+    /// Kafka's `ConsumerProtocol.serializeSubscription` sorts the topics and
+    /// the owned partitions, and carries the user data.
+    #[test]
+    fn subscription_sorts_topics_and_owned_partitions_and_keeps_user_data() {
+        let s = encode_subscription(
+            &["t2".into(), "t1".into()],
+            &[("t2".into(), 1), ("t1".into(), 3), ("t2".into(), 0)],
+            5,
+            None,
+            Some(Bytes::from_static(&[0, 0, 0, 5])),
+        );
+        assert2::assert!(
+            decode_subscription(&s)
+                == DecodedSubscription {
+                    topics: vec!["t1".into(), "t2".into()],
+                    owned: vec![("t1".into(), 3), ("t2".into(), 0), ("t2".into(), 1)],
+                    generation_id: 5,
+                    rack_id: None,
+                    user_data: Some(Bytes::from_static(&[0, 0, 0, 5])),
+                }
+        );
+    }
+
     #[test]
     fn subscription_round_trip() {
-        let s = encode_subscription(&["t1".into(), "t2".into()], &[], -1, None);
+        let s = encode_subscription(&["t1".into(), "t2".into()], &[], -1, None, None);
         let decoded = decode_subscription(&s);
         assert2::assert!(decoded.topics == vec!["t1", "t2"]);
     }
 
     #[test]
     fn subscription_empty_round_trip() {
-        let s = encode_subscription(&[], &[], -1, None);
+        let s = encode_subscription(&[], &[], -1, None, None);
         let decoded = decode_subscription(&s);
         assert2::assert!(
             decoded
@@ -496,6 +531,7 @@ mod tests {
                     owned: Vec::new(),
                     generation_id: -1,
                     rack_id: None,
+                    user_data: None,
                 }
         );
     }
@@ -503,7 +539,7 @@ mod tests {
     #[test]
     fn subscription_v3_owned_partitions_round_trip() {
         let owned = vec![("t".into(), 0), ("t".into(), 1), ("u".into(), 0)];
-        let s = encode_subscription(&["t".into(), "u".into()], &owned, -1, None);
+        let s = encode_subscription(&["t".into(), "u".into()], &owned, -1, None, None);
         let decoded = decode_subscription(&s);
         let mut got = decoded.owned.clone();
         got.sort();
@@ -514,7 +550,7 @@ mod tests {
 
     #[test]
     fn subscription_v3_generation_and_rack_round_trip() {
-        let s = encode_subscription(&["t".into()], &[], 42, Some("rack-a"));
+        let s = encode_subscription(&["t".into()], &[], 42, Some("rack-a"), None);
         let decoded = decode_subscription(&s);
         assert2::assert!(
             decoded
@@ -523,6 +559,7 @@ mod tests {
                     owned: Vec::new(),
                     generation_id: 42,
                     rack_id: Some("rack-a".into()),
+                    user_data: None,
                 }
         );
     }
@@ -547,6 +584,7 @@ mod tests {
                     owned: Vec::new(),
                     generation_id: -1,
                     rack_id: None,
+                    user_data: None,
                 }
         );
     }

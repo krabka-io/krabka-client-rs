@@ -39,7 +39,81 @@ pub fn assign(
     if members.is_empty() {
         return HashMap::new();
     }
+    let (member_ids, previous_owner, raw_assignment) = sticky_assignment(members, topic_partitions);
 
+    // === Pass 3: cooperative adjustment ===
+    // Strip any partition that's moving from a still-live, still-subscribed
+    // previous owner to a new member.
+    let mut adjusted: HashMap<String, Vec<(String, i32)>> = HashMap::new();
+    for id in &member_ids {
+        adjusted.insert(id.clone(), Vec::new());
+    }
+    for id in &member_ids {
+        let new_parts = raw_assignment.get(id).cloned().unwrap_or_default();
+        for tp in new_parts {
+            match previous_owner.get(&tp) {
+                Some(prev) if prev != id => {
+                    // Previous owner still alive (it's in current_assignment,
+                    // which by construction means they're in members & subscribed).
+                    // Omit: phase 2 will place it.
+                }
+                _ => {
+                    adjusted.get_mut(id).unwrap().push(tp);
+                }
+            }
+        }
+    }
+
+    // Sort each member's partition list (topic, partition) for determinism.
+    for v in adjusted.values_mut() {
+        v.sort();
+    }
+    adjusted
+}
+
+/// Kafka's eager `StickyAssignor`: the sticky assignment of
+/// `AbstractStickyAssignor.assignPartitions`, without the cooperative
+/// adjustment. A partition that moves goes to its new owner at once, because
+/// every member of an eager group revokes all partitions before it joins.
+#[must_use]
+#[tracing::instrument(
+    name = "consumer.assignor.sticky",
+    level = "info",
+    skip_all,
+    fields(members = members.len(), topics = topic_partitions.len())
+)]
+pub fn assign_eager(
+    members: &[MemberInput],
+    topic_partitions: &HashMap<String, i32>,
+) -> HashMap<String, Vec<(String, i32)>> {
+    if members.is_empty() {
+        return HashMap::new();
+    }
+    let (member_ids, _, raw_assignment) = sticky_assignment(members, topic_partitions);
+    member_ids
+        .into_iter()
+        .map(|id| {
+            let mut partitions = raw_assignment.get(&id).cloned().unwrap_or_default();
+            partitions.sort();
+            (id, partitions)
+        })
+        .collect()
+}
+
+/// The sticky assignment of `AbstractStickyAssignor.assignPartitions`: the
+/// sorted member ids, the previous owner of each partition, and the raw
+/// assignment.
+type StickyAssignment = (
+    Vec<String>,
+    HashMap<(String, i32), String>,
+    HashMap<String, Vec<(String, i32)>>,
+);
+
+/// Run the sticky assignment. See [`StickyAssignment`].
+fn sticky_assignment(
+    members: &[MemberInput],
+    topic_partitions: &HashMap<String, i32>,
+) -> StickyAssignment {
     // Index members by id (sorted, deterministic ordering everywhere).
     let mut member_ids: Vec<String> = members.iter().map(|(id, _, _, _)| id.clone()).collect();
     member_ids.sort();
@@ -86,34 +160,7 @@ pub fn assign(
         general_assign(&member_ids, &subs, &current_assignment, topic_partitions)
     };
 
-    // === Pass 3: cooperative adjustment ===
-    // Strip any partition that's moving from a still-live, still-subscribed
-    // previous owner to a new member.
-    let mut adjusted: HashMap<String, Vec<(String, i32)>> = HashMap::new();
-    for id in &member_ids {
-        adjusted.insert(id.clone(), Vec::new());
-    }
-    for id in &member_ids {
-        let new_parts = raw_assignment.get(id).cloned().unwrap_or_default();
-        for tp in new_parts {
-            match previous_owner.get(&tp) {
-                Some(prev) if prev != id => {
-                    // Previous owner still alive (it's in current_assignment,
-                    // which by construction means they're in members & subscribed).
-                    // Omit: phase 2 will place it.
-                }
-                _ => {
-                    adjusted.get_mut(id).unwrap().push(tp);
-                }
-            }
-        }
-    }
-
-    // Sort each member's partition list (topic, partition) for determinism.
-    for v in adjusted.values_mut() {
-        v.sort();
-    }
-    adjusted
+    (member_ids, previous_owner, raw_assignment)
 }
 
 /// Build `current_assignment`, filtered to the live topics and subscriptions.

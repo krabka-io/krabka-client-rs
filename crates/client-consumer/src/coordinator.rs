@@ -439,7 +439,10 @@ pub(crate) struct CoordinatorState {
     /// commit after a rebalance never carries the stale generation that the
     /// broker rejects with `ILLEGAL_GENERATION`.
     pub current_generation: Arc<AtomicI32>,
-    pub assignor: Assignor,
+    /// Kafka's `partition.assignment.strategy`, in the order of preference.
+    pub assignors: Vec<Assignor>,
+    /// The newest rebalance protocol that every assignor supports.
+    pub rebalance_protocol: RebalanceProtocol,
     pub subscribed_topics: Vec<String>,
     pub assigned: Arc<Mutex<Vec<(String, i32)>>>,
     pub assignment_changed: Arc<Notify>,
@@ -1303,7 +1306,7 @@ async fn refind_after(state: &CoordinatorState, ctx: &str) {
     fields(
         group_id = %state.group_id,
         member_id = %state.member_id,
-        protocol = ?state.assignor.rebalance_protocol(),
+        protocol = ?state.rebalance_protocol,
         generation = tracing::field::Empty,
         revoked = tracing::field::Empty,
         added = tracing::field::Empty,
@@ -1332,7 +1335,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
     // computed against — returned so the coordinator re-baselines against exactly
     // what it assigned (eager / pure-add use the round-1 snapshot; a cooperative
     // revoke uses phase 2's).
-    let final_counts = match state.assignor.rebalance_protocol() {
+    let final_counts = match state.rebalance_protocol {
         RebalanceProtocol::Eager => {
             // Drop everything and reinstall in a single round. Prime the
             // added partitions' fetch offsets *before* publishing the new
@@ -1426,6 +1429,42 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
     Ok(final_counts)
 }
 
+/// The `JoinGroup` protocols of a member: one subscription per assignor, in
+/// the configured order.
+///
+/// This is Kafka's `ConsumerCoordinator.metadata`. Each subscription carries
+/// the owned partitions, the generation, the rack and the `userData` of its
+/// assignor. `last_assignment` is the assignment of the last completed join,
+/// which the `sticky` user data carries.
+pub(crate) fn join_protocols(
+    assignors: &[Assignor],
+    topics: &[String],
+    owned: &[(String, i32)],
+    generation_id: i32,
+    rack_id: Option<&str>,
+    last_assignment: Option<&[(String, i32)]>,
+) -> Vec<(String, Bytes)> {
+    assignors
+        .iter()
+        .map(|assignor| {
+            (
+                assignor.protocol_name().to_owned(),
+                encode_subscription(
+                    topics,
+                    owned,
+                    generation_id,
+                    rack_id,
+                    crate::assignor::subscription_user_data(
+                        *assignor,
+                        last_assignment,
+                        generation_id,
+                    ),
+                ),
+            )
+        })
+        .collect()
+}
+
 /// The fields of the `JoinGroup` requests of one join. Only the member id
 /// differs between the requests of the `MEMBER_ID_REQUIRED` handshake.
 #[derive(Clone, Debug)]
@@ -1434,8 +1473,8 @@ pub(crate) struct JoinRequestFields {
     pub group_instance_id: Option<String>,
     pub session_timeout_ms: i32,
     pub rebalance_timeout_ms: i32,
-    pub protocol_name: String,
-    pub subscription: Bytes,
+    /// One `(name, subscription)` per assignor, in the configured order.
+    pub protocols: Vec<(String, Bytes)>,
     /// Kafka's `AbstractCoordinator.rejoinReason`.
     pub reason: String,
 }
@@ -1449,11 +1488,15 @@ impl JoinRequestFields {
             group_instance_id: self.group_instance_id.clone(),
             session_timeout_ms: self.session_timeout_ms,
             rebalance_timeout_ms: self.rebalance_timeout_ms,
-            protocols: vec![JoinGroupRequestProtocol {
-                name: self.protocol_name.clone(),
-                metadata: self.subscription.clone(),
-                ..Default::default()
-            }],
+            protocols: self
+                .protocols
+                .iter()
+                .map(|(name, metadata)| JoinGroupRequestProtocol {
+                    name: name.clone(),
+                    metadata: metadata.clone(),
+                    ..Default::default()
+                })
+                .collect(),
             // KIP-800. Version 8 and later carry the reason.
             reason: Some(truncate_reason(&self.reason).to_owned()),
             ..Default::default()
@@ -1461,7 +1504,7 @@ impl JoinRequestFields {
     }
 }
 
-fn build_sync_group_assignment(
+pub(crate) fn build_sync_group_assignment(
     member_id: String,
     partitions: &[(String, i32)],
 ) -> SyncGroupRequestAssignment {
@@ -1726,12 +1769,19 @@ async fn perform_join(
         group_instance_id: state.group_instance_id.clone(),
         session_timeout_ms: crate::consumer::protocol_millis_i32(state.session_timeout),
         rebalance_timeout_ms: crate::consumer::protocol_millis_i32(state.max_poll_interval),
-        protocol_name: state.assignor.protocol_name().to_string(),
-        subscription: encode_subscription(
+        // Kafka's eager `onJoinPrepare` revokes every partition before the
+        // join, so an eager subscription owns nothing. The `sticky` user data
+        // still carries the last assignment.
+        protocols: join_protocols(
+            &state.assignors,
             &state.subscribed_topics,
-            owned,
+            match state.rebalance_protocol {
+                RebalanceProtocol::Eager => &[],
+                RebalanceProtocol::Cooperative => owned,
+            },
             state.generation_id,
             state.client_rack.as_deref(),
+            (state.generation_id >= 0).then_some(owned),
         ),
         reason: state.rejoin_reason.clone(),
     };
@@ -1854,10 +1904,7 @@ async fn join_and_sync(
     if !join_resp.member_id.is_empty() {
         state.member_id.clone_from(&join_resp.member_id);
     }
-    let chosen_protocol = join_resp
-        .protocol_name
-        .clone()
-        .unwrap_or_else(|| state.assignor.protocol_name().to_string());
+    let chosen_protocol = join_resp.protocol_name.clone().unwrap_or_default();
     let generation_id = join_resp.generation_id;
 
     // Leader: resolve partition counts via Metadata and run the assignor.
@@ -1888,6 +1935,65 @@ async fn join_and_sync(
         generation: generation_id,
         topic_partitions: leader.topic_partitions,
     })
+}
+
+/// The `SyncGroup` assignments of the group leader.
+///
+/// Kafka's `ConsumerCoordinator.onLeaderElected` looks up the assignor that the
+/// coordinator selected, decodes each member subscription, and assigns the
+/// partitions of every topic that a member subscribes to.
+///
+/// # Errors
+///
+/// Returns `IllegalState` when the coordinator selected a protocol that this
+/// member did not offer.
+pub(crate) fn leader_assignments(
+    assignors: &[Assignor],
+    response: &JoinGroupResponse,
+    metadata: &krabka_protocol::owned::metadata_response::MetadataResponse,
+) -> Result<Vec<SyncGroupRequestAssignment>, ConsumerError> {
+    let name = response.protocol_name.as_deref().unwrap_or_default();
+    let assignor = Assignor::by_protocol_name(assignors, name).ok_or_else(|| {
+        ConsumerError::IllegalState(format!(
+            "Coordinator selected invalid assignment protocol: {name}"
+        ))
+    })?;
+    let members: Vec<crate::assignor::GroupMember> = response
+        .members
+        .iter()
+        .map(|member| crate::assignor::GroupMember {
+            key: crate::assignor::MemberKey {
+                member_id: member.member_id.clone(),
+                group_instance_id: member.group_instance_id.clone(),
+            },
+            subscription: decode_subscription(&member.metadata),
+        })
+        .collect();
+    let all_topics: HashSet<&String> = members
+        .iter()
+        .flat_map(|member| &member.subscription.topics)
+        .collect();
+    let topic_partitions: HashMap<String, i32> = metadata
+        .topics
+        .iter()
+        .filter_map(|topic| {
+            let name = topic.name.as_ref()?;
+            all_topics.contains(name).then(|| {
+                (
+                    name.clone(),
+                    i32::try_from(topic.partitions.len()).unwrap_or(i32::MAX),
+                )
+            })
+        })
+        .collect();
+    let mut assignments: Vec<_> = crate::assignor::assign(assignor, &members, &topic_partitions)
+        .into_iter()
+        .collect();
+    assignments.sort();
+    Ok(assignments
+        .into_iter()
+        .map(|(member, partitions)| build_sync_group_assignment(member, &partitions))
+        .collect())
 }
 
 struct LeaderAssignment {
@@ -1924,44 +2030,9 @@ async fn compute_leader_assignment(
         }
     }
     state.topic_ids.lock().await.extend(resolved_ids);
-    let decoded: Vec<(String, crate::builder::DecodedSubscription)> = response
-        .members
-        .iter()
-        .map(|member| {
-            (
-                member.member_id.clone(),
-                decode_subscription(&member.metadata),
-            )
-        })
-        .collect();
-    let assignments = match state.assignor {
-        Assignor::Range => {
-            let inputs: Vec<(String, Vec<String>)> = decoded
-                .into_iter()
-                .map(|(id, subscription)| (id, subscription.topics))
-                .collect();
-            crate::assignor::range::assign(inputs, &topic_partitions)
-        }
-        Assignor::CooperativeSticky => {
-            let inputs: Vec<crate::assignor::cooperative_sticky::MemberInput> = decoded
-                .into_iter()
-                .map(|(id, subscription)| {
-                    (
-                        id,
-                        subscription.topics,
-                        subscription.owned,
-                        subscription.generation_id,
-                    )
-                })
-                .collect();
-            crate::assignor::cooperative_sticky::assign(&inputs, &topic_partitions)
-        }
-    };
+    let assignments = leader_assignments(&state.assignors, response, &metadata)?;
     Ok(LeaderAssignment {
-        assignments: assignments
-            .into_iter()
-            .map(|(member, partitions)| build_sync_group_assignment(member, &partitions))
-            .collect(),
+        assignments,
         topic_partitions,
     })
 }
@@ -2852,7 +2923,8 @@ mod retry_tests {
             group_instance_id: None,
             generation_id: 1,
             current_generation: Arc::new(AtomicI32::new(1)),
-            assignor: Assignor::Range,
+            assignors: vec![Assignor::Range],
+            rebalance_protocol: RebalanceProtocol::Eager,
             subscribed_topics: vec!["topic".into()],
             assigned: Arc::new(Mutex::new(Vec::new())),
             assignment_changed: Arc::new(Notify::new()),
@@ -3025,6 +3097,98 @@ mod retry_tests {
         );
     }
 
+    /// Kafka's `ConsumerCoordinator.onLeaderElected` runs the assignor that the
+    /// coordinator selected over the partitions of every topic that a member
+    /// subscribes to, and fails for a protocol that this member did not offer.
+    #[test]
+    fn leader_runs_the_selected_assignor_over_all_member_topics() {
+        use krabka_protocol::owned::{
+            join_group_response::JoinGroupResponseMember,
+            metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
+        };
+        let topic = |name: &str, partitions: i32| MetadataResponseTopic {
+            name: Some(name.into()),
+            partitions: (0..partitions)
+                .map(|partition_index| MetadataResponsePartition {
+                    partition_index,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let metadata = MetadataResponse {
+            topics: vec![topic("a", 2), topic("b", 2), topic("c", 1)],
+            ..Default::default()
+        };
+        let member = |id: &str, topics: &[&str]| JoinGroupResponseMember {
+            member_id: id.into(),
+            metadata: encode_subscription(
+                &topics.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>(),
+                &[],
+                -1,
+                None,
+                None,
+            ),
+            ..Default::default()
+        };
+        let response = |protocol: &str| JoinGroupResponse {
+            protocol_name: Some(protocol.into()),
+            members: vec![member("m1", &["a"]), member("m2", &["a", "b"])],
+            ..Default::default()
+        };
+        let decoded = |result: Result<Vec<SyncGroupRequestAssignment>, ConsumerError>| {
+            result
+                .map(|assignments| {
+                    assignments
+                        .into_iter()
+                        .map(|assignment| {
+                            (
+                                assignment.member_id,
+                                decode_assignment(&assignment.assignment),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| error.to_string())
+        };
+        let p = |topic: &str, partition: i32| (topic.to_owned(), partition);
+        let assignors = [Assignor::Range, Assignor::RoundRobin];
+        let actual = [
+            decoded(leader_assignments(
+                &assignors,
+                &response("roundrobin"),
+                &metadata,
+            )),
+            decoded(leader_assignments(
+                &assignors,
+                &response("range"),
+                &metadata,
+            )),
+            decoded(leader_assignments(
+                &assignors,
+                &response("sticky"),
+                &metadata,
+            )),
+        ];
+        assert2::assert!(
+            actual
+                == [
+                    Ok(vec![
+                        ("m1".to_owned(), vec![p("a", 0)]),
+                        ("m2".to_owned(), vec![p("a", 1), p("b", 0), p("b", 1)]),
+                    ]),
+                    Ok(vec![
+                        ("m1".to_owned(), vec![p("a", 0)]),
+                        ("m2".to_owned(), vec![p("a", 1), p("b", 0), p("b", 1)]),
+                    ]),
+                    Err(
+                        "illegal state: Coordinator selected invalid assignment protocol: sticky"
+                            .to_owned()
+                    ),
+                ]
+        );
+    }
+
     #[test]
     fn join_group_request_preserves_group_member_timeouts_protocol_and_reason() {
         let fields = JoinRequestFields {
@@ -3032,8 +3196,7 @@ mod retry_tests {
             group_instance_id: Some("instance-a".into()),
             session_timeout_ms: 10_000,
             rebalance_timeout_ms: 30_000,
-            protocol_name: "range".into(),
-            subscription: vec![1, 2, 3].into(),
+            protocols: vec![("range".into(), vec![1, 2, 3].into())],
             reason: "group is already rebalancing".into(),
         };
 
@@ -3357,7 +3520,8 @@ mod retry_tests {
             group_instance_id: Some("instance-a".into()),
             generation_id: 1,
             current_generation: Arc::new(AtomicI32::new(1)),
-            assignor: Assignor::Range,
+            assignors: vec![Assignor::Range],
+            rebalance_protocol: RebalanceProtocol::Eager,
             subscribed_topics: vec![ORDERS.into()],
             assigned: Arc::new(Mutex::new(vec![orders_0.clone()])),
             assignment_changed: Arc::new(Notify::new()),

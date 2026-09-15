@@ -1262,7 +1262,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Assignor, AutoOffsetReset, IsolationLevel, consumer::ConsumerRetryPolicy,
+        AutoOffsetReset, IsolationLevel, consumer::ConsumerRetryPolicy,
         coordinator::CoordinatorRetryPolicy,
     };
 
@@ -1512,7 +1512,7 @@ mod tests {
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
             session_timeout: secs(45),
             heartbeat_interval: secs(3),
-            assignor: Assignor::Range,
+            rebalance_protocol: crate::assignor::RebalanceProtocol::Eager,
             coordinator_shutdown: CancellationToken::new(),
             coordinator_handle: None,
             isolation_level: IsolationLevel::ReadUncommitted,
