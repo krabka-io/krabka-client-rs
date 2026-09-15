@@ -62,7 +62,9 @@ pub struct Consumer {
     /// `OffsetCommit` to the coordinator over this data-path client.
     pub(crate) coordinator_id: Arc<AtomicI32>,
     pub(crate) retry_policy: CoordinatorRetryPolicy,
-    pub(crate) member_id: String,
+    /// The live member id. The coordinator task publishes each change, for
+    /// example the new id of a join from scratch.
+    pub(crate) member_id: tokio::sync::watch::Receiver<String>,
     pub(crate) commit_identity: Arc<Mutex<CommitIdentity>>,
     pub(crate) commit_serialization: Arc<Mutex<()>>,
     pub(crate) commit_async_state: Arc<AtomicU8>,
@@ -1457,11 +1459,14 @@ async fn spawn_consumer(
     let auto_commit = auto_commit_interval.map(crate::commit::AutoCommit::new);
 
     let shutdown = CancellationToken::new();
+    let published_member_id = tokio::sync::watch::Sender::new(member_id.clone());
+    let live_member_id = published_member_id.subscribe();
     let state = CoordinatorState {
         client: coordinator_client,
         group_id: group_id.clone(),
         coordinator_id: Arc::clone(&coordinator_id),
-        member_id: member_id.clone(),
+        member_id,
+        published_member_id,
         commit_identity: Arc::clone(&commit_identity),
         group_instance_id: group_instance_id.clone(),
         generation_id,
@@ -1506,7 +1511,7 @@ async fn spawn_consumer(
         group_id,
         coordinator_id,
         retry_policy: retry_policy.into(),
-        member_id,
+        member_id: live_member_id,
         commit_identity,
         commit_serialization,
         commit_async_state,
@@ -1579,10 +1584,11 @@ impl Consumer {
         &self.group_id
     }
 
-    /// The member id that the coordinator assigned at join time.
+    /// The current member id. It is empty while the member is not in the group,
+    /// and it changes when the member joins the group again from scratch.
     #[must_use]
-    pub fn member_id(&self) -> &str {
-        &self.member_id
+    pub fn member_id(&self) -> String {
+        self.member_id.borrow().clone()
     }
 
     /// The current group generation. The coordinator task keeps it live across
@@ -1602,7 +1608,7 @@ impl Consumer {
         ConsumerGroupMetadata {
             group_id: self.group_id.clone(),
             generation_id: self.current_generation.load(Ordering::Relaxed),
-            member_id: self.member_id.clone(),
+            member_id: self.member_id(),
             group_instance_id: self.group_instance_id.clone(),
         }
     }
@@ -1650,7 +1656,7 @@ impl Consumer {
         name = "consumer.close",
         level = "info",
         skip_all,
-        fields(group_id = %self.group_id, member_id = %self.member_id),
+        fields(group_id = %self.group_id, member_id = %self.member_id()),
         err
     )]
     /// # Errors
@@ -2340,7 +2346,7 @@ mod security_arg_tests {
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(3)),
             retry_policy: ConsumerRetryPolicy::default().into(),
-            member_id: "member-a".into(),
+            member_id: tokio::sync::watch::channel("member-a".to_owned()).1,
             commit_identity: Arc::new(Mutex::new(CommitIdentity {
                 generation: 7,
                 member_id: "member-a".into(),
@@ -2391,7 +2397,7 @@ mod security_arg_tests {
                 consumer.assignment().await,
             ) == (
                 "group-a",
-                "member-a",
+                "member-a".to_owned(),
                 7,
                 &["orders".to_string(), "payments".to_string()][..],
                 vec![("orders".into(), 0)],
@@ -2689,6 +2695,8 @@ mod auto_commit_tests {
         pub(super) joins: std::sync::Mutex<Vec<JoinGroupRequest>>,
         /// Each decoded `LeaveGroup` request.
         pub(super) leaves: std::sync::Mutex<Vec<LeaveGroupRequest>>,
+        /// When `true`, the mock does not answer `LeaveGroup`.
+        pub(super) drop_leaves: std::sync::atomic::AtomicBool,
     }
 
     fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
@@ -2713,6 +2721,7 @@ mod auto_commit_tests {
                 drop_heartbeats: std::sync::atomic::AtomicBool::new(false),
                 joins: std::sync::Mutex::new(Vec::new()),
                 leaves: std::sync::Mutex::new(Vec::new()),
+                drop_leaves: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -2831,6 +2840,9 @@ mod auto_commit_tests {
                         .lock()
                         .expect("leaves lock")
                         .push(LeaveGroupRequest::decode(&mut body, version).expect("decode leave"));
+                    if self.drop_leaves.load(Ordering::SeqCst) {
+                        return None;
+                    }
                     let mut response = if flexible { vec![0] } else { Vec::new() };
                     response.extend(encode(&LeaveGroupResponse::default(), version));
                     Some(response)
@@ -3681,16 +3693,17 @@ mod poll_interval_tests {
         *,
     };
 
-    /// How the application polls in a poll timeout case. The polls before the
-    /// timeout only signal the coordinator task, as the start of `poll` does:
-    /// with paused time, the network wait of a full `poll` lets the clock jump
-    /// to the next timer.
+    /// How the application polls in a poll timeout case, with a
+    /// `max_poll_interval` of 500 ms. The polls before the timeout only signal
+    /// the coordinator task, as the start of `poll` does. The case runs in real
+    /// time: with paused time, the network wait of a request lets the clock
+    /// jump past the poll deadline.
     #[derive(Clone, Copy, Debug)]
     enum Polls {
-        /// One `poll` each 500 ms.
-        EachHalfSecond,
-        /// No `poll` for 1.1 s.
-        LateByTenthOfASecond,
+        /// One `poll` each 100 ms.
+        EachTenthOfASecond,
+        /// No `poll` for 700 ms.
+        Late,
     }
 
     /// What the group saw in a poll timeout case.
@@ -3699,9 +3712,13 @@ mod poll_interval_tests {
         leaves: Vec<LeaveGroupRequest>,
         heartbeats_after_timeout: bool,
         commit: Result<(), String>,
+        /// `Consumer::member_id` before the next `poll`.
+        member_id_before_next_poll: String,
         /// `(member_id, group_instance_id)` of each `JoinGroup` after the next
         /// `poll`.
         joins_after_next_poll: Vec<(String, Option<String>)>,
+        /// `Consumer::member_id` after the join of the next `poll`.
+        member_id_after_next_poll: String,
     }
 
     async fn run_poll_timeout_case(
@@ -3714,8 +3731,9 @@ mod poll_interval_tests {
             in_mock.respond(api_key, version, body)
         })
         .await;
-        let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, secs(1));
+        let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, millis(500));
         config.group_instance_id = group_instance_id.map(str::to_owned);
+        config.heartbeat_interval = millis(100);
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
             .build()
@@ -3737,8 +3755,7 @@ mod poll_interval_tests {
         )
         .await
         .expect("spawn consumer");
-        // With paused time, the clock can jump while the coordinator task
-        // connects. The case starts after its first heartbeat, with a `poll`.
+        // The case starts after the first heartbeat, with a `poll`.
         let spawned_at = *coordinator
             .last_heartbeat
             .lock()
@@ -3753,22 +3770,22 @@ mod poll_interval_tests {
         }
         crate::coordinator::note_poll(&consumer.poll_signal);
 
-        let poller = matches!(polls, Polls::EachHalfSecond).then(|| {
+        let poller = matches!(polls, Polls::EachTenthOfASecond).then(|| {
             let poll_signal = consumer.poll_signal.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     crate::coordinator::note_poll(&poll_signal);
                 }
             })
         });
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
         let heartbeat_at_timeout = *coordinator
             .last_heartbeat
             .lock()
             .expect("last heartbeat lock");
-        // Two heartbeat intervals.
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        // Four heartbeat intervals.
+        tokio::time::sleep(Duration::from_millis(400)).await;
         let heartbeats_after_timeout = *coordinator
             .last_heartbeat
             .lock()
@@ -3779,13 +3796,22 @@ mod poll_interval_tests {
             .await
             .map_err(|error| error.to_string());
         let leaves = coordinator.leaves.lock().expect("leaves lock").clone();
+        let member_id_before_next_poll = consumer.member_id();
         let joins_before = coordinator.joins.lock().expect("joins lock").len();
         consumer.poll(millis(0)).await.expect("next poll");
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // The application keeps polling while the join runs.
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while consumer.member_id().is_empty() {
+                crate::coordinator::note_poll(&consumer.poll_signal);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
         let joins_after_next_poll = coordinator.joins.lock().expect("joins lock")[joins_before..]
             .iter()
             .map(|join| (join.member_id.clone(), join.group_instance_id.clone()))
             .collect();
+        let member_id_after_next_poll = consumer.member_id();
         if let Some(poller) = poller {
             poller.abort();
         }
@@ -3796,7 +3822,9 @@ mod poll_interval_tests {
             leaves,
             heartbeats_after_timeout,
             commit,
+            member_id_before_next_poll,
             joins_after_next_poll,
+            member_id_after_next_poll,
         }
     }
 
@@ -3807,7 +3835,7 @@ mod poll_interval_tests {
     /// member resets its generation, so heartbeats stop, a commit fails with
     /// `CommitFailedException`, and the next `poll` joins with an empty member
     /// id.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_member_leaves_the_group_when_poll_does_not_come_within_max_poll_interval() {
         let commit_failed = Err(ConsumerError::CommitFailed.to_string());
         let leave = LeaveGroupRequest {
@@ -3828,34 +3856,40 @@ mod poll_interval_tests {
             (
                 "dynamic member polls in time",
                 None,
-                Polls::EachHalfSecond,
+                Polls::EachTenthOfASecond,
                 PollTimeoutObservation {
                     leaves: Vec::new(),
                     heartbeats_after_timeout: true,
                     commit: Ok(()),
+                    member_id_before_next_poll: MEMBER.into(),
                     joins_after_next_poll: Vec::new(),
+                    member_id_after_next_poll: MEMBER.into(),
                 },
             ),
             (
                 "dynamic member polls late",
                 None,
-                Polls::LateByTenthOfASecond,
+                Polls::Late,
                 PollTimeoutObservation {
                     leaves: vec![leave],
                     heartbeats_after_timeout: false,
                     commit: commit_failed.clone(),
+                    member_id_before_next_poll: String::new(),
                     joins_after_next_poll: vec![(String::new(), None)],
+                    member_id_after_next_poll: MEMBER.into(),
                 },
             ),
             (
                 "static member polls late",
                 Some("instance-a"),
-                Polls::LateByTenthOfASecond,
+                Polls::Late,
                 PollTimeoutObservation {
                     leaves: Vec::new(),
                     heartbeats_after_timeout: false,
                     commit: commit_failed,
+                    member_id_before_next_poll: String::new(),
                     joins_after_next_poll: vec![(String::new(), Some("instance-a".into()))],
+                    member_id_after_next_poll: MEMBER.into(),
                 },
             ),
         ] {
@@ -3863,6 +3897,70 @@ mod poll_interval_tests {
             wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted, "{actual:#?}");
+    }
+
+    /// The poll timeout clears the assignment before the `LeaveGroup` goes out.
+    /// A `poll` while the coordinator does not answer the `LeaveGroup` fetches
+    /// nothing, and it starts the join at once.
+    #[tokio::test]
+    async fn a_poll_during_the_poll_timeout_leave_fetches_nothing_and_starts_the_join() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        coordinator
+            .drop_leaves
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, millis(300));
+        config.heartbeat_interval = millis(50);
+        config.leave_group_timeout = secs(10);
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = spawn_consumer(
+            config,
+            client,
+            Arc::new(AtomicI32::new(0)),
+            MEMBER.into(),
+            StartupState {
+                generation_id: 1,
+                assigned_partitions: vec![partition(0)],
+                next_offsets: HashMap::from([(partition(0), 12)]),
+                positions: HashMap::new(),
+                topic_ids: HashMap::new(),
+                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
+            },
+        )
+        .await
+        .expect("spawn consumer");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while coordinator.leaves.lock().expect("leaves lock").is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the member sends LeaveGroup");
+
+        let records = consumer.poll(millis(100)).await.expect("poll");
+        let joined = tokio::time::timeout(Duration::from_secs(5), async {
+            while coordinator.joins.lock().expect("joins lock").is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let observation = (
+            records.len(),
+            joined,
+            coordinator.leaves.lock().expect("leaves lock").len(),
+        );
+        drop(consumer);
+        mock.stop();
+        assert2::assert!(observation == (0, true, 1));
     }
 
     /// Kafka's `ClassicKafkaConsumer` sends `max.poll.interval.ms` as the

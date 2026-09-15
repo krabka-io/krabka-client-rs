@@ -1935,7 +1935,7 @@ mod partition_error_tests {
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(0)),
             retry_policy: ConsumerRetryPolicy::default().into(),
-            member_id: "member-a".into(),
+            member_id: tokio::sync::watch::channel("member-a".to_owned()).1,
             commit_identity: Arc::new(Mutex::new(CommitIdentity {
                 generation: 1,
                 member_id: "member-a".into(),

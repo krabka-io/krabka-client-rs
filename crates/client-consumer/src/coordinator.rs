@@ -374,6 +374,9 @@ pub(crate) struct CoordinatorState {
     /// same coordinator and sees re-discovery updates the moment they land.
     pub coordinator_id: Arc<AtomicI32>,
     pub member_id: String,
+    /// The member id that the parent `Consumer` reports. The task publishes
+    /// `member_id` here whenever it publishes a new generation.
+    pub published_member_id: tokio::sync::watch::Sender<String>,
     pub commit_identity: Arc<Mutex<CommitIdentity>>,
     pub group_instance_id: Option<String>,
     pub generation_id: i32,
@@ -555,6 +558,9 @@ async fn install_assignment(
     identity.member_id.clone_from(&state.member_id);
     identity.rejoin_on_poll = rejoin_on_poll;
     drop(identity);
+    state
+        .published_member_id
+        .send_replace(state.member_id.clone());
     drop(assigned);
     // A high watermark belongs to an ownership snapshot.  Re-learn it from
     // the next successful fetch after any assignment publication.
@@ -725,13 +731,10 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
 
     loop {
         let event = tokio::select! {
+            // A `poll` that came while an RPC was in flight goes before a tick
+            // or the poll deadline, so it resets the timer first.
+            biased;
             () = shutdown.cancelled() => break,
-            _ = ticker.tick() => TaskEvent::Tick,
-            // Kafka's heartbeat thread checks `pollTimeoutExpired` each retry
-            // backoff. The task wakes at the deadline of the poll timer.
-            () = tokio::time::sleep_until(poll_timer.deadline), if !state.member_id.is_empty() => {
-                TaskEvent::PollTimeout
-            }
             changed = state.polls.changed(), if polls_open => {
                 if changed.is_ok() {
                     TaskEvent::Poll
@@ -739,6 +742,12 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     polls_open = false;
                     continue;
                 }
+            }
+            _ = ticker.tick() => TaskEvent::Tick,
+            // Kafka's heartbeat thread checks `pollTimeoutExpired` each retry
+            // backoff. The task wakes at the deadline of the poll timer.
+            () = tokio::time::sleep_until(poll_timer.deadline), if !state.member_id.is_empty() => {
+                TaskEvent::PollTimeout
             }
         };
         if event == TaskEvent::Poll {
@@ -749,8 +758,10 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
         }
 
         if event != TaskEvent::Poll && !state.member_id.is_empty() && poll_timer.expired() {
-            leave_on_poll_timeout(&mut state).await;
+            // Take the `poll` count before the `LeaveGroup` goes out: a `poll`
+            // during the request starts the join.
             rejoin.request_after_next_poll(&state);
+            leave_on_poll_timeout(&mut state).await;
             continue;
         }
 
@@ -849,7 +860,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
     // with a stale id is a silent no-op that orphans the real member until
     // its session expires, stalling the rest of the group's rebalance.
     // Best-effort and bounded: a hung broker must not block `close()`.
-    leave_group(&state, CLOSE_LEAVE_REASON).await;
+    leave_group(&state, &state.member_id, CLOSE_LEAVE_REASON).await;
 }
 
 /// What woke the coordinator task.
@@ -954,6 +965,11 @@ const POLL_TIMEOUT_LEAVE_REASON: &str = "consumer poll timeout has expired.";
 /// then stop, and the next `poll` joins the group again. This function does the
 /// same, clears the assignment, and marks the commit identity with
 /// `rejoin_on_poll`, so a commit fails with `CommitFailed` until the join.
+///
+/// The function clears the member and the assignment before it sends the
+/// `LeaveGroup`, so a `poll` fetches nothing. It does not wait for the
+/// response, as `maybeLeaveGroup` only sends the request: a `poll` can start
+/// the join while the request is in flight.
 async fn leave_on_poll_timeout(state: &mut CoordinatorState) {
     tracing::warn!(
         group = %state.group_id,
@@ -961,25 +977,36 @@ async fn leave_on_poll_timeout(state: &mut CoordinatorState) {
         "consumer poll timeout has expired: the time between two poll calls was longer than \
          max_poll_interval; the member leaves the group and joins again on the next poll"
     );
-    if state.group_instance_id.is_none() {
-        leave_group(state, POLL_TIMEOUT_LEAVE_REASON).await;
-    }
-    state.member_id.clear();
+    let member_id = std::mem::take(&mut state.member_id);
     state.rebalance_pending.send_replace(true);
     install_assignment(state, &[], false, -1, true).await;
+    if state.group_instance_id.is_none() && !member_id.is_empty() {
+        let request = build_leave_group_request(
+            state.group_id.clone(),
+            member_id,
+            None,
+            Some(POLL_TIMEOUT_LEAVE_REASON),
+        );
+        let client = state.client.clone();
+        let coordinator = state.coordinator_id.load(Ordering::Relaxed);
+        let timeout = state.leave_group_timeout.to_std();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(timeout, client.broker(coordinator).send(request)).await;
+        });
+    }
 }
 
 /// Forget the member id, the generation and the partition ownership after
 /// `UNKNOWN_MEMBER_ID`, so the next join starts from scratch.
+///
+/// Kafka's `ConsumerCoordinator.onJoinPrepare` treats the owned partitions of
+/// a member without a generation as lost, for the eager and the cooperative
+/// protocol. The function therefore clears the assignment too, so no `poll`
+/// fetches a partition that the coordinator can give to another member.
 async fn forget_member(state: &mut CoordinatorState) {
     state.member_id.clear();
-    let mut identity = state.commit_identity.lock().await;
-    identity.member_id.clear();
-    identity.ownership_ids.clear();
-    identity.generation = -1;
-    drop(identity);
-    set_generation(state, -1);
-    state.assignment_changed.notify_waiters();
+    state.rebalance_pending.send_replace(true);
+    install_assignment(state, &[], false, -1, false).await;
 }
 
 /// Remove the member from the group after the coordinator fenced its
@@ -1036,8 +1063,8 @@ fn group_response_error(error_code: i16, group_instance_id: Option<&str>) -> Con
     skip_all,
     fields(group_id = %state.group_id, member_id = %state.member_id)
 )]
-async fn leave_group(state: &CoordinatorState, reason: &str) {
-    if state.member_id.is_empty() {
+async fn leave_group(state: &CoordinatorState, member_id: &str, reason: &str) {
+    if member_id.is_empty() {
         return;
     }
     // `member_id` is populated for both the v0–v2 (top-level) and v3+
@@ -1051,7 +1078,7 @@ async fn leave_group(state: &CoordinatorState, reason: &str) {
         .broker(state.coordinator_id.load(Ordering::Relaxed));
     let send = coordinator.send(build_leave_group_request(
         state.group_id.clone(),
-        state.member_id.clone(),
+        member_id.to_owned(),
         state.group_instance_id.clone(),
         Some(reason),
     ));
@@ -2707,6 +2734,7 @@ mod retry_tests {
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(0)),
             member_id: "member-a".into(),
+            published_member_id: tokio::sync::watch::Sender::new("member-a".to_owned()),
             commit_identity: Arc::new(Mutex::new(CommitIdentity {
                 generation: 1,
                 member_id: "member-a".into(),
@@ -2744,7 +2772,7 @@ mod retry_tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            leave_group(&state, CLOSE_LEAVE_REASON),
+            leave_group(&state, &state.member_id, CLOSE_LEAVE_REASON),
         )
         .await
         .expect("configured leave deadline bounds coordinator shutdown");
@@ -3200,6 +3228,7 @@ mod retry_tests {
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(0)),
             member_id: "member-a".into(),
+            published_member_id: tokio::sync::watch::Sender::new("member-a".to_owned()),
             commit_identity: Arc::new(Mutex::new(CommitIdentity {
                 generation: 1,
                 member_id: "member-a".into(),
@@ -3389,6 +3418,25 @@ mod retry_tests {
                     commit_member_id: "member-a".into(),
                     rejoin_on_poll: false,
                     group_requests: requests(&["Heartbeat", "JoinGroup"]),
+                },
+            ),
+            (
+                "unknown member id",
+                GroupAnswers {
+                    polls: false,
+                    heartbeat: 25,
+                    join_group: None,
+                    sync_group: None,
+                },
+                TaskObservation {
+                    task_exited: false,
+                    shutdown_cancelled: false,
+                    poll_error: None,
+                    assigned: Vec::new(),
+                    generation: -1,
+                    commit_member_id: String::new(),
+                    rejoin_on_poll: false,
+                    group_requests: requests(&["Heartbeat"]),
                 },
             ),
             (
