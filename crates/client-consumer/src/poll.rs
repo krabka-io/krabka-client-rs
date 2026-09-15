@@ -652,8 +652,6 @@ impl Consumer {
         // it after the rebalance step. A failed callback therefore does not
         // end this `poll` while the join that queued it still runs.
         let mut first_error = self.run_pending_listener_calls().await.err();
-        // A callback can seek. Apply the seek before this `poll` fetches.
-        self.apply_pending_seeks().await;
         if !*self.rebalance_pending.borrow() {
             return first_error.map_or(Ok(true), Err);
         }
@@ -705,7 +703,6 @@ impl Consumer {
         if let Err(error) = self.run_pending_listener_calls().await {
             first_error.get_or_insert(error);
         }
-        self.apply_pending_seeks().await;
         first_error.map_or(Ok(joined), Err)
     }
 
@@ -1290,7 +1287,6 @@ impl Consumer {
         if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
             return Err(error);
         }
-        self.apply_pending_seeks().await;
         // Kafka's `ConsumerCoordinator.poll` sends the interval auto commit
         // before `updateFetchPositions`.
         self.maybe_auto_commit_async().await;
@@ -2472,6 +2468,7 @@ pub(crate) mod partition_error_tests {
             })),
             commit_serialization: Arc::new(Mutex::new(())),
             commit_async_state: Arc::new(AtomicU8::new(0)),
+            commit_async_callbacks: Arc::default(),
             group_instance_id: None,
             current_generation: Arc::new(AtomicI32::new(1)),
             subscribed_topics: vec!["orders".into()],
@@ -2480,7 +2477,6 @@ pub(crate) mod partition_error_tests {
             next_offsets: Arc::new(Mutex::new(HashMap::from([(("orders".into(), 0), 5)]))),
             end_offsets: Arc::new(Mutex::new(HashMap::new())),
             positions: Arc::new(Mutex::new(HashMap::new())),
-            pending_seeks: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::from([("orders".into(), TOPIC_ID)]))),
             session_timeout: secs(45),
             heartbeat_interval: secs(3),
@@ -3998,6 +3994,58 @@ mod fetch_path_tests {
         drop(consumer);
         stop(brokers);
         assert2::assert!((waiting, after) == (vec![2], vec![1, 2]));
+    }
+
+    /// Kafka's `seek` sets the position of an assigned partition at once, and
+    /// `SubscriptionState.assignedState` throws for a partition that the
+    /// consumer does not own. The next Fetch uses the sought offset.
+    #[tokio::test]
+    async fn seek_moves_an_owned_position_and_rejects_an_unowned_partition() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, partition, expected_error, expected_offset) in [
+            ("owned partition", 0, None, 2),
+            (
+                "unowned partition",
+                9,
+                Some("no current assignment for partition orders-9"),
+                5,
+            ),
+        ] {
+            let sent = SentFetches::default();
+            let brokers = start_brokers(
+                &[vec![FetchAnswer::Respond {
+                    error_code: 0,
+                    session_id: 0,
+                }]],
+                &sent,
+            )
+            .await;
+            let mut consumer = consumer_on(&brokers).await;
+            let error = consumer
+                .seek("orders", partition, 2)
+                .await
+                .err()
+                .map(|error| error.to_string());
+            consumer.poll(millis(200)).await.expect("poll");
+            let offsets: Vec<i64> = sent
+                .lock()
+                .expect("sent lock")
+                .iter()
+                .flat_map(|(_, request)| &request.topics)
+                .flat_map(|topic| &topic.partitions)
+                .map(|partition| partition.fetch_offset)
+                .collect();
+            drop(consumer);
+            stop(brokers);
+            actual.push((name, error, offsets));
+            wanted.push((
+                name,
+                expected_error.map(str::to_owned),
+                vec![expected_offset],
+            ));
+        }
+        assert2::assert!(actual == wanted);
     }
 
     /// One step of a read replica case.

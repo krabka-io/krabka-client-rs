@@ -45,6 +45,56 @@ const GROUP_AUTHORIZATION_FAILED: i16 = 30;
 /// `FENCED_INSTANCE_ID`.
 const FENCED_INSTANCE_ID: i16 = 82;
 
+/// The offset that a commit stores for one partition. Kafka's
+/// `OffsetAndMetadata`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OffsetAndMetadata {
+    /// The next offset to read, that is the last consumed offset plus 1.
+    pub offset: i64,
+    /// The leader epoch of the last consumed record, if known.
+    pub leader_epoch: Option<i32>,
+    /// A string that the coordinator stores with the offset. Kafka's default
+    /// is the empty string.
+    pub metadata: String,
+}
+
+impl OffsetAndMetadata {
+    /// An offset with no leader epoch and empty metadata.
+    #[must_use]
+    pub fn new(offset: i64) -> Self {
+        Self {
+            offset,
+            leader_epoch: None,
+            metadata: String::new(),
+        }
+    }
+
+    /// The commit of a fetch position with its raw wire leader epoch. `-1`
+    /// means no known epoch.
+    fn of_position(offset: i64, leader_epoch: i32) -> Self {
+        Self {
+            offset,
+            leader_epoch: (leader_epoch >= 0).then_some(leader_epoch),
+            metadata: String::new(),
+        }
+    }
+}
+
+/// The commits of fetch positions, as `(offset, leader_epoch)` pairs.
+pub(crate) fn position_commits(
+    offsets: HashMap<(String, i32), (i64, i32)>,
+) -> HashMap<(String, i32), OffsetAndMetadata> {
+    offsets
+        .into_iter()
+        .map(|(partition, (offset, leader_epoch))| {
+            (
+                partition,
+                OffsetAndMetadata::of_position(offset, leader_epoch),
+            )
+        })
+        .collect()
+}
+
 fn commit_offsets(
     raw_offsets: HashMap<(String, i32), i64>,
     positions: &HashMap<(String, i32), PartitionPosition>,
@@ -60,25 +110,21 @@ fn commit_offsets(
         .collect()
 }
 
+/// Check the offsets of [`Consumer::commit_offsets_sync`].
+///
+/// Kafka's `OffsetAndMetadata` rejects a negative offset. Kafka accepts any
+/// other offset, also one past the consumed position.
 fn validate_selected_offsets(
-    offsets: &HashMap<(String, i32), i64>,
-    assigned: &[(String, i32)],
-    consumed_positions: &HashMap<(String, i32), i64>,
+    offsets: &HashMap<(String, i32), OffsetAndMetadata>,
+    assigned: &HashMap<(String, i32), u64>,
 ) -> Result<(), ConsumerError> {
     for ((topic, partition), offset) in offsets {
-        if *offset < 0 {
-            return Err(ConsumerError::InvalidOffset(*offset));
+        if offset.offset < 0 {
+            return Err(ConsumerError::InvalidOffset(offset.offset));
         }
-        let key = (topic.clone(), *partition);
-        if !assigned.contains(&key) {
+        if !assigned.contains_key(&(topic.clone(), *partition)) {
             return Err(ConsumerError::IllegalState(format!(
                 "cannot commit unassigned partition {topic}-{partition}"
-            )));
-        }
-        let consumed = consumed_positions.get(&key).copied().unwrap_or(0);
-        if *offset > consumed {
-            return Err(ConsumerError::IllegalState(format!(
-                "cannot commit offset {offset} past consumed position {consumed} for {topic}-{partition}"
             )));
         }
     }
@@ -89,21 +135,20 @@ fn validate_selected_offsets(
 ///
 /// With `auto_commit`, the function also raises the positions for the commit
 /// before a `JoinGroup` to these offsets. See [`AutoCommit::record_sent`].
-async fn snapshot_commit_topics(
+async fn snapshot_commit_offsets(
     commit_identity: &Arc<Mutex<CommitIdentity>>,
     offsets: &Arc<Mutex<HashMap<(String, i32), i64>>>,
     positions: &Arc<Mutex<HashMap<(String, i32), PartitionPosition>>>,
     auto_commit: Option<&AutoCommit>,
-) -> Option<(usize, Vec<OffsetCommitRequestTopic>, (i32, String))> {
+) -> (HashMap<(String, i32), OffsetAndMetadata>, (i32, String)) {
     let identity = commit_identity.lock().await.clone();
     let mut raw_offsets = offsets.lock().await.clone();
     raw_offsets.retain(|partition, offset| {
         identity.ownership_ids.contains_key(partition) && has_valid_position(*offset)
     });
     if raw_offsets.is_empty() {
-        return None;
+        return (HashMap::new(), (identity.generation, identity.member_id));
     }
-    let partitions = raw_offsets.len();
     let pos = positions.lock().await;
     let offsets = commit_offsets(raw_offsets, &pos);
     drop(pos);
@@ -112,11 +157,88 @@ async fn snapshot_commit_topics(
             .record_sent(sent_positions(&offsets, &identity.ownership_ids))
             .await;
     }
-    Some((
-        partitions,
-        build_commit_topics(offsets),
+    (
+        position_commits(offsets),
         (identity.generation, identity.member_id),
-    ))
+    )
+}
+
+/// The callback of an asynchronous commit. Kafka's `OffsetCommitCallback`.
+///
+/// The consumer calls it once with the offsets that the commit sent and the
+/// result. An empty map means that the consumer had no position to commit.
+pub type OffsetCommitCallback =
+    Box<dyn FnOnce(&HashMap<(String, i32), OffsetAndMetadata>, Result<(), &ConsumerError>) + Send>;
+
+/// The callbacks of the asynchronous commits that wait for the next snapshot.
+pub(crate) type OffsetCommitCallbacks = Arc<std::sync::Mutex<Vec<OffsetCommitCallback>>>;
+
+/// Take the callbacks that the next asynchronous commit snapshot covers.
+fn take_callbacks(callbacks: &OffsetCommitCallbacks) -> Vec<OffsetCommitCallback> {
+    std::mem::take(
+        &mut *callbacks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// The result that an asynchronous commit gives to its callbacks.
+///
+/// This follows Kafka's `ConsumerCoordinator.OffsetCommitResponseHandler` and
+/// `doCommitOffsetsAsync`. A retriable error becomes
+/// [`ConsumerError::RetriableCommitFailed`]. When partitions have errors of
+/// more than one class, the class with the largest [`PartitionCommitError`]
+/// wins, as in [`auto_commit_outcome`].
+fn async_commit_result(
+    result: Result<OffsetCommitResponse, ConsumerError>,
+    group_id: &str,
+    group_instance_id: Option<&str>,
+) -> Result<(), ConsumerError> {
+    let response = match result {
+        Ok(response) => response,
+        Err(ConsumerError::Client(error))
+            if is_retriable_transport_error(&error)
+                || matches!(error, krabka_client_core::ClientError::Timeout(_)) =>
+        {
+            return Err(ConsumerError::RetriableCommitFailed(Box::new(
+                ConsumerError::Client(error),
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let partitions = || {
+        response.topics.iter().flat_map(|topic| {
+            topic
+                .partitions
+                .iter()
+                .map(move |partition| (topic, partition.error_code))
+        })
+    };
+    let class = PartitionCommitError::of_response(&response);
+    let code = partitions()
+        .map(|(_, code)| code)
+        .find(|code| PartitionCommitError::of(*code) == class)
+        .unwrap_or_default();
+    match class {
+        PartitionCommitError::None => Ok(()),
+        PartitionCommitError::TopicAuthorization => Err(ConsumerError::TopicAuthorizationFailed(
+            partitions()
+                .filter(|(_, code)| *code == TOPIC_AUTHORIZATION_FAILED)
+                .map(|(topic, _)| topic.name.clone())
+                .collect(),
+        )),
+        PartitionCommitError::Retriable | PartitionCommitError::CoordinatorUnknown => Err(
+            ConsumerError::RetriableCommitFailed(Box::new(ConsumerError::Server(code))),
+        ),
+        PartitionCommitError::Rebalance => Err(ConsumerError::CommitFailed),
+        PartitionCommitError::FencedInstanceId => Err(ConsumerError::FencedInstanceId(
+            group_instance_id.unwrap_or_default().to_owned(),
+        )),
+        PartitionCommitError::GroupAuthorization => {
+            Err(ConsumerError::GroupAuthorizationFailed(group_id.to_owned()))
+        }
+        PartitionCommitError::Fatal => Err(ConsumerError::Server(code)),
+    }
 }
 
 /// Build the `OffsetCommit` request of a commit. The request names each
@@ -269,7 +391,7 @@ fn commit_response_outcome(
 }
 
 fn retain_continuously_owned(
-    pending: &mut HashMap<(String, i32), (i64, u64)>,
+    pending: &mut HashMap<(String, i32), (OffsetAndMetadata, u64)>,
     current: &HashMap<(String, i32), u64>,
 ) {
     pending.retain(|partition, (_, ownership_id)| current.get(partition) == Some(ownership_id));
@@ -362,6 +484,25 @@ fn sent_positions(
                     },
                 )
             })
+        })
+        .collect()
+}
+
+/// The committable positions of the offsets that a synchronous commit sends.
+fn pending_positions(
+    pending: &HashMap<(String, i32), (OffsetAndMetadata, u64)>,
+) -> Vec<((String, i32), ConsumedPosition)> {
+    pending
+        .iter()
+        .map(|(partition, (offset, ownership_id))| {
+            (
+                partition.clone(),
+                ConsumedPosition {
+                    offset: offset.offset,
+                    leader_epoch: offset.leader_epoch.unwrap_or(-1),
+                    ownership_id: *ownership_id,
+                },
+            )
         })
         .collect()
 }
@@ -731,7 +872,7 @@ impl Consumer {
             let _commit_guard = commit_guard;
             let result = route
                 .send(
-                    build_commit_topics(offsets),
+                    build_commit_topics(position_commits(offsets)),
                     identity.generation,
                     &identity.member_id,
                 )
@@ -774,7 +915,15 @@ impl Consumer {
             let (_, consumed) = self.consumed_positions().await;
             let pending = consumed
                 .into_iter()
-                .map(|(partition, position)| (partition, (position.offset, position.ownership_id)))
+                .map(|(partition, position)| {
+                    (
+                        partition,
+                        (
+                            OffsetAndMetadata::of_position(position.offset, position.leader_epoch),
+                            position.ownership_id,
+                        ),
+                    )
+                })
                 .collect::<HashMap<_, _>>();
             if pending.is_empty() {
                 return Ok(());
@@ -818,14 +967,19 @@ impl Consumer {
             let identity = self.commit_identity.lock().await;
             self.ensure_active_group(&identity)?;
             let offsets = self.next_offsets.lock().await;
-            offsets
-                .iter()
-                .filter(|(_, offset)| has_valid_position(**offset))
-                .filter_map(|(partition, offset)| {
-                    identity
-                        .ownership_ids
-                        .get(partition)
-                        .map(|ownership_id| (partition.clone(), (*offset, *ownership_id)))
+            let positions = self.positions.lock().await;
+            // Kafka's `commitSync()` commits `SubscriptionState.allConsumed`:
+            // the position and the leader epoch at the call.
+            all_consumed(&identity.ownership_ids, &offsets, &positions)
+                .into_iter()
+                .map(|(partition, position)| {
+                    (
+                        partition,
+                        (
+                            OffsetAndMetadata::of_position(position.offset, position.leader_epoch),
+                            position.ownership_id,
+                        ),
+                    )
                 })
                 .collect::<HashMap<_, _>>()
         };
@@ -837,9 +991,12 @@ impl Consumer {
         self.commit_pending_offsets(pending).await
     }
 
-    /// Commit caller-selected next offsets for currently assigned partitions.
-    /// Unlike [`Consumer::commit_sync`], this does not commit unrelated
-    /// partitions and does not change the consumer's fetch positions.
+    /// Commit caller-selected offsets for currently assigned partitions.
+    ///
+    /// This is Kafka's `commitSync(Map<TopicPartition, OffsetAndMetadata>)`.
+    /// The call commits each offset with its leader epoch and metadata. It
+    /// does not commit other partitions and does not change the fetch
+    /// positions. An offset can be past the consumed position, as in Kafka.
     ///
     /// # Errors
     ///
@@ -848,11 +1005,11 @@ impl Consumer {
     /// the new owner will safely replay from the prior committed offset.
     ///
     /// Returns an error if an offset is negative, targets an unassigned
-    /// partition, is ahead of the current consumed position, or the coordinator
-    /// rejects the commit with a non-rebalance error.
+    /// partition, or the coordinator rejects the commit with a non-rebalance
+    /// error.
     pub async fn commit_offsets_sync(
         &self,
-        offsets: HashMap<(String, i32), i64>,
+        offsets: HashMap<(String, i32), OffsetAndMetadata>,
     ) -> Result<(), ConsumerError> {
         let _commit_guard = self.commit_serialization.lock().await;
         if offsets.is_empty() {
@@ -861,9 +1018,7 @@ impl Consumer {
         let pending = {
             let identity = self.commit_identity.lock().await;
             self.ensure_active_group(&identity)?;
-            let consumed_positions = self.next_offsets.lock().await;
-            let owned = identity.ownership_ids.keys().cloned().collect::<Vec<_>>();
-            validate_selected_offsets(&offsets, &owned, &consumed_positions)?;
+            validate_selected_offsets(&offsets, &identity.ownership_ids)?;
             offsets
                 .into_iter()
                 .map(|(partition, offset)| {
@@ -903,7 +1058,7 @@ impl Consumer {
 
     async fn commit_pending_offsets(
         &self,
-        mut pending: HashMap<(String, i32), (i64, u64)>,
+        mut pending: HashMap<(String, i32), (OffsetAndMetadata, u64)>,
     ) -> Result<(), ConsumerError> {
         let retry_start = tokio::time::Instant::now();
         let mut retry_backoff = self.retry_policy.initial_backoff;
@@ -917,24 +1072,15 @@ impl Consumer {
 
             let mut assignment_changed = Box::pin(self.assignment_changed.notified());
             assignment_changed.as_mut().enable();
-            let position_epochs = self.positions.lock().await.clone();
-            let offsets = commit_offsets(
+            if let Some(auto_commit) = &self.auto_commit {
+                auto_commit.record_sent(pending_positions(&pending)).await;
+            }
+            let topics = build_commit_topics(
                 pending
                     .iter()
-                    .map(|(partition, (offset, _))| (partition.clone(), *offset))
+                    .map(|(partition, (offset, _))| (partition.clone(), offset.clone()))
                     .collect(),
-                &position_epochs,
             );
-            if let Some(auto_commit) = &self.auto_commit {
-                let ownership_ids = pending
-                    .iter()
-                    .map(|(partition, (_, ownership_id))| (partition.clone(), *ownership_id))
-                    .collect();
-                auto_commit
-                    .record_sent(sent_positions(&offsets, &ownership_ids))
-                    .await;
-            }
-            let topics = build_commit_topics(offsets);
             let outcome = match self
                 .commit_topics_once(topics, (identity.generation, identity.member_id.clone()))
                 .await
@@ -1128,7 +1274,8 @@ impl Consumer {
     /// This method returns after scheduling the latest offsets for a background
     /// commit. Calls made while one is queued or running are coalesced into its
     /// snapshot or one follow-up snapshot. It does NOT wait for the broker ack.
-    /// It logs errors and does not return them.
+    /// It logs errors and does not return them. Kafka's `commitAsync()` with
+    /// its `DefaultOffsetCommitCallback`.
     #[cfg_attr(test, mutants::skip)] // cargo-mutants: fire-and-forget I/O spawn, exercised by integration tests
     #[tracing::instrument(
         name = "consumer.commit_async",
@@ -1141,6 +1288,30 @@ impl Consumer {
         )
     )]
     pub fn commit_async(&self) {
+        self.schedule_commit_async();
+    }
+
+    /// Commit the positions in the background, and call `callback` with the
+    /// result. Kafka's `commitAsync(OffsetCommitCallback)`.
+    ///
+    /// The commit is coalesced with other asynchronous commits as
+    /// [`Consumer::commit_async`] describes. The callback gets the offsets and
+    /// the result of the commit that covers this call. The consumer calls it
+    /// on a background task.
+    pub fn commit_async_with_callback<F>(&self, callback: F)
+    where
+        F: FnOnce(&HashMap<(String, i32), OffsetAndMetadata>, Result<(), &ConsumerError>)
+            + Send
+            + 'static,
+    {
+        self.commit_async_callbacks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Box::new(callback));
+        self.schedule_commit_async();
+    }
+
+    fn schedule_commit_async(&self) {
         loop {
             match self.commit_async_state.load(Ordering::Acquire) {
                 ASYNC_COMMIT_IDLE => {
@@ -1183,6 +1354,7 @@ impl Consumer {
         let positions = Arc::clone(&self.positions);
         let commit_async_state = Arc::clone(&self.commit_async_state);
         let auto_commit = self.auto_commit.clone();
+        let callbacks = Arc::clone(&self.commit_async_callbacks);
         tokio::spawn(async move {
             loop {
                 {
@@ -1190,20 +1362,35 @@ impl Consumer {
                     // Calls queued before this snapshot are represented by the
                     // current offsets, so collapse them into this request.
                     commit_async_state.store(ASYNC_COMMIT_RUNNING, Ordering::Release);
-                    if let Some((_, topics, (generation, member_id))) = snapshot_commit_topics(
+                    let waiting = take_callbacks(&callbacks);
+                    let (sent, (generation, member_id)) = snapshot_commit_offsets(
                         &commit_identity,
                         &offsets,
                         &positions,
                         auto_commit.as_ref(),
                     )
-                    .await
-                    {
-                        // Kafka's `DefaultOffsetCommitCallback` logs a failed
-                        // asynchronous commit, also one with a retriable error.
-                        let result = route.send(topics, generation, &member_id).await;
-                        if auto_commit_outcome(&result) != AutoCommitOutcome::Committed {
-                            tracing::warn!(?result, "commit_async failed");
-                        }
+                    .await;
+                    // Kafka completes an asynchronous commit of no offsets
+                    // locally with success.
+                    let result = if sent.is_empty() {
+                        Ok(())
+                    } else {
+                        let response = route
+                            .send(build_commit_topics(sent.clone()), generation, &member_id)
+                            .await;
+                        async_commit_result(
+                            response,
+                            &route.group_id,
+                            route.group_instance_id.as_deref(),
+                        )
+                    };
+                    // Kafka's `DefaultOffsetCommitCallback` logs a failed
+                    // asynchronous commit, also one with a retriable error.
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "commit_async failed");
+                    }
+                    for callback in waiting {
+                        callback(&sent, result.as_ref().copied());
                     }
                 }
 
@@ -1253,7 +1440,9 @@ mod tests {
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             find_coordinator_request, metadata_request, offset_commit_request,
             offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
-            offset_commit_response::{OffsetCommitResponsePartition, OffsetCommitResponseTopic},
+            offset_commit_response::{
+                OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+            },
         },
         primitives::uuid::Uuid,
     };
@@ -1500,6 +1689,7 @@ mod tests {
             commit_identity,
             commit_serialization: Arc::new(Mutex::new(())),
             commit_async_state: Arc::new(std::sync::atomic::AtomicU8::new(ASYNC_COMMIT_IDLE)),
+            commit_async_callbacks: Arc::default(),
             group_instance_id: None,
             current_generation: generation,
             subscribed_topics: vec!["topic".into()],
@@ -1508,7 +1698,6 @@ mod tests {
             next_offsets: Arc::new(Mutex::new(next_offsets)),
             end_offsets: Arc::new(Mutex::new(HashMap::new())),
             positions: Arc::new(Mutex::new(HashMap::new())),
-            pending_seeks: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
             session_timeout: secs(45),
             heartbeat_interval: secs(3),
@@ -1539,30 +1728,39 @@ mod tests {
         }
     }
 
+    /// Kafka's `OffsetAndMetadata` rejects a negative offset, and Kafka's
+    /// `commitSync(offsets)` accepts an offset past the consumed position.
     #[test]
-    fn selected_offset_validation_rejects_invalid_targets_and_future_offsets() {
-        let assigned = vec![("topic".to_string(), 2)];
-        let positions = HashMap::from([(("topic".to_string(), 2), 11)]);
+    fn selected_offset_validation_follows_kafka() {
+        let assigned = HashMap::from([(("topic".to_string(), 2), 1)]);
 
-        for (offsets, expected) in [
-            (HashMap::from([(("topic".to_string(), 2), -1)]), "negative"),
-            (HashMap::from([(("other".to_string(), 2), 1)]), "unassigned"),
-            (HashMap::from([(("topic".to_string(), 2), 12)]), "future"),
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, partition, offset, expected) in [
+            (
+                "negative",
+                ("topic", 2),
+                -1,
+                Some("invalid seek offset -1: must be non-negative"),
+            ),
+            (
+                "unassigned",
+                ("other", 2),
+                1,
+                Some("illegal state: cannot commit unassigned partition other-2"),
+            ),
+            ("at the position", ("topic", 2), 11, None),
+            ("past the position", ("topic", 2), 100, None),
         ] {
-            check!(
-                validate_selected_offsets(&offsets, &assigned, &positions).is_err(),
-                "{expected} selected offset must fail"
-            );
+            let offsets = HashMap::from([(
+                (partition.0.to_string(), partition.1),
+                OffsetAndMetadata::new(offset),
+            )]);
+            let result = validate_selected_offsets(&offsets, &assigned).err();
+            actual.push((name, result.map(|error| error.to_string())));
+            wanted.push((name, expected.map(str::to_owned)));
         }
-
-        check!(
-            validate_selected_offsets(
-                &HashMap::from([(("topic".to_string(), 2), 11)]),
-                &assigned,
-                &positions,
-            )
-            .is_ok()
-        );
+        assert2::assert!(actual == wanted);
     }
 
     #[test]
@@ -1893,18 +2091,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_commit_topics_returns_none_for_empty_offsets() {
+    async fn snapshot_commit_offsets_is_empty_without_offsets() {
         let identity = commit_identity(7, "member-a");
         let offsets = Arc::new(Mutex::new(HashMap::new()));
         let positions = Arc::new(Mutex::new(HashMap::new()));
 
-        let snapshot = snapshot_commit_topics(&identity, &offsets, &positions, None).await;
+        let snapshot = snapshot_commit_offsets(&identity, &offsets, &positions, None).await;
 
-        assert2::assert!(snapshot.is_none());
+        assert2::assert!(snapshot == (HashMap::new(), (7, "member-a".into())));
     }
 
     #[tokio::test]
-    async fn snapshot_commit_topics_preserves_count_topics_offsets_and_epochs() {
+    async fn snapshot_commit_offsets_preserves_offsets_and_epochs() {
         let identity = Arc::new(Mutex::new(CommitIdentity {
             generation: 7,
             member_id: "member-a".into(),
@@ -1922,41 +2120,25 @@ mod tests {
                 ..Default::default()
             },
         )])));
-        let (partition_count, topics, seen_identity) =
-            snapshot_commit_topics(&identity, &offsets, &positions, None)
-                .await
-                .expect("non-empty offsets are snapshotted");
-        let mut topics = topics;
-        topics[0].partitions.sort_by_key(|p| p.partition_index);
+        let snapshot = snapshot_commit_offsets(&identity, &offsets, &positions, None).await;
 
         assert2::assert!(
-            (partition_count, topics)
+            snapshot
                 == (
-                    2,
-                    vec![OffsetCommitRequestTopic {
-                        name: "alpha".into(),
-                        topic_id: Uuid::ZERO,
-                        partitions: vec![
-                            OffsetCommitRequestPartition {
-                                partition_index: 0,
-                                committed_offset: 10,
-                                committed_leader_epoch: -1,
-                                committed_metadata: Some(String::new()),
-                                unknown_tagged_fields: UnknownTaggedFields::default(),
-                            },
-                            OffsetCommitRequestPartition {
-                                partition_index: 1,
-                                committed_offset: 20,
-                                committed_leader_epoch: 7,
-                                committed_metadata: Some(String::new()),
-                                unknown_tagged_fields: UnknownTaggedFields::default(),
-                            },
-                        ],
-                        unknown_tagged_fields: UnknownTaggedFields::default(),
-                    }]
+                    HashMap::from([
+                        (("alpha".to_string(), 0), OffsetAndMetadata::new(10)),
+                        (
+                            ("alpha".to_string(), 1),
+                            OffsetAndMetadata {
+                                offset: 20,
+                                leader_epoch: Some(7),
+                                metadata: String::new(),
+                            }
+                        ),
+                    ]),
+                    (7, "member-a".into())
                 )
         );
-        assert2::assert!(seen_identity == (7, "member-a".into()));
     }
 
     #[test]
@@ -2227,7 +2409,10 @@ mod tests {
             .await;
 
             let result: CommitResult = consumer
-                .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+                .commit_offsets_sync(HashMap::from([(
+                    ("topic".into(), 0),
+                    OffsetAndMetadata::new(12),
+                )]))
                 .await
                 .map_err(|error| match error {
                     ConsumerError::Client(
@@ -2710,7 +2895,10 @@ mod tests {
                     Commit::All => consumer.commit_sync().await,
                     Commit::Selected => {
                         consumer
-                            .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+                            .commit_offsets_sync(HashMap::from([(
+                                ("topic".into(), 0),
+                                OffsetAndMetadata::new(12),
+                            )]))
                             .await
                     }
                 }
@@ -2752,7 +2940,10 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            consumer.commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)])),
+            consumer.commit_offsets_sync(HashMap::from([(
+                ("topic".into(), 0),
+                OffsetAndMetadata::new(12),
+            )])),
         )
         .await
         .expect("selected commit completes after retained rejoin")
@@ -2788,7 +2979,10 @@ mod tests {
             .await;
 
             consumer
-                .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+                .commit_offsets_sync(HashMap::from([(
+                    ("topic".into(), 0),
+                    OffsetAndMetadata::new(12),
+                )]))
                 .await
                 .expect("revocation safely ends the old ownership commit");
 
@@ -2818,7 +3012,10 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            consumer.commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)])),
+            consumer.commit_offsets_sync(HashMap::from([(
+                ("topic".into(), 0),
+                OffsetAndMetadata::new(12),
+            )])),
         )
         .await
         .expect("notification sent before response is not lost")
@@ -2854,10 +3051,10 @@ mod tests {
         changed_identity.generation = 8;
         drop(changed_identity);
         generation.store(8, Ordering::Relaxed);
-        let topics = build_commit_topics(commit_offsets(
-            HashMap::from([(("topic".into(), 0), 12)]),
-            &HashMap::new(),
-        ));
+        let topics = build_commit_topics(HashMap::from([(
+            ("topic".into(), 0),
+            OffsetAndMetadata::new(12),
+        )]));
 
         let outcome = consumer
             .commit_topics_once(topics, (7, "member-a".into()))
@@ -2896,7 +3093,10 @@ mod tests {
         )
         .await;
         consumer
-            .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+            .commit_offsets_sync(HashMap::from([(
+                ("topic".into(), 0),
+                OffsetAndMetadata::new(12),
+            )]))
             .await
             .expect("selected commit retries with live member identity");
 
@@ -2963,7 +3163,10 @@ mod tests {
             let consumer = Arc::clone(&consumer);
             tokio::spawn(async move {
                 consumer
-                    .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 10)]))
+                    .commit_offsets_sync(HashMap::from([(
+                        ("topic".into(), 0),
+                        OffsetAndMetadata::new(10),
+                    )]))
                     .await
             })
         };
@@ -2972,7 +3175,10 @@ mod tests {
             let consumer = Arc::clone(&consumer);
             tokio::spawn(async move {
                 consumer
-                    .commit_offsets_sync(HashMap::from([(("topic".into(), 0), 12)]))
+                    .commit_offsets_sync(HashMap::from([(
+                        ("topic".into(), 0),
+                        OffsetAndMetadata::new(12),
+                    )]))
                     .await
             })
         };
@@ -3024,11 +3230,212 @@ mod tests {
 
     #[test]
     fn selected_commit_topics_exclude_unrequested_assignment_positions() {
-        let selected = commit_offsets(HashMap::from([(("topic".into(), 0), 12)]), &HashMap::new());
-        let topics = build_commit_topics(selected);
+        let topics = build_commit_topics(HashMap::from([(
+            ("topic".into(), 0),
+            OffsetAndMetadata::new(12),
+        )]));
 
         assert2::assert!(topics.len() == 1);
         assert2::assert!(topics[0].partitions.len() == 1);
         assert2::assert!(topics[0].partitions[0].partition_index == 0);
+    }
+
+    /// The `OffsetCommit` requests that [`recording_coordinator`] received.
+    type SentCommits = Arc<std::sync::Mutex<Vec<OffsetCommitRequest>>>;
+
+    /// A coordinator that records each `OffsetCommit` v7 request and answers
+    /// each partition with `error_code`.
+    async fn recording_coordinator(error_code: i16) -> (MockBroker, SentCommits) {
+        use bytes::Buf as _;
+        use krabka_protocol::Decode as _;
+
+        let sent = SentCommits::default();
+        let sent_in_mock = Arc::clone(&sent);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions_for_offset_commit((7, 7)));
+            }
+            if api_key != offset_commit_request::API_KEY {
+                return None;
+            }
+            let client_id_len = usize::try_from(body.get_i16()).unwrap();
+            body.advance(client_id_len);
+            let request = OffsetCommitRequest::decode(&mut body, version).unwrap();
+            let response = OffsetCommitResponse {
+                topics: request
+                    .topics
+                    .iter()
+                    .map(|topic| OffsetCommitResponseTopic {
+                        name: topic.name.clone(),
+                        partitions: topic
+                            .partitions
+                            .iter()
+                            .map(|partition| OffsetCommitResponsePartition {
+                                partition_index: partition.partition_index,
+                                error_code,
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            sent_in_mock.lock().unwrap().push(request);
+            Some(encode_response(&response, version))
+        })
+        .await;
+        (mock, sent)
+    }
+
+    fn sent_partitions(sent: &SentCommits) -> Vec<OffsetCommitRequestPartition> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| request.topics.iter())
+            .flat_map(|topic| topic.partitions.iter().cloned())
+            .collect()
+    }
+
+    /// Kafka's `commitSync(offsets)` sends each offset with its leader epoch
+    /// and metadata, also an offset past the consumed position. Kafka's
+    /// `commitSync()` sends the position with its leader epoch.
+    #[tokio::test]
+    async fn synchronous_commits_send_kafkas_offsets_epochs_and_metadata() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, selected, expected) in [
+            (
+                "selected offset past the position",
+                Some(OffsetAndMetadata {
+                    offset: 100,
+                    leader_epoch: Some(4),
+                    metadata: "note".into(),
+                }),
+                (100, 4, "note"),
+            ),
+            (
+                "selected offset without epoch",
+                Some(OffsetAndMetadata::new(3)),
+                (3, -1, ""),
+            ),
+            ("positions", None, (12, 9, "")),
+        ] {
+            let (mock, sent) = recording_coordinator(0).await;
+            let consumer = commit_consumer(
+                &mock,
+                commit_identity(7, "member-a"),
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(AtomicI32::new(7)),
+            )
+            .await;
+            consumer.positions.lock().await.insert(
+                ("topic".into(), 0),
+                PartitionPosition {
+                    offset_epoch: krabka_ids::LeaderEpoch(9),
+                    ..Default::default()
+                },
+            );
+            let result = match selected {
+                Some(offset) => {
+                    consumer
+                        .commit_offsets_sync(HashMap::from([(("topic".into(), 0), offset)]))
+                        .await
+                }
+                None => consumer.commit_sync().await,
+            };
+            mock.stop();
+            actual.push((
+                name,
+                result.map_err(|error| error.to_string()),
+                sent_partitions(&sent),
+            ));
+            wanted.push((
+                name,
+                Ok(()),
+                vec![OffsetCommitRequestPartition {
+                    partition_index: 0,
+                    committed_offset: expected.0,
+                    committed_leader_epoch: expected.1,
+                    committed_metadata: Some(expected.2.into()),
+                    ..Default::default()
+                }],
+            ));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka's `commitAsync(callback)` calls the callback with the offsets and
+    /// the result. A retriable error comes as `RetriableCommitFailedException`.
+    #[tokio::test]
+    async fn asynchronous_commit_calls_the_callback_with_offsets_and_result() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, error_code, expected) in [
+            ("success", 0, Ok(())),
+            (
+                "coordinator loading",
+                14,
+                Err("offset commit failed with a retriable exception: broker error_code 14"),
+            ),
+            (
+                "group authorization",
+                30,
+                Err("not authorized to access group: group-a"),
+            ),
+            ("metadata too large", 12, Err("broker error_code 12")),
+        ] {
+            let (mock, _sent) = recording_coordinator(error_code).await;
+            let consumer = commit_consumer(
+                &mock,
+                commit_identity(7, "member-a"),
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(AtomicI32::new(7)),
+            )
+            .await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            consumer.commit_async_with_callback(move |offsets, result| {
+                let _ = tx.send((offsets.clone(), result.map_err(ToString::to_string)));
+            });
+            let completed = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("callback runs")
+                .expect("callback sends");
+            mock.stop();
+            actual.push((name, completed));
+            wanted.push((
+                name,
+                (
+                    HashMap::from([(("topic".to_string(), 0), OffsetAndMetadata::new(12))]),
+                    expected.map_err(str::to_owned),
+                ),
+            ));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
+    /// Kafka completes an asynchronous commit of no offsets locally with
+    /// success, and calls the callback.
+    #[tokio::test]
+    async fn asynchronous_commit_without_positions_calls_the_callback() {
+        let (mock, sent) = recording_coordinator(0).await;
+        let consumer = commit_consumer(
+            &mock,
+            commit_identity(7, "member-a"),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicI32::new(7)),
+        )
+        .await;
+        consumer.next_offsets.lock().await.clear();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        consumer.commit_async_with_callback(move |offsets, result| {
+            let _ = tx.send((offsets.clone(), result.map_err(ToString::to_string)));
+        });
+        let completed = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("callback runs")
+            .expect("callback sends");
+        mock.stop();
+        assert2::assert!((completed, sent_partitions(&sent)) == ((HashMap::new(), Ok(())), vec![]));
     }
 }

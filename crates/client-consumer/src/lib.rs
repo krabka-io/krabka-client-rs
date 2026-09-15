@@ -95,6 +95,7 @@ mod validate;
 
 pub use assignor::Assignor;
 pub use builder::{AutoOffsetReset, IsolationLevel};
+pub use commit::{OffsetAndMetadata, OffsetCommitCallback};
 pub use consumer::{
     Consumer, ConsumerFetchMaxBytes, ConsumerFetchPartitionMaxBytes, ConsumerLeaveGroupTimeout,
     ConsumerRecord, ConsumerRetryPolicy, ConsumerSubscriptionMetadataRefreshInterval,

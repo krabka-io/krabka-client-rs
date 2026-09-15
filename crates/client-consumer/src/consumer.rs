@@ -64,6 +64,8 @@ pub struct Consumer {
     pub(crate) commit_identity: Arc<Mutex<CommitIdentity>>,
     pub(crate) commit_serialization: Arc<Mutex<()>>,
     pub(crate) commit_async_state: Arc<AtomicU8>,
+    /// The callbacks of the asynchronous commits that wait for a snapshot.
+    pub(crate) commit_async_callbacks: crate::commit::OffsetCommitCallbacks,
     pub(crate) group_instance_id: Option<String>,
     /// The current group generation exposed by [`Consumer::generation`].
     /// Commit RPCs use the generation atomically paired with membership and
@@ -80,12 +82,6 @@ pub struct Consumer {
     pub(crate) end_offsets: Arc<Mutex<HashMap<(String, i32), i64>>>,
     /// KIP-320 per-partition leader-epoch metadata, keyed like `next_offsets`.
     pub(crate) positions: Arc<Mutex<HashMap<(String, i32), crate::position::PartitionPosition>>>,
-    /// Pending [`seek`](Consumer::seek) targets: `(topic, partition) -> next
-    /// offset to fetch`. `poll` applies them at its top once the partition is
-    /// assigned, *after* the coordinator's post-assignment prime. The prime
-    /// therefore does not overwrite a seek requested before assignment. See
-    /// `seek.rs`. The map is empty in steady state.
-    pub(crate) pending_seeks: Arc<Mutex<HashMap<(String, i32), i64>>>,
     /// Topic UUIDs resolved at build time. Fetch v ≥ 13 needs them, because it
     /// carries `topic_id` instead of the topic name.
     pub(crate) topic_ids: Arc<Mutex<HashMap<String, WireUuid>>>,
@@ -1554,7 +1550,6 @@ async fn spawn_consumer(
     let next_offsets = Arc::new(Mutex::new(next_offsets));
     let end_offsets = Arc::new(Mutex::new(HashMap::new()));
     let positions = Arc::new(Mutex::new(positions));
-    let pending_seeks = Arc::new(Mutex::new(HashMap::new()));
     let topic_ids = Arc::new(Mutex::new(topic_ids));
     // Shared with the coordinator task so the commit path always stamps the
     // current generation; the coordinator publishes to it on every (re)join.
@@ -1645,6 +1640,7 @@ async fn spawn_consumer(
         commit_identity,
         commit_serialization,
         commit_async_state,
+        commit_async_callbacks: Arc::default(),
         group_instance_id: group_instance_id.clone(),
         current_generation,
         subscribed_topics: subscribe,
@@ -1653,7 +1649,6 @@ async fn spawn_consumer(
         next_offsets,
         end_offsets,
         positions,
-        pending_seeks,
         topic_ids,
         session_timeout,
         heartbeat_interval,
@@ -2580,6 +2575,7 @@ mod security_arg_tests {
             })),
             commit_serialization: Arc::new(Mutex::new(())),
             commit_async_state: Arc::new(AtomicU8::new(0)),
+            commit_async_callbacks: Arc::default(),
             group_instance_id: Some("instance-a".into()),
             current_generation: Arc::new(AtomicI32::new(7)),
             subscribed_topics: vec!["orders".into(), "payments".into()],
@@ -2588,7 +2584,6 @@ mod security_arg_tests {
             next_offsets: Arc::new(Mutex::new(HashMap::new())),
             end_offsets: Arc::new(Mutex::new(HashMap::new())),
             positions: Arc::new(Mutex::new(HashMap::new())),
-            pending_seeks: Arc::new(Mutex::new(HashMap::new())),
             topic_ids: Arc::new(Mutex::new(HashMap::new())),
             session_timeout: secs(45),
             heartbeat_interval: secs(3),

@@ -38,6 +38,17 @@ pub enum ConsumerError {
     #[error("invalid seek offset {0}: must be non-negative")]
     InvalidOffset(i64),
 
+    /// The call names a partition that the consumer does not own. Kafka's
+    /// `SubscriptionState.assignedState` raises `IllegalStateException`.
+    #[error("no current assignment for partition {topic}-{partition}")]
+    NoCurrentAssignment { topic: String, partition: i32 },
+
+    /// An asynchronous commit failed with a retriable error. A later commit
+    /// can succeed. Kafka's consumer gives `RetriableCommitFailedException` to
+    /// the `OffsetCommitCallback`.
+    #[error("offset commit failed with a retriable exception: {0}")]
+    RetriableCommitFailed(Box<ConsumerError>),
+
     #[error("commit conflict: rejoined since this poll")]
     CommitInvalid,
 
@@ -154,6 +165,19 @@ mod tests {
                 "commit failed",
                 ConsumerError::CommitFailed,
                 "offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group",
+            ),
+            (
+                "no current assignment",
+                ConsumerError::NoCurrentAssignment {
+                    topic: "t".into(),
+                    partition: 9,
+                },
+                "no current assignment for partition t-9",
+            ),
+            (
+                "retriable commit failed",
+                ConsumerError::RetriableCommitFailed(Box::new(ConsumerError::Server(15))),
+                "offset commit failed with a retriable exception: broker error_code 15",
             ),
             (
                 "log truncation",

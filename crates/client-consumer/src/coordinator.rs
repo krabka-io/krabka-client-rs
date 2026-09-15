@@ -1934,7 +1934,7 @@ async fn commit_consumed_before_join(
             identity.generation,
             identity.member_id,
             state.group_instance_id.clone(),
-            build_commit_topics(offsets),
+            build_commit_topics(crate::commit::position_commits(offsets)),
         ));
         let Ok(result) = tokio::time::timeout_at(deadline, send).await else {
             tracing::error!("auto commit before the rebalance timed out; joining the group");
