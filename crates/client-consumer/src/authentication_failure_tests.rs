@@ -189,6 +189,7 @@ fn consumer(client: Client) -> Consumer {
         rebalance_pending: tokio::sync::watch::channel(false).1,
         max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
         fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
+        close_operation: tokio::sync::watch::Sender::new(crate::GroupMembershipOperation::Default),
     }
 }
 
@@ -236,6 +237,8 @@ fn coordinator_state(client: Client) -> CoordinatorState {
         join_prepared: false,
         polls: crate::coordinator::PollSignal::default().subscribe(),
         rebalance_pending: tokio::sync::watch::Sender::new(false),
+        close_operation: tokio::sync::watch::channel(crate::GroupMembershipOperation::Default).1,
+        rejoin_reason: String::new(),
     }
 }
 
