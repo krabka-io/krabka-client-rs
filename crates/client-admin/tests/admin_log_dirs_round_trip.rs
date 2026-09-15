@@ -19,7 +19,7 @@ mod support;
 use std::{collections::BTreeMap, time::Duration};
 
 use assert2::assert;
-use krabka_client_admin::{AdminClient, LogDirInfo};
+use krabka_client_admin::{AdminClient, LogDirInfo, TopicPartitionReplica};
 use testcontainers::ImageExt as _;
 use testcontainers_modules::kafka::Kafka;
 
@@ -29,7 +29,7 @@ const PRIMARY_LOG_DIR: &str = "/var/lib/kafka/data";
 const TARGET_LOG_DIR: &str = "/var/lib/kafka/data2";
 
 /// Bound on a read-back loop. The broker moves a replica in its own time.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SETTLE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Pause between two read-backs.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -76,12 +76,31 @@ async fn admin_log_dirs_alter_then_describe_converges() {
     assert_filtered_report(&mut admin, &topic).await;
 }
 
-/// The report before the move names both dirs and holds no future log.
-async fn assert_initial_report(admin: &mut AdminClient, topic: &str) {
-    let initial = admin
-        .describe_log_dirs(None)
+/// The id of the one broker of the container. On a one-broker cluster the
+/// broker is also the controller.
+async fn broker_id(admin: &mut AdminClient) -> i32 {
+    admin.metadata(&[]).await.expect("metadata").controller_id
+}
+
+/// The log dirs of the one broker.
+async fn describe(
+    admin: &mut AdminClient,
+    filter: Option<&BTreeMap<String, Vec<i32>>>,
+) -> Vec<LogDirInfo> {
+    let broker = broker_id(admin).await;
+    let mut report = admin
+        .describe_log_dirs(&[broker], filter)
         .await
         .expect("describe_log_dirs");
+    report
+        .remove(&broker)
+        .expect("a result for the broker")
+        .expect("the broker describes its log dirs")
+}
+
+/// The report before the move names both dirs and holds no future log.
+async fn assert_initial_report(admin: &mut AdminClient, topic: &str) {
+    let initial = describe(admin, None).await;
     let mut reported: Vec<&str> = initial.iter().map(|d| d.log_dir.as_str()).collect();
     reported.sort_unstable();
     assert!(reported == vec![PRIMARY_LOG_DIR, TARGET_LOG_DIR]);
@@ -106,19 +125,21 @@ async fn assert_initial_report(admin: &mut AdminClient, topic: &str) {
 /// `AlterReplicaLogDirs` takes the last entry per topic and partition when the
 /// wire message lists one twice. The request below lists each partition once.
 async fn move_partitions_to_target(admin: &mut AdminClient, topic: &str) {
-    let mut assignments: BTreeMap<String, Vec<(String, Vec<i32>)>> = BTreeMap::new();
-    assignments.insert(
-        TARGET_LOG_DIR.to_owned(),
-        vec![(topic.to_owned(), vec![0, 1])],
-    );
+    let broker = broker_id(admin).await;
+    let replica = |partition| TopicPartitionReplica {
+        topic: topic.to_owned(),
+        partition,
+        broker_id: broker,
+    };
+    let assignments = BTreeMap::from([
+        (replica(0), TARGET_LOG_DIR.to_owned()),
+        (replica(1), TARGET_LOG_DIR.to_owned()),
+    ]);
     let outcomes = admin
         .alter_replica_log_dirs(&assignments)
         .await
         .expect("alter_replica_log_dirs");
-    assert!(outcomes.len() == 2);
-    for outcome in &outcomes {
-        assert!(outcome.error.is_none(), "{outcome:?}");
-    }
+    assert!(outcomes == BTreeMap::from([(replica(0), Ok(())), (replica(1), Ok(()))]));
 }
 
 /// A filtered describe, for the one topic, still sees both partitions in the
@@ -126,10 +147,7 @@ async fn move_partitions_to_target(admin: &mut AdminClient, topic: &str) {
 async fn assert_filtered_report(admin: &mut AdminClient, topic: &str) {
     // An empty partition list means every partition of that topic.
     let filter = BTreeMap::from([(topic.to_owned(), Vec::new())]);
-    let filtered = admin
-        .describe_log_dirs(Some(&filter))
-        .await
-        .expect("filtered describe_log_dirs");
+    let filtered = describe(admin, Some(&filter)).await;
     let (current, any_future) = partitions_of(&filtered, topic, Some(TARGET_LOG_DIR));
     assert!(current == vec![0, 1]);
     assert!(!any_future);
@@ -146,10 +164,7 @@ async fn assert_filtered_report(admin: &mut AdminClient, topic: &str) {
 async fn await_partitions(admin: &mut AdminClient, topic: &str, in_dir: Option<&str>, what: &str) {
     tokio::time::timeout(SETTLE_TIMEOUT, async {
         loop {
-            let report = admin
-                .describe_log_dirs(None)
-                .await
-                .expect("describe_log_dirs");
+            let report = describe(admin, None).await;
             let (current, any_future) = partitions_of(&report, topic, in_dir);
             if !any_future && current == vec![0, 1] {
                 break;

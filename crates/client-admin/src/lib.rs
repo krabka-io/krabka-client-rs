@@ -42,7 +42,9 @@ pub struct MetadataVersionUpdate {
 pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
 pub use features::{FeatureMetadata, FeatureRange, FeatureUpdate, FeatureUpdateOutcome};
 pub use groups::ConsumerGroupOffsetOutcome;
-pub use log_dirs::{AlterReplicaLogDirOutcome, LogDirInfo, LogDirPartitionInfo, LogDirTopicInfo};
+pub use log_dirs::{
+    BrokerResult, LogDirInfo, LogDirPartitionInfo, LogDirTopicInfo, TopicPartitionReplica,
+};
 pub use quorum::{MetadataQuorum, QuorumReplica};
 pub use quotas::{QuotaOp, UserQuotaConfig, diff_user_quotas};
 pub use topics::{
