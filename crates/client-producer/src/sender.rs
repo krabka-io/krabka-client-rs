@@ -317,7 +317,11 @@ impl RetryBackoff {
         if self.max <= self.initial {
             return self.initial;
         }
-        let smallest = self.initial.max(Duration::from_millis(1));
+        // Kafka counts in whole milliseconds and divides by `max(initial, 1)`.
+        // This backoff accepts a sub-millisecond initial interval, so it
+        // divides by the interval itself, and only a zero interval takes the
+        // smallest unit.
+        let smallest = self.initial.max(Duration::from_nanos(1));
         let exp_max =
             (self.max.as_secs_f64() / smallest.as_secs_f64()).ln() / RETRY_BACKOFF_EXP_BASE.ln();
         let exp = f64::from(attempts).min(exp_max);
@@ -2528,6 +2532,16 @@ mod tests {
         assert2::assert!(
             [0, 5].map(|attempts| constant.backoff(attempts, 0.0)) == [ms(50), ms(50)]
         );
+
+        // A sub-millisecond initial backoff grows from its own value up to the
+        // maximum.
+        let us = Duration::from_micros;
+        let small = RetryBackoff::new(us(500), us(750));
+        assert2::assert!(
+            [(0, 0.5), (1, 0.0), (5, 0.999)]
+                .map(|(attempts, unit)| small.backoff(attempts, unit).as_micros())
+                == [500, 600, 750]
+        );
     }
 
     #[test]
@@ -3243,6 +3257,9 @@ mod harness {
         retries: i32,
         delivery_timeout: Time,
         retry_backoff: Time,
+        /// The default equals `retry_backoff`, so the backoff is constant
+        /// with no jitter, and paused-time tests see exact instants.
+        retry_backoff_max: Time,
         acks: Acks,
         mode: BatchMode,
     }
@@ -3255,6 +3272,7 @@ mod harness {
                 retries: i32::MAX,
                 delivery_timeout: secs(30),
                 retry_backoff: millis(1),
+                retry_backoff_max: millis(1),
                 acks: Acks::All,
                 mode: BatchMode::Idempotent,
             }
@@ -3268,6 +3286,7 @@ mod harness {
             retries,
             delivery_timeout,
             retry_backoff,
+            retry_backoff_max,
             acks,
             mode,
         } = policy;
@@ -3308,7 +3327,7 @@ mod harness {
             linger,
             request_timeout_ms: 5_000,
             retries,
-            retry_backoff: RetryBackoff::new(retry_backoff.to_std(), Duration::from_secs(1)),
+            retry_backoff: RetryBackoff::new(retry_backoff.to_std(), retry_backoff_max.to_std()),
             delivery_timeout,
             max_in_flight,
             metadata_cache: Arc::clone(&metadata_cache),
@@ -4912,6 +4931,7 @@ mod harness {
             transport.clone(),
             HarnessPolicy {
                 retry_backoff: millis(100),
+                retry_backoff_max: millis(100),
                 delivery_timeout: millis(300),
                 ..HarnessPolicy::default()
             },
@@ -4944,6 +4964,7 @@ mod harness {
             transport.clone(),
             HarnessPolicy {
                 retry_backoff: millis(100),
+                retry_backoff_max: secs(1),
                 ..HarnessPolicy::default()
             },
         );
