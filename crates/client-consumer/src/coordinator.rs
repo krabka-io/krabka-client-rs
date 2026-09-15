@@ -1389,6 +1389,9 @@ async fn handle_subscription_change(state: &mut CoordinatorState, rejoin: &mut R
     }
     refresh_pattern_topics(state).await;
     let topics = state.subscription.borrow().topics.clone();
+    // The task has its own client. Its metadata requests name the new topics,
+    // so the leader assigns them.
+    state.client.metadata_topics().set(topics.iter().cloned());
     if topics != state.joined_topics {
         state.rejoin_reason =
             crate::subscription::subscription_changed_reason(&state.joined_topics, &topics);
