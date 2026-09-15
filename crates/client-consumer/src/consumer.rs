@@ -112,6 +112,9 @@ pub struct Consumer {
     /// Kafka's `enable.auto.commit` state. `None` when auto commit is off.
     /// The coordinator task holds a clone.
     pub(crate) auto_commit: Option<crate::commit::AutoCommit>,
+    /// Counts the `poll` calls that got no error. The coordinator task waits
+    /// for it after a fatal error.
+    pub(crate) poll_signal: crate::coordinator::PollSignal,
 }
 
 #[derive(Clone)]
@@ -119,6 +122,10 @@ pub(crate) struct CommitIdentity {
     pub generation: i32,
     pub member_id: String,
     pub ownership_ids: HashMap<(String, i32), u64>,
+    /// `true` after a fatal coordinator error removed the member from the
+    /// group, until the join that the next `poll` starts completes. A commit
+    /// fails with `CommitFailed` while it is set.
+    pub rejoin_on_poll: bool,
 }
 
 #[derive(Clone)]
@@ -1369,6 +1376,7 @@ async fn spawn_consumer(
         generation: generation_id,
         member_id: member_id.clone(),
         ownership_ids,
+        rejoin_on_poll: false,
     }));
     let commit_serialization = Arc::new(Mutex::new(()));
     let commit_async_state = Arc::new(AtomicU8::new(0));
@@ -1382,6 +1390,7 @@ async fn spawn_consumer(
     let current_generation = Arc::new(AtomicI32::new(generation_id));
 
     let poll_error = crate::coordinator::PollErrorSlot::default();
+    let poll_signal = crate::coordinator::PollSignal::default();
     let auto_commit = auto_commit_interval.map(crate::commit::AutoCommit::new);
 
     let shutdown = CancellationToken::new();
@@ -1421,6 +1430,7 @@ async fn spawn_consumer(
         auto_commit: auto_commit.clone(),
         commit_serialization: Arc::clone(&commit_serialization),
         join_prepared: false,
+        polls: poll_signal.subscribe(),
     };
     // IMPORTANT: `tokio::spawn` is the very last operation — no `.await`
     // follows it.  Dropping a timed-out `start_once` future before this
@@ -1458,6 +1468,7 @@ async fn spawn_consumer(
         auto_offset_reset,
         poll_error,
         auto_commit,
+        poll_signal,
     })
 }
 
@@ -2267,6 +2278,7 @@ mod security_arg_tests {
                 generation: 7,
                 member_id: "member-a".into(),
                 ownership_ids: HashMap::from([(("orders".into(), 0), 1)]),
+                rejoin_on_poll: false,
             })),
             commit_serialization: Arc::new(Mutex::new(())),
             commit_async_state: Arc::new(AtomicU8::new(0)),
@@ -2292,6 +2304,7 @@ mod security_arg_tests {
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
+            poll_signal: crate::coordinator::PollSignal::default(),
         }
     }
 
@@ -2497,6 +2510,8 @@ mod auto_commit_tests {
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
+            fetch_request,
+            fetch_response::FetchResponse,
             find_coordinator_request, heartbeat_request,
             heartbeat_response::HeartbeatResponse,
             join_group_request, leave_group_request,
@@ -2509,6 +2524,8 @@ mod auto_commit_tests {
             offset_commit_response::{
                 OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
             },
+            offset_fetch_request,
+            offset_fetch_response::OffsetFetchResponse,
             sync_group_request,
         },
     };
@@ -2516,8 +2533,8 @@ mod auto_commit_tests {
     use super::*;
 
     const GROUP: &str = "group-a";
-    const MEMBER: &str = "member-a";
-    const TOPIC: &str = "orders";
+    pub(super) const MEMBER: &str = "member-a";
+    pub(super) const TOPIC: &str = "orders";
     /// `REBALANCE_IN_PROGRESS`.
     const REBALANCE_IN_PROGRESS: i16 = 27;
     const AUTO_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
@@ -2529,7 +2546,7 @@ mod auto_commit_tests {
     /// A group request that the mock coordinator received, or an event of the
     /// application, in arrival order.
     #[derive(Clone, Debug, PartialEq)]
-    enum GroupRequest {
+    pub(super) enum GroupRequest {
         OffsetCommit(OffsetCommitRequest),
         JoinGroup,
         SyncGroup,
@@ -2558,7 +2575,7 @@ mod auto_commit_tests {
     /// The API versions that the mock advertises: `(api_key, min, max)`. Each
     /// maximum is below the flexible version of its API, so no response needs a
     /// tagged response header.
-    const API_VERSIONS: [(i16, i16, i16); 8] = [
+    const API_VERSIONS: [(i16, i16, i16); 10] = [
         (api_versions_request::API_KEY, 0, 3),
         (metadata_request::API_KEY, 0, 8),
         (find_coordinator_request::API_KEY, 0, 2),
@@ -2567,17 +2584,19 @@ mod auto_commit_tests {
         (heartbeat_request::API_KEY, 0, 3),
         (leave_group_request::API_KEY, 0, 3),
         (offset_commit_request::API_KEY, 2, 7),
+        (offset_fetch_request::API_KEY, 1, 5),
+        (fetch_request::API_KEY, 4, 11),
     ];
 
     /// A group coordinator that records every group request. It answers each
     /// one with success, except the `OffsetCommit` requests in
     /// `commit_replies`. It does not answer `FindCoordinator`.
-    struct MockCoordinator {
+    pub(super) struct MockCoordinator {
         protocol: &'static str,
         requests: std::sync::Mutex<Vec<GroupRequest>>,
         /// The error code of the next `Heartbeat` response. The mock sends it
         /// once and then answers `0`.
-        heartbeat_error: AtomicI16,
+        pub(super) heartbeat_error: AtomicI16,
         /// The assignment of each `SyncGroup` response. The mock repeats the
         /// last one.
         assignments: std::sync::Mutex<VecDeque<Vec<(String, i32)>>>,
@@ -2602,11 +2621,27 @@ mod auto_commit_tests {
     }
 
     impl MockCoordinator {
+        /// A coordinator at generation 1 whose `SyncGroup` responses carry
+        /// `assignments`.
+        pub(super) fn new(assignor: Assignor, assignments: Vec<Vec<(String, i32)>>) -> Arc<Self> {
+            Arc::new(Self {
+                protocol: assignor.protocol_name(),
+                requests: std::sync::Mutex::new(Vec::new()),
+                heartbeat_error: AtomicI16::new(0),
+                assignments: std::sync::Mutex::new(assignments.into()),
+                generation: AtomicI32::new(1),
+                commit_replies: std::sync::Mutex::new(VecDeque::new()),
+                rebalance_on_commit: std::sync::atomic::AtomicBool::new(false),
+                last_heartbeat: std::sync::Mutex::new(tokio::time::Instant::now()),
+                drop_heartbeats: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
         fn record(&self, request: GroupRequest) {
             self.requests.lock().expect("requests lock").push(request);
         }
 
-        fn requests(&self) -> Vec<GroupRequest> {
+        pub(super) fn requests(&self) -> Vec<GroupRequest> {
             self.requests.lock().expect("requests lock").clone()
         }
 
@@ -2617,7 +2652,12 @@ mod auto_commit_tests {
                 .count()
         }
 
-        fn respond(&self, api_key: i16, version: i16, mut body: &[u8]) -> Option<Vec<u8>> {
+        pub(super) fn respond(
+            &self,
+            api_key: i16,
+            version: i16,
+            mut body: &[u8],
+        ) -> Option<Vec<u8>> {
             match api_key {
                 api_versions_request::API_KEY => Some(encode(
                     &ApiVersionsResponse {
@@ -2687,6 +2727,12 @@ mod auto_commit_tests {
                         version,
                     ))
                 }
+                // No partition has records.
+                fetch_request::API_KEY => Some(encode(&FetchResponse::default(), version)),
+                // No partition has a committed offset.
+                offset_fetch_request::API_KEY => {
+                    Some(encode(&OffsetFetchResponse::default(), version))
+                }
                 leave_group_request::API_KEY => {
                     self.record(GroupRequest::LeaveGroup);
                     Some(encode(&LeaveGroupResponse::default(), version))
@@ -2745,7 +2791,7 @@ mod auto_commit_tests {
         }
     }
 
-    fn partition(index: i32) -> (String, i32) {
+    pub(super) fn partition(index: i32) -> (String, i32) {
         (TOPIC.to_owned(), index)
     }
 
@@ -2780,7 +2826,7 @@ mod auto_commit_tests {
         })
     }
 
-    fn start_config(
+    pub(super) fn start_config(
         bootstrap: String,
         assignor: Assignor,
         auto_commit: bool,
@@ -2859,7 +2905,11 @@ mod auto_commit_tests {
 
     /// Wait until the coordinator received `syncs` `SyncGroup` requests in
     /// total, or record `SyncGroupLate` after `within`.
-    async fn wait_for_sync_groups(coordinator: &MockCoordinator, syncs: usize, within: Duration) {
+    pub(super) async fn wait_for_sync_groups(
+        coordinator: &MockCoordinator,
+        syncs: usize,
+        within: Duration,
+    ) {
         let waited = tokio::time::timeout(within, async {
             while coordinator.sync_groups() < syncs {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2893,17 +2943,7 @@ mod auto_commit_tests {
         rebalance_timeout: Time,
         steps: &[Step],
     ) -> Vec<GroupRequest> {
-        let coordinator = Arc::new(MockCoordinator {
-            protocol: assignor.protocol_name(),
-            requests: std::sync::Mutex::new(Vec::new()),
-            heartbeat_error: AtomicI16::new(0),
-            assignments: std::sync::Mutex::new(assignments.into()),
-            generation: AtomicI32::new(1),
-            commit_replies: std::sync::Mutex::new(VecDeque::new()),
-            rebalance_on_commit: std::sync::atomic::AtomicBool::new(false),
-            last_heartbeat: std::sync::Mutex::new(tokio::time::Instant::now()),
-            drop_heartbeats: std::sync::atomic::AtomicBool::new(false),
-        });
+        let coordinator = MockCoordinator::new(assignor, assignments);
         let in_mock = Arc::clone(&coordinator);
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
             in_mock.respond(api_key, version, body)
@@ -3371,5 +3411,136 @@ mod auto_commit_tests {
             wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted);
+    }
+}
+
+#[cfg(test)]
+mod group_rejoin_tests {
+    use std::sync::atomic::Ordering;
+
+    use krabka_client_core::MockBroker;
+
+    use super::{
+        auto_commit_tests::{
+            GroupRequest, MEMBER, MockCoordinator, TOPIC, partition, start_config,
+            wait_for_sync_groups,
+        },
+        *,
+    };
+
+    /// `FENCED_INSTANCE_ID`.
+    const FENCED_INSTANCE_ID: i16 = 82;
+
+    /// What the application saw around a fence of its static member.
+    #[derive(Debug, PartialEq)]
+    struct FenceObservation {
+        first_poll: Result<usize, String>,
+        commit_after_fence: Result<(), String>,
+        requests_before_next_poll: Vec<GroupRequest>,
+        next_poll: Result<usize, String>,
+        requests_after_next_poll: Vec<GroupRequest>,
+        assignment: Vec<(String, i32)>,
+        generation: i32,
+    }
+
+    /// The coordinator fences the static member on a heartbeat. `poll` returns
+    /// the error once, a commit fails, and the member sends no `JoinGroup`
+    /// until the application polls again. That `poll` joins the group and gets
+    /// a new assignment. Kafka's `AbstractCoordinator.pollHeartbeat` raises the
+    /// failure cause once, and the next `poll` calls `ensureActiveGroup`.
+    #[tokio::test(start_paused = true)]
+    async fn poll_after_a_fenced_instance_id_joins_the_group_again() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(1)]]);
+        coordinator
+            .heartbeat_error
+            .store(FENCED_INSTANCE_ID, Ordering::SeqCst);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, minutes(1));
+        config.group_instance_id = Some("instance-a".into());
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = spawn_consumer(
+            config,
+            client,
+            Arc::new(AtomicI32::new(0)),
+            MEMBER.into(),
+            StartupState {
+                generation_id: 1,
+                assigned_partitions: vec![partition(0), partition(1)],
+                next_offsets: HashMap::from([(partition(0), 12), (partition(1), 7)]),
+                positions: HashMap::new(),
+                topic_ids: HashMap::new(),
+                topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
+            },
+        )
+        .await
+        .expect("spawn consumer");
+        // Wait for the heartbeat that gets the fence.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !crate::coordinator::poll_error_pending(&consumer.poll_error) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the coordinator fences the member");
+
+        let first_poll = consumer
+            .poll(millis(100))
+            .await
+            .map(|records| records.len())
+            .map_err(|error| error.to_string());
+        // Several heartbeat intervals without a poll.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let commit_after_fence = consumer
+            .commit_sync()
+            .await
+            .map_err(|error| error.to_string());
+        let requests_before_next_poll = coordinator.requests();
+        let next_poll = consumer
+            .poll(millis(100))
+            .await
+            .map(|records| records.len())
+            .map_err(|error| error.to_string());
+        wait_for_sync_groups(&coordinator, 1, Duration::from_secs(30)).await;
+        let observation = FenceObservation {
+            first_poll,
+            commit_after_fence,
+            requests_before_next_poll,
+            next_poll,
+            requests_after_next_poll: coordinator
+                .requests()
+                .into_iter()
+                .filter(|request| *request != GroupRequest::SessionExpired)
+                .collect(),
+            assignment: consumer.assignment().await,
+            generation: consumer.generation_id(),
+        };
+        consumer.close().await.expect("close");
+        mock.stop();
+
+        assert2::assert!(
+            observation
+                == FenceObservation {
+                    first_poll: Err(
+                        ConsumerError::FencedInstanceId("instance-a".into()).to_string()
+                    ),
+                    commit_after_fence: Err(ConsumerError::CommitFailed.to_string()),
+                    requests_before_next_poll: Vec::new(),
+                    next_poll: Ok(0),
+                    requests_after_next_poll: vec![
+                        GroupRequest::JoinGroup,
+                        GroupRequest::SyncGroup
+                    ],
+                    assignment: vec![partition(1)],
+                    generation: 2,
+                }
+        );
     }
 }

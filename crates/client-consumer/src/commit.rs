@@ -740,7 +740,7 @@ impl Consumer {
         let _commit_guard = self.commit_serialization.lock().await;
         let pending = {
             let identity = self.commit_identity.lock().await;
-            self.ensure_active_group()?;
+            self.ensure_active_group(&identity)?;
             let offsets = self.next_offsets.lock().await;
             offsets
                 .iter()
@@ -784,7 +784,7 @@ impl Consumer {
         }
         let pending = {
             let identity = self.commit_identity.lock().await;
-            self.ensure_active_group()?;
+            self.ensure_active_group(&identity)?;
             let consumed_positions = self.next_offsets.lock().await;
             let owned = identity.ownership_ids.keys().cloned().collect::<Vec<_>>();
             validate_selected_offsets(&offsets, &owned, &consumed_positions)?;
@@ -800,21 +800,21 @@ impl Consumer {
         self.commit_pending_offsets(pending).await
     }
 
-    /// Fail a synchronous commit when the coordinator task has stopped or
-    /// stops.
+    /// Fail a synchronous commit when the consumer is not part of an active
+    /// group.
     ///
-    /// The task stops when the coordinator fences the static member. The
-    /// consumer is then not part of an active group, and no later generation
-    /// can make a commit valid. Kafka's
-    /// `ConsumerCoordinator.sendOffsetCommitRequest` raises
-    /// `CommitFailedException` in this state and sends no request.
+    /// That is the case after a fatal coordinator error removed the member,
+    /// until the next `poll` joins the group again, and after the coordinator
+    /// task stopped. Kafka's `ConsumerCoordinator.sendOffsetCommitRequest`
+    /// raises `CommitFailedException` in this state and sends no request.
     ///
-    /// A fenced task cancels `coordinator_shutdown` before it clears the
-    /// ownership in `commit_identity`. Call this function while you hold the
-    /// `commit_identity` lock, or after you read it. An ownership snapshot that
-    /// the fence cleared then always comes with a cancelled token.
-    fn ensure_active_group(&self) -> Result<(), ConsumerError> {
-        if self.coordinator_shutdown.is_cancelled()
+    /// A fence sets `rejoin_on_poll` in the same critical section in which it
+    /// clears the ownership. Pass an `identity` that you read under the
+    /// `commit_identity` lock, so an ownership that the fence cleared always
+    /// comes with the flag.
+    fn ensure_active_group(&self, identity: &CommitIdentity) -> Result<(), ConsumerError> {
+        if identity.rejoin_on_poll
+            || self.coordinator_shutdown.is_cancelled()
             || self
                 .coordinator_handle
                 .as_ref()
@@ -833,7 +833,7 @@ impl Consumer {
         let mut retry_backoff = self.retry_policy.initial_backoff;
         loop {
             let identity = self.commit_identity.lock().await.clone();
-            self.ensure_active_group()?;
+            self.ensure_active_group(&identity)?;
             retain_continuously_owned(&mut pending, &identity.ownership_ids);
             if pending.is_empty() {
                 return Ok(());
@@ -1243,6 +1243,7 @@ mod tests {
             generation,
             member_id: member_id.into(),
             ownership_ids: HashMap::from([(("topic".into(), 0), 1)]),
+            rejoin_on_poll: false,
         }))
     }
 
@@ -1362,6 +1363,7 @@ mod tests {
             auto_offset_reset: AutoOffsetReset::Latest,
             poll_error: crate::coordinator::PollErrorSlot::default(),
             auto_commit: None,
+            poll_signal: crate::coordinator::PollSignal::default(),
         }
     }
 
@@ -1707,6 +1709,7 @@ mod tests {
             generation: 7,
             member_id: "member-a".into(),
             ownership_ids: HashMap::from([(("alpha".into(), 0), 1), (("alpha".into(), 1), 2)]),
+            rejoin_on_poll: false,
         }));
         let offsets = Arc::new(Mutex::new(HashMap::from([
             (("alpha".to_string(), 0), 10),
@@ -2065,8 +2068,9 @@ mod tests {
         }
     }
 
-    /// A commit fails without a request after the coordinator task stopped,
-    /// for example after the coordinator fenced the static member. Kafka's
+    /// A commit fails without a request after the coordinator task stopped, and
+    /// after the coordinator fenced the static member until the next `poll`
+    /// joins the group again. Kafka's
     /// `ConsumerCoordinator.sendOffsetCommitRequest` raises
     /// `CommitFailedException` when the member is not part of an active group.
     #[tokio::test]
@@ -2079,6 +2083,8 @@ mod tests {
         #[derive(Clone, Copy)]
         enum TaskState {
             Running,
+            /// The task runs and waits for the next `poll` after a fence.
+            Fenced,
             Stopping,
             Stopped,
         }
@@ -2092,9 +2098,23 @@ mod tests {
                 (Ok(()), 1),
             ),
             (
-                "commit sync after a fence cancelled the task but before it ends",
+                "commit sync after close cancelled the task but before it ends",
                 Commit::All,
                 TaskState::Stopping,
+                true,
+                (Err(commit_failed.to_string()), 0),
+            ),
+            (
+                "commit sync while the task waits for a poll after a fence",
+                Commit::All,
+                TaskState::Fenced,
+                false,
+                (Err(commit_failed.to_string()), 0),
+            ),
+            (
+                "selected commit while the task waits for a poll after a fence",
+                Commit::Selected,
+                TaskState::Fenced,
                 false,
                 (Err(commit_failed.to_string()), 0),
             ),
@@ -2137,6 +2157,9 @@ mod tests {
             if !owned {
                 identity.lock().await.ownership_ids.clear();
             }
+            if matches!(task_state, TaskState::Fenced) {
+                identity.lock().await.rejoin_on_poll = true;
+            }
             let mut consumer = commit_consumer(
                 &mock,
                 identity,
@@ -2145,7 +2168,9 @@ mod tests {
             )
             .await;
             let task = match task_state {
-                TaskState::Running => tokio::spawn(std::future::pending::<()>()),
+                TaskState::Running | TaskState::Fenced => {
+                    tokio::spawn(std::future::pending::<()>())
+                }
                 TaskState::Stopping => {
                     consumer.coordinator_shutdown.cancel();
                     tokio::spawn(std::future::pending::<()>())
@@ -2365,6 +2390,7 @@ mod tests {
             generation: 7,
             member_id: "member-a".into(),
             ownership_ids: HashMap::from([(("topic".into(), 0), 1), (("topic".into(), 1), 2)]),
+            rejoin_on_poll: false,
         }));
         let changed = Arc::new(tokio::sync::Notify::new());
         let generation = Arc::new(AtomicI32::new(7));
