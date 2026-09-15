@@ -452,6 +452,12 @@ pub(crate) struct CoordinatorState {
     pub joined_topics: Vec<String>,
     /// The `unsubscribe` calls that the task handled.
     pub seen_unsubscribes: u64,
+    /// Kafka's `group.remote.assignor`, for the consumer group protocol.
+    pub server_assignor: Option<String>,
+    /// The member epoch of the consumer group protocol.
+    pub member_epoch: i32,
+    /// The fields of the last `ConsumerGroupHeartbeat`.
+    pub sent_heartbeat_fields: crate::consumer_group::SentFields,
     pub assigned: Arc<Mutex<Vec<(String, i32)>>>,
     pub assignment_changed: Arc<Notify>,
     pub next_ownership_id: u64,
@@ -528,6 +534,67 @@ async fn remember_lost_partitions(state: &mut CoordinatorState) {
     for partition in owned {
         if !state.lost_partitions.contains(&partition) {
             state.lost_partitions.push(partition);
+        }
+    }
+}
+
+/// Ask `poll` to run a listener callback, for the consumer group protocol.
+pub(crate) async fn call_listener_kind(
+    state: &mut CoordinatorState,
+    kind: crate::rebalance_listener::ListenerCallKind,
+    partitions: Vec<(String, i32)>,
+) -> Result<(), ConsumerError> {
+    call_listener(state, kind, partitions).await
+}
+
+/// Prime the fetch positions of the partitions that an assignment added.
+pub(crate) async fn prime_added_offsets(
+    state: &CoordinatorState,
+    partitions: &[(String, i32)],
+) -> Result<(), ConsumerError> {
+    prime_offsets(state, partitions).await
+}
+
+/// Publish an assignment of the consumer group protocol, with the member
+/// epoch in place of the generation.
+pub(crate) async fn publish_group_assignment(
+    state: &mut CoordinatorState,
+    assignment: &[(String, i32)],
+    member_epoch: i32,
+) {
+    install_assignment(state, assignment, true, member_epoch, false).await;
+}
+
+/// Give up the partitions of a fenced member and keep its member id, as
+/// Kafka's `transitionToFenced` does.
+pub(crate) async fn forget_member_keeping_id(state: &mut CoordinatorState) {
+    state.rebalance_pending.send_replace(true);
+    remember_lost_partitions(state).await;
+    install_assignment(state, &[], false, JOIN_GROUP_EPOCH, false).await;
+}
+
+/// Publish the member epoch of the consumer group protocol as the generation
+/// that commits carry. Kafka sends the member epoch of a consumer-protocol
+/// member in `OffsetCommit.generationIdOrMemberEpoch`.
+pub(crate) async fn publish_member_epoch(state: &mut CoordinatorState) {
+    let epoch = state.member_epoch;
+    let mut identity = state.commit_identity.lock().await;
+    identity.generation = epoch;
+    identity.member_id.clone_from(&state.member_id);
+    drop(identity);
+    set_generation(state, epoch);
+}
+
+/// The generation of a member that joins the consumer group protocol again.
+const JOIN_GROUP_EPOCH: i32 = 0;
+
+/// Find the coordinator of the group again after a heartbeat named another
+/// one.
+pub(crate) async fn find_coordinator_again(state: &CoordinatorState) {
+    match find_coordinator(&state.client, &state.group_id, state.retry_policy).await {
+        Ok(id) => state.coordinator_id.store(id, Ordering::Relaxed),
+        Err(error) => {
+            tracing::warn!(group = %state.group_id, %error, "coordinator lookup failed");
         }
     }
 }
@@ -811,7 +878,7 @@ async fn install_generation(state: &mut CoordinatorState, generation_id: i32) {
 
 /// Keep `poll` from fetching `partitions` until the returned gate drops after
 /// their assign callback. Without a listener there is no callback to wait for.
-fn assigned_callback_gate(
+pub(crate) fn assigned_callback_gate(
     state: &CoordinatorState,
     partitions: &[(String, i32)],
 ) -> Option<crate::rebalance_listener::AssignedCallbackGate> {
@@ -3398,6 +3465,9 @@ mod retry_tests {
             subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
             joined_topics: Vec::new(),
             seen_unsubscribes: 0,
+            server_assignor: None,
+            member_epoch: 0,
+            sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
             assigned: Arc::new(Mutex::new(Vec::new())),
             assignment_changed: Arc::new(Notify::new()),
             next_ownership_id: 1,
@@ -4191,6 +4261,9 @@ mod retry_tests {
             subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
             joined_topics: Vec::new(),
             seen_unsubscribes: 0,
+            server_assignor: None,
+            member_epoch: 0,
+            sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
             assigned: Arc::new(Mutex::new(vec![orders_0.clone()])),
             assignment_changed: Arc::new(Notify::new()),
             next_ownership_id: 2,
