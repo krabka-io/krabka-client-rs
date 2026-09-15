@@ -4336,6 +4336,40 @@ mod group_membership_tests {
         assert2::assert!(actual == wanted);
     }
 
+    /// A heartbeat can request a rebalance after the start of `poll` signalled
+    /// the coordinator task. The eager `poll` that then waits for the join
+    /// must still start it, or it waits until its timeout.
+    #[tokio::test]
+    async fn a_poll_that_waits_for_an_eager_join_starts_a_join_requested_after_it_began() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut consumer = started_consumer(&mock, None).await;
+        // The start of `poll` signals the task.
+        crate::coordinator::note_poll(&consumer.poll_signal);
+        coordinator.heartbeat_error.store(27, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !*consumer.rebalance_pending.borrow() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the heartbeat requests a rebalance");
+
+        let started = tokio::time::Instant::now();
+        let joined = consumer
+            .wait_for_rebalance(started + Duration::from_secs(5))
+            .await;
+        let within_timeout = started.elapsed() < Duration::from_secs(4);
+        let joins = coordinator.joins.lock().expect("joins lock").len();
+        drop(consumer);
+        mock.stop();
+        assert2::assert!((joined, within_timeout, joins) == (true, true, 1));
+    }
+
     /// Kafka's `JoinGroup` carries `AbstractCoordinator.rejoinReason`
     /// (KIP-800): "group is already rebalancing" after a heartbeat
     /// `REBALANCE_IN_PROGRESS`, and "encountered <error> from HEARTBEAT

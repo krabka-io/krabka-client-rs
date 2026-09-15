@@ -479,7 +479,7 @@ impl Consumer {
     /// `poll` fetches nothing until the join completes. The cooperative
     /// protocol keeps the owned partitions, and `poll` fetches them while the
     /// join runs. A member without partitions has nothing to fetch either.
-    async fn wait_for_rebalance(&mut self, deadline: tokio::time::Instant) -> bool {
+    pub(crate) async fn wait_for_rebalance(&mut self, deadline: tokio::time::Instant) -> bool {
         if !*self.rebalance_pending.borrow() {
             return true;
         }
@@ -487,6 +487,10 @@ impl Consumer {
         if !eager && !self.assigned.lock().await.is_empty() {
             return true;
         }
+        // The coordinator task can request the rejoin after the start of this
+        // `poll` signalled it. Signal again, so that this `poll` starts the
+        // join that it waits for, as Kafka's `ensureActiveGroup` does.
+        crate::coordinator::note_poll(&self.poll_signal);
         let joined = tokio::time::timeout_at(
             deadline,
             self.rebalance_pending.wait_for(|pending| !*pending),
