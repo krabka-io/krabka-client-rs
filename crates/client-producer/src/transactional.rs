@@ -498,7 +498,7 @@ mod tests {
         Decode, Encode,
         owned::{
             add_offsets_to_txn_request,
-            add_offsets_to_txn_response::AddOffsetsToTxnResponse,
+            add_offsets_to_txn_response::{self, AddOffsetsToTxnResponse},
             add_partitions_to_txn_request,
             add_partitions_to_txn_response::{self, AddPartitionsToTxnResponse},
             api_versions_request,
@@ -524,7 +524,7 @@ mod tests {
             },
             txn_offset_commit_request,
             txn_offset_commit_response::{
-                TxnOffsetCommitResponse, TxnOffsetCommitResponsePartition,
+                self, TxnOffsetCommitResponse, TxnOffsetCommitResponsePartition,
                 TxnOffsetCommitResponseTopic,
             },
         },
@@ -981,6 +981,13 @@ mod tests {
         two_phase_commit: bool,
         /// The linger of the producer. Zero when `None`.
         linger: Option<Duration>,
+        /// The finalized `transaction.version` that the mock reports. With a
+        /// value, the mock also advertises `AddOffsetsToTxn` v0 to v4, and
+        /// `EndTxn` and `TxnOffsetCommit` v0 to v5, as a Kafka 4 broker does.
+        transaction_version: Option<i16>,
+        /// The API key and version of each request other than `ApiVersions`,
+        /// `Metadata`, `FindCoordinator` and `InitProducerId`.
+        transaction_requests: Vec<(i16, i16)>,
     }
 
     type SharedCoordinator = Arc<std::sync::Mutex<Coordinator>>;
@@ -1024,37 +1031,75 @@ mod tests {
         }
     }
 
-    /// The `ApiVersions` answer of the scripted mock coordinator.
-    fn scripted_api_versions(add_partitions_range: (i16, i16), two_phase_commit: bool) -> Vec<u8> {
-        encode_v0(&ApiVersionsResponse {
-            api_keys: vec![
-                ApiVersion {
-                    api_key: add_partitions_to_txn_request::API_KEY,
-                    min_version: add_partitions_range.0,
-                    max_version: add_partitions_range.1,
-                    ..Default::default()
-                },
-                ApiVersion {
-                    api_key: metadata_request::API_KEY,
-                    min_version: 0,
-                    max_version: 12,
-                    ..Default::default()
-                },
-                ApiVersion {
-                    api_key: produce_request::API_KEY,
-                    min_version: 3,
-                    max_version: 13,
-                    ..Default::default()
-                },
-                ApiVersion {
-                    api_key: init_producer_id_request::API_KEY,
-                    min_version: 0,
-                    max_version: if two_phase_commit { 6 } else { 0 },
-                    ..Default::default()
-                },
-            ],
+    /// Encode `response` at `version`, after the tagged-fields byte of
+    /// response header v1 for a flexible version.
+    fn encode_at(response: &impl Encode, version: i16, flexible_min: i16) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        if version >= flexible_min {
+            buf.extend_from_slice(&[0]);
+        }
+        response.encode(&mut buf, version).expect("encode response");
+        buf.to_vec()
+    }
+
+    /// The `ApiVersions` answer of the scripted mock coordinator, encoded at
+    /// the request `version` (response header v0 for every version).
+    fn scripted_api_versions(
+        add_partitions_range: (i16, i16),
+        two_phase_commit: bool,
+        transaction_version: Option<i16>,
+        version: i16,
+    ) -> Vec<u8> {
+        use krabka_protocol::owned::api_versions_response::FinalizedFeatureKey;
+        let range = |api_key, max_version| ApiVersion {
+            api_key,
+            min_version: 0,
+            max_version,
             ..Default::default()
-        })
+        };
+        let mut api_keys = vec![
+            ApiVersion {
+                api_key: add_partitions_to_txn_request::API_KEY,
+                min_version: add_partitions_range.0,
+                max_version: add_partitions_range.1,
+                ..Default::default()
+            },
+            range(metadata_request::API_KEY, 12),
+            ApiVersion {
+                api_key: produce_request::API_KEY,
+                min_version: 3,
+                max_version: 13,
+                ..Default::default()
+            },
+            range(
+                init_producer_id_request::API_KEY,
+                if two_phase_commit { 6 } else { 0 },
+            ),
+        ];
+        let mut finalized_features = Vec::new();
+        if let Some(level) = transaction_version {
+            api_keys.extend([
+                range(add_offsets_to_txn_request::API_KEY, 4),
+                range(end_txn_request::API_KEY, 5),
+                range(txn_offset_commit_request::API_KEY, 5),
+            ]);
+            finalized_features.push(FinalizedFeatureKey {
+                name: "transaction.version".into(),
+                max_version_level: level,
+                min_version_level: level,
+                ..Default::default()
+            });
+        }
+        let mut buf = BytesMut::new();
+        ApiVersionsResponse {
+            api_keys,
+            finalized_features_epoch: if transaction_version.is_some() { 1 } else { -1 },
+            finalized_features,
+            ..Default::default()
+        }
+        .encode(&mut buf, version.min(5))
+        .expect("encode ApiVersions");
+        buf.to_vec()
     }
 
     /// The `Metadata` answer of the scripted mock coordinator: the topic
@@ -1098,11 +1143,12 @@ mod tests {
         let handler_port = Arc::clone(&port_cell);
         let shared = Arc::new(std::sync::Mutex::new(coordinator));
         let handler_shared = Arc::clone(&shared);
-        let (add_partitions_range, two_phase_commit, linger) = {
+        let (add_partitions_range, two_phase_commit, transaction_version, linger) = {
             let coordinator = shared.lock().expect("scripted coordinator");
             (
                 coordinator.add_partitions_range.unwrap_or((0, 5)),
                 coordinator.two_phase_commit,
+                coordinator.transaction_version,
                 coordinator.linger.unwrap_or(Duration::ZERO),
             )
         };
@@ -1111,9 +1157,20 @@ mod tests {
                 return Some(scripted_api_versions(
                     add_partitions_range,
                     two_phase_commit,
+                    transaction_version,
+                    version,
                 ));
             }
             let mut coordinator = handler_shared.lock().expect("scripted coordinator");
+            if ![
+                metadata_request::API_KEY,
+                find_coordinator_request::API_KEY,
+                init_producer_id_request::API_KEY,
+            ]
+            .contains(&api_key)
+            {
+                coordinator.transaction_requests.push((api_key, version));
+            }
             if api_key == metadata_request::API_KEY {
                 coordinator.metadata_requests += 1;
                 return Some(scripted_metadata(
@@ -1149,27 +1206,35 @@ mod tests {
             if api_key == add_offsets_to_txn_request::API_KEY {
                 return match coordinator.add_offsets.next() {
                     Reply::Silent => None,
-                    Reply::Code(error_code) => Some(encode_v0(&AddOffsetsToTxnResponse {
-                        error_code,
-                        ..Default::default()
-                    })),
+                    Reply::Code(error_code) => Some(encode_at(
+                        &AddOffsetsToTxnResponse {
+                            error_code,
+                            ..Default::default()
+                        },
+                        version,
+                        add_offsets_to_txn_response::FLEXIBLE_MIN,
+                    )),
                 };
             }
             if api_key == txn_offset_commit_request::API_KEY {
                 return match coordinator.txn_offset_commit.next() {
                     Reply::Silent => None,
-                    Reply::Code(error_code) => Some(encode_v0(&TxnOffsetCommitResponse {
-                        topics: vec![TxnOffsetCommitResponseTopic {
-                            name: "topic".into(),
-                            partitions: vec![TxnOffsetCommitResponsePartition {
-                                partition_index: 0,
-                                error_code,
+                    Reply::Code(error_code) => Some(encode_at(
+                        &TxnOffsetCommitResponse {
+                            topics: vec![TxnOffsetCommitResponseTopic {
+                                name: "topic".into(),
+                                partitions: vec![TxnOffsetCommitResponsePartition {
+                                    partition_index: 0,
+                                    error_code,
+                                    ..Default::default()
+                                }],
                                 ..Default::default()
                             }],
                             ..Default::default()
-                        }],
-                        ..Default::default()
-                    })),
+                        },
+                        version,
+                        txn_offset_commit_response::FLEXIBLE_MIN,
+                    )),
                 };
             }
             if api_key == find_coordinator_request::API_KEY {
@@ -1203,10 +1268,14 @@ mod tests {
             if api_key == end_txn_request::API_KEY {
                 return match coordinator.end_txn.next() {
                     Reply::Silent => None,
-                    Reply::Code(error_code) => Some(encode_v0(&EndTxnResponse {
-                        error_code,
-                        ..Default::default()
-                    })),
+                    Reply::Code(error_code) => Some(encode_at(
+                        &EndTxnResponse {
+                            error_code,
+                            ..Default::default()
+                        },
+                        version,
+                        end_txn_response::FLEXIBLE_MIN,
+                    )),
                 };
             }
             if api_key == add_partitions_to_txn_request::API_KEY {
@@ -1834,6 +1903,90 @@ mod tests {
         }
     }
 
+    /// Kafka's producer follows the finalized feature `transaction.version`
+    /// (`TransactionManager.maybeUpdateTransactionV2Enabled`). With level 2 it
+    /// sends no `AddPartitionsToTxn` (`maybeAddPartition`) and no
+    /// `AddOffsetsToTxn` (`sendOffsetsToTransaction`), and it sends Produce,
+    /// `TxnOffsetCommit` and `EndTxn` at their latest versions. With level 1
+    /// it caps them at `LAST_STABLE_VERSION_BEFORE_TRANSACTION_V2`: 11, 4 and
+    /// 4.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_transaction_version_decides_the_transaction_requests() {
+        let group = krabka_client_consumer::ConsumerGroupMetadata {
+            group_id: "group-a".into(),
+            generation_id: 3,
+            member_id: "member-a".into(),
+            group_instance_id: None,
+        };
+        let cases = [
+            (
+                "transaction version 1",
+                1,
+                vec![
+                    (produce_request::API_KEY, 11),
+                    (txn_offset_commit_request::API_KEY, 4),
+                    (end_txn_request::API_KEY, 4),
+                    (add_partitions_to_txn_request::API_KEY, 3),
+                    (add_offsets_to_txn_request::API_KEY, 4),
+                ],
+            ),
+            (
+                "transaction version 2",
+                2,
+                // The mock metadata has no topic id, so Produce stops at v12,
+                // the last version with topic names.
+                vec![
+                    (produce_request::API_KEY, 12),
+                    (txn_offset_commit_request::API_KEY, 5),
+                    (end_txn_request::API_KEY, 5),
+                ],
+            ),
+        ];
+        for (name, transaction_version, expected) in cases {
+            let (mock, producer, coordinator) = scripted_producer(Coordinator {
+                transaction_version: Some(transaction_version),
+                ..Coordinator::default()
+            })
+            .await;
+            coordinator
+                .lock()
+                .expect("scripted coordinator")
+                .transaction_requests
+                .clear();
+            let transaction = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction");
+            let record = producer
+                .send(ProducerRecord {
+                    topic: "topic".to_owned(),
+                    partition: Some(0),
+                    value: Some(bytes::Bytes::from_static(b"v")),
+                    ..Default::default()
+                })
+                .await;
+            producer
+                .send_offsets_to_transaction([(("topic".to_owned(), 0), 42)], &group)
+                .await
+                .expect("send offsets");
+            transaction.commit().await.expect("commit");
+            record
+                .await
+                .expect("the record is resolved")
+                .expect("the record is delivered");
+            let mut actual = coordinator
+                .lock()
+                .expect("scripted coordinator")
+                .transaction_requests
+                .clone();
+            mock.stop();
+            let mut expected = expected;
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert2::assert!(actual == expected, "{name}");
+        }
+    }
+
     /// The observable result of a commit after a failed transactional batch.
     #[derive(Debug, PartialEq, Eq)]
     struct CommitAfterFailedBatch {
@@ -2073,15 +2226,9 @@ mod tests {
             let handler_port = Arc::clone(&port_cell);
             let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
                 if api_key == api_versions_request::API_KEY {
-                    return Some(encode_v0(&ApiVersionsResponse {
-                        api_keys: vec![ApiVersion {
-                            api_key: end_txn_request::API_KEY,
-                            min_version: 0,
-                            max_version: 5,
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }));
+                    // Only transaction version 2 sends `EndTxn` v5, whose
+                    // answer carries the new identity.
+                    return Some(scripted_api_versions((0, 5), false, Some(2), version));
                 }
                 if api_key == find_coordinator_request::API_KEY {
                     return Some(encode_v0(&FindCoordinatorResponse {
