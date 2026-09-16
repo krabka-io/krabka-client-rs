@@ -2076,6 +2076,63 @@ mod tests {
         slow.stop();
     }
 
+    /// `connect_with_config` and `connect_controller_with_config` take the
+    /// settings of `AdminClientConfig` onto the connection and the retry
+    /// policy of the client, and an invalid setting stops the connect.
+    #[tokio::test]
+    async fn connect_with_config_carries_the_settings_and_refuses_an_invalid_one() {
+        let live = ObservedAdminBroker::start(Duration::ZERO).await;
+        let config = || AdminClientConfig {
+            client_id: Some("tool-a".to_owned()),
+            request_timeout: secs(45),
+            default_api_timeout: Some(secs(90)),
+            retries: 4,
+            retry_backoff: Time::from_millis(30),
+            retry_backoff_max: Time::from_millis(300),
+            ..AdminClientConfig::default()
+        };
+
+        let admin = AdminClient::connect_with_config(&[live.addr.to_string()], config())
+            .await
+            .expect("admin connects");
+
+        assert2::assert!(admin.options.client_id == "tool-a");
+        assert2::assert!(admin.options.request_timeout == secs(45));
+        assert2::assert!(
+            admin.retry
+                == retry::RetryPolicy {
+                    timeout: Duration::from_secs(90),
+                    initial_backoff: Duration::from_millis(30),
+                    max_backoff: Duration::from_millis(300),
+                    jitter: admin.retry.jitter,
+                    max_retries: 4,
+                }
+        );
+        live.stop();
+
+        let controller = ObservedController::start(2).await;
+        let on_controller =
+            AdminClient::connect_controller_with_config(&[controller.addr.to_string()], config())
+                .await
+                .expect("controller admin connects");
+
+        assert2::assert!(on_controller.conn.uses_controller_bootstrap());
+        assert2::assert!(on_controller.options.client_id == "tool-a");
+        assert2::assert!(on_controller.retry.max_retries == 4);
+
+        let refused = AdminClient::connect_with_config(
+            &["127.0.0.1:1".to_owned()],
+            AdminClientConfig {
+                request_timeout: secs(90),
+                default_api_timeout: Some(secs(60)),
+                ..AdminClientConfig::default()
+            },
+        )
+        .await;
+
+        assert2::assert!(matches!(refused, Err(AdminError::InvalidConfig(_))));
+    }
+
     #[tokio::test]
     async fn connect_with_dns_timeout_preserves_admin_defaults() {
         let live = ObservedAdminBroker::start(Duration::ZERO).await;
