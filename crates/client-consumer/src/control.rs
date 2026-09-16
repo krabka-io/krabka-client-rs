@@ -137,9 +137,17 @@ impl Consumer {
     /// Returns [`ConsumerError::InvalidGroupId`] without a group id, and
     /// [`ConsumerError::IllegalState`] for a consumer without group
     /// membership (Kafka: `Tried to force a rebalance but consumer does not
-    /// have a group.`).
+    /// have a group.`). A member of the consumer group protocol logs a
+    /// warning and does nothing, as Kafka's `AsyncKafkaConsumer` does.
     pub fn enforce_rebalance(&self, reason: Option<&str>) -> Result<(), ConsumerError> {
         self.require_group_membership()?;
+        if self.group_protocol == crate::GroupProtocol::Consumer {
+            // Kafka's `AsyncKafkaConsumer.enforceRebalance` logs
+            // `Operation not supported in new consumer group protocol` and
+            // does nothing: the group coordinator owns the assignment.
+            tracing::warn!("enforce_rebalance is not supported in the consumer group protocol");
+            return Ok(());
+        }
         if self.subscription.borrow().manual_assignment {
             return Err(ConsumerError::IllegalState(
                 "Tried to force a rebalance but the consumer has a manual assignment.".to_owned(),

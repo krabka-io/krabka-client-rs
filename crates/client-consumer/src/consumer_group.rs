@@ -295,6 +295,7 @@ pub(crate) async fn run(
     // `true` after the poll timer expired: the member left the group and waits
     // for a `poll` before it joins again. Kafka's `MemberState.STALE`.
     let mut left_on_poll_timeout = false;
+    let mut last_pattern_check: Option<tokio::time::Instant> = None;
     loop {
         if !send_now {
             let event = tokio::select! {
@@ -347,6 +348,20 @@ pub(crate) async fn run(
                 }
                 TaskEvent::Heartbeat => {}
             }
+        }
+        // Kafka's `AsyncKafkaConsumer.updateAssignmentMetadataIfNeeded` matches
+        // a client-side pattern against the metadata in each poll. The member
+        // sends the topics that matched, and the coordinator assigns them.
+        if state.subscription.borrow().pattern.is_some()
+            && last_pattern_check.is_none_or(|last| {
+                crate::coordinator::subscription_metadata_refresh_due(
+                    last,
+                    state.subscription_metadata_refresh_interval,
+                )
+            })
+        {
+            last_pattern_check = Some(tokio::time::Instant::now());
+            crate::coordinator::refresh_pattern_topics(&mut state).await;
         }
         send_now = false;
         let outcome = tokio::select! {
@@ -1296,6 +1311,45 @@ mod group_protocol_tests {
                 true,
                 vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
                 vec![TOPIC.to_owned()],
+            )
+        );
+    }
+
+    /// A client-side pattern subscription matches the metadata itself, and the
+    /// member sends the topics that matched. Kafka's
+    /// `AsyncKafkaConsumer.updateAssignmentMetadataIfNeeded`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_side_pattern_sends_the_topics_that_matched() {
+        let recorder = Recorder::default();
+        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe_pattern(crate::TopicPattern::new(|topic| topic.starts_with("ord")))
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let assignment = consumer.assignment().await;
+        consumer.close().await.expect("close");
+        mock.stop();
+        let first = recorder.heartbeats().first().cloned();
+        let first = first.expect("a first heartbeat");
+        assert2::assert!(
+            (
+                first.subscribed_topic_names,
+                first.subscribed_topic_regex,
+                assignment,
+            ) == (
+                Some(vec![TOPIC.to_owned()]),
+                None,
+                vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
             )
         );
     }

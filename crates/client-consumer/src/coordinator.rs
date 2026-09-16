@@ -1043,7 +1043,10 @@ fn heartbeat_outcome(error_code: i16) -> HeartbeatOutcome {
 /// as the broker signals a rebalance. The next tick then does the rejoin in
 /// place of the heartbeat.
 #[cfg_attr(test, mutants::skip)] // cargo-mutants: long-running I/O event loop, exercised by integration tests
-fn subscription_metadata_refresh_due(last_check: tokio::time::Instant, interval: Time) -> bool {
+pub(crate) fn subscription_metadata_refresh_due(
+    last_check: tokio::time::Instant,
+    interval: Time,
+) -> bool {
     last_check.elapsed().as_time() >= interval
 }
 
@@ -1540,7 +1543,7 @@ const UNSUBSCRIBE_LEAVE_REASON: &str = "the consumer unsubscribed from all topic
 
 /// Match the pattern of a pattern subscription against all topics of the
 /// cluster, and store the matched topics. Return whether they changed.
-async fn refresh_pattern_topics(state: &mut CoordinatorState) -> bool {
+pub(crate) async fn refresh_pattern_topics(state: &mut CoordinatorState) -> bool {
     let (pattern, version) = {
         let subscription = state.subscription.borrow();
         let Some(pattern) = subscription.pattern.clone() else {
