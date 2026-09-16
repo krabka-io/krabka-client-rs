@@ -1413,6 +1413,7 @@ async fn finish_startup(
 
     let InitialAssignment {
         assigned_partitions,
+        group_topics,
         topic_ids,
         topic_partitions,
     } = resolve_initial_assignment(&spawn_config, &client, &coordinator_id, &member_id, &r2)
@@ -1452,6 +1453,7 @@ async fn finish_startup(
         member_id,
         StartupState {
             generation_id: r2.generation_id,
+            group_topics,
             assigned_partitions,
             next_offsets,
             positions,
@@ -1464,6 +1466,9 @@ async fn finish_startup(
 
 struct InitialAssignment {
     assigned_partitions: Vec<(String, i32)>,
+    /// The topics of all member subscriptions for a leader, else the own
+    /// subscription.
+    group_topics: Vec<String>,
     topic_ids: HashMap<String, WireUuid>,
     topic_partitions: HashMap<String, i32>,
 }
@@ -1486,19 +1491,29 @@ async fn resolve_initial_assignment(
     //    BrokerPool learns each broker's (id → addr) mapping up front,
     //    letting `poll`/`validate` route to partition leaders immediately
     //    rather than waiting for the first `refresh_leader_epochs` pass.
-    let md = client.refresh_metadata().await?;
+    let is_leader = is_group_leader(&r2.leader, member_id);
+    // Kafka's `ConsumerCoordinator.onLeaderElected`: the leader fetches
+    // metadata for the topics of every member.
+    let group_topics = if is_leader {
+        crate::coordinator::group_subscription_topics(r2, subscribe)
+    } else {
+        subscribe.clone()
+    };
+    client.metadata_topics().set(group_topics.iter().cloned());
+    let md = client.refresh_metadata().await;
+    client.metadata_topics().set(subscribe.iter().cloned());
+    let md = md?;
     let mut topic_ids: HashMap<String, WireUuid> = HashMap::new();
     let mut topic_partitions: HashMap<String, i32> = HashMap::new();
     for t in &md.topics {
         let Some(name) = &t.name else { continue };
-        if is_subscribed_topic(subscribe, name) {
+        if is_subscribed_topic(&group_topics, name) {
             let count = i32::try_from(t.partitions.len()).unwrap_or(i32::MAX);
             topic_partitions.insert(name.clone(), count);
             topic_ids.insert(name.clone(), t.topic_id);
         }
     }
 
-    let is_leader = is_group_leader(&r2.leader, member_id);
     tracing::Span::current().record("generation", r2.generation_id);
     tracing::Span::current().record("is_leader", is_leader);
     let assignments_for_sync: Vec<SyncGroupRequestAssignment> = if is_leader {
@@ -1549,6 +1564,7 @@ async fn resolve_initial_assignment(
 
     Ok(InitialAssignment {
         assigned_partitions,
+        group_topics,
         topic_ids,
         topic_partitions,
     })
@@ -1556,6 +1572,8 @@ async fn resolve_initial_assignment(
 
 struct StartupState {
     generation_id: i32,
+    /// The topics that the coordinator task watches until the next join.
+    group_topics: Vec<String>,
     assigned_partitions: Vec<(String, i32)>,
     next_offsets: HashMap<(String, i32), i64>,
     positions: HashMap<(String, i32), crate::position::PartitionPosition>,
@@ -1613,6 +1631,7 @@ async fn spawn_consumer(
     );
     let StartupState {
         generation_id,
+        group_topics,
         assigned_partitions,
         next_offsets,
         positions,
@@ -1645,9 +1664,15 @@ async fn spawn_consumer(
         .metadata_scope(subscription_metadata_scope(allow_auto_create_topics))
         .build()
         .await?;
+    // A leader of the build watches the topics of the whole group until the
+    // next join (Kafka's `SubscriptionState.metadataTopics`).
     coordinator_client
         .metadata_topics()
-        .set(subscribe.iter().cloned());
+        .set(if group_topics.is_empty() {
+            subscribe.clone()
+        } else {
+            group_topics
+        });
 
     let (identity, next_ownership_id) =
         initial_commit_identity(&assigned_partitions, generation_id, &member_id);
@@ -3498,6 +3523,94 @@ mod auto_commit_tests {
         }
     }
 
+    /// Kafka's leader watches the topics of the whole group
+    /// (`SubscriptionState.metadataTopics` after `groupSubscribe`). The
+    /// coordinator task of a consumer that led the join of its build names
+    /// them in its metadata requests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_coordinator_task_of_a_leader_build_watches_the_group_topics() {
+        use krabka_protocol::owned::{
+            find_coordinator_response::FindCoordinatorResponse,
+            heartbeat_response::HeartbeatResponse, metadata_request::MetadataRequest,
+        };
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler_requests = Arc::clone(&requests);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| match api_key {
+            api_versions_request::API_KEY => Some(encode(
+                &ApiVersionsResponse {
+                    api_keys: API_VERSIONS
+                        .iter()
+                        .map(|(api_key, min_version, max_version)| ApiVersion {
+                            api_key: *api_key,
+                            min_version: *min_version,
+                            max_version: *max_version,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                0,
+            )),
+            find_coordinator_request::API_KEY => {
+                Some(encode(&FindCoordinatorResponse::default(), version))
+            }
+            heartbeat_request::API_KEY => Some(encode(&HeartbeatResponse::default(), version)),
+            metadata_request::API_KEY => {
+                let client_id_len = body.get_i16();
+                body.advance(usize::try_from(client_id_len.max(0)).expect("length"));
+                let request = MetadataRequest::decode(&mut body, version).expect("decode Metadata");
+                let names: Vec<String> = request
+                    .topics
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|topic| topic.name)
+                    .collect();
+                handler_requests.lock().expect("requests lock").push(names);
+                Some(encode(&MetadataResponse::default(), version))
+            }
+            _ => None,
+        })
+        .await;
+        let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, minutes(1));
+        config.heartbeat_interval = millis(50);
+        config.subscription_metadata_refresh_interval = millis(50);
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let consumer = spawn_consumer(
+            config,
+            client,
+            Arc::new(AtomicI32::new(0)),
+            MEMBER.into(),
+            StartupState {
+                generation_id: 1,
+                group_topics: vec![TOPIC.to_owned(), "payments".to_owned()],
+                assigned_partitions: vec![partition(0)],
+                next_offsets: HashMap::from([(partition(0), 12)]),
+                positions: HashMap::new(),
+                topic_ids: HashMap::new(),
+                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
+            },
+        )
+        .await
+        .expect("spawn consumer");
+        let first = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(first) = requests.lock().expect("requests lock").first().cloned() {
+                    break first;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(consumer);
+        mock.stop();
+        assert2::assert!(first == Ok(vec![TOPIC.to_owned(), "payments".to_owned()]));
+    }
+
     pub(super) fn start_config(
         bootstrap: String,
         assignor: Assignor,
@@ -3654,6 +3767,7 @@ mod auto_commit_tests {
                 MEMBER.into(),
                 StartupState {
                     generation_id: 1,
+                    group_topics: Vec::new(),
                     assigned_partitions: vec![partition(0), partition(1)],
                     next_offsets: HashMap::from([(partition(0), 12), (partition(1), 7)]),
                     positions: HashMap::from([(partition(0), primed_position(3))]),
@@ -4164,6 +4278,7 @@ mod group_rejoin_tests {
             MEMBER.into(),
             StartupState {
                 generation_id: 1,
+                group_topics: Vec::new(),
                 assigned_partitions: vec![partition(0), partition(1)],
                 next_offsets: HashMap::from([(partition(0), 12), (partition(1), 7)]),
                 positions: HashMap::new(),
@@ -4310,6 +4425,7 @@ mod poll_interval_tests {
             MEMBER.into(),
             StartupState {
                 generation_id: 1,
+                group_topics: Vec::new(),
                 assigned_partitions: vec![partition(0)],
                 next_offsets: HashMap::from([(partition(0), 12)]),
                 positions: HashMap::new(),
@@ -4492,6 +4608,7 @@ mod poll_interval_tests {
             MEMBER.into(),
             StartupState {
                 generation_id: 1,
+                group_topics: Vec::new(),
                 assigned_partitions: vec![partition(0)],
                 next_offsets: HashMap::from([(partition(0), 12)]),
                 positions: HashMap::new(),
@@ -4682,6 +4799,7 @@ mod group_membership_tests {
             MEMBER.into(),
             StartupState {
                 generation_id: 1,
+                group_topics: Vec::new(),
                 assigned_partitions: vec![partition(0)],
                 next_offsets: HashMap::from([(partition(0), 12)]),
                 positions: HashMap::new(),
@@ -4792,6 +4910,7 @@ mod group_membership_tests {
             MEMBER.into(),
             StartupState {
                 generation_id: 1,
+                group_topics: Vec::new(),
                 assigned_partitions: vec![partition(0)],
                 next_offsets: HashMap::from([(partition(0), 12)]),
                 positions: HashMap::new(),
@@ -4869,6 +4988,7 @@ mod group_membership_tests {
                 MEMBER.into(),
                 StartupState {
                     generation_id: 1,
+                    group_topics: Vec::new(),
                     assigned_partitions: vec![partition(0)],
                     next_offsets: HashMap::from([(partition(0), 12)]),
                     positions: HashMap::new(),
@@ -5229,6 +5349,7 @@ mod group_membership_tests {
             MEMBER.into(),
             StartupState {
                 generation_id: 1,
+                group_topics: Vec::new(),
                 assigned_partitions: vec![partition(0)],
                 next_offsets: HashMap::from([(partition(0), 12)]),
                 positions: HashMap::new(),
@@ -5563,6 +5684,7 @@ mod rebalance_listener_tests {
             MEMBER.into(),
             StartupState {
                 generation_id: 1,
+                group_topics: Vec::new(),
                 assigned_partitions: case.owned.clone(),
                 next_offsets: case.owned.iter().map(|key| (key.clone(), 12)).collect(),
                 positions: HashMap::new(),
@@ -5727,6 +5849,7 @@ mod rebalance_listener_tests {
             MEMBER.into(),
             StartupState {
                 generation_id: 1,
+                group_topics: Vec::new(),
                 assigned_partitions: vec![partition(0)],
                 next_offsets: HashMap::from([(partition(0), 12)]),
                 positions: HashMap::new(),
@@ -5845,6 +5968,7 @@ mod rebalance_listener_tests {
             MEMBER.into(),
             StartupState {
                 generation_id: 1,
+                group_topics: Vec::new(),
                 assigned_partitions: vec![partition(0)],
                 next_offsets: HashMap::from([(partition(0), 12)]),
                 positions: HashMap::new(),
