@@ -55,6 +55,11 @@ pub(crate) struct Subscription {
     pub topics: Vec<String>,
     /// The pattern of a pattern subscription.
     pub pattern: Option<TopicPattern>,
+    /// The regular expression of a broker-side pattern subscription of the
+    /// consumer group protocol (KIP-848). Kafka's
+    /// `SubscriptionState.subscribedRe2JPattern`: the group coordinator
+    /// matches it with RE2J, so the consumer does no matching.
+    pub regex: Option<String>,
     /// Kafka's `exclude.internal.topics`: a pattern does not match an
     /// internal topic.
     pub exclude_internal_topics: bool,
@@ -78,6 +83,7 @@ impl Subscription {
         Self {
             topics: sorted(topics),
             pattern: None,
+            regex: None,
             exclude_internal_topics: exclude_internal,
             unsubscribes: 0,
             version: 0,
@@ -88,7 +94,7 @@ impl Subscription {
     /// Whether the consumer subscribes to nothing. Kafka's
     /// `SubscriptionState.subscriptionType == NONE`.
     pub(crate) fn is_none(&self) -> bool {
-        self.topics.is_empty() && self.pattern.is_none()
+        self.topics.is_empty() && self.pattern.is_none() && self.regex.is_none()
     }
 
     /// Whether `topic` is subscribed.
@@ -96,6 +102,24 @@ impl Subscription {
         self.topics
             .binary_search_by(|t| t.as_str().cmp(topic))
             .is_ok()
+    }
+
+    /// Store the topics of an assignment of a regular expression
+    /// subscription. Return whether they changed.
+    ///
+    /// The group coordinator matches the regular expression, so the topics of
+    /// the subscription come from the assignment. They give `poll` the topics
+    /// of its metadata and its fetch filter.
+    pub(crate) fn store_assigned_topics(&mut self, assigned: &[String]) -> bool {
+        if self.regex.is_none() {
+            return false;
+        }
+        let topics = sorted(assigned.iter().cloned());
+        if self.topics == topics {
+            return false;
+        }
+        self.topics = topics;
+        true
     }
 
     /// Store `matched` as the topics of the pattern of `version`. Return
@@ -197,6 +221,7 @@ impl Consumer {
         self.subscription.send_modify(|subscription| {
             subscription.topics = sorted(topics);
             subscription.pattern = None;
+            subscription.regex = None;
             subscription.version += 1;
         });
         Ok(())
@@ -227,6 +252,50 @@ impl Consumer {
         self.subscription.send_modify(|subscription| {
             subscription.topics.clear();
             subscription.pattern = Some(pattern);
+            subscription.regex = None;
+            subscription.version += 1;
+        });
+        Ok(())
+    }
+
+    /// Subscribe to the topics that the regular expression `regex` matches,
+    /// in place of the current subscription. Kafka's
+    /// `KafkaConsumer.subscribe(SubscriptionPattern)` (KIP-848).
+    ///
+    /// The group coordinator matches the expression with RE2J and assigns the
+    /// partitions of the topics that match, so the consumer sends no topic
+    /// names and matches nothing itself. The expression must follow the RE2
+    /// syntax; a broker that cannot compile it answers with
+    /// `INVALID_REGULAR_EXPRESSION`, which `poll` returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::InvalidArgument`] for an empty expression,
+    /// [`ConsumerError::InvalidGroupId`] without a group id, and
+    /// [`ConsumerError::IllegalState`] for a consumer with a manual
+    /// assignment or with the classic group protocol.
+    pub fn subscribe_regex(&mut self, regex: &str) -> Result<(), ConsumerError> {
+        if regex.is_empty() {
+            return Err(ConsumerError::InvalidArgument(
+                "Topic pattern to subscribe to cannot be empty".to_owned(),
+            ));
+        }
+        self.require_group_membership()?;
+        if self.group_protocol != crate::GroupProtocol::Consumer {
+            return Err(ConsumerError::IllegalState(
+                crate::consumer_group::RE2J_NEEDS_CONSUMER_PROTOCOL.to_owned(),
+            ));
+        }
+        if self.subscription.borrow().manual_assignment {
+            return Err(ConsumerError::IllegalState(
+                "Subscription to topics, partitions and pattern are mutually exclusive".to_owned(),
+            ));
+        }
+        self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
+        self.subscription.send_modify(|subscription| {
+            subscription.topics.clear();
+            subscription.pattern = None;
+            subscription.regex = Some(regex.to_owned());
             subscription.version += 1;
         });
         Ok(())
@@ -268,6 +337,7 @@ impl Consumer {
         self.subscription.send_modify(|subscription| {
             subscription.topics.clear();
             subscription.pattern = None;
+            subscription.regex = None;
             subscription.manual_assignment = false;
             subscription.unsubscribes += 1;
             subscription.version += 1;

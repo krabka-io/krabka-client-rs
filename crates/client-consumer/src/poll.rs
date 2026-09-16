@@ -2734,6 +2734,7 @@ pub(crate) mod partition_error_tests {
             group_instance_id: None,
             current_generation: Arc::new(AtomicI32::new(1)),
             subscription: crate::subscription::shared(vec!["orders".into()], None, true),
+            group_protocol: crate::GroupProtocol::Classic,
             assigned: Arc::new(Mutex::new(vec![("orders".into(), 0)])),
             assignment_changed: Arc::new(Notify::new()),
             next_offsets: Arc::new(Mutex::new(HashMap::from([(("orders".into(), 0), 5)]))),

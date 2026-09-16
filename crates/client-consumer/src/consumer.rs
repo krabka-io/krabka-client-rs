@@ -74,6 +74,8 @@ pub struct Consumer {
     pub(crate) current_generation: Arc<AtomicI32>,
     /// The subscription, shared with the coordinator task.
     pub(crate) subscription: crate::subscription::SharedSubscription,
+    /// Kafka's `group.protocol`.
+    pub(crate) group_protocol: crate::GroupProtocol,
     /// Current assigned partitions: `(topic, partition_index)`.
     pub(crate) assigned: Arc<Mutex<Vec<(String, i32)>>>,
     /// Wakes selected-offset commits after assignment publication.
@@ -193,6 +195,8 @@ struct StartConfig {
     /// The pattern of a pattern subscription. `subscribe` then holds the
     /// topics that matched at the build.
     subscribe_pattern: Option<crate::TopicPattern>,
+    /// The regular expression of a broker-side pattern subscription.
+    subscribe_regex: Option<String>,
     /// Kafka's `exclude.internal.topics`.
     exclude_internal_topics: bool,
     /// Kafka's `group.protocol`.
@@ -1007,6 +1011,12 @@ impl Consumer {
         /// not match an internal topic.
         #[builder(default = true)]
         exclude_internal_topics: bool,
+        /// Subscribe to the topics that this RE2 regular expression matches.
+        /// Kafka's `subscribe(SubscriptionPattern)` (KIP-848): the group
+        /// coordinator matches the expression, so it needs
+        /// `group_protocol(GroupProtocol::Consumer)`.
+        #[builder(into)]
+        subscribe_regex: Option<String>,
         /// Kafka's `group.protocol`: `Classic` (the default) uses `JoinGroup`,
         /// `SyncGroup` and `Heartbeat`; `Consumer` uses
         /// `ConsumerGroupHeartbeat` with server-side assignment (KIP-848).
@@ -1080,6 +1090,26 @@ impl Consumer {
             return Err(ConsumerError::InvalidConfig(
                 "subscribe and subscribe_pattern are mutually exclusive".to_owned(),
             ));
+        }
+        if subscribe_regex.is_some() && (!subscribe.is_empty() || subscribe_pattern.is_some()) {
+            return Err(ConsumerError::InvalidConfig(
+                "Subscription to topics, partitions and pattern are mutually exclusive".to_owned(),
+            ));
+        }
+        if let Some(regex) = &subscribe_regex {
+            if regex.is_empty() {
+                return Err(ConsumerError::InvalidArgument(
+                    "Topic pattern to subscribe to cannot be empty".to_owned(),
+                ));
+            }
+            if group_protocol != crate::GroupProtocol::Consumer {
+                return Err(ConsumerError::InvalidConfig(
+                    crate::consumer_group::RE2J_NEEDS_CONSUMER_PROTOCOL.to_owned(),
+                ));
+            }
+            if group_id.is_empty() {
+                return Err(ConsumerError::InvalidGroupId);
+            }
         }
         if subscribe.iter().any(String::is_empty) {
             return Err(ConsumerError::InvalidConfig(
@@ -1163,6 +1193,7 @@ impl Consumer {
             ),
             subscribe,
             subscribe_pattern,
+            subscribe_regex,
             exclude_internal_topics,
             group_protocol,
             server_assignor: group_remote_assignor,
@@ -1267,7 +1298,10 @@ impl Consumer {
         err
     )]
     async fn start_once(mut config: StartConfig) -> Result<Self, ConsumerError> {
-        if config.subscribe.is_empty() && config.subscribe_pattern.is_none() {
+        if config.subscribe.is_empty()
+            && config.subscribe_pattern.is_none()
+            && config.subscribe_regex.is_none()
+        {
             return start_without_subscription(config).await;
         }
         if config.subscribe_pattern.is_some() {
@@ -1687,7 +1721,10 @@ async fn coordinator_task_client(
     config: &StartConfig,
     group_topics: &[String],
 ) -> Result<Option<Client>, ConsumerError> {
-    if config.subscribe.is_empty() && config.subscribe_pattern.is_none() {
+    if config.subscribe.is_empty()
+        && config.subscribe_pattern.is_none()
+        && config.subscribe_regex.is_none()
+    {
         return Ok(None);
     }
     let client = Client::builder()
@@ -1730,6 +1767,7 @@ async fn spawn_consumer(
         subscription_metadata_refresh_interval,
         subscribe,
         subscribe_pattern,
+        subscribe_regex,
         exclude_internal_topics,
         group_protocol,
         server_assignor,
@@ -1757,6 +1795,9 @@ async fn spawn_consumer(
         subscribe_pattern,
         exclude_internal_topics,
     );
+    if subscribe_regex.is_some() {
+        subscription.send_modify(|state| state.regex.clone_from(&subscribe_regex));
+    }
     let StartupState {
         generation_id,
         group_topics: _,
@@ -1887,6 +1928,7 @@ async fn spawn_consumer(
         group_instance_id: group_instance_id.clone(),
         current_generation,
         subscription,
+        group_protocol,
         assigned,
         assignment_changed,
         next_offsets,
@@ -2480,6 +2522,65 @@ mod security_arg_tests {
         assert2::assert!(actual == wanted);
     }
 
+    /// The consumer group protocol options of KIP-848: Kafka's
+    /// `ConsumerConfig.checkUnsupportedConfigsPostProcess`,
+    /// `ClassicKafkaConsumer.subscribe(SubscriptionPattern)` and
+    /// `AsyncKafkaConsumer.throwIfSubscriptionPatternIsInvalid`.
+    #[tokio::test]
+    async fn the_consumer_group_protocol_options_are_checked_before_broker_lookup() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, protocol, assignor, regex, topics, expected) in [
+            (
+                "a remote assignor with the classic protocol",
+                crate::GroupProtocol::Classic,
+                Some("uniform"),
+                None,
+                Vec::new(),
+                "invalid configuration: group.remote.assignor cannot be set when group.protocol=classic",
+            ),
+            (
+                "a regular expression with the classic protocol",
+                crate::GroupProtocol::Classic,
+                None,
+                Some("orders-.*"),
+                Vec::new(),
+                "invalid configuration: Subscribe to RE2/J pattern is not supported when using the CLASSIC protocol defined in config group.protocol",
+            ),
+            (
+                "an empty regular expression",
+                crate::GroupProtocol::Consumer,
+                None,
+                Some(""),
+                Vec::new(),
+                "invalid argument: Topic pattern to subscribe to cannot be empty",
+            ),
+            (
+                "a regular expression and topics",
+                crate::GroupProtocol::Consumer,
+                None,
+                Some("orders-.*"),
+                vec!["orders".to_owned()],
+                "invalid configuration: Subscription to topics, partitions and pattern are mutually exclusive",
+            ),
+        ] {
+            let error = Consumer::builder()
+                .bootstrap("invalid.invalid:9092")
+                .group_id("protocol-validation")
+                .subscribe(topics)
+                .group_protocol(protocol)
+                .maybe_group_remote_assignor(assignor)
+                .maybe_subscribe_regex(regex)
+                .build()
+                .await
+                .err()
+                .map(|error| error.to_string());
+            actual.push((name, error));
+            wanted.push((name, Some(expected.to_owned())));
+        }
+        assert2::assert!(actual == wanted);
+    }
+
     #[tokio::test]
     async fn invalid_leave_group_timeout_fails_before_broker_lookup() {
         let error = Consumer::builder()
@@ -2941,6 +3042,7 @@ mod security_arg_tests {
                 None,
                 true,
             ),
+            group_protocol: crate::GroupProtocol::Classic,
             assigned: Arc::new(Mutex::new(vec![("orders".into(), 0)])),
             assignment_changed: Arc::new(Notify::new()),
             next_offsets: Arc::new(Mutex::new(HashMap::new())),
@@ -3747,6 +3849,7 @@ mod auto_commit_tests {
             subscription_metadata_refresh_interval: minutes(60),
             subscribe: vec![TOPIC.into()],
             subscribe_pattern: None,
+            subscribe_regex: None,
             exclude_internal_topics: true,
             group_protocol: crate::GroupProtocol::Classic,
             server_assignor: None,

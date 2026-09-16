@@ -167,6 +167,7 @@ fn consumer(client: Client) -> Consumer {
         group_instance_id: None,
         current_generation: Arc::new(AtomicI32::new(1)),
         subscription: crate::subscription::shared(vec!["orders".into()], None, true),
+        group_protocol: crate::GroupProtocol::Classic,
         assigned: Arc::new(Mutex::new(Vec::new())),
         assignment_changed: Arc::new(Notify::new()),
         next_offsets: Arc::new(Mutex::new(HashMap::new())),
