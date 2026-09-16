@@ -41,6 +41,31 @@ fn endpoints_parse_as_urls() {
             endpoint(false, "127.0.0.1", 8080, "/token?x=1"),
         ),
         ("https://[::1]:8443", endpoint(true, "::1", 8443, "/")),
+        ("http://[::1]/token", endpoint(false, "::1", 80, "/token")),
+        (
+            "https://[::1:8443",
+            Err(
+                "sasl.oauthbearer.token.endpoint.url \"https://[::1:8443\" is not an http or \
+                 https URL"
+                    .to_owned(),
+            ),
+        ),
+        (
+            "https://idp.example:http/token",
+            Err(
+                "sasl.oauthbearer.token.endpoint.url \"https://idp.example:http/token\" is not \
+                 an http or https URL"
+                    .to_owned(),
+            ),
+        ),
+        (
+            "https:///token",
+            Err(
+                "sasl.oauthbearer.token.endpoint.url \"https:///token\" is not an http or \
+                 https URL"
+                    .to_owned(),
+            ),
+        ),
         (
             "file:///tmp/token",
             Err(

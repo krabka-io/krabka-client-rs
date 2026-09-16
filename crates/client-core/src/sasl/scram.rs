@@ -273,6 +273,16 @@ mod tests {
                 "requested iterations 1024 is less than the minimum 4096 for SCRAM-SHA-256"
                     .to_owned(),
             ),
+            (
+                "no salt and no iteration count",
+                format!("r={nonce}x"),
+                format!("invalid SCRAM server-first message format: r={nonce}x"),
+            ),
+            (
+                "an iteration count that is not a number",
+                format!("r={nonce}x,s=c2FsdA==,i=many"),
+                "invalid SCRAM iteration count".to_owned(),
+            ),
         ] {
             let client = ClientFirst {
                 nonce: nonce.clone(),
@@ -295,6 +305,16 @@ mod tests {
                     "Sasl authentication using SCRAM-SHA-256 failed with error: invalid-proof"
                         .to_owned()
                 )
+        );
+        let (_, client) = ClientFirst {
+            nonce: nonce.clone(),
+            ..start()
+        }
+        .step(format!("r={nonce}x,s=c2FsdA==,i=4096").as_bytes())
+        .unwrap();
+        check!(
+            client.verify(b"v=c2lnbmF0dXJl").err()
+                == Some("invalid SCRAM server signature in server final message".to_owned())
         );
     }
 }
