@@ -293,7 +293,10 @@ impl Consumer {
         }
         self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
         self.subscription.send_modify(|subscription| {
-            subscription.topics.clear();
+            // The topics of a regular expression subscription are the topics
+            // of its assignment, not a list of the application. They stay
+            // until the next assignment replaces them, so `poll` keeps the
+            // metadata of the partitions that the member still owns.
             subscription.pattern = None;
             subscription.regex = Some(regex.to_owned());
             subscription.version += 1;

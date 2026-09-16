@@ -470,7 +470,11 @@ pub(crate) async fn heartbeat_during_callback(
                 .coordinator_id
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
-        let call = HeartbeatCall { broker, request };
+        let call = HeartbeatCall {
+            broker,
+            request,
+            needs_regex: state.subscription.borrow().regex.is_some(),
+        };
         let result = tokio::select! {
             biased;
             () = done.cancelled() => return,
@@ -651,6 +655,7 @@ async fn send_heartbeat(
     kind: HeartbeatKind,
 ) -> HeartbeatCall<'_> {
     let mut sent = state.sent_heartbeat_fields.clone();
+    let needs_regex = state.subscription.borrow().regex.is_some();
     let request = build_heartbeat(&heartbeat_fields(state, kind).await, &mut sent);
     state.sent_heartbeat_fields = sent;
     let broker = state.client.broker(
@@ -658,7 +663,11 @@ async fn send_heartbeat(
             .coordinator_id
             .load(std::sync::atomic::Ordering::Relaxed),
     );
-    HeartbeatCall { broker, request }
+    HeartbeatCall {
+        broker,
+        request,
+        needs_regex,
+    }
 }
 
 /// The heartbeat fields of the current member state.
@@ -699,14 +708,50 @@ async fn heartbeat_fields(
     }
 }
 
+/// A `ConsumerGroupHeartbeat` that carries `subscribed_topic_regex`. The
+/// field exists from version 1, so a broker that speaks only version 0 must
+/// fail the call in place of dropping the expression.
+struct RegexHeartbeat(ConsumerGroupHeartbeatRequest);
+
+impl krabka_protocol::Encode for RegexHeartbeat {
+    fn encode<B: bytes::BufMut>(
+        &self,
+        buf: &mut B,
+        version: i16,
+    ) -> Result<(), krabka_protocol::ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl krabka_protocol::ProtocolRequest for RegexHeartbeat {
+    const API_KEY: i16 = krabka_protocol::owned::consumer_group_heartbeat_request::API_KEY;
+    const MIN_VERSION: i16 = 1;
+    const MAX_VERSION: i16 = krabka_protocol::owned::consumer_group_heartbeat_request::MAX_VERSION;
+    const LATEST_STABLE_VERSION: i16 =
+        krabka_protocol::owned::consumer_group_heartbeat_request::LATEST_STABLE_VERSION;
+    const FLEXIBLE_MIN: i16 =
+        krabka_protocol::owned::consumer_group_heartbeat_request::FLEXIBLE_MIN;
+    type Response = ConsumerGroupHeartbeatResponse;
+}
+
 /// One `ConsumerGroupHeartbeat` that is ready to go out.
 struct HeartbeatCall<'a> {
     broker: krabka_client_core::BrokerHandle<'a>,
     request: ConsumerGroupHeartbeatRequest,
+    /// `true` when the member subscribes to a regular expression, which needs
+    /// version 1.
+    needs_regex: bool,
 }
 
 impl HeartbeatCall<'_> {
     async fn send(self) -> Result<ConsumerGroupHeartbeatResponse, krabka_client_core::ClientError> {
+        if self.needs_regex {
+            return self.broker.send(RegexHeartbeat(self.request)).await;
+        }
         self.broker.send(self.request).await
     }
 }
@@ -1495,13 +1540,19 @@ mod group_protocol_tests {
     /// A broker whose `ConsumerGroupHeartbeat` versions do not overlap the
     /// ones of the client.
     async fn classic_only_coordinator() -> MockBroker {
+        coordinator_with_heartbeat_versions(2, 2).await
+    }
+
+    /// A coordinator that speaks `ConsumerGroupHeartbeat` in this version
+    /// range and answers no heartbeat.
+    async fn coordinator_with_heartbeat_versions(min_version: i16, max_version: i16) -> MockBroker {
         MockBroker::start(move |api_key, version, _corr_id, _body| {
             if api_key == api_versions_request::API_KEY {
                 let mut versions = api_versions();
                 for api in &mut versions.api_keys {
                     if api.api_key == consumer_group_heartbeat_request::API_KEY {
-                        api.min_version = 2;
-                        api.max_version = 2;
+                        api.min_version = min_version;
+                        api.max_version = max_version;
                     }
                 }
                 return Some(encode(&versions, 0));
@@ -1515,6 +1566,94 @@ mod group_protocol_tests {
             None
         })
         .await
+    }
+
+    /// A regular expression subscription needs `ConsumerGroupHeartbeat` v1,
+    /// which added `subscribed_topic_regex`. A coordinator that speaks only
+    /// v0 fails the call, because a v0 request would name no topic at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_regular_expression_needs_heartbeat_version_1() {
+        let mock = coordinator_with_heartbeat_versions(0, 0).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe_regex("orders-.*")
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut error = None;
+        while error.is_none() && tokio::time::Instant::now() < deadline {
+            error = consumer
+                .poll(millis(20))
+                .await
+                .err()
+                .map(|error| error.to_string());
+        }
+        consumer.close().await.expect("close");
+        mock.stop();
+        assert2::assert!(
+            error
+                == Some(
+                    "client: incompatible version: broker supports 0..=0, client wants 1..=1 for api_key 68"
+                        .to_owned()
+                )
+        );
+    }
+
+    /// The member fetches the partitions of a regular expression assignment
+    /// also after the application subscribes to the same expression again,
+    /// because the topics of such a subscription come from the assignment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_regular_expression_subscription_keeps_fetching_after_a_resubscribe() {
+        let recorder = Recorder::default();
+        let mock = heartbeat_coordinator_with(vec![assigns(1, &[0, 1])], &recorder, true).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe_regex("orders-.*")
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        // Poll until the member owns the partitions and their positions are
+        // ready, so that the fetch of the next poll would go out.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+            let assigned = consumer.assignment().await;
+            if !assigned.is_empty() && !consumer.group_fetches(&assigned).await.is_empty() {
+                break;
+            }
+        }
+        consumer.subscribe_regex("orders-.*").expect("subscribe");
+        let assigned = consumer.assignment().await;
+        let mut fetched: Vec<(String, i32)> = consumer
+            .group_fetches(&assigned)
+            .await
+            .into_values()
+            .flatten()
+            .flat_map(|(topic, partitions)| {
+                partitions
+                    .into_iter()
+                    .map(move |(partition, ..)| (topic.clone(), partition))
+            })
+            .collect();
+        fetched.sort();
+        consumer.close().await.expect("close");
+        mock.stop();
+        assert2::assert!(
+            (assigned, fetched)
+                == (
+                    vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
+                    vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
+                )
+        );
     }
 
     /// The member leaves the group when the time between two `poll` calls is
