@@ -295,13 +295,21 @@ pub(crate) async fn run(
     // `true` after the poll timer expired: the member left the group and waits
     // for a `poll` before it joins again. Kafka's `MemberState.STALE`.
     let mut left_on_poll_timeout = false;
+    // `true` after `unsubscribe`: the member left the group and waits for a
+    // new subscription. Kafka's `AbstractMembershipManager.leaveGroup`.
+    let mut unsubscribed = false;
+    // `true` after a fatal error: Kafka's `transitionToSendingLeaveGroup`
+    // sends no leave heartbeat in the fatal state.
+    let mut fatal = false;
     let mut last_pattern_check: Option<tokio::time::Instant> = None;
     loop {
         if !send_now {
             let event = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
-                () = tokio::time::sleep(interval), if !left_on_poll_timeout => TaskEvent::Heartbeat,
+                () = tokio::time::sleep(interval), if !left_on_poll_timeout && !unsubscribed => {
+                    TaskEvent::Heartbeat
+                }
                 changed = state.polls.changed(), if polls_open => {
                     if changed.is_err() {
                         polls_open = false;
@@ -315,7 +323,9 @@ pub(crate) async fn run(
                     }
                     TaskEvent::Subscription
                 }
-                () = tokio::time::sleep_until(state.poll_timer.deadline()), if !left_on_poll_timeout => {
+                () = tokio::time::sleep_until(state.poll_timer.deadline()),
+                    if !left_on_poll_timeout && !unsubscribed =>
+                {
                     TaskEvent::PollTimeout
                 }
             };
@@ -338,12 +348,27 @@ pub(crate) async fn run(
                     continue;
                 }
                 TaskEvent::Subscription => {
+                    let subscription = state.subscription.borrow().clone();
+                    if subscription.unsubscribes != state.seen_unsubscribes {
+                        state.seen_unsubscribes = subscription.unsubscribes;
+                        leave_after_unsubscribe(&mut state).await;
+                        unsubscribed = true;
+                        continue;
+                    }
+                    if subscription.is_none() {
+                        continue;
+                    }
+                    if unsubscribed {
+                        // A new subscription joins the group again.
+                        unsubscribed = false;
+                        state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
+                        state.sent_heartbeat_fields = SentFields::default();
+                    }
                     // The task has its own client. Its metadata requests name
                     // the topics of the new subscription, so it can resolve
                     // the topic ids of the next assignment.
-                    let topics = state.subscription.borrow().topics.clone();
-                    if !topics.is_empty() {
-                        state.client.metadata_topics().set(topics);
+                    if !subscription.topics.is_empty() {
+                        state.client.metadata_topics().set(subscription.topics);
                     }
                 }
                 TaskEvent::Heartbeat => {}
@@ -384,15 +409,26 @@ pub(crate) async fn run(
                 }
                 send_now = true;
             }
-            HeartbeatOutcome::Stop => break,
+            HeartbeatOutcome::Stop => {
+                fatal = true;
+                break;
+            }
         }
     }
     let close = *state.close_operation.borrow();
-    if should_send_leave_heartbeat(
-        &state.member_id,
-        state.group_instance_id.as_deref(),
-        close.operation,
-    ) {
+    // A member that already left the group, or that stopped for a fatal
+    // error, sends no leave heartbeat. Kafka's
+    // `AbstractMembershipManager.leaveGroup` returns at once when the member
+    // is not in the group.
+    if !left_on_poll_timeout
+        && !unsubscribed
+        && !fatal
+        && should_send_leave_heartbeat(
+            &state.member_id,
+            state.group_instance_id.as_deref(),
+            close.operation,
+        )
+    {
         let epoch = leave_group_epoch(state.group_instance_id.as_deref(), close.operation);
         state.member_epoch = epoch;
         let leave_timeout = state.leave_group_timeout.to_std();
@@ -438,6 +474,24 @@ async fn leave_after_poll_timeout(state: &mut crate::coordinator::CoordinatorSta
     if let Err(error) = crate::coordinator::call_lost_listener(state).await {
         tracing::warn!(%error, group = %state.group_id, "the lost callback failed");
     }
+    state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
+    state.sent_heartbeat_fields = SentFields::default();
+}
+
+/// Leave the group because the application unsubscribed. Kafka's
+/// `AbstractMembershipManager.leaveGroup`: the member sends a heartbeat with
+/// its leave epoch and gives up its partitions. The `Consumer` already ran the
+/// revoke callback and cleared the assignment.
+async fn leave_after_unsubscribe(state: &mut crate::coordinator::CoordinatorState) {
+    state.member_epoch = leave_group_epoch(
+        state.group_instance_id.as_deref(),
+        crate::consumer::GroupMembershipOperation::Default,
+    );
+    let leave_timeout = state.leave_group_timeout.to_std();
+    let leave = send_heartbeat(state, HeartbeatKind::Leave).await;
+    let _ = tokio::time::timeout(leave_timeout, leave.send()).await;
+    crate::coordinator::forget_member_keeping_id(state).await;
+    state.rebalance_pending.send_replace(false);
     state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
     state.sent_heartbeat_fields = SentFields::default();
 }
@@ -1653,6 +1707,67 @@ mod group_protocol_tests {
                     vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
                     vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
                 )
+        );
+    }
+
+    /// `unsubscribe` makes the member leave the group with its leave epoch and
+    /// give up its partitions, and a new `subscribe` joins the group again.
+    /// Kafka's `AbstractMembershipManager.leaveGroup`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsubscribe_leaves_the_group_and_a_new_subscription_joins_again() {
+        let recorder = Recorder::default();
+        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe([TOPIC.to_owned()])
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        consumer.unsubscribe().await.expect("unsubscribe");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !recorder.epochs().contains(&LEAVE_GROUP_MEMBER_EPOCH)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let after_unsubscribe = (consumer.assignment().await, recorder.epochs());
+        consumer
+            .subscribe([TOPIC.to_owned()])
+            .await
+            .expect("subscribe");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let joined_again = consumer.assignment().await;
+        consumer.close().await.expect("close");
+        mock.stop();
+        let (left, epochs) = after_unsubscribe;
+        let joins_after_the_leave = epochs
+            .iter()
+            .skip_while(|epoch| **epoch != LEAVE_GROUP_MEMBER_EPOCH)
+            .filter(|epoch| **epoch == JOIN_GROUP_MEMBER_EPOCH)
+            .count();
+        assert2::assert!(
+            (
+                left,
+                epochs.contains(&LEAVE_GROUP_MEMBER_EPOCH),
+                joins_after_the_leave,
+                joined_again
+            ) == (
+                Vec::new(),
+                true,
+                0,
+                vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
+            )
         );
     }
 
