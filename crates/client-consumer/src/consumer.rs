@@ -1,8 +1,9 @@
 //! `Consumer`, the public lifecycle handle. Build it with
 //! [`Consumer::builder`].
 //!
-//! The consumer is subscribe-only and has no `assign()`. Use
-//! `krabka-client-core` directly for manual partition consumption.
+//! A consumer with `subscribe` or `subscribe_pattern` joins a group. A
+//! consumer without a subscription uses [`Consumer::assign`], with or without a
+//! group id.
 
 use std::{
     collections::HashMap,
@@ -976,7 +977,7 @@ impl Consumer {
         name = "consumer.start",
         level = "info",
         skip_all,
-        fields(group_id = %group_id, client_id = ?client_id),
+        fields(group_id = ?group_id, client_id = ?client_id),
         err
     )]
     /// # Errors
@@ -984,7 +985,10 @@ impl Consumer {
     pub async fn start(
         #[builder(into)] bootstrap: String,
         #[builder(into)] client_id: Option<String>,
-        #[builder(into)] group_id: String,
+        /// Kafka's `group.id`. Without it, the consumer has no group: use
+        /// [`assign`](Self::assign), and do not commit.
+        #[builder(into)]
+        group_id: Option<String>,
         #[builder(default = secs(45))] session_timeout: Time,
         #[builder(default = DEFAULT_CONSUMER_MAX_POLL_INTERVAL)] max_poll_interval: Time,
         #[builder(default = DEFAULT_CONSUMER_MAX_POLL_RECORDS)] max_poll_records: usize,
@@ -1026,7 +1030,9 @@ impl Consumer {
         security: Option<krabka_client_core::security::ClientSecurity>,
         rebalance_listener: Option<Box<dyn crate::ConsumerRebalanceListener>>,
         #[builder(default = ConsumerRetryPolicy::default())] retry_policy: ConsumerRetryPolicy,
-        #[builder(default = true)] enable_auto_commit: bool,
+        /// Kafka's `enable.auto.commit`: on by default with a group id, off
+        /// without one.
+        enable_auto_commit: Option<bool>,
         #[builder(default = secs(5))] auto_commit_interval: Time,
         /// Kafka's `allow.auto.create.topics`: the metadata requests name the
         /// subscribed topics and let a broker with
@@ -1035,9 +1041,19 @@ impl Consumer {
         allow_auto_create_topics: bool,
     ) -> Result<Self, ConsumerError> {
         // Fail fast on misconfig — before any retry loop.
-        if subscribe.is_empty() && subscribe_pattern.is_none() {
-            return Err(ConsumerError::NotSubscribed);
+        // Kafka treats an empty `group.id` as no group id.
+        let group_id = group_id.unwrap_or_default();
+        if group_id.is_empty() && !(subscribe.is_empty() && subscribe_pattern.is_none()) {
+            return Err(ConsumerError::InvalidGroupId);
         }
+        // Kafka's `ConsumerConfig.maybeOverrideEnableAutoCommit`.
+        if group_id.is_empty() && enable_auto_commit == Some(true) {
+            return Err(ConsumerError::InvalidConfig(
+                "enable.auto.commit cannot be set to true when default group id (null) is used."
+                    .to_owned(),
+            ));
+        }
+        let enable_auto_commit = enable_auto_commit.unwrap_or(!group_id.is_empty());
         if !subscribe.is_empty() && subscribe_pattern.is_some() {
             return Err(ConsumerError::InvalidConfig(
                 "subscribe and subscribe_pattern are mutually exclusive".to_owned(),
@@ -1047,9 +1063,6 @@ impl Consumer {
             return Err(ConsumerError::InvalidConfig(
                 "Topic collection to subscribe to cannot contain null or empty topic".to_owned(),
             ));
-        }
-        if group_id.is_empty() {
-            return Err(ConsumerError::InvalidConfig("group_id required".into()));
         }
         if group_instance_id.as_deref().is_some_and(str::is_empty) {
             return Err(ConsumerError::InvalidConfig(
@@ -1230,6 +1243,9 @@ impl Consumer {
         err
     )]
     async fn start_once(mut config: StartConfig) -> Result<Self, ConsumerError> {
+        if config.subscribe.is_empty() && config.subscribe_pattern.is_none() {
+            return start_without_subscription(config).await;
+        }
         if config.subscribe_pattern.is_some() {
             config.subscribe = pattern_topics(&config).await?;
         }
@@ -1581,6 +1597,83 @@ struct StartupState {
     topic_partitions: HashMap<String, i32>,
 }
 
+/// Start a consumer without a subscription: Kafka's consumer before
+/// `subscribe` or `assign`, and a consumer without `group.id`. It joins no
+/// group and has no coordinator task. With a group id it finds the
+/// coordinator, so it can commit the offsets of an `assign`.
+async fn start_without_subscription(config: StartConfig) -> Result<Consumer, ConsumerError> {
+    let client = Client::builder()
+        .bootstrap(&config.bootstrap)
+        .client_id(config.client_id.clone())
+        .request_timeout(config.request_timeout)
+        .dispatch_queue_capacity(config.dispatch_queue_capacity.get())
+        .frame_max(config.frame_max.size())
+        .metadata_recovery_strategy(config.metadata_recovery_strategy)
+        .metadata_recovery_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger)
+        .maybe_security(config.security.clone())
+        .metadata_scope(subscription_metadata_scope(config.allow_auto_create_topics))
+        .build()
+        .await?;
+    let coordinator_id = if config.group_id.is_empty() {
+        -1
+    } else {
+        find_coordinator(&client, &config.group_id, config.retry_policy.into()).await?
+    };
+    spawn_consumer(
+        config,
+        client,
+        Arc::new(AtomicI32::new(coordinator_id)),
+        String::new(),
+        StartupState {
+            generation_id: -1,
+            group_topics: Vec::new(),
+            assigned_partitions: Vec::new(),
+            next_offsets: HashMap::new(),
+            positions: HashMap::new(),
+            topic_ids: HashMap::new(),
+            topic_partitions: HashMap::new(),
+        },
+    )
+    .await
+}
+
+/// The client of the coordinator task, or `None` for a consumer without a
+/// subscription, which has no coordinator task.
+///
+/// The broker processes requests serially per TCP connection: a `JoinGroup`
+/// parked in the rebalance-join purgatory blocks every later request on that
+/// socket. A dedicated coordinator connection keeps the data path (`poll`,
+/// commit) independent of the group-protocol path.
+async fn coordinator_task_client(
+    config: &StartConfig,
+    group_topics: &[String],
+) -> Result<Option<Client>, ConsumerError> {
+    if config.subscribe.is_empty() && config.subscribe_pattern.is_none() {
+        return Ok(None);
+    }
+    let client = Client::builder()
+        .bootstrap(&config.bootstrap)
+        .client_id(config.client_id.clone())
+        .request_timeout(config.request_timeout)
+        .dispatch_queue_capacity(config.dispatch_queue_capacity.get())
+        .frame_max(config.frame_max.size())
+        .metadata_recovery_strategy(config.metadata_recovery_strategy)
+        .metadata_recovery_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger)
+        .maybe_security(config.security.clone())
+        .metadata_scope(subscription_metadata_scope(config.allow_auto_create_topics))
+        .build()
+        .await?;
+    // A leader of the build watches the topics of the whole group until the
+    // next join (Kafka's `SubscriptionState.metadataTopics`).
+    let topics = if group_topics.is_empty() {
+        &config.subscribe
+    } else {
+        group_topics
+    };
+    client.metadata_topics().set(topics.iter().cloned());
+    Ok(Some(client))
+}
+
 async fn spawn_consumer(
     config: StartConfig,
     client: Client,
@@ -1588,9 +1681,8 @@ async fn spawn_consumer(
     member_id: String,
     startup: StartupState,
 ) -> Result<Consumer, ConsumerError> {
+    let coordinator_client = coordinator_task_client(&config, &startup.group_topics).await?;
     let StartConfig {
-        bootstrap,
-        client_id,
         group_id,
         session_timeout,
         max_poll_interval,
@@ -1612,17 +1704,12 @@ async fn spawn_consumer(
         metadata_max_age,
         default_api_timeout,
         request_timeout,
-        dispatch_queue_capacity,
-        frame_max,
-        metadata_recovery_strategy,
-        metadata_recovery_rebootstrap_trigger,
         leave_group_timeout,
         client_rack,
-        security,
         has_rebalance_listener,
         retry_policy,
         auto_commit_interval,
-        allow_auto_create_topics,
+        ..
     } = config;
     let subscription = crate::subscription::shared(
         subscribe.clone(),
@@ -1631,48 +1718,16 @@ async fn spawn_consumer(
     );
     let StartupState {
         generation_id,
-        group_topics,
+        group_topics: _,
         assigned_partitions,
         next_offsets,
         positions,
         topic_ids,
         topic_partitions,
     } = startup;
-    // 6. Spawn the coordinator task (heartbeat + rebalance loop) on its
-    //    own connection.
-    //
-    //    The broker processes requests serially per TCP connection: a
-    //    JoinGroup parked in the rebalance-join purgatory (up to
-    //    INITIAL_REBALANCE_DELAY per round, and cooperative rounds
-    //    cascade) blocks every later request on that same socket. If the
-    //    coordinator shared `poll()`'s connection, a `Fetch` issued
-    //    mid-rebalance would head-of-line-block behind the parked
-    //    JoinGroup and stall until the client request timeout. A dedicated
-    //    coordinator connection keeps the data path (`poll`/commit)
-    //    independent of the group-protocol path. (The JVM client never
-    //    hits this because real brokers serve a connection's requests
-    //    concurrently.)
-    let coordinator_client = Client::builder()
-        .bootstrap(&bootstrap)
-        .client_id(client_id.clone())
-        .request_timeout(request_timeout)
-        .dispatch_queue_capacity(dispatch_queue_capacity.get())
-        .frame_max(frame_max.size())
-        .metadata_recovery_strategy(metadata_recovery_strategy)
-        .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger)
-        .maybe_security(security.clone())
-        .metadata_scope(subscription_metadata_scope(allow_auto_create_topics))
-        .build()
-        .await?;
-    // A leader of the build watches the topics of the whole group until the
-    // next join (Kafka's `SubscriptionState.metadataTopics`).
-    coordinator_client
-        .metadata_topics()
-        .set(if group_topics.is_empty() {
-            subscribe.clone()
-        } else {
-            group_topics
-        });
+    // A consumer without a subscription has no coordinator task.
+    let standalone = coordinator_client.is_none();
+    let coordinator_client = coordinator_client.unwrap_or_else(|| client.clone());
 
     let (identity, next_ownership_id) =
         initial_commit_identity(&assigned_partitions, generation_id, &member_id);
@@ -1698,7 +1753,8 @@ async fn spawn_consumer(
     let (listener_sender, listener_calls) = tokio::sync::mpsc::unbounded_channel();
     let (enforced_rebalances, enforced_rebalance_reasons) = tokio::sync::mpsc::unbounded_channel();
     let assigned_callback_pending = crate::rebalance_listener::AssignedCallbackPending::default();
-    if has_rebalance_listener {
+    // A consumer that joined no group runs no rebalance callback.
+    if has_rebalance_listener && !standalone {
         queue_initial_assign_call(&listener_sender, initial_assignment);
     }
     let auto_commit = auto_commit_interval.map(crate::commit::AutoCommit::new);
@@ -1761,7 +1817,8 @@ async fn spawn_consumer(
     // IMPORTANT: `tokio::spawn` is the very last operation — no `.await`
     // follows it.  Dropping a timed-out `start_once` future before this
     // point cancels all in-flight connections without spawning anything.
-    let coord_handle = tokio::spawn(crate::coordinator::run(state, shutdown.clone()));
+    let coord_handle =
+        (!standalone).then(|| tokio::spawn(crate::coordinator::run(state, shutdown.clone())));
 
     Ok(Consumer {
         client,
@@ -1786,7 +1843,7 @@ async fn spawn_consumer(
         heartbeat_interval,
         rebalance_protocol,
         coordinator_shutdown: shutdown,
-        coordinator_handle: Some(coord_handle),
+        coordinator_handle: coord_handle,
         isolation_level,
         fetch_min,
         fetch_max,
@@ -2332,7 +2389,12 @@ mod security_arg_tests {
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for (name, topics, pattern, expected) in [
-            ("neither", vec![], None, "not subscribed to any topic"),
+            (
+                "a subscription without a group id",
+                vec!["orders".to_owned()],
+                None,
+                "To use the group management or offset commit APIs, you must provide a valid group.id in the consumer configuration.",
+            ),
             (
                 "both",
                 vec!["orders".to_owned()],
@@ -2348,7 +2410,10 @@ mod security_arg_tests {
         ] {
             let error = Consumer::builder()
                 .bootstrap("invalid.invalid:9092")
-                .group_id("subscription-validation")
+                .maybe_group_id(
+                    (name != "a subscription without a group id")
+                        .then_some("subscription-validation"),
+                )
                 .subscribe(topics)
                 .maybe_subscribe_pattern(pattern)
                 .build()
@@ -5043,9 +5108,11 @@ mod group_membership_tests {
         });
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called_in_callback = Arc::clone(&called);
-        consumer.commit_async_with_callback(move |_, _| {
-            called_in_callback.store(true, Ordering::SeqCst);
-        });
+        consumer
+            .commit_async_with_callback(move |_, _| {
+                called_in_callback.store(true, Ordering::SeqCst);
+            })
+            .expect("commit_async_with_callback");
         consumer.close().await.expect("close");
         let called_before_close_returned = called.load(Ordering::SeqCst);
         release.await.expect("release");
@@ -5145,7 +5212,9 @@ mod group_membership_tests {
                     consumer.subscribe(["orders"]).await.expect("subscribe");
                 }
                 Change::PatternWithoutMatch => {
-                    consumer.subscribe_pattern(crate::TopicPattern::new(|_| false));
+                    consumer
+                        .subscribe_pattern(crate::TopicPattern::new(|_| false))
+                        .expect("subscribe_pattern");
                 }
             }
             let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -5213,6 +5282,45 @@ mod group_membership_tests {
         assert2::assert!((before, after, owned) == (vec![partition(0)], vec![], 0));
     }
 
+    /// Kafka's `assign` after `unsubscribe` keeps its partitions, and
+    /// `enforceRebalance` then fails because the consumer has no group
+    /// subscription.
+    #[tokio::test]
+    async fn a_manual_assignment_after_unsubscribe_survives_and_blocks_enforce_rebalance() {
+        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        let in_mock = Arc::clone(&coordinator);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await;
+        let mut consumer = started_consumer(&mock, None).await;
+        consumer.unsubscribe().await.expect("unsubscribe");
+        consumer
+            .assign(&[(TOPIC.to_owned(), 1)])
+            .await
+            .expect("assign");
+        // Let the coordinator task handle the changes.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let assignment = consumer.assignment().await;
+        let enforced = consumer
+            .enforce_rebalance(None)
+            .map_err(|error| error.to_string());
+        let rejected = consumer
+            .assign(&[(TOPIC.to_owned(), -1)])
+            .await
+            .map_err(|error| error.to_string());
+        drop(consumer);
+        mock.stop();
+        assert2::assert!(
+            (assignment, enforced, rejected)
+                == (
+                    vec![(TOPIC.to_owned(), 1)],
+                    Err("illegal state: Tried to force a rebalance but the consumer has a manual assignment.".to_owned()),
+                    Err("invalid argument: Partition index of orders--1 is negative".to_owned())
+                )
+        );
+    }
+
     /// Kafka's `enforceRebalance(reason)` makes the next `poll` join the group
     /// with the reason, or with `rebalance enforced by user`.
     #[tokio::test]
@@ -5231,7 +5339,9 @@ mod group_membership_tests {
             })
             .await;
             let mut consumer = started_consumer(&mock, None).await;
-            consumer.enforce_rebalance(reason);
+            consumer
+                .enforce_rebalance(reason)
+                .expect("enforce_rebalance");
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             while coordinator.joins.lock().expect("joins lock").is_empty()
                 && tokio::time::Instant::now() < deadline
