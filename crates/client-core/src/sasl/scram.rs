@@ -152,8 +152,12 @@ impl ClientFinal {
                 self.mechanism.wire_name()
             ));
         }
+        // RFC 5802 allows extensions after the verifier
+        // (`v=<base64>,ext=value`), so read the attribute list and decode the
+        // `v` value alone.
         let signature = server_final
-            .strip_prefix("v=")
+            .split(',')
+            .find_map(|attribute| attribute.strip_prefix("v="))
             .and_then(|value| B64.decode(value).ok())
             .ok_or_else(|| format!("invalid SCRAM server-final message format: {server_final}"))?;
         let expected = hmac(
@@ -246,6 +250,26 @@ mod tests {
                 check!(client.verify(&server_final).is_ok());
             }
         }
+    }
+
+    /// RFC 5802: a server-final message may carry extensions after the
+    /// verifier, and the client reads the verifier alone.
+    #[test]
+    fn a_server_final_extension_after_the_verifier_is_accepted() {
+        let credential = hash_scram_password(b"p", SaslMechanism::ScramSha256, 4096);
+        let server = ScramServerExchange::new("u".into(), credential);
+        let (first, client) = client_first(SaslMechanism::ScramSha256, "u", "p", false).unwrap();
+        let StepResult::Continue(server_first, server) = server.step(&first) else {
+            panic!("server-first");
+        };
+        let (final_message, client) = client.step(&server_first).unwrap();
+        let StepResult::Done(_, server_final) = server.step(&final_message) else {
+            panic!("server-final");
+        };
+        let mut extended = server_final.clone();
+        extended.extend_from_slice(b",ext=value");
+
+        check!(client.verify(&extended).is_ok());
     }
 
     #[test]

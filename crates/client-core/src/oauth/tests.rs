@@ -43,6 +43,14 @@ fn endpoints_parse_as_urls() {
         ("https://[::1]:8443", endpoint(true, "::1", 8443, "/")),
         ("http://[::1]/token", endpoint(false, "::1", 80, "/token")),
         (
+            "https://idp.example?realm=x",
+            endpoint(true, "idp.example", 443, "/?realm=x"),
+        ),
+        (
+            "https://idp.example/token?realm=x#frag",
+            endpoint(true, "idp.example", 443, "/token?realm=x"),
+        ),
+        (
             "https://[::1:8443",
             Err(
                 "sasl.oauthbearer.token.endpoint.url \"https://[::1:8443\" is not an http or \
@@ -131,6 +139,22 @@ fn blank_credentials_are_rejected() {
             ClientCredentialsConfig::new("https://idp/token", "id", ""),
             "sasl.oauthbearer.client.credentials.client.secret is blank",
         ),
+        (
+            "window factor above the range",
+            ClientCredentialsConfig {
+                refresh_window_factor: 1.5,
+                ..ClientCredentialsConfig::new("https://idp/token", "id", "secret")
+            },
+            "sasl.login.refresh.window.factor must be between 0.5 and 1, and it is 1.5",
+        ),
+        (
+            "window jitter that is not a number",
+            ClientCredentialsConfig {
+                refresh_window_jitter: f64::NAN,
+                ..ClientCredentialsConfig::new("https://idp/token", "id", "secret")
+            },
+            "sasl.login.refresh.window.jitter must be between 0 and 0.25, and it is NaN",
+        ),
     ] {
         check!(
             ClientCredentialsTokenProvider::new(config).err() == Some(expected.to_owned()),
@@ -174,6 +198,35 @@ fn responses_give_the_access_token_or_the_id_token() {
             ))
     );
     check!(token_times("opaque").err() == Some("the token is not a JWT".to_owned()));
+    // RFC 7519 NumericDate may carry a fraction of a second.
+    let fractional = format!(
+        "{}.{}.sig",
+        URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+        URL_SAFE_NO_PAD.encode(r#"{"exp":200.5}"#)
+    );
+    check!(token_times(&fractional) == Ok((None, UNIX_EPOCH + Duration::from_secs_f64(200.5))));
+}
+
+/// A chunk boundary may cut a multibyte character in two. The dechunk runs on
+/// bytes, so the body still decodes.
+#[test]
+fn a_chunked_body_that_splits_a_character_still_decodes() {
+    let body = r#"{"access_token":"t","scope":"café"}"#.as_bytes();
+    // The second chunk starts inside the two bytes of "é".
+    let split = body.len() - 3;
+    let (first, second) = body.split_at(split);
+    let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for chunk in [first, second] {
+        response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        response.extend_from_slice(chunk);
+        response.extend_from_slice(b"\r\n");
+    }
+    response.extend_from_slice(b"0\r\n\r\n");
+
+    check!(
+        parse_http_response(&response)
+            == Ok((200, r#"{"access_token":"t","scope":"café"}"#.to_owned()))
+    );
 }
 
 /// Kafka's `ExpiringCredentialRefreshingLogin.refreshMs` with the default

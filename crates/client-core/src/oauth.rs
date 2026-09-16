@@ -152,6 +152,28 @@ impl ClientCredentialsTokenProvider {
             return Err("sasl.oauthbearer.client.credentials.client.secret is blank".into());
         }
         Endpoint::parse(&config.token_endpoint_url)?;
+        // Kafka's `ExpiringCredentialRefreshConfig` refuses a window factor or
+        // jitter outside its range. A bad one would reach
+        // `Duration::mul_f64` and panic at the first token.
+        for (name, value, range) in [
+            (
+                "sasl.login.refresh.window.factor",
+                config.refresh_window_factor,
+                (0.5, 1.0),
+            ),
+            (
+                "sasl.login.refresh.window.jitter",
+                config.refresh_window_jitter,
+                (0.0, 0.25),
+            ),
+        ] {
+            if !value.is_finite() || value < range.0 || value > range.1 {
+                return Err(format!(
+                    "{name} must be between {} and {}, and it is {value}",
+                    range.0, range.1
+                ));
+            }
+        }
         Ok(Arc::new(Self {
             config,
             cached: tokio::sync::Mutex::new(None),
@@ -233,7 +255,14 @@ impl ClientCredentialsTokenProvider {
                     .tls
                     .connector()
                     .map_err(|error| Failure::Final(error.to_string()))?;
-                let name = rustls::pki_types::ServerName::try_from(endpoint.host.clone())
+                // `tls.server_name` overrides the SNI name, as it does on a
+                // broker connection.
+                let server_name = if self.config.tls.server_name.is_empty() {
+                    endpoint.host.clone()
+                } else {
+                    self.config.tls.server_name.clone()
+                };
+                let name = rustls::pki_types::ServerName::try_from(server_name)
                     .map_err(|error| Failure::Final(format!("invalid endpoint host: {error}")))?;
                 let stream = connector
                     .connect(name, tcp)
@@ -343,9 +372,17 @@ impl Endpoint {
         } else {
             return Err(invalid());
         };
-        let (authority, target) = rest
-            .find('/')
-            .map_or((rest, "/"), |index| (&rest[..index], &rest[index..]));
+        // The authority ends at the first `/`, `?` or `#`, as RFC 3986 says.
+        // A query with no path still posts to `/?...`, and a fragment never
+        // goes on the wire.
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, after) = rest.split_at(authority_end);
+        let after = after.split('#').next().unwrap_or("");
+        let target = match after.as_bytes().first() {
+            None => "/".to_owned(),
+            Some(b'?') => format!("/{after}"),
+            Some(_) => after.to_owned(),
+        };
         let default_port = if https { 443 } else { 80 };
         let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
             let (host, after) = bracketed.split_once(']').ok_or_else(invalid)?;
@@ -367,7 +404,7 @@ impl Endpoint {
             https,
             host,
             port,
-            target: target.to_owned(),
+            target,
         })
     }
 }
@@ -429,11 +466,17 @@ where
 }
 
 /// The status code and body of an HTTP/1.1 response that ends at EOF.
+///
+/// The body stays bytes until the chunk framing is off it. A chunk boundary
+/// may cut a multibyte character in two, so a decode before the dechunk would
+/// move every later byte offset.
 fn parse_http_response(response: &[u8]) -> Result<(u16, String), String> {
-    let text = String::from_utf8_lossy(response);
-    let (head, body) = text
-        .split_once("\r\n\r\n")
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
         .ok_or_else(|| "incomplete token endpoint response".to_owned())?;
+    let head = String::from_utf8_lossy(&response[..separator]).into_owned();
+    let body = &response[separator + 4..];
     let mut lines = head.split("\r\n");
     let status = lines
         .next()
@@ -449,27 +492,33 @@ fn parse_http_response(response: &[u8]) -> Result<(u16, String), String> {
     let body = if chunked {
         dechunk(body)?
     } else {
-        body.to_owned()
+        body.to_vec()
     };
+    let body = String::from_utf8(body)
+        .map_err(|_| "the token endpoint response is not UTF-8".to_owned())?;
     Ok((status, body))
 }
 
-fn dechunk(mut body: &str) -> Result<String, String> {
-    let mut out = String::new();
+/// Strip the chunk framing of a chunked body, in bytes.
+fn dechunk(mut body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
     loop {
-        let (size, rest) = body
-            .split_once("\r\n")
+        let line_end = body
+            .windows(2)
+            .position(|window| window == b"\r\n")
             .ok_or_else(|| "invalid chunked token endpoint response".to_owned())?;
+        let size = String::from_utf8_lossy(&body[..line_end]);
         let size = usize::from_str_radix(size.split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| "invalid chunk size in token endpoint response".to_owned())?;
+        let rest = &body[line_end + 2..];
         if size == 0 {
             return Ok(out);
         }
         let chunk = rest
             .get(..size)
             .ok_or_else(|| "truncated chunk in token endpoint response".to_owned())?;
-        out.push_str(chunk);
-        body = rest.get(size + 2..).unwrap_or("");
+        out.extend_from_slice(chunk);
+        body = rest.get(size + 2..).unwrap_or(&[]);
     }
 }
 
@@ -518,10 +567,13 @@ fn token_times(token: &str) -> Result<(Option<SystemTime>, SystemTime), String> 
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .ok_or_else(|| "the JWT payload is not base64url JSON".to_owned())?;
+    // RFC 7519 NumericDate is a JSON number, so a provider may send a
+    // fractional second. A negative or unreal value has no time.
     let time = |name: &str| {
         json.get(name)
-            .and_then(serde_json::Value::as_u64)
-            .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
+            .and_then(serde_json::Value::as_f64)
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(|seconds| UNIX_EPOCH + Duration::from_secs_f64(seconds))
     };
     let expire = time("exp").ok_or_else(|| "the JWT has no exp claim".to_owned())?;
     Ok((time("iat"), expire))
