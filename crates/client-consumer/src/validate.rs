@@ -71,7 +71,7 @@ fn response_has_error(error_code: i16) -> bool {
 /// ids of each metadata response in the same way. The metadata requests name
 /// the topics of the consumer, so the response holds no other topics. This
 /// function skips a topic row with an error or with the zero id.
-fn refresh_tracked_topic_ids(
+pub(crate) fn refresh_tracked_topic_ids(
     topic_ids: &mut HashMap<String, WireUuid>,
     metadata: &MetadataResponse,
 ) {

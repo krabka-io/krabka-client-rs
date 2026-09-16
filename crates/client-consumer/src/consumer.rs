@@ -195,6 +195,10 @@ struct StartConfig {
     subscribe_pattern: Option<crate::TopicPattern>,
     /// Kafka's `exclude.internal.topics`.
     exclude_internal_topics: bool,
+    /// Kafka's `group.protocol`.
+    group_protocol: crate::GroupProtocol,
+    /// Kafka's `group.remote.assignor`, for the consumer group protocol.
+    server_assignor: Option<String>,
     group_instance_id: Option<String>,
     auto_offset_reset: AutoOffsetReset,
     isolation_level: IsolationLevel,
@@ -1003,6 +1007,16 @@ impl Consumer {
         /// not match an internal topic.
         #[builder(default = true)]
         exclude_internal_topics: bool,
+        /// Kafka's `group.protocol`: `Classic` (the default) uses `JoinGroup`,
+        /// `SyncGroup` and `Heartbeat`; `Consumer` uses
+        /// `ConsumerGroupHeartbeat` with server-side assignment (KIP-848).
+        #[builder(default)]
+        group_protocol: crate::GroupProtocol,
+        /// Kafka's `group.remote.assignor`: the assignor that the group
+        /// coordinator runs, for example `uniform` or `range`. Only for
+        /// `group_protocol(GroupProtocol::Consumer)`.
+        #[builder(into)]
+        group_remote_assignor: Option<String>,
         #[builder(into)] group_instance_id: Option<String>,
         #[builder(default = AutoOffsetReset::Latest)] auto_offset_reset: AutoOffsetReset,
         #[builder(default = IsolationLevel::ReadUncommitted)] isolation_level: IsolationLevel,
@@ -1054,6 +1068,14 @@ impl Consumer {
             ));
         }
         let enable_auto_commit = enable_auto_commit.unwrap_or(!group_id.is_empty());
+        // Kafka's `ConsumerConfig.checkUnsupportedConfigsPostProcess`:
+        // `group.remote.assignor` belongs to the consumer group protocol, and
+        // `partition.assignment.strategy` to the classic one.
+        if group_protocol == crate::GroupProtocol::Classic && group_remote_assignor.is_some() {
+            return Err(ConsumerError::InvalidConfig(
+                "group.remote.assignor cannot be set when group.protocol=classic".to_owned(),
+            ));
+        }
         if !subscribe.is_empty() && subscribe_pattern.is_some() {
             return Err(ConsumerError::InvalidConfig(
                 "subscribe and subscribe_pattern are mutually exclusive".to_owned(),
@@ -1142,6 +1164,8 @@ impl Consumer {
             subscribe,
             subscribe_pattern,
             exclude_internal_topics,
+            group_protocol,
+            server_assignor: group_remote_assignor,
             group_instance_id,
             auto_offset_reset,
             isolation_level,
@@ -1248,6 +1272,11 @@ impl Consumer {
         }
         if config.subscribe_pattern.is_some() {
             config.subscribe = pattern_topics(&config).await?;
+        }
+        if config.group_protocol == crate::GroupProtocol::Consumer {
+            // KIP-848: the member joins with its first
+            // `ConsumerGroupHeartbeat`, which the coordinator task sends.
+            return start_without_subscription(config).await;
         }
         let finish_config = config.clone();
         let StartConfig {
@@ -1619,11 +1648,21 @@ async fn start_without_subscription(config: StartConfig) -> Result<Consumer, Con
     } else {
         find_coordinator(&client, &config.group_id, config.retry_policy.into()).await?
     };
+    // KIP-848: the member id comes from the client. Kafka's
+    // `AsyncKafkaConsumer` generates a random one at startup.
+    let member_id = if config.group_protocol == crate::GroupProtocol::Consumer {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        String::new()
+    };
+    client
+        .metadata_topics()
+        .set(config.subscribe.iter().cloned());
     spawn_consumer(
         config,
         client,
         Arc::new(AtomicI32::new(coordinator_id)),
-        String::new(),
+        member_id,
         StartupState {
             generation_id: -1,
             group_topics: Vec::new(),
@@ -1692,6 +1731,8 @@ async fn spawn_consumer(
         subscribe,
         subscribe_pattern,
         exclude_internal_topics,
+        group_protocol,
+        server_assignor,
         group_instance_id,
         auto_offset_reset,
         isolation_level,
@@ -1747,7 +1788,10 @@ async fn spawn_consumer(
 
     let poll_error = crate::coordinator::PollErrorSlot::default();
     let poll_signal = crate::coordinator::PollSignal::default();
-    let rebalance_pending = tokio::sync::watch::Sender::new(false);
+    // A member of the consumer group protocol has no assignment before its
+    // first heartbeat, so the first `poll` waits for it.
+    let rebalance_pending =
+        tokio::sync::watch::Sender::new(group_protocol == crate::GroupProtocol::Consumer);
     let rebalance_pending_receiver = rebalance_pending.subscribe();
     let close_operation = tokio::sync::watch::Sender::new(crate::control::CloseRequest::default());
     let (listener_sender, listener_calls) = tokio::sync::mpsc::unbounded_channel();
@@ -1778,6 +1822,10 @@ async fn spawn_consumer(
         subscription_changes: subscription.subscribe(),
         joined_topics: subscribe.clone(),
         seen_unsubscribes: 0,
+        group_protocol,
+        server_assignor,
+        member_epoch: 0,
+        sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
         assigned: Arc::clone(&assigned),
         assignment_changed: Arc::clone(&assignment_changed),
         next_ownership_id,
@@ -1817,8 +1865,14 @@ async fn spawn_consumer(
     // IMPORTANT: `tokio::spawn` is the very last operation — no `.await`
     // follows it.  Dropping a timed-out `start_once` future before this
     // point cancels all in-flight connections without spawning anything.
-    let coord_handle =
-        (!standalone).then(|| tokio::spawn(crate::coordinator::run(state, shutdown.clone())));
+    let coord_handle = (!standalone).then(|| match group_protocol {
+        crate::GroupProtocol::Classic => {
+            tokio::spawn(crate::coordinator::run(state, shutdown.clone()))
+        }
+        crate::GroupProtocol::Consumer => {
+            tokio::spawn(crate::consumer_group::run(state, shutdown.clone()))
+        }
+    });
 
     Ok(Consumer {
         client,
@@ -3694,6 +3748,8 @@ mod auto_commit_tests {
             subscribe: vec![TOPIC.into()],
             subscribe_pattern: None,
             exclude_internal_topics: true,
+            group_protocol: crate::GroupProtocol::Classic,
+            server_assignor: None,
             group_instance_id: None,
             auto_offset_reset: AutoOffsetReset::Earliest,
             isolation_level: IsolationLevel::ReadUncommitted,
