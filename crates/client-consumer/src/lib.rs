@@ -94,6 +94,7 @@ mod queries;
 mod rebalance_listener;
 mod seek;
 mod share;
+mod subscription;
 mod validate;
 
 pub use assignor::Assignor;
@@ -120,3 +121,4 @@ pub use share::{
     ShareConsumerFetchMaxRecords, ShareConsumerFetchMinBytes, ShareConsumerLeaveHeartbeatTimeout,
     ShareConsumerRecord,
 };
+pub use subscription::TopicPattern;
