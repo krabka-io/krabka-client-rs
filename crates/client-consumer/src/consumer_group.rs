@@ -40,6 +40,9 @@ pub(crate) const LEAVE_GROUP_STATIC_MEMBER_EPOCH: i32 = -2;
 pub(crate) const FENCED_MEMBER_EPOCH: i16 = 110;
 /// `UNKNOWN_MEMBER_ID`.
 const UNKNOWN_MEMBER_ID: i16 = 25;
+/// `UNSUPPORTED_ASSIGNOR`.
+#[cfg(test)]
+const UNSUPPORTED_ASSIGNOR: i16 = 112;
 
 /// The partitions of an assignment, and the topic ids that the metadata does
 /// not name yet.
@@ -266,21 +269,75 @@ pub(crate) async fn run(
     if let Err(error) = state.client.refresh_metadata().await {
         tracing::warn!(%error, "coordinator client metadata refresh failed at startup");
     }
+    // Kafka's `Heartbeat.pollTimer`: `poll` resets it, and the member leaves
+    // the group when it expires.
+    state.poll_timer = crate::coordinator::PollTimer::new(state.max_poll_interval);
     let mut interval = state.heartbeat_interval.to_std();
     let mut send_now = true;
+    let mut polls_open = true;
+    // `true` after the poll timer expired: the member left the group and waits
+    // for a `poll` before it joins again. Kafka's `MemberState.STALE`.
+    let mut left_on_poll_timeout = false;
     loop {
         if !send_now {
-            let waited = tokio::select! {
+            let event = tokio::select! {
+                biased;
                 () = shutdown.cancelled() => break,
-                () = tokio::time::sleep(interval) => true,
-                changed = state.subscription_changes.changed() => changed.is_ok(),
+                () = tokio::time::sleep(interval), if !left_on_poll_timeout => TaskEvent::Heartbeat,
+                changed = state.polls.changed(), if polls_open => {
+                    if changed.is_err() {
+                        polls_open = false;
+                        continue;
+                    }
+                    TaskEvent::Poll
+                }
+                changed = state.subscription_changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    TaskEvent::Subscription
+                }
+                () = tokio::time::sleep_until(state.poll_timer.deadline()), if !left_on_poll_timeout => {
+                    TaskEvent::PollTimeout
+                }
             };
-            if !waited {
-                break;
+            match event {
+                TaskEvent::Poll => {
+                    state.poll_timer.reset();
+                    if !left_on_poll_timeout {
+                        continue;
+                    }
+                    // The `poll` came back: join the group again, as Kafka's
+                    // member leaves the stale state when the poll timer is
+                    // reset.
+                    left_on_poll_timeout = false;
+                    state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
+                    state.sent_heartbeat_fields = SentFields::default();
+                }
+                TaskEvent::PollTimeout => {
+                    leave_after_poll_timeout(&mut state).await;
+                    left_on_poll_timeout = true;
+                    continue;
+                }
+                TaskEvent::Subscription => {
+                    // The task has its own client. Its metadata requests name
+                    // the topics of the new subscription, so it can resolve
+                    // the topic ids of the next assignment.
+                    let topics = state.subscription.borrow().topics.clone();
+                    if !topics.is_empty() {
+                        state.client.metadata_topics().set(topics);
+                    }
+                }
+                TaskEvent::Heartbeat => {}
             }
         }
         send_now = false;
-        match heartbeat_once(&mut state).await {
+        let outcome = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            outcome = heartbeat_once(&mut state) => outcome,
+        };
+        match outcome {
             HeartbeatOutcome::Interval(next) => interval = next,
             HeartbeatOutcome::Reconciled(next) => {
                 interval = next;
@@ -309,6 +366,87 @@ pub(crate) async fn run(
         let leave_timeout = state.leave_group_timeout.to_std();
         let leave = send_heartbeat(&mut state, HeartbeatKind::Leave).await;
         let _ = tokio::time::timeout(leave_timeout, leave.send()).await;
+    }
+}
+
+/// What wakes the heartbeat task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskEvent {
+    /// The heartbeat interval elapsed.
+    Heartbeat,
+    /// A `poll` came: reset the poll timer.
+    Poll,
+    /// The subscription changed.
+    Subscription,
+    /// The poll timer expired: leave the group.
+    PollTimeout,
+}
+
+/// Leave the group because the time between two `poll` calls was longer than
+/// `max_poll_interval`, and give up every partition.
+///
+/// Kafka's `AbstractHeartbeatRequestManager.poll` calls
+/// `transitionToSendingLeaveGroup(true)` for an expired poll timer, sends the
+/// leave heartbeat and then makes the member stale until the next `poll`.
+async fn leave_after_poll_timeout(state: &mut crate::coordinator::CoordinatorState) {
+    tracing::warn!(
+        group = %state.group_id,
+        max_poll_interval = ?state.max_poll_interval,
+        "consumer poll timeout has expired: the time between two poll calls was longer than \
+         max_poll_interval; the member leaves the group and joins again on the next poll"
+    );
+    state.member_epoch = leave_group_epoch(
+        state.group_instance_id.as_deref(),
+        crate::consumer::GroupMembershipOperation::Default,
+    );
+    let leave_timeout = state.leave_group_timeout.to_std();
+    let leave = send_heartbeat(state, HeartbeatKind::Leave).await;
+    let _ = tokio::time::timeout(leave_timeout, leave.send()).await;
+    crate::coordinator::release_partitions_after_poll_timeout(state).await;
+    if let Err(error) = crate::coordinator::call_lost_listener(state).await {
+        tracing::warn!(%error, group = %state.group_id, "the lost callback failed");
+    }
+    state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
+    state.sent_heartbeat_fields = SentFields::default();
+}
+
+/// Keep the member in the group while `poll` runs a rebalance listener
+/// callback. Kafka's heartbeat manager keeps sending `ConsumerGroupHeartbeat`
+/// while the application thread runs the callback.
+///
+/// The request carries only the fields that changed, so it repeats the member
+/// state and asks for nothing new. The heartbeat after the callback acts on
+/// the response of the member state.
+pub(crate) async fn heartbeat_during_callback(
+    state: &crate::coordinator::CoordinatorState,
+    done: &tokio_util::sync::CancellationToken,
+) {
+    let interval = state.heartbeat_interval.to_std();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            () = done.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let mut sent = state.sent_heartbeat_fields.clone();
+        let fields = heartbeat_fields(state, HeartbeatKind::Interval).await;
+        let request = build_heartbeat(&fields, &mut sent);
+        let broker = state.client.broker(
+            state
+                .coordinator_id
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let call = HeartbeatCall { broker, request };
+        let result = tokio::select! {
+            biased;
+            () = done.cancelled() => return,
+            result = call.send() => result,
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, group = %state.group_id, "the heartbeat during a rebalance callback failed");
+        }
     }
 }
 
@@ -341,13 +479,26 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
             // next heartbeat sends every field again. Kafka's
             // `ConsumerHeartbeatRequestManager.resetHeartbeatState`.
             state.sent_heartbeat_fields = SentFields::default();
-            if crate::coordinator::is_retriable_transport_error(&error) {
-                state.client.evict_broker(
-                    state
-                        .coordinator_id
-                        .load(std::sync::atomic::Ordering::Relaxed),
+            if !crate::coordinator::is_retriable_transport_error(&error) {
+                // Kafka's `AbstractHeartbeatRequestManager.onFailure` retries
+                // only a `RetriableException`, and hands every other failure
+                // to the application. A broker without api key 68 fails here.
+                tracing::error!(
+                    %error,
+                    group = %state.group_id,
+                    "the consumer group heartbeat failed for good; the member stops"
                 );
+                crate::coordinator::report_fatal_error(
+                    &state.poll_error,
+                    crate::error::ConsumerError::Client(error),
+                );
+                return HeartbeatOutcome::Stop;
             }
+            state.client.evict_broker(
+                state
+                    .coordinator_id
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             return HeartbeatOutcome::Backoff;
         }
     };
@@ -368,6 +519,11 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
             state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
             state.sent_heartbeat_fields = SentFields::default();
             crate::coordinator::forget_member_keeping_id(state).await;
+            // Kafka's `transitionToFenced` gives the partitions to
+            // `onPartitionsLost` before the member joins again.
+            if let Err(error) = crate::coordinator::call_lost_listener(state).await {
+                tracing::warn!(%error, group = %state.group_id, "the lost callback failed");
+            }
             return HeartbeatOutcome::Backoff;
         }
         HeartbeatAction::Fatal => {
@@ -377,7 +533,7 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
                 error = ?response.error_message,
                 "the consumer group heartbeat failed with a fatal error"
             );
-            crate::coordinator::report_rejoin_error(
+            crate::coordinator::report_fatal_error(
                 &state.poll_error,
                 crate::error::ConsumerError::Server(response.error_code),
             );
@@ -451,29 +607,8 @@ async fn send_heartbeat(
     state: &mut crate::coordinator::CoordinatorState,
     kind: HeartbeatKind,
 ) -> HeartbeatCall<'_> {
-    let topic_ids = state.topic_ids.lock().await.clone();
-    let owned = if kind == HeartbeatKind::Leave {
-        OwnedByTopicId::new()
-    } else {
-        owned_by_topic_id(&state.assigned.lock().await, &topic_ids)
-    };
-    let subscribed_topic_names = state.subscription.borrow().topics.clone();
-    let mut sent = std::mem::take(&mut state.sent_heartbeat_fields);
-    let request = build_heartbeat(
-        &HeartbeatFields {
-            group_id: &state.group_id,
-            member_id: &state.member_id,
-            member_epoch: state.member_epoch,
-            instance_id: state.group_instance_id.as_deref(),
-            rack_id: state.client_rack.as_deref(),
-            rebalance_timeout_ms: crate::consumer::protocol_millis_i32(state.max_poll_interval),
-            subscribed_topic_names,
-            server_assignor: state.server_assignor.as_deref(),
-            owned,
-            joining: kind == HeartbeatKind::Join,
-        },
-        &mut sent,
-    );
+    let mut sent = state.sent_heartbeat_fields.clone();
+    let request = build_heartbeat(&heartbeat_fields(state, kind).await, &mut sent);
     state.sent_heartbeat_fields = sent;
     let broker = state.client.broker(
         state
@@ -481,6 +616,32 @@ async fn send_heartbeat(
             .load(std::sync::atomic::Ordering::Relaxed),
     );
     HeartbeatCall { broker, request }
+}
+
+/// The heartbeat fields of the current member state.
+async fn heartbeat_fields(
+    state: &crate::coordinator::CoordinatorState,
+    kind: HeartbeatKind,
+) -> HeartbeatFields<'_> {
+    let topic_ids = state.topic_ids.lock().await.clone();
+    let owned = if kind == HeartbeatKind::Leave {
+        OwnedByTopicId::new()
+    } else {
+        owned_by_topic_id(&state.assigned.lock().await, &topic_ids)
+    };
+    let subscribed_topic_names = state.subscription.borrow().topics.clone();
+    HeartbeatFields {
+        group_id: &state.group_id,
+        member_id: &state.member_id,
+        member_epoch: state.member_epoch,
+        instance_id: state.group_instance_id.as_deref(),
+        rack_id: state.client_rack.as_deref(),
+        rebalance_timeout_ms: crate::consumer::protocol_millis_i32(state.max_poll_interval),
+        subscribed_topic_names,
+        server_assignor: state.server_assignor.as_deref(),
+        owned,
+        joining: kind == HeartbeatKind::Join,
+    }
 }
 
 /// One `ConsumerGroupHeartbeat` that is ready to go out.
@@ -597,9 +758,15 @@ mod group_protocol_tests {
             common::consumer_group_heartbeat_response::topic_partitions::TopicPartitions as AssignedPartitions,
             consumer_group_heartbeat_request,
             consumer_group_heartbeat_response::Assignment,
+            fetch_request,
+            fetch_response::FetchResponse,
             find_coordinator_request,
             find_coordinator_response::FindCoordinatorResponse,
-            metadata_request,
+            list_offsets_request,
+            list_offsets_response::{
+                ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
+            },
+            metadata_request::{self, MetadataRequest},
             metadata_response::{
                 MetadataResponse, MetadataResponsePartition, MetadataResponseTopic,
             },
@@ -625,6 +792,9 @@ mod group_protocol_tests {
         /// The assigned partitions of `orders`, or `None` for a response
         /// without an assignment.
         assignment: Option<Vec<i32>>,
+        /// The member id of the response. The coordinator can name another one
+        /// than the request.
+        member_id: Option<String>,
     }
 
     /// An answer that assigns `partitions` at `member_epoch`.
@@ -633,6 +803,15 @@ mod group_protocol_tests {
             error_code: 0,
             member_epoch,
             assignment: Some(partitions.to_vec()),
+            member_id: None,
+        }
+    }
+
+    /// `answer` with the member id that the coordinator names.
+    fn named(answer: Answer, member_id: &str) -> Answer {
+        Answer {
+            member_id: Some(member_id.to_owned()),
+            ..answer
         }
     }
 
@@ -642,6 +821,39 @@ mod group_protocol_tests {
             error_code,
             member_epoch: 0,
             assignment: None,
+            member_id: None,
+        }
+    }
+
+    /// What the mock coordinator recorded.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        /// Each `ConsumerGroupHeartbeat` that the mock decoded.
+        heartbeats: Arc<Mutex<Vec<ConsumerGroupHeartbeatRequest>>>,
+        /// The topic names of each `Metadata` request.
+        metadata_topics: Arc<Mutex<Vec<String>>>,
+        /// Whether a `Metadata` request named a topic by id.
+        asked_by_id: Arc<Mutex<bool>>,
+        /// The classic `Heartbeat` requests. A member of the consumer group
+        /// protocol sends none.
+        classic_heartbeats: Arc<Mutex<usize>>,
+    }
+
+    impl Recorder {
+        fn heartbeats(&self) -> Vec<ConsumerGroupHeartbeatRequest> {
+            self.heartbeats.lock().expect("heartbeats lock").clone()
+        }
+
+        /// The owned partitions that each heartbeat carried.
+        fn acknowledged(&self) -> Vec<Vec<i32>> {
+            acknowledged(&self.heartbeats())
+        }
+
+        fn epochs(&self) -> Vec<i32> {
+            self.heartbeats()
+                .iter()
+                .map(|request| request.member_epoch)
+                .collect()
         }
     }
 
@@ -667,6 +879,8 @@ mod group_protocol_tests {
                 (metadata_request::API_KEY, 12),
                 (find_coordinator_request::API_KEY, 2),
                 (offset_fetch_request::API_KEY, 5),
+                (list_offsets_request::API_KEY, 7),
+                (fetch_request::API_KEY, 12),
                 (consumer_group_heartbeat_request::API_KEY, 0),
             ]
             .into_iter()
@@ -699,6 +913,26 @@ mod group_protocol_tests {
         }
     }
 
+    /// The log start and end of `orders`: both partitions are empty.
+    fn list_offsets() -> ListOffsetsResponse {
+        ListOffsetsResponse {
+            topics: vec![ListOffsetsTopicResponse {
+                name: TOPIC.into(),
+                partitions: (0..2)
+                    .map(|partition_index| ListOffsetsPartitionResponse {
+                        partition_index,
+                        timestamp: -1,
+                        offset: 0,
+                        leader_epoch: -1,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
     /// The committed offsets of the group: `orders` has none, so the member
     /// starts its partitions at the `auto_offset_reset`.
     fn no_committed_offsets() -> OffsetFetchResponse {
@@ -719,6 +953,16 @@ mod group_protocol_tests {
         }
     }
 
+    /// The `Metadata` request of a frame, without its header.
+    fn metadata_request_of(mut body: &[u8], version: i16) -> MetadataRequest {
+        let client_id_len = usize::try_from(body.get_i16()).expect("client id length");
+        body.advance(client_id_len);
+        if version >= 9 {
+            body.advance(1);
+        }
+        MetadataRequest::decode(&mut body, version).expect("decode")
+    }
+
     /// The `ConsumerGroupHeartbeat` request of a frame, without its header.
     fn heartbeat_request(mut body: &[u8], version: i16) -> ConsumerGroupHeartbeatRequest {
         let client_id_len = usize::try_from(body.get_i16()).expect("client id length");
@@ -731,11 +975,19 @@ mod group_protocol_tests {
     /// A coordinator that answers each `ConsumerGroupHeartbeat` with the next
     /// entry of `answers`, repeats the last entry after that, and records every
     /// request that it decoded.
-    async fn heartbeat_coordinator(
+    async fn heartbeat_coordinator(answers: Vec<Answer>, recorder: &Recorder) -> MockBroker {
+        heartbeat_coordinator_with(answers, recorder, false).await
+    }
+
+    /// The same coordinator. With `by_id_only` it names the topic only for a
+    /// `Metadata` request that asks for its id, as a broker does for a group
+    /// with a broker-side pattern subscription.
+    async fn heartbeat_coordinator_with(
         answers: Vec<Answer>,
-        sent: &Arc<Mutex<Vec<ConsumerGroupHeartbeatRequest>>>,
+        recorder: &Recorder,
+        by_id_only: bool,
     ) -> MockBroker {
-        let sent = Arc::clone(sent);
+        let recorder = recorder.clone();
         let answers = Mutex::new(answers.into_iter());
         let last = Mutex::new(assigns(1, &[]));
         MockBroker::start(move |api_key, version, _corr_id, body| {
@@ -745,17 +997,48 @@ mod group_protocol_tests {
             if api_key == find_coordinator_request::API_KEY {
                 return Some(encode(&FindCoordinatorResponse::default(), version));
             }
+            if api_key == CLASSIC_HEARTBEAT_API_KEY {
+                *recorder
+                    .classic_heartbeats
+                    .lock()
+                    .expect("classic heartbeats lock") += 1;
+                return None;
+            }
             if api_key == metadata_request::API_KEY {
+                let request = metadata_request_of(body, version);
+                let topics = request.topics.unwrap_or_default();
+                let by_id = topics
+                    .iter()
+                    .any(|topic| topic.topic_id != WireUuid::default());
+                if by_id {
+                    *recorder.asked_by_id.lock().expect("asked lock") = true;
+                }
+                recorder
+                    .metadata_topics
+                    .lock()
+                    .expect("metadata topics lock")
+                    .extend(topics.iter().filter_map(|topic| topic.name.clone()));
+                if by_id_only && !by_id {
+                    return Some(flexible(&MetadataResponse::default(), version));
+                }
                 return Some(flexible(&metadata(), version));
             }
             if api_key == offset_fetch_request::API_KEY {
                 return Some(encode(&no_committed_offsets(), version));
             }
+            if api_key == list_offsets_request::API_KEY {
+                return Some(flexible(&list_offsets(), version));
+            }
+            if api_key == fetch_request::API_KEY {
+                return Some(flexible(&FetchResponse::default(), version));
+            }
             if api_key != consumer_group_heartbeat_request::API_KEY {
                 return None;
             }
-            sent.lock()
-                .expect("sent lock")
+            recorder
+                .heartbeats
+                .lock()
+                .expect("heartbeats lock")
                 .push(heartbeat_request(body, version));
             let mut last = last.lock().expect("last lock");
             if let Some(next) = answers.lock().expect("answers lock").next() {
@@ -764,6 +1047,7 @@ mod group_protocol_tests {
             let response = ConsumerGroupHeartbeatResponse {
                 error_code: last.error_code,
                 member_epoch: last.member_epoch,
+                member_id: last.member_id.clone(),
                 heartbeat_interval_ms: 20,
                 assignment: last.assignment.clone().map(|partitions| Assignment {
                     topic_partitions: vec![AssignedPartitions {
@@ -779,6 +1063,9 @@ mod group_protocol_tests {
         })
         .await
     }
+
+    /// Kafka's `Heartbeat` api key, which the classic protocol uses.
+    const CLASSIC_HEARTBEAT_API_KEY: i16 = 12;
 
     /// What one case observed of the member.
     #[derive(Debug, Eq, PartialEq)]
@@ -812,8 +1099,8 @@ mod group_protocol_tests {
     /// Run one member against `answers` until its heartbeats carried `acks`
     /// partition lists, then close it.
     async fn run_member(answers: Vec<Answer>, instance_id: Option<&str>, acks: usize) -> Observed {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let mock = heartbeat_coordinator(answers, &sent).await;
+        let recorder = Recorder::default();
+        let mock = heartbeat_coordinator(answers, &recorder).await;
         let mut consumer = Consumer::builder()
             .bootstrap(mock.addr.to_string())
             .group_id("group-a")
@@ -827,9 +1114,7 @@ mod group_protocol_tests {
             .await
             .expect("build");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while acknowledged(&sent.lock().expect("sent lock")).len() < acks
-            && tokio::time::Instant::now() < deadline
-        {
+        while recorder.acknowledged().len() < acks && tokio::time::Instant::now() < deadline {
             let _ = consumer.poll(millis(20)).await;
         }
         let owned: Vec<i32> = consumer
@@ -845,18 +1130,15 @@ mod group_protocol_tests {
             .await
             .expect("close");
         mock.stop();
-        let requests = sent.lock().expect("sent lock").clone();
+        let epochs = recorder.epochs();
         Observed {
-            acknowledged: acknowledged(&requests),
+            acknowledged: recorder.acknowledged(),
             owned,
-            last_epoch: *requests
-                .last()
-                .map(|request| &request.member_epoch)
-                .expect("a last heartbeat"),
-            rejoins: requests
+            last_epoch: *epochs.last().expect("a last heartbeat"),
+            rejoins: epochs
                 .iter()
                 .skip(1)
-                .filter(|request| request.member_epoch == JOIN_GROUP_MEMBER_EPOCH)
+                .filter(|epoch| **epoch == JOIN_GROUP_MEMBER_EPOCH)
                 .count(),
         }
     }
@@ -865,8 +1147,8 @@ mod group_protocol_tests {
     /// field: Kafka's `ConsumerHeartbeatRequestManager.HeartbeatState`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_first_heartbeat_joins_the_group_with_every_field() {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &sent).await;
+        let recorder = Recorder::default();
+        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
         let mut consumer = Consumer::builder()
             .bootstrap(mock.addr.to_string())
             .group_id("group-a")
@@ -884,7 +1166,7 @@ mod group_protocol_tests {
         }
         consumer.close().await.expect("close");
         mock.stop();
-        let first = sent.lock().expect("sent lock").first().cloned();
+        let first = recorder.heartbeats().first().cloned();
         let first = first.expect("a first heartbeat");
         assert2::assert!(
             ConsumerGroupHeartbeatRequest {
@@ -903,6 +1185,364 @@ mod group_protocol_tests {
         );
         // Kafka's `AsyncKafkaConsumer` generates a v4 uuid for the member id.
         assert2::assert!(uuid::Uuid::parse_str(&first.member_id).is_ok());
+    }
+
+    /// The kind and partitions of one rebalance listener call.
+    type ListenerCall = (crate::rebalance_listener::ListenerCallKind, Vec<i32>);
+
+    /// The listener calls of one run.
+    type ListenerCalls = Arc<Mutex<Vec<ListenerCall>>>;
+
+    /// A rebalance listener that records its calls, and that can hold the
+    /// assign callback for a while.
+    struct RecordingListener {
+        calls: ListenerCalls,
+        assign_delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ConsumerRebalanceListener for RecordingListener {
+        async fn on_partitions_revoked(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), crate::RebalanceListenerError> {
+            self.record(
+                crate::rebalance_listener::ListenerCallKind::Revoked,
+                partitions,
+            );
+            Ok(())
+        }
+
+        async fn on_partitions_assigned(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), crate::RebalanceListenerError> {
+            self.record(
+                crate::rebalance_listener::ListenerCallKind::Assigned,
+                partitions,
+            );
+            tokio::time::sleep(self.assign_delay).await;
+            Ok(())
+        }
+
+        async fn on_partitions_lost(
+            &mut self,
+            _consumer: &Consumer,
+            partitions: &[(String, i32)],
+        ) -> Result<(), crate::RebalanceListenerError> {
+            self.record(
+                crate::rebalance_listener::ListenerCallKind::Lost,
+                partitions,
+            );
+            Ok(())
+        }
+    }
+
+    impl RecordingListener {
+        fn record(
+            &self,
+            kind: crate::rebalance_listener::ListenerCallKind,
+            partitions: &[(String, i32)],
+        ) {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push((kind, partitions.iter().map(|(_, index)| *index).collect()));
+        }
+    }
+
+    /// The first lost callback of `calls`.
+    fn first_lost(calls: &ListenerCalls) -> Option<ListenerCall> {
+        calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .find(|(kind, _)| *kind == crate::rebalance_listener::ListenerCallKind::Lost)
+            .cloned()
+    }
+
+    /// A fatal heartbeat response and a heartbeat that cannot go out both end
+    /// the member and reach the application through `poll`. Kafka's
+    /// `AbstractHeartbeatRequestManager.onErrorResponse` and `onFailure` hand
+    /// such an error to the application thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fatal_heartbeat_error_reaches_poll() {
+        let mut actual = Vec::new();
+        for (name, answers, speaks_heartbeat) in [
+            (
+                "an unsupported assignor",
+                vec![fails(UNSUPPORTED_ASSIGNOR)],
+                true,
+            ),
+            ("a broker without the api", Vec::new(), false),
+        ] {
+            let recorder = Recorder::default();
+            let mock = if speaks_heartbeat {
+                heartbeat_coordinator(answers, &recorder).await
+            } else {
+                classic_only_coordinator().await
+            };
+            let mut consumer = Consumer::builder()
+                .bootstrap(mock.addr.to_string())
+                .group_id("group-a")
+                .subscribe([TOPIC.to_owned()])
+                .group_protocol(GroupProtocol::Consumer)
+                .heartbeat_interval(millis(20))
+                .request_timeout(secs(5))
+                .build()
+                .await
+                .expect("build");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut error = None;
+            while error.is_none() && tokio::time::Instant::now() < deadline {
+                error = consumer
+                    .poll(millis(20))
+                    .await
+                    .err()
+                    .map(|error| error.to_string());
+            }
+            consumer.close().await.expect("close");
+            mock.stop();
+            actual.push((name, error));
+        }
+        assert2::assert!(
+            actual
+                == vec![
+                    (
+                        "an unsupported assignor",
+                        Some("broker error_code 112".to_owned()),
+                    ),
+                    (
+                        "a broker without the api",
+                        Some(
+                            "client: incompatible version: broker supports 2..=2, client wants 0..=1 for api_key 68"
+                                .to_owned()
+                        ),
+                    ),
+                ]
+        );
+    }
+
+    /// A broker whose `ConsumerGroupHeartbeat` versions do not overlap the
+    /// ones of the client.
+    async fn classic_only_coordinator() -> MockBroker {
+        MockBroker::start(move |api_key, version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                let mut versions = api_versions();
+                for api in &mut versions.api_keys {
+                    if api.api_key == consumer_group_heartbeat_request::API_KEY {
+                        api.min_version = 2;
+                        api.max_version = 2;
+                    }
+                }
+                return Some(encode(&versions, 0));
+            }
+            if api_key == find_coordinator_request::API_KEY {
+                return Some(encode(&FindCoordinatorResponse::default(), version));
+            }
+            if api_key == metadata_request::API_KEY {
+                return Some(flexible(&metadata(), version));
+            }
+            None
+        })
+        .await
+    }
+
+    /// The member leaves the group when the time between two `poll` calls is
+    /// longer than `max_poll_interval`, gives its partitions to the lost
+    /// callback, and joins again with the next `poll`. Kafka's
+    /// `AbstractHeartbeatRequestManager.poll` and `transitionToStale`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_member_that_stops_polling_leaves_and_joins_again() {
+        let recorder = Recorder::default();
+        let calls: ListenerCalls = Arc::default();
+        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe([TOPIC.to_owned()])
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .max_poll_interval(millis(300))
+            .request_timeout(secs(5))
+            .rebalance_listener(Box::new(RecordingListener {
+                calls: Arc::clone(&calls),
+                assign_delay: std::time::Duration::ZERO,
+            }))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        // The application stops polling for longer than `max_poll_interval`.
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let left = consumer.assignment().await;
+        let epochs_after_leave = recorder.epochs();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let joined_again = consumer.assignment().await;
+        consumer.close().await.expect("close");
+        mock.stop();
+        // A `poll` that ends before its callback ran makes the next `poll`
+        // run the callback again, so the list can hold more than one call.
+        let lost = first_lost(&calls);
+        assert2::assert!(
+            (
+                left,
+                epochs_after_leave.contains(&LEAVE_GROUP_MEMBER_EPOCH),
+                joined_again,
+                lost,
+            ) == (
+                Vec::new(),
+                true,
+                vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
+                Some((
+                    crate::rebalance_listener::ListenerCallKind::Lost,
+                    vec![0, 1]
+                )),
+            )
+        );
+    }
+
+    /// A fenced member gives its partitions to the lost callback, and the
+    /// member keeps its id. Kafka's `transitionToFenced`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fenced_member_gives_its_partitions_to_the_lost_callback() {
+        let recorder = Recorder::default();
+        let calls: ListenerCalls = Arc::default();
+        let mock = heartbeat_coordinator(
+            vec![
+                assigns(1, &[0, 1]),
+                fails(FENCED_MEMBER_EPOCH),
+                assigns(1, &[0, 1]),
+            ],
+            &recorder,
+        )
+        .await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe([TOPIC.to_owned()])
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .rebalance_listener(Box::new(RecordingListener {
+                calls: Arc::clone(&calls),
+                assign_delay: std::time::Duration::ZERO,
+            }))
+            .build()
+            .await
+            .expect("build");
+        let member_id = consumer.member_id();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while first_lost(&calls).is_none() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let kept_id = consumer.member_id();
+        consumer.close().await.expect("close");
+        mock.stop();
+        assert2::assert!(
+            (first_lost(&calls), kept_id == member_id)
+                == (
+                    Some((
+                        crate::rebalance_listener::ListenerCallKind::Lost,
+                        vec![0, 1]
+                    )),
+                    true,
+                )
+        );
+    }
+
+    /// The member keeps its membership with `ConsumerGroupHeartbeat` while a
+    /// rebalance listener callback runs, and never sends the classic
+    /// `Heartbeat`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeats_go_on_during_a_rebalance_callback() {
+        let recorder = Recorder::default();
+        let calls: ListenerCalls = Arc::default();
+        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe([TOPIC.to_owned()])
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .rebalance_listener(Box::new(RecordingListener {
+                calls: Arc::clone(&calls),
+                assign_delay: std::time::Duration::from_millis(200),
+            }))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(200)).await;
+        }
+        let during_callback = recorder.heartbeats().len();
+        consumer.close().await.expect("close");
+        mock.stop();
+        let classic = *recorder
+            .classic_heartbeats
+            .lock()
+            .expect("classic heartbeats lock");
+        // The join, the acknowledgement and the heartbeats of the 200 ms
+        // callback at a 20 ms interval.
+        assert2::assert!((during_callback >= 4, classic) == (true, 0));
+    }
+
+    /// The member id of the coordinator reaches the consumer, and a new
+    /// subscription reaches the metadata of the heartbeat task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_member_id_and_a_new_subscription_reach_the_consumer() {
+        let recorder = Recorder::default();
+        let mock =
+            heartbeat_coordinator(vec![named(assigns(1, &[0, 1]), "server-id")], &recorder).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe([TOPIC.to_owned()])
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let member_id = consumer.member_id();
+        consumer
+            .subscribe([TOPIC.to_owned(), "payments".to_owned()])
+            .await
+            .expect("subscribe");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !recorder
+            .metadata_topics
+            .lock()
+            .expect("metadata topics lock")
+            .iter()
+            .any(|topic| topic == "payments")
+            && tokio::time::Instant::now() < deadline
+        {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let asked_for_payments = recorder
+            .metadata_topics
+            .lock()
+            .expect("metadata topics lock")
+            .iter()
+            .any(|topic| topic == "payments");
+        consumer.close().await.expect("close");
+        mock.stop();
+        assert2::assert!((member_id, asked_for_payments) == ("server-id".to_owned(), true));
     }
 
     /// The member reconciles each assignment of the coordinator, acknowledges

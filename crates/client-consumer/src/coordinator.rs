@@ -452,6 +452,8 @@ pub(crate) struct CoordinatorState {
     pub joined_topics: Vec<String>,
     /// The `unsubscribe` calls that the task handled.
     pub seen_unsubscribes: u64,
+    /// Kafka's `group.protocol`.
+    pub group_protocol: crate::GroupProtocol,
     /// Kafka's `group.remote.assignor`, for the consumer group protocol.
     pub server_assignor: Option<String>,
     /// The member epoch of the consumer group protocol.
@@ -573,16 +575,58 @@ pub(crate) async fn forget_member_keeping_id(state: &mut CoordinatorState) {
     install_assignment(state, &[], false, JOIN_GROUP_EPOCH, false).await;
 }
 
-/// Publish the member epoch of the consumer group protocol as the generation
-/// that commits carry. Kafka sends the member epoch of a consumer-protocol
-/// member in `OffsetCommit.generationIdOrMemberEpoch`.
+/// Publish the member epoch and the member id of the consumer group protocol.
+/// The epoch is the generation that commits carry: Kafka sends the member
+/// epoch of a consumer-protocol member in
+/// `OffsetCommit.generationIdOrMemberEpoch`.
 pub(crate) async fn publish_member_epoch(state: &mut CoordinatorState) {
     let epoch = state.member_epoch;
     let mut identity = state.commit_identity.lock().await;
     identity.generation = epoch;
     identity.member_id.clone_from(&state.member_id);
     drop(identity);
+    if *state.published_member_id.borrow() != state.member_id {
+        state
+            .published_member_id
+            .send_replace(state.member_id.clone());
+    }
     set_generation(state, epoch);
+}
+
+/// Call the lost callback for the partitions that a fence or a poll timeout
+/// took. Kafka's `AbstractMembershipManager` calls `onPartitionsLost` for
+/// them.
+///
+/// # Errors
+///
+/// Returns the error of the callback.
+pub(crate) async fn call_lost_listener(state: &mut CoordinatorState) -> Result<(), ConsumerError> {
+    let lost = std::mem::take(&mut state.lost_partitions);
+    if lost.is_empty() {
+        return Ok(());
+    }
+    call_listener(
+        state,
+        crate::rebalance_listener::ListenerCallKind::Lost,
+        lost,
+    )
+    .await
+}
+
+/// Give up every partition after the poll timer expired, and make the next
+/// `poll` join the group again. Kafka's `transitionToStale`.
+pub(crate) async fn release_partitions_after_poll_timeout(state: &mut CoordinatorState) {
+    state.rebalance_pending.send_replace(true);
+    remember_lost_partitions(state).await;
+    install_assignment(state, &[], false, JOIN_GROUP_EPOCH, true).await;
+}
+
+/// Leave an error for the next `poll`. Kafka's background thread hands a fatal
+/// error of the group protocol to the application thread.
+pub(crate) fn report_fatal_error(slot: &PollErrorSlot, error: ConsumerError) {
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
 }
 
 /// The generation of a member that joins the consumer group protocol again.
@@ -1310,8 +1354,13 @@ impl PollTimer {
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.deadline = tokio::time::Instant::now() + self.interval;
+    }
+
+    /// The instant at which the timer expires.
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
     }
 
     /// Kafka's `Timer.isExpired`: the deadline is inclusive.
@@ -2126,6 +2175,13 @@ async fn heartbeat_during_join_prepare(
     state: &CoordinatorState,
     commit_done: &CancellationToken,
 ) -> Option<HeartbeatOutcome> {
+    if state.group_protocol == crate::GroupProtocol::Consumer {
+        // A member of the consumer group protocol keeps its membership with
+        // `ConsumerGroupHeartbeat`, not with the classic `Heartbeat`. The
+        // heartbeat after the callback acts on the member state.
+        crate::consumer_group::heartbeat_during_callback(state, commit_done).await;
+        return None;
+    }
     let interval = state.heartbeat_interval.to_std();
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3465,6 +3521,7 @@ mod retry_tests {
             subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
             joined_topics: Vec::new(),
             seen_unsubscribes: 0,
+            group_protocol: crate::GroupProtocol::Classic,
             server_assignor: None,
             member_epoch: 0,
             sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
@@ -4261,6 +4318,7 @@ mod retry_tests {
             subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
             joined_topics: Vec::new(),
             seen_unsubscribes: 0,
+            group_protocol: crate::GroupProtocol::Classic,
             server_assignor: None,
             member_epoch: 0,
             sent_heartbeat_fields: crate::consumer_group::SentFields::default(),

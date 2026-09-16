@@ -1822,6 +1822,7 @@ async fn spawn_consumer(
         subscription_changes: subscription.subscribe(),
         joined_topics: subscribe.clone(),
         seen_unsubscribes: 0,
+        group_protocol,
         server_assignor,
         member_epoch: 0,
         sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
