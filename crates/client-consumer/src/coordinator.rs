@@ -1547,7 +1547,10 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
             // re-fetch from 0 and re-deliver already-consumed records. Prime
             // first → a partition is only visible in `assigned` once its
             // next_offset is established.
-            prime_offsets(state, &added).await?;
+            // Eager join preparation revoked every old partition, including
+            // ones this member receives again. Re-prime the whole assignment
+            // so discarded, uncommitted records are replayed.
+            prime_offsets(state, &new_assignment).await?;
             let _gate = assigned_callback_gate(state, &new_assignment);
             publish_assignment(state, &new_assignment, false, new_generation).await;
             {
