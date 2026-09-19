@@ -67,6 +67,9 @@ pub(crate) struct SessionPartition {
     pub current_leader_epoch: i32,
     pub last_fetched_epoch: i32,
     pub partition_max_bytes: i32,
+    /// Local ownership generation; not encoded on the wire. A reassignment
+    /// must refresh even when every protocol field is unchanged.
+    pub ownership_id: u64,
 }
 
 /// The session fields and partitions of one Fetch request.
@@ -218,6 +221,7 @@ mod tests {
             current_leader_epoch: 3,
             last_fetched_epoch: 2,
             partition_max_bytes: 1024,
+            ownership_id: 1,
         }
     }
 
@@ -278,6 +282,35 @@ mod tests {
                 vec![
                     request(0, 0, both.clone(), Vec::new()),
                     request(77, 1, vec![(key(0), partition(15))], vec![key(1)]),
+                ],
+            ),
+            (
+                "incremental refreshes a reassigned partition",
+                vec![
+                    Fetch(both.clone()),
+                    Respond(0, 77, 2, 0),
+                    Fetch(vec![(
+                        key(0),
+                        SessionPartition {
+                            ownership_id: 2,
+                            ..partition(10)
+                        },
+                    )]),
+                ],
+                vec![
+                    request(0, 0, both.clone(), Vec::new()),
+                    request(
+                        77,
+                        1,
+                        vec![(
+                            key(0),
+                            SessionPartition {
+                                ownership_id: 2,
+                                ..partition(10)
+                            },
+                        )],
+                        vec![key(1)],
+                    ),
                 ],
             ),
             (

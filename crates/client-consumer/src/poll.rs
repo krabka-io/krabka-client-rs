@@ -52,7 +52,7 @@ pub(crate) const DEFAULT_FETCH_MAX: ByteSize = mebibytes(50);
 
 /// One fetchable partition's request fields:
 /// `(partition, fetch_offset, current_leader_epoch, last_fetched_epoch)`.
-type FetchSpec = (i32, i64, LeaderEpoch, LeaderEpoch);
+type FetchSpec = (i32, i64, LeaderEpoch, LeaderEpoch, u64);
 
 /// Partitions to fetch, grouped first by leader id, then by topic.
 type FetchByLeader = HashMap<i32, HashMap<String, Vec<FetchSpec>>>;
@@ -176,7 +176,7 @@ pub(crate) fn record_timestamp(batch: &RecordBatch, record: &Record) -> (i64, Ti
 /// The `max_bytes` of one partition in a Fetch request.
 fn session_partition(
     topic_id: krabka_protocol::primitives::uuid::Uuid,
-    (_, fetch_offset, leader_epoch, last_fetched_epoch): FetchSpec,
+    (_, fetch_offset, leader_epoch, last_fetched_epoch, ownership_id): FetchSpec,
     partition_max: ByteSize,
 ) -> SessionPartition {
     SessionPartition {
@@ -187,6 +187,7 @@ fn session_partition(
         current_leader_epoch: leader_epoch.get(),
         last_fetched_epoch: last_fetched_epoch.get(),
         partition_max_bytes: partition_max.bytes_i32(),
+        ownership_id,
     }
 }
 
@@ -1212,6 +1213,7 @@ impl Consumer {
         let mut grouped: FetchByLeader = HashMap::new();
         let now = tokio::time::Instant::now();
         let mut refresh_metadata = false;
+        let ownership = self.commit_identity.lock().await.ownership_ids.clone();
         {
             let offsets = self.next_offsets.lock().await;
             let positions = self.positions.lock().await;
@@ -1270,7 +1272,13 @@ impl Consumer {
                     .or_default()
                     .entry(t.clone())
                     .or_default()
-                    .push((*p, next, pos.leader_epoch, pos.offset_epoch));
+                    .push((
+                        *p,
+                        next,
+                        pos.leader_epoch,
+                        pos.offset_epoch,
+                        ownership.get(&key).copied().unwrap_or_default(),
+                    ));
             }
         }
         if refresh_metadata {
@@ -1997,6 +2005,7 @@ mod offset_advance_tests {
             current_leader_epoch: 5,
             last_fetched_epoch: 4,
             partition_max_bytes: 128 * 1024,
+            ownership_id: 1,
         };
         let req = build_fetch_request(
             500,
