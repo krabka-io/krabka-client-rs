@@ -110,6 +110,12 @@ impl TopicMutationOptions {
     }
 }
 
+impl From<Time> for TopicMutationOptions {
+    fn from(timeout: Time) -> Self {
+        Self::with_timeout(timeout)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteRecordsOp {
     pub topic: String,
@@ -443,8 +449,9 @@ impl AdminClient {
     pub async fn create_topics(
         &mut self,
         specs: &[CreateTopicSpec],
-        options: TopicMutationOptions,
+        options: impl Into<TopicMutationOptions>,
     ) -> Result<Vec<CreateTopicOutcome>, AdminError> {
+        let options = options.into();
         self.create_topics_with_retry(specs, options, options.retry_policy())
             .await
     }
