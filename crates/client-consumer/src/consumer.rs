@@ -1331,6 +1331,15 @@ async fn finish_startup(
             next_offsets.insert((name.clone(), partition_index), starting);
             positions.insert((name, partition_index), primed_position(committed_epoch));
         }
+        // A broker may omit partitions that have no committed offset yet.
+        // Poll must still fetch those partitions, including empty ones whose
+        // high watermark proves that recovery is caught up.
+        for partition in &assigned_partitions {
+            next_offsets
+                .entry(partition.clone())
+                .or_insert_with(|| reset_starting_offset(auto_offset_reset));
+            positions.entry(partition.clone()).or_default();
+        }
     }
 
     spawn_consumer(
