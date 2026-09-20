@@ -112,15 +112,17 @@ impl FetchSession {
         &mut self,
         wanted: BTreeMap<(String, i32), SessionPartition>,
     ) -> SessionRequest {
-        // Kafka forgets a partition whose topic id changed and sends it again.
-        // The forget goes by topic id only from Fetch v13, and the client does
-        // not know the version here. A full request that closes the session and
-        // creates a new one is correct at every version.
+        // Kafka forgets a partition whose topic id or local ownership changed
+        // and sends it again. An ownership change also needs a full response:
+        // an incremental broker may omit an unchanged empty partition, leaving
+        // the new owner without an end offset. Closing and recreating the
+        // session is correct at every Fetch version.
         let replaced = wanted.iter().any(|(key, next)| {
             self.partitions.get(key).is_some_and(|previous| {
-                previous.topic_id != next.topic_id
-                    && previous.topic_id != WireUuid::default()
-                    && next.topic_id != WireUuid::default()
+                previous.ownership_id != next.ownership_id
+                    || (previous.topic_id != next.topic_id
+                        && previous.topic_id != WireUuid::default()
+                        && next.topic_id != WireUuid::default())
             })
         });
         if replaced && !self.next.is_full() {
@@ -285,7 +287,7 @@ mod tests {
                 ],
             ),
             (
-                "incremental refreshes a reassigned partition",
+                "reassignment refreshes with a full request",
                 vec![
                     Fetch(both.clone()),
                     Respond(0, 77, 2, 0),
@@ -301,7 +303,7 @@ mod tests {
                     request(0, 0, both.clone(), Vec::new()),
                     request(
                         77,
-                        1,
+                        0,
                         vec![(
                             key(0),
                             SessionPartition {
@@ -309,7 +311,7 @@ mod tests {
                                 ..partition(10)
                             },
                         )],
-                        vec![key(1)],
+                        Vec::new(),
                     ),
                 ],
             ),
