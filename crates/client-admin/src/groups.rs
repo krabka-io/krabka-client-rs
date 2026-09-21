@@ -56,9 +56,7 @@ use krabka_protocol::{
 
 use crate::{
     AdminClient, AdminError, KafkaError, format_host_port, kafka_error_if, kafka_error_name,
-    retry::{
-        CoordinatorRetry, KAFKA_ADMIN_RETRY, RetryAction, RetryPolicy, connection_failure_action,
-    },
+    retry::{CoordinatorRetry, RetryAction, RetryPolicy, connection_failure_action},
     send_connection_at_least,
 };
 
@@ -349,7 +347,7 @@ impl AdminClient {
         group: &str,
         offsets: &BTreeMap<(String, i32), i64>,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        self.alter_consumer_group_offsets_with_retry(group, offsets, KAFKA_ADMIN_RETRY)
+        self.alter_consumer_group_offsets_with_retry(group, offsets, self.retry)
             .await
     }
 
@@ -426,8 +424,7 @@ impl AdminClient {
         &self,
         options: &ListGroupsOptions,
     ) -> Result<ListGroupsResult, AdminError> {
-        self.list_groups_with_retry(options, KAFKA_ADMIN_RETRY)
-            .await
+        self.list_groups_with_retry(options, self.retry).await
     }
 
     async fn list_groups_with_retry(
@@ -567,7 +564,7 @@ impl AdminClient {
         &mut self,
         group: &str,
     ) -> Result<BTreeMap<(String, i32), i64>, AdminError> {
-        self.list_consumer_group_offsets_with_retry(group, KAFKA_ADMIN_RETRY)
+        self.list_consumer_group_offsets_with_retry(group, self.retry)
             .await
     }
 
@@ -785,6 +782,11 @@ async fn list_groups_on_broker(
                 }
             }
             Err(_) => break,
+        }
+        // Kafka's `Call.fail` stops after `retries` retries with a
+        // `TimeoutException`.
+        if attempts > retry.max_retries {
+            break;
         }
         tracing::debug!(
             node_id = broker.node_id,
@@ -1938,6 +1940,7 @@ mod tests {
                         initial_backoff: backoff(timeout),
                         max_backoff: backoff(timeout),
                         jitter: 0.0,
+                        max_retries: u32::MAX,
                     },
                 )
                 .await
@@ -2137,6 +2140,7 @@ mod tests {
                         initial_backoff: backoff(timeout),
                         max_backoff: backoff(timeout),
                         jitter: 0.0,
+                        max_retries: u32::MAX,
                     },
                 )
                 .await
@@ -2485,6 +2489,42 @@ mod tests {
         }
     }
 
+    /// Kafka's `Call.fail` stops a node call after `retries` retries with a
+    /// `TimeoutException`, before the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_groups_stops_a_broker_after_the_retry_limit() {
+        let cluster = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let broker =
+            list_groups_broker(broker_error(14), Arc::clone(&cluster), Arc::clone(&sent)).await;
+        *cluster.lock().expect("cluster lock") = vec![broker.addr];
+        let admin = AdminClient::connect(&[broker.addr.to_string()])
+            .await
+            .expect("admin connects");
+
+        let result = admin
+            .list_groups_with_retry(
+                &ListGroupsOptions::default(),
+                RetryPolicy {
+                    timeout: Duration::from_secs(10),
+                    initial_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(1),
+                    jitter: 0.0,
+                    max_retries: 2,
+                },
+            )
+            .await
+            .expect("list_groups succeeds");
+
+        broker.stop();
+        let codes = result
+            .errors
+            .iter()
+            .map(|error| error.error.code)
+            .collect::<Vec<_>>();
+        assert!((codes, sent.lock().expect("sent lock").len()) == (vec![7], 3));
+    }
+
     fn below(max_version: i16, ids: &[&str]) -> ListGroupsBroker {
         ListGroupsBroker {
             max_version,
@@ -2516,6 +2556,7 @@ mod tests {
                     initial_backoff: BACKOFF,
                     max_backoff: BACKOFF,
                     jitter: 0.0,
+                    max_retries: u32::MAX,
                 },
             )
             .await
@@ -2892,6 +2933,7 @@ mod tests {
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_millis(100),
             jitter: 0.0,
+            max_retries: u32::MAX,
         };
         for broker_2 in [SecuredBroker::Stalls, SecuredBroker::RejectsAuthentication] {
             let cluster = Arc::new(Mutex::new(Vec::new()));

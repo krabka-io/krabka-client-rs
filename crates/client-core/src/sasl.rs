@@ -13,10 +13,16 @@
 //! and the public clients both call. The only difference is the
 //! credentials value and the reporter `client_id`.
 
+mod scram;
+
 use std::{
+    collections::BTreeMap,
     future::Future,
     path::PathBuf,
-    sync::atomic::{AtomicI64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
 };
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -31,7 +37,7 @@ use krabka_protocol::{
         sasl_handshake_response::SaslHandshakeResponse,
     },
 };
-use krabka_security::{SaslMechanism, ScramClientExchange};
+use krabka_security::SaslMechanism;
 use krabka_units::{ByteSize, kibibytes};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -182,6 +188,11 @@ pub enum SaslCredentials {
         mechanism: SaslMechanism,
         username: String,
         password: String,
+        /// Log in with a delegation token (KIP-48): `username` is the token
+        /// id and `password` the token HMAC. The client-first message then
+        /// carries the `tokenauth=true` extension, as Kafka's
+        /// `ScramLoginModule` with `tokenauth=true` sends it.
+        delegation_token: bool,
     },
     /// SASL/GSSAPI: authenticate as `client_principal` with the long-term
     /// key in `keytab_path`. This mechanism needs no password.
@@ -191,9 +202,29 @@ pub enum SaslCredentials {
         service_name: String,
         kdc_url: String,
     },
-    /// SASL/OAUTHBEARER: a file containing an RFC 6750 bearer token. The file
-    /// is read for every new connection so token rotation needs no restart.
-    OAuthBearer { token_path: PathBuf },
+    /// SASL/OAUTHBEARER (RFC 7628).
+    OAuthBearer {
+        /// Where each exchange gets its token.
+        token: OAuthBearerTokenSource,
+        /// SASL extensions (KIP-342) that the initial client response carries,
+        /// such as `logicalCluster`. A name is letters only and must not be
+        /// `auth`, and a value is printable ASCII, space, tab, CR or LF, as
+        /// Kafka's `OAuthBearerClientInitialResponse.validateExtensions`
+        /// requires.
+        extensions: BTreeMap<String, String>,
+    },
+}
+
+/// Where an OAUTHBEARER exchange gets its token.
+#[derive(Debug, Clone)]
+pub enum OAuthBearerTokenSource {
+    /// A file with an RFC 6750 bearer token. Each exchange reads the file
+    /// again, so token rotation needs no restart.
+    File(PathBuf),
+    /// A token provider, such as
+    /// [`ClientCredentialsTokenProvider`](crate::oauth::ClientCredentialsTokenProvider)
+    /// for an OIDC token endpoint (KIP-768).
+    Provider(Arc<dyn crate::oauth::OAuthBearerTokenProvider>),
 }
 
 impl SaslCredentials {
@@ -386,7 +417,17 @@ where
             mechanism,
             username,
             password,
-        } => run_scram_client(channel, username, password, *mechanism, corr_id, policy).await,
+            delegation_token,
+        } => {
+            run_scram_client(
+                channel,
+                (username, password, *delegation_token),
+                *mechanism,
+                corr_id,
+                policy,
+            )
+            .await
+        }
         SaslCredentials::Gssapi {
             keytab_path,
             client_principal,
@@ -404,16 +445,27 @@ where
             )
             .await
         }
-        SaslCredentials::OAuthBearer { token_path } => {
-            // Each exchange reads the token file again, so a re-authentication
-            // sends a refreshed token.
-            let token = tokio::fs::read(token_path).await.map_err(|error| {
-                mechanism_failure(format!(
-                    "cannot read OAUTHBEARER token {}: {error}",
-                    token_path.display()
-                ))
-            })?;
-            run_oauthbearer_client(channel, token.trim_ascii(), corr_id, policy).await
+        SaslCredentials::OAuthBearer { token, extensions } => {
+            // Each exchange gets the token again, so a re-authentication sends
+            // a refreshed token.
+            let token = match token {
+                OAuthBearerTokenSource::File(token_path) => {
+                    tokio::fs::read(token_path).await.map_err(|error| {
+                        mechanism_failure(format!(
+                            "cannot read OAUTHBEARER token {}: {error}",
+                            token_path.display()
+                        ))
+                    })?
+                }
+                OAuthBearerTokenSource::Provider(provider) => provider
+                    .token()
+                    .await
+                    .map_err(|error| {
+                        mechanism_failure(format!("cannot get an OAUTHBEARER token: {error}"))
+                    })?
+                    .into_bytes(),
+            };
+            run_oauthbearer_client(channel, token.trim_ascii(), extensions, corr_id, policy).await
         }
     }?;
     let lifetime = session_lifetime_ms.load(Ordering::Relaxed);
@@ -432,6 +484,7 @@ where
 async fn run_oauthbearer_client<S>(
     stream: &mut S,
     token: &[u8],
+    extensions: &BTreeMap<String, String>,
     corr_id: &mut i32,
     policy: SaslPolicy<'_>,
 ) -> Result<(), OutboundSaslError>
@@ -444,10 +497,7 @@ where
         ));
     }
 
-    let mut initial = Vec::with_capacity(token.len() + 20);
-    initial.extend_from_slice(b"n,,\x01auth=Bearer ");
-    initial.extend_from_slice(token);
-    initial.extend_from_slice(b"\x01\x01");
+    let initial = oauthbearer_initial_response(token, extensions)?;
 
     let response = send_sasl_authenticate(stream, initial, corr_id, policy).await?;
     if response.error_code != 0 {
@@ -465,6 +515,45 @@ where
         "SaslAuthenticate(OAUTHBEARER) rejected bearer token: {}",
         String::from_utf8_lossy(&response.auth_bytes)
     )))
+}
+
+/// The initial client response of Kafka's
+/// `OAuthBearerClientInitialResponse.toBytes`:
+/// `n,,\x01auth=Bearer <token>[\x01key=value]...\x01\x01`.
+fn oauthbearer_initial_response(
+    token: &[u8],
+    extensions: &BTreeMap<String, String>,
+) -> Result<Vec<u8>, OutboundSaslError> {
+    for (name, value) in extensions {
+        if name == "auth" {
+            return Err(mechanism_failure("Extension name auth is invalid".into()));
+        }
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            return Err(mechanism_failure(format!(
+                "Extension name {name} is invalid"
+            )));
+        }
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| matches!(byte, 0x21..=0x7E | b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            return Err(mechanism_failure(format!(
+                "Extension value ({value}) for extension {name} is invalid"
+            )));
+        }
+    }
+    let mut initial = Vec::with_capacity(token.len() + 20);
+    initial.extend_from_slice(b"n,,\x01auth=Bearer ");
+    initial.extend_from_slice(token);
+    for (name, value) in extensions {
+        initial.push(b'\x01');
+        initial.extend_from_slice(name.as_bytes());
+        initial.push(b'=');
+        initial.extend_from_slice(value.as_bytes());
+    }
+    initial.extend_from_slice(b"\x01\x01");
+    Ok(initial)
 }
 
 /// Send `ApiVersions` v0 and read the response.
@@ -600,8 +689,7 @@ where
 /// connection authenticated.
 async fn run_scram_client<S>(
     stream: &mut S,
-    user: &str,
-    pass: &str,
+    (user, pass, delegation_token): (&str, &str, bool),
     mechanism: SaslMechanism,
     corr_id: &mut i32,
     policy: SaslPolicy<'_>,
@@ -609,30 +697,27 @@ async fn run_scram_client<S>(
 where
     S: SaslChannel + ?Sized,
 {
-    let exch = ScramClientExchange::new(user.to_string(), pass.as_bytes().to_vec(), mechanism);
-
     // Round 1: client-first → server-first.
-    let (client_first, exch) = exch
-        .client_first()
-        .map_err(|e| mechanism_failure(format!("scram client_first: {e:?}")))?;
+    let (client_first, exchange) = scram::client_first(mechanism, user, pass, delegation_token)
+        .map_err(|e| mechanism_failure(format!("scram client_first: {e}")))?;
     let resp1 = send_sasl_authenticate(stream, client_first, corr_id, policy).await?;
     if resp1.error_code != 0 {
         return Err(authenticate_error("SCRAM round 1", &resp1));
     }
-    let server_first = resp1.auth_bytes.to_vec();
 
     // Round 2: client-final → server-final.
-    let (client_final, exch) = exch
-        .step(&server_first)
-        .map_err(|e| mechanism_failure(format!("scram client step: {e:?}")))?;
+    let (client_final, exchange) = exchange
+        .step(&resp1.auth_bytes)
+        .map_err(|e| mechanism_failure(format!("scram client step: {e}")))?;
     let resp2 = send_sasl_authenticate(stream, client_final, corr_id, policy).await?;
     if resp2.error_code != 0 {
         return Err(authenticate_error("SCRAM round 2", &resp2));
     }
     // Server-final verification proves the broker holds the matching
-    // `server_key` — not just any compatible `stored_key`.
-    exch.verify_server_final(&resp2.auth_bytes)
-        .map_err(|e| mechanism_failure(format!("server-final verify: {e:?}")))?;
+    // `server_key`, not just any compatible `stored_key`.
+    exchange
+        .verify(&resp2.auth_bytes)
+        .map_err(|e| mechanism_failure(format!("server-final verify: {e}")))?;
     Ok(())
 }
 
@@ -1122,6 +1207,178 @@ mod tests {
         }
     }
 
+    /// Kafka's `OAuthBearerClientInitialResponse.toBytes` and
+    /// `validateExtensions`.
+    #[test]
+    fn oauthbearer_initial_responses_carry_valid_extensions() {
+        let extensions = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        for (name, pairs, expected) in [
+            ("no extensions", vec![], Ok(b"n,,\x01auth=Bearer t\x01\x01".to_vec())),
+            (
+                "two extensions",
+                vec![("logicalCluster", "lkc-1"), ("identityPoolId", "pool-2")],
+                Ok(b"n,,\x01auth=Bearer t\x01identityPoolId=pool-2\x01logicalCluster=lkc-1\x01\x01"
+                    .to_vec()),
+            ),
+            (
+                "reserved name",
+                vec![("auth", "x")],
+                Err("Extension name auth is invalid".to_owned()),
+            ),
+            (
+                "name with a digit",
+                vec![("cluster1", "x")],
+                Err("Extension name cluster1 is invalid".to_owned()),
+            ),
+            (
+                "value with a control character",
+                vec![("cluster", "a\x01b")],
+                Err("Extension value (a\x01b) for extension cluster is invalid".to_owned()),
+            ),
+        ] {
+            let result = oauthbearer_initial_response(b"t", &extensions(&pairs)).map_err(|error| {
+                match error {
+                    OutboundSaslError::Authentication(SaslAuthenticationError::Failed(message)) => {
+                        message
+                    }
+                    other => other.to_string(),
+                }
+            });
+            check!(result == expected, "{name}");
+        }
+    }
+
+    /// A SASL channel that answers every request with success and records the
+    /// `auth_bytes` of each `SaslAuthenticate`.
+    struct RecordingChannel {
+        tokens: Vec<Vec<u8>>,
+        server: Option<krabka_security::ScramServerExchange>,
+    }
+
+    impl SaslChannel for RecordingChannel {
+        async fn request(
+            &mut self,
+            (api_key, version, _corr_id): (ApiKey, ApiVersion, i32),
+            _flexible: bool,
+            body: &[u8],
+            _policy: SaslPolicy<'_>,
+        ) -> Result<Vec<u8>, OutboundSaslError> {
+            let mut out = BytesMut::new();
+            if api_key == ApiKey(API_KEY_SASL_HANDSHAKE) {
+                SaslHandshakeResponse::default()
+                    .encode(&mut out, version.0)
+                    .unwrap();
+                return Ok(out.to_vec());
+            }
+            let mut cursor = body;
+            let request = SaslAuthenticateRequest::decode(&mut cursor, version.0).unwrap();
+            self.tokens.push(request.auth_bytes.to_vec());
+            let auth_bytes = match self.server.take() {
+                Some(server) => match server.step(&request.auth_bytes) {
+                    StepResult::Continue(bytes, next) => {
+                        self.server = Some(next);
+                        bytes
+                    }
+                    StepResult::Done(_, bytes) => bytes,
+                    StepResult::Failed(error) => panic!("SCRAM server failed: {error:?}"),
+                },
+                None => Vec::new(),
+            };
+            SaslAuthenticateResponse {
+                auth_bytes: auth_bytes.into(),
+                ..Default::default()
+            }
+            .encode(&mut out, version.0)
+            .unwrap();
+            Ok(out.to_vec())
+        }
+
+        async fn token(
+            &mut self,
+            _token: &[u8],
+            _frame_max: ClientFrameMax,
+        ) -> Result<SaslAuthenticateResponse, OutboundSaslError> {
+            unreachable!("the test lists SaslAuthenticate")
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedToken;
+
+    impl crate::oauth::OAuthBearerTokenProvider for FixedToken {
+        fn token(&self) -> crate::oauth::TokenFuture<'_> {
+            Box::pin(async { Ok("provided.token".to_owned()) })
+        }
+    }
+
+    /// The first token of each credential kind, as the broker receives it.
+    #[tokio::test]
+    async fn credentials_send_provider_tokens_extensions_and_delegation_token_login() {
+        let session = SaslSession {
+            handshake_version: 1,
+            authenticate_version: Some(1),
+            session_lifetime_ms: None,
+        };
+        let scram_server = || {
+            Some(ScramServerExchange::new(
+                "token-id".into(),
+                hash_scram_password(b"hmac", SaslMechanism::ScramSha256, 4096),
+            ))
+        };
+        for (name, credentials, server, check_first) in [
+            (
+                "OAUTHBEARER provider with an extension",
+                SaslCredentials::OAuthBearer {
+                    token: OAuthBearerTokenSource::Provider(Arc::new(FixedToken)),
+                    extensions: BTreeMap::from([("logicalCluster".into(), "lkc-1".into())]),
+                },
+                None,
+                Box::new(|first: &[u8]| {
+                    first == b"n,,\x01auth=Bearer provided.token\x01logicalCluster=lkc-1\x01\x01"
+                }) as Box<dyn Fn(&[u8]) -> bool>,
+            ),
+            (
+                "SCRAM delegation token",
+                SaslCredentials::Scram {
+                    mechanism: SaslMechanism::ScramSha256,
+                    username: "token-id".into(),
+                    password: "hmac".into(),
+                    delegation_token: true,
+                },
+                scram_server(),
+                Box::new(|first: &[u8]| {
+                    let first = String::from_utf8_lossy(first);
+                    first.starts_with("n,,n=token-id,r=") && first.ends_with(",tokenauth=true")
+                }),
+            ),
+        ] {
+            let mut channel = RecordingChannel {
+                tokens: Vec::new(),
+                server,
+            };
+            let mut corr_id = 0;
+            let result = authenticate(
+                &mut channel,
+                &credentials,
+                "localhost",
+                session,
+                (&mut corr_id, TEST_CLIENT_ID, ClientFrameMax::default()),
+            )
+            .await;
+            check!(result.is_ok(), "{name}: {result:?}");
+            check!(
+                check_first(&channel.tokens[0]),
+                "{name}: {:?}",
+                String::from_utf8_lossy(&channel.tokens[0])
+            );
+        }
+    }
+
     #[test]
     fn sasl_correlation_ids_stay_in_the_reserved_range() {
         let mut corr_id = i32::MAX - 1;
@@ -1234,7 +1491,8 @@ mod tests {
             });
 
             let credentials = SaslCredentials::OAuthBearer {
-                token_path: token_path.clone(),
+                token: OAuthBearerTokenSource::File(token_path.clone()),
+                extensions: BTreeMap::new(),
             };
             outbound_sasl(
                 &mut client,
@@ -1294,7 +1552,10 @@ mod tests {
             check!(decoded.auth_bytes.as_ref() == b"\x01");
         });
 
-        let credentials = SaslCredentials::OAuthBearer { token_path };
+        let credentials = SaslCredentials::OAuthBearer {
+            token: OAuthBearerTokenSource::File(token_path),
+            extensions: BTreeMap::new(),
+        };
         let error = outbound_sasl(
             &mut client,
             &credentials,
@@ -1415,6 +1676,7 @@ mod tests {
             mechanism: SaslMechanism::ScramSha256,
             username: "u".into(),
             password: "p".into(),
+            delegation_token: false,
         };
         let err = outbound_sasl(
             &mut client,
@@ -1501,6 +1763,7 @@ mod tests {
             mechanism: SaslMechanism::ScramSha256,
             username: "u".into(),
             password: "p".into(),
+            delegation_token: false,
         };
         let err = outbound_sasl(
             &mut client,

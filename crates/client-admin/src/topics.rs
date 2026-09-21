@@ -33,9 +33,7 @@ use uuid::Uuid;
 
 use crate::{
     AdminClient, AdminError, KafkaError, NOT_CONTROLLER, kafka_error_if,
-    retry::{
-        ControllerRetry, KAFKA_ADMIN_RETRY, RetryPolicy, call_timeout_error, is_connection_failure,
-    },
+    retry::{ControllerRetry, RetryPolicy, call_timeout_error, is_connection_failure},
 };
 
 #[derive(Debug, Clone)]
@@ -99,13 +97,14 @@ impl TopicMutationOptions {
         }
     }
 
-    fn retry_policy(self) -> RetryPolicy {
+    /// The retry policy of the call: `base` with the call timeout, when set.
+    fn retry_policy(self, base: RetryPolicy) -> RetryPolicy {
         match self.timeout {
             Some(timeout) => RetryPolicy {
                 timeout: Duration::from_millis(u64::try_from(timeout.millis_i64()).unwrap_or(0)),
-                ..KAFKA_ADMIN_RETRY
+                ..base
             },
-            None => KAFKA_ADMIN_RETRY,
+            None => base,
         }
     }
 }
@@ -276,7 +275,7 @@ impl AdminClient {
         timeout: Time,
     ) -> Result<Vec<PartitionAssignmentOutcome>, AdminError> {
         let request = build_partition_assignment_request(assignments, timeout);
-        let mut retry = ControllerRetry::new("AlterPartitionReassignments", KAFKA_ADMIN_RETRY);
+        let mut retry = ControllerRetry::new("AlterPartitionReassignments", self.retry);
         loop {
             let response = retry.bounded(self.conn.send(request.clone())).await?;
             if response.error_code != NOT_CONTROLLER {
@@ -327,8 +326,10 @@ impl AdminClient {
         // Replica selection depends on the controller's authoritative
         // heartbeat registry. Connect to the active controller before reading
         // Metadata so dead-but-still-registered brokers are not candidates.
-        self.refresh_controller_connection().await?;
-        let mut retry = ControllerRetry::new("AlterPartitionReassignments", KAFKA_ADMIN_RETRY);
+        // The call deadline starts before the first controller refresh, so the
+        // refresh and the retries share one `default.api.timeout.ms`.
+        let mut retry = ControllerRetry::new("AlterPartitionReassignments", self.retry);
+        retry.bounded(self.refresh_controller_connection()).await?;
         loop {
             match retry
                 .bounded(self.reconcile_topic_replication_factor_once(
@@ -445,7 +446,7 @@ impl AdminClient {
         specs: &[CreateTopicSpec],
         options: TopicMutationOptions,
     ) -> Result<Vec<CreateTopicOutcome>, AdminError> {
-        self.create_topics_with_retry(specs, options, options.retry_policy())
+        self.create_topics_with_retry(specs, options, options.retry_policy(self.retry))
             .await
     }
 
@@ -486,7 +487,7 @@ impl AdminClient {
         names: &[&str],
         options: TopicMutationOptions,
     ) -> Result<Vec<DeleteTopicOutcome>, AdminError> {
-        self.delete_topics_with_retry(names, options, options.retry_policy())
+        self.delete_topics_with_retry(names, options, options.retry_policy(self.retry))
             .await
     }
 
@@ -520,7 +521,7 @@ impl AdminClient {
         ops: &[CreatePartitionsOp],
         options: TopicMutationOptions,
     ) -> Result<Vec<CreatePartitionsOutcome>, AdminError> {
-        self.create_partitions_with_retry(ops, options, options.retry_policy())
+        self.create_partitions_with_retry(ops, options, options.retry_policy(self.retry))
             .await
     }
 
@@ -592,6 +593,9 @@ impl AdminClient {
                 // `Call.fail` retries with the backoff until the deadline.
                 Err(error) if is_connection_failure(&error) => {
                     last_error = error.to_string();
+                    if deadline.exhausted() {
+                        break;
+                    }
                     deadline.backoff().await;
                     if deadline.expired() {
                         break;
@@ -614,9 +618,10 @@ impl AdminClient {
                 {
                     break;
                 }
-                if !deadline.expired() {
-                    deadline.backoff().await;
+                if deadline.exhausted() {
+                    break;
                 }
+                deadline.backoff().await;
                 if deadline.expired() {
                     break;
                 }
@@ -1340,6 +1345,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::retry::KAFKA_ADMIN_RETRY;
 
     #[test]
     fn exact_assignment_request_preserves_replica_order() {
@@ -2452,6 +2458,7 @@ mod tests {
                     initial_backoff: backoff,
                     max_backoff: backoff,
                     jitter: 0.0,
+                    max_retries: u32::MAX,
                 };
 
                 let started = tokio::time::Instant::now();
