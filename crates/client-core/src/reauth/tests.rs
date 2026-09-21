@@ -291,7 +291,10 @@ async fn oauthbearer_reauthentication_sends_the_refreshed_token() {
     std::fs::write(&token_path, "first").unwrap();
     let refreshed = token_path.clone();
     let observed = run(
-        SaslCredentials::OAuthBearer { token_path },
+        SaslCredentials::OAuthBearer {
+            token: crate::sasl::OAuthBearerTokenSource::File(token_path),
+            extensions: std::collections::BTreeMap::new(),
+        },
         10_000,
         None,
         &[Duration::from_secs_f64(9.6)],
