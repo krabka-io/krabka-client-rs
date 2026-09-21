@@ -4,7 +4,7 @@ use krabka_protocol::owned::unregister_broker_request::UnregisterBrokerRequest;
 
 use crate::{
     AdminClient, AdminError, kafka_error_name,
-    retry::{ControllerRetry, KAFKA_ADMIN_RETRY, REQUEST_TIMED_OUT, RetryPolicy},
+    retry::{ControllerRetry, REQUEST_TIMED_OUT, RetryPolicy},
 };
 
 impl AdminClient {
@@ -19,7 +19,7 @@ impl AdminClient {
     /// Returns a transport, protocol, or broker error. At the deadline it
     /// gives `REQUEST_TIMED_OUT` (7).
     pub async fn unregister_broker(&mut self, broker_id: i32) -> Result<(), AdminError> {
-        self.unregister_broker_with_retry(broker_id, KAFKA_ADMIN_RETRY)
+        self.unregister_broker_with_retry(broker_id, self.retry)
             .await
     }
 
@@ -170,6 +170,7 @@ mod tests {
                         initial_backoff: backoff,
                         max_backoff: backoff,
                         jitter: 0.0,
+                        max_retries: u32::MAX,
                     },
                 )
                 .await
