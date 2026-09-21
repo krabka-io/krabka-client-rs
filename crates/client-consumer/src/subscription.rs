@@ -67,6 +67,9 @@ pub(crate) struct Subscription {
     /// topics of a pattern only while this number is the one of its metadata
     /// request.
     pub version: u64,
+    /// The consumer has a manual assignment. Kafka's
+    /// `SubscriptionType.USER_ASSIGNED`.
+    pub manual_assignment: bool,
 }
 
 impl Subscription {
@@ -78,6 +81,7 @@ impl Subscription {
             exclude_internal_topics: exclude_internal,
             unsubscribes: 0,
             version: 0,
+            manual_assignment: false,
         }
     }
 
@@ -179,7 +183,17 @@ impl Consumer {
         if topics.is_empty() {
             return self.unsubscribe().await;
         }
+        self.require_group_membership()?;
+        if self.subscription.borrow().manual_assignment {
+            return Err(ConsumerError::IllegalState(
+                "Subscription to topics, partitions and pattern are mutually exclusive".to_owned(),
+            ));
+        }
         self.client.metadata_topics().set(topics.iter().cloned());
+        // Kafka's `subscribe(topics)` calls
+        // `fetcher.clearBufferedDataForUnassignedTopics(topics)`.
+        self.fetch_buffer
+            .retain_topics(&topics.iter().cloned().collect());
         self.subscription.send_modify(|subscription| {
             subscription.topics = sorted(topics);
             subscription.pattern = None;
@@ -194,12 +208,28 @@ impl Consumer {
     /// The coordinator task matches the pattern against all topics of the
     /// cluster at once and each `subscription_metadata_refresh_interval`, and
     /// the next `poll` joins the group again when the matched topics change.
-    pub fn subscribe_pattern(&self, pattern: TopicPattern) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::InvalidGroupId`] without a group id, and
+    /// [`ConsumerError::IllegalState`] for a consumer without group
+    /// membership.
+    pub fn subscribe_pattern(&mut self, pattern: TopicPattern) -> Result<(), ConsumerError> {
+        self.require_group_membership()?;
+        if self.subscription.borrow().manual_assignment {
+            return Err(ConsumerError::IllegalState(
+                "Subscription to topics, partitions and pattern are mutually exclusive".to_owned(),
+            ));
+        }
+        // Kafka's `subscribe(pattern)` calls
+        // `fetcher.clearBufferedDataForUnassignedPartitions(emptySet())`.
+        self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
         self.subscription.send_modify(|subscription| {
             subscription.topics.clear();
             subscription.pattern = Some(pattern);
             subscription.version += 1;
         });
+        Ok(())
     }
 
     /// Give up the subscription and the assigned partitions, and leave the
@@ -215,9 +245,13 @@ impl Consumer {
     /// Returns [`ConsumerError::RebalanceListenerFailed`] when the listener
     /// callback fails. The consumer unsubscribes also then.
     pub async fn unsubscribe(&mut self) -> Result<(), ConsumerError> {
-        // Kafka's `unsubscribe` runs `onLeavePrepare` before
-        // `maybeLeaveGroup`.
-        let listener_result = self.leave_prepare().await;
+        // Kafka's `unsubscribe` runs `onLeavePrepare` and `maybeLeaveGroup`
+        // only with a coordinator, that is with a group.
+        let listener_result = if self.coordinator_handle.is_some() {
+            self.leave_prepare().await
+        } else {
+            Ok(())
+        };
         self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
         // Kafka's `SubscriptionState.unsubscribe` clears the assignment before
         // `unsubscribe` returns. The coordinator task also clears it when it
@@ -228,9 +262,13 @@ impl Consumer {
             assigned.clear();
             identity.ownership_ids.clear();
         }
+        self.next_offsets.lock().await.clear();
+        self.positions.lock().await.clear();
+        self.end_offsets.lock().await.clear();
         self.subscription.send_modify(|subscription| {
             subscription.topics.clear();
             subscription.pattern = None;
+            subscription.manual_assignment = false;
             subscription.unsubscribes += 1;
             subscription.version += 1;
         });

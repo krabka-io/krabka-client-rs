@@ -28,7 +28,10 @@ fn update_leader_epoch(pos: &mut PartitionPosition, leader_epoch: LeaderEpoch) {
     }
 }
 
-fn should_await_validation(leader_epoch: LeaderEpoch, offset_epoch: LeaderEpoch) -> bool {
+pub(crate) fn should_await_validation(
+    leader_epoch: LeaderEpoch,
+    offset_epoch: LeaderEpoch,
+) -> bool {
     leader_epoch > offset_epoch && offset_epoch.is_known()
 }
 

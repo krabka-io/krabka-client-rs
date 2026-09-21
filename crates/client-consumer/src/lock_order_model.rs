@@ -62,6 +62,7 @@
 //!   `position` (`partition_state.rs`) takes A alone, then N→P, then the
 //!   regions of `update_fetch_positions` that the poll task lists below.
 //!   `current_lag` (`queries.rs`) holds A→N, then takes E alone.
+//!   `assign` (`assignment.rs`) holds A→CI, then N→P, then takes E alone.
 //!   `pause`, `resume` and `paused` take CI alone. The paused set is a
 //!   `std::sync::Mutex` that no region holds while it takes another lock.
 //!
