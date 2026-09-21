@@ -952,10 +952,13 @@ async fn subscribed_partition_counts(
     state: &CoordinatorState,
 ) -> Result<HashMap<String, i32>, ConsumerError> {
     let md = state.client.refresh_metadata().await?;
+    // The metadata topics: the subscription, or for a leader the topics of
+    // the whole group (Kafka's `SubscriptionState.metadataTopics`).
+    let watched = state.client.metadata_topics().names();
     let mut counts = HashMap::new();
     for t in &md.topics {
         let Some(name) = &t.name else { continue };
-        if state.subscription.borrow().contains(name) {
+        if watched.binary_search(name).is_ok() {
             counts.insert(
                 name.clone(),
                 i32::try_from(t.partitions.len()).unwrap_or(i32::MAX),
@@ -2328,6 +2331,10 @@ async fn perform_join(
 )]
 async fn join_and_sync(state: &mut CoordinatorState) -> Result<JoinOutcome, ConsumerError> {
     join_prepare(state).await?;
+    // Kafka's `onJoinPrepare` calls `resetGroupSubscription`: until the member
+    // is the leader again, it watches only its own topics.
+    let own_topics = state.subscription.borrow().topics.clone();
+    state.client.metadata_topics().set(own_topics);
     // The preparation can reset the member and clear its partitions, as
     // Kafka's `onJoinPrepare` does. The subscription names what is left.
     let owned = state.assigned.lock().await.clone();
@@ -2434,6 +2441,22 @@ struct LeaderAssignment {
     topic_partitions: HashMap<String, i32>,
 }
 
+/// The sorted topics of all member subscriptions of `response`, with `own`.
+/// Kafka's `ConsumerCoordinator.onLeaderElected` `allSubscribedTopics`.
+pub(crate) fn group_subscription_topics(
+    response: &JoinGroupResponse,
+    own: &[String],
+) -> Vec<String> {
+    response
+        .members
+        .iter()
+        .flat_map(|member| decode_subscription(&member.metadata).topics)
+        .chain(own.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 async fn compute_leader_assignment(
     state: &CoordinatorState,
     response: &JoinGroupResponse,
@@ -2445,12 +2468,20 @@ async fn compute_leader_assignment(
             topic_partitions: HashMap::new(),
         });
     }
+    // Kafka's `ConsumerCoordinator.onLeaderElected` and
+    // `updateGroupSubscription`: the leader fetches metadata for the topics of
+    // every member and watches them until the next join.
+    let group_topics = group_subscription_topics(response, &state.subscription.borrow().topics);
+    state
+        .client
+        .metadata_topics()
+        .set(group_topics.iter().cloned());
     let metadata = state.client.refresh_metadata().await?;
     let mut topic_partitions = HashMap::new();
     let mut resolved_ids = HashMap::new();
     for topic in &metadata.topics {
         let Some(name) = &topic.name else { continue };
-        if state.subscription.borrow().contains(name) {
+        if group_topics.binary_search(name).is_ok() {
             topic_partitions.insert(
                 name.clone(),
                 i32::try_from(topic.partitions.len()).unwrap_or(i32::MAX),
@@ -3330,28 +3361,9 @@ mod retry_tests {
         assert2::assert!(subscription_metadata_refresh_due(last_check, interval));
     }
 
-    #[tokio::test]
-    async fn coordinator_leave_group_uses_configured_timeout() {
-        let saw_leave = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let saw_leave_in_mock = Arc::clone(&saw_leave);
-        let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
-            if api_key == api_versions_request::API_KEY {
-                Some(api_versions_for_leave_group())
-            } else if api_key == leave_group_request::API_KEY {
-                saw_leave_in_mock.store(true, Ordering::SeqCst);
-                None
-            } else {
-                None
-            }
-        })
-        .await;
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .request_timeout(krabka_units::secs(5))
-            .build()
-            .await
-            .expect("client");
-        let state = CoordinatorState {
+    /// A coordinator task state of `group-a` on `client`.
+    fn test_state(client: Client) -> CoordinatorState {
+        CoordinatorState {
             client,
             group_id: "group-a".into(),
             coordinator_id: Arc::new(AtomicI32::new(0)),
@@ -3402,7 +3414,135 @@ mod retry_tests {
             assigned_callback_pending: Arc::default(),
             poll_timer: PollTimer::new(secs(300)),
             poll_timeout_in_callback: false,
+        }
+    }
+
+    /// Kafka's `ConsumerCoordinator.onLeaderElected` fetches metadata for the
+    /// topics of every member before the assignor runs, so a topic that only
+    /// another member subscribes to is assigned.
+    #[tokio::test]
+    async fn the_leader_assigns_with_metadata_for_the_whole_group_subscription() {
+        use krabka_protocol::owned::{
+            join_group_response::JoinGroupResponseMember,
+            metadata_request::MetadataRequest,
+            metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
         };
+
+        let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requested_in_mock = Arc::clone(&requested);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions_for_leave_group());
+            }
+            if api_key != metadata_request::API_KEY {
+                return None;
+            }
+            let client_id_len = body.get_i16();
+            body.advance(usize::try_from(client_id_len.max(0)).expect("length"));
+            let request = MetadataRequest::decode(&mut body, version).expect("decode Metadata");
+            let names: Vec<String> = request
+                .topics
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|topic| topic.name)
+                .collect();
+            let response = MetadataResponse {
+                topics: names
+                    .iter()
+                    .map(|name| MetadataResponseTopic {
+                        name: Some(name.clone()),
+                        partitions: vec![MetadataResponsePartition {
+                            partition_index: 0,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            requested_in_mock
+                .lock()
+                .expect("requested lock")
+                .push(names);
+            let mut buffer = bytes::BytesMut::new();
+            response
+                .encode(&mut buffer, version)
+                .expect("encode Metadata");
+            Some(buffer.to_vec())
+        })
+        .await;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .metadata_scope(krabka_client_core::MetadataScope::Topics {
+                allow_auto_topic_creation: false,
+            })
+            .build()
+            .await
+            .expect("client");
+        let mut state = test_state(client);
+        state.subscription = crate::subscription::shared(vec![ORDERS.into()], None, true);
+        let member = |member_id: &str, topic: &str| JoinGroupResponseMember {
+            member_id: member_id.into(),
+            metadata: crate::builder::encode_subscription(&[topic.to_owned()], &[], -1, None, None),
+            ..Default::default()
+        };
+        let response = JoinGroupResponse {
+            protocol_name: Some("range".into()),
+            leader: "member-a".into(),
+            member_id: "member-a".into(),
+            members: vec![member("member-a", ORDERS), member("member-b", PAYMENTS)],
+            ..Default::default()
+        };
+        let leader = compute_leader_assignment(&state, &response, true)
+            .await
+            .expect("leader assignment");
+        mock.stop();
+        let mut assignments: Vec<(String, Vec<(String, i32)>)> = leader
+            .assignments
+            .iter()
+            .map(|assignment| {
+                (
+                    assignment.member_id.clone(),
+                    crate::builder::decode_assignment(&assignment.assignment),
+                )
+            })
+            .collect();
+        assignments.sort();
+        let requested = requested.lock().expect("requested lock").clone();
+        assert2::assert!(
+            (requested, assignments)
+                == (
+                    vec![vec![ORDERS.to_owned(), PAYMENTS.to_owned()]],
+                    vec![
+                        ("member-a".to_owned(), vec![(ORDERS.to_owned(), 0)]),
+                        ("member-b".to_owned(), vec![(PAYMENTS.to_owned(), 0)]),
+                    ]
+                )
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_leave_group_uses_configured_timeout() {
+        let saw_leave = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_leave_in_mock = Arc::clone(&saw_leave);
+        let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                Some(api_versions_for_leave_group())
+            } else if api_key == leave_group_request::API_KEY {
+                saw_leave_in_mock.store(true, Ordering::SeqCst);
+                None
+            } else {
+                None
+            }
+        })
+        .await;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .request_timeout(krabka_units::secs(5))
+            .build()
+            .await
+            .expect("client");
+        let state = test_state(client);
 
         tokio::time::timeout(
             Duration::from_secs(1),
