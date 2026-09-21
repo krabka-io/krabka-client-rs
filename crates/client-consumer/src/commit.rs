@@ -1782,7 +1782,7 @@ mod tests {
             commit_async_callbacks: Arc::default(),
             group_instance_id: None,
             current_generation: generation,
-            subscribed_topics: vec!["topic".into()],
+            subscription: crate::subscription::shared(vec!["topic".into()], None, true),
             assigned: Arc::new(Mutex::new(assigned)),
             assignment_changed,
             next_offsets: Arc::new(Mutex::new(next_offsets)),
