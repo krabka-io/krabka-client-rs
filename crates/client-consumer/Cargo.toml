@@ -34,6 +34,7 @@ tracing = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 futures-util = { workspace = true }
 refined_type = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 krabka-client-producer = { path = "../client-producer" }
