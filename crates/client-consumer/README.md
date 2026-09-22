@@ -24,6 +24,8 @@ Manual single-partition fetches and raw request dispatch stay in
 
 - Classic consumer-group lifecycle with `JoinGroup`, `SyncGroup`, `Heartbeat`,
   `Fetch`, `OffsetCommit`, and `LeaveGroup`.
+- The consumer group protocol of KIP-848 with `ConsumerGroupHeartbeat`,
+  server-side assignment and a broker-side pattern subscription.
 - Range, round-robin, sticky and cooperative-sticky partition assignors.
 - `subscribe` by topics or by pattern, `unsubscribe`, and manual `assign` with
   or without a group id.
@@ -35,7 +37,8 @@ Manual single-partition fetches and raw request dispatch stay in
 
 ## Kafka Scope
 
-The crate implements the classic consumer group protocol and manual
+The crate implements the classic consumer group protocol, the consumer group
+protocol of KIP-848 (`group_protocol(GroupProtocol::Consumer)`) and manual
 assignment. These flows cover KIP-429 cooperative sticky assignment, KIP-320
 leader-epoch validation, KIP-516 offset wire shapes, KIP-447 consumer group
 metadata, and KIP-932 share groups.

@@ -1801,6 +1801,7 @@ mod tests {
             group_instance_id: None,
             current_generation: generation,
             subscription: crate::subscription::shared(vec!["topic".into()], None, true),
+            group_protocol: crate::GroupProtocol::Classic,
             assigned: Arc::new(Mutex::new(assigned)),
             assignment_changed,
             next_offsets: Arc::new(Mutex::new(next_offsets)),

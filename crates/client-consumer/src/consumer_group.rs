@@ -14,6 +14,7 @@ use krabka_protocol::{
     owned::{
         consumer_group_heartbeat_request::{ConsumerGroupHeartbeatRequest, TopicPartitions},
         consumer_group_heartbeat_response::ConsumerGroupHeartbeatResponse,
+        metadata_request::{MetadataRequest, MetadataRequestTopic},
     },
     primitives::uuid::Uuid as WireUuid,
 };
@@ -44,6 +45,10 @@ const UNKNOWN_MEMBER_ID: i16 = 25;
 #[cfg(test)]
 const UNSUPPORTED_ASSIGNOR: i16 = 112;
 
+/// Kafka's message for a regular expression subscription of a classic member:
+/// `ClassicKafkaConsumer.subscribe(SubscriptionPattern)`.
+pub(crate) const RE2J_NEEDS_CONSUMER_PROTOCOL: &str = "Subscribe to RE2/J pattern is not supported when using the CLASSIC protocol defined in config group.protocol";
+
 /// The partitions of an assignment, and the topic ids that the metadata does
 /// not name yet.
 pub(crate) type ResolvedAssignment = (Vec<(String, i32)>, HashSet<WireUuid>);
@@ -59,6 +64,7 @@ pub(crate) type OwnedByTopicId = BTreeMap<[u8; 16], Vec<i32>>;
 pub(crate) struct SentFields {
     rebalance_timeout_ms: Option<i32>,
     subscribed_topic_names: Option<Vec<String>>,
+    regex: Option<String>,
     server_assignor: Option<String>,
     topic_partitions: Option<OwnedByTopicId>,
 }
@@ -72,8 +78,11 @@ pub(crate) struct HeartbeatFields<'a> {
     pub instance_id: Option<&'a str>,
     pub rack_id: Option<&'a str>,
     pub rebalance_timeout_ms: i32,
-    /// The subscribed topics, sorted.
+    /// The subscribed topics, sorted. A regular expression subscription sends
+    /// none, because the coordinator matches the expression.
     pub subscribed_topic_names: Vec<String>,
+    /// The regular expression of a broker-side pattern subscription.
+    pub regex: Option<String>,
     pub server_assignor: Option<&'a str>,
     /// The partitions that the member owns, by topic id.
     pub owned: OwnedByTopicId,
@@ -109,6 +118,14 @@ pub(crate) fn build_heartbeat(
     if all || sent.subscribed_topic_names.as_ref() != Some(&fields.subscribed_topic_names) {
         request.subscribed_topic_names = Some(fields.subscribed_topic_names.clone());
         sent.subscribed_topic_names = Some(fields.subscribed_topic_names.clone());
+    }
+    // Kafka sends an empty expression to remove a pattern subscription, and
+    // sends the expression again only when it changed or when the member
+    // joins with one.
+    let pattern_changed = sent.regex != fields.regex;
+    if (all && fields.regex.is_some()) || pattern_changed {
+        request.subscribed_topic_regex = Some(fields.regex.clone().unwrap_or_default());
+        sent.regex.clone_from(&fields.regex);
     }
     if let Some(assignor) = fields.server_assignor
         && (all || sent.server_assignor.as_deref() != Some(assignor))
@@ -278,12 +295,21 @@ pub(crate) async fn run(
     // `true` after the poll timer expired: the member left the group and waits
     // for a `poll` before it joins again. Kafka's `MemberState.STALE`.
     let mut left_on_poll_timeout = false;
+    // `true` after `unsubscribe`: the member left the group and waits for a
+    // new subscription. Kafka's `AbstractMembershipManager.leaveGroup`.
+    let mut unsubscribed = false;
+    // `true` after a fatal error: Kafka's `transitionToSendingLeaveGroup`
+    // sends no leave heartbeat in the fatal state.
+    let mut fatal = false;
+    let mut last_pattern_check: Option<tokio::time::Instant> = None;
     loop {
         if !send_now {
             let event = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
-                () = tokio::time::sleep(interval), if !left_on_poll_timeout => TaskEvent::Heartbeat,
+                () = tokio::time::sleep(interval), if !left_on_poll_timeout && !unsubscribed => {
+                    TaskEvent::Heartbeat
+                }
                 changed = state.polls.changed(), if polls_open => {
                     if changed.is_err() {
                         polls_open = false;
@@ -297,7 +323,9 @@ pub(crate) async fn run(
                     }
                     TaskEvent::Subscription
                 }
-                () = tokio::time::sleep_until(state.poll_timer.deadline()), if !left_on_poll_timeout => {
+                () = tokio::time::sleep_until(state.poll_timer.deadline()),
+                    if !left_on_poll_timeout && !unsubscribed =>
+                {
                     TaskEvent::PollTimeout
                 }
             };
@@ -320,16 +348,45 @@ pub(crate) async fn run(
                     continue;
                 }
                 TaskEvent::Subscription => {
+                    let subscription = state.subscription.borrow().clone();
+                    if subscription.unsubscribes != state.seen_unsubscribes {
+                        state.seen_unsubscribes = subscription.unsubscribes;
+                        leave_after_unsubscribe(&mut state).await;
+                        unsubscribed = true;
+                        continue;
+                    }
+                    if subscription.is_none() {
+                        continue;
+                    }
+                    if unsubscribed {
+                        // A new subscription joins the group again.
+                        unsubscribed = false;
+                        state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
+                        state.sent_heartbeat_fields = SentFields::default();
+                    }
                     // The task has its own client. Its metadata requests name
                     // the topics of the new subscription, so it can resolve
                     // the topic ids of the next assignment.
-                    let topics = state.subscription.borrow().topics.clone();
-                    if !topics.is_empty() {
-                        state.client.metadata_topics().set(topics);
+                    if !subscription.topics.is_empty() {
+                        state.client.metadata_topics().set(subscription.topics);
                     }
                 }
                 TaskEvent::Heartbeat => {}
             }
+        }
+        // Kafka's `AsyncKafkaConsumer.updateAssignmentMetadataIfNeeded` matches
+        // a client-side pattern against the metadata in each poll. The member
+        // sends the topics that matched, and the coordinator assigns them.
+        if state.subscription.borrow().pattern.is_some()
+            && last_pattern_check.is_none_or(|last| {
+                crate::coordinator::subscription_metadata_refresh_due(
+                    last,
+                    state.subscription_metadata_refresh_interval,
+                )
+            })
+        {
+            last_pattern_check = Some(tokio::time::Instant::now());
+            crate::coordinator::refresh_pattern_topics(&mut state).await;
         }
         send_now = false;
         let outcome = tokio::select! {
@@ -352,15 +409,26 @@ pub(crate) async fn run(
                 }
                 send_now = true;
             }
-            HeartbeatOutcome::Stop => break,
+            HeartbeatOutcome::Stop => {
+                fatal = true;
+                break;
+            }
         }
     }
     let close = *state.close_operation.borrow();
-    if should_send_leave_heartbeat(
-        &state.member_id,
-        state.group_instance_id.as_deref(),
-        close.operation,
-    ) {
+    // A member that already left the group, or that stopped for a fatal
+    // error, sends no leave heartbeat. Kafka's
+    // `AbstractMembershipManager.leaveGroup` returns at once when the member
+    // is not in the group.
+    if !left_on_poll_timeout
+        && !unsubscribed
+        && !fatal
+        && should_send_leave_heartbeat(
+            &state.member_id,
+            state.group_instance_id.as_deref(),
+            close.operation,
+        )
+    {
         let epoch = leave_group_epoch(state.group_instance_id.as_deref(), close.operation);
         state.member_epoch = epoch;
         let leave_timeout = state.leave_group_timeout.to_std();
@@ -410,6 +478,24 @@ async fn leave_after_poll_timeout(state: &mut crate::coordinator::CoordinatorSta
     state.sent_heartbeat_fields = SentFields::default();
 }
 
+/// Leave the group because the application unsubscribed. Kafka's
+/// `AbstractMembershipManager.leaveGroup`: the member sends a heartbeat with
+/// its leave epoch and gives up its partitions. The `Consumer` already ran the
+/// revoke callback and cleared the assignment.
+async fn leave_after_unsubscribe(state: &mut crate::coordinator::CoordinatorState) {
+    state.member_epoch = leave_group_epoch(
+        state.group_instance_id.as_deref(),
+        crate::consumer::GroupMembershipOperation::Default,
+    );
+    let leave_timeout = state.leave_group_timeout.to_std();
+    let leave = send_heartbeat(state, HeartbeatKind::Leave).await;
+    let _ = tokio::time::timeout(leave_timeout, leave.send()).await;
+    crate::coordinator::forget_member_keeping_id(state).await;
+    state.rebalance_pending.send_replace(false);
+    state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
+    state.sent_heartbeat_fields = SentFields::default();
+}
+
 /// Keep the member in the group while `poll` runs a rebalance listener
 /// callback. Kafka's heartbeat manager keeps sending `ConsumerGroupHeartbeat`
 /// while the application thread runs the callback.
@@ -438,7 +524,11 @@ pub(crate) async fn heartbeat_during_callback(
                 .coordinator_id
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
-        let call = HeartbeatCall { broker, request };
+        let call = HeartbeatCall {
+            broker,
+            request,
+            needs_regex: state.subscription.borrow().regex.is_some(),
+        };
         let result = tokio::select! {
             biased;
             () = done.cancelled() => return,
@@ -503,6 +593,11 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
         }
     };
     let interval = heartbeat_interval(response.heartbeat_interval_ms, state.heartbeat_interval);
+    if response.error_code != 0 {
+        // Kafka's `AbstractHeartbeatRequestManager.onErrorResponse` resets the
+        // sent fields, so the heartbeat after an error carries them again.
+        state.sent_heartbeat_fields = SentFields::default();
+    }
     match heartbeat_action(response.error_code) {
         HeartbeatAction::Ok => {}
         HeartbeatAction::Retry => return HeartbeatOutcome::Backoff,
@@ -517,7 +612,6 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
                 "the coordinator fenced the member; giving up the partitions and joining again"
             );
             state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
-            state.sent_heartbeat_fields = SentFields::default();
             crate::coordinator::forget_member_keeping_id(state).await;
             // Kafka's `transitionToFenced` gives the partitions to
             // `onPartitionsLost` before the member joins again.
@@ -555,7 +649,7 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
         // of the metadata. Kafka's `Metadata` holds them for the consumer, and
         // `ConsumerMembershipManager` keeps an unresolved assignment until a
         // metadata update names its topics.
-        refresh_topic_ids(state).await;
+        refresh_topic_ids(state, &unresolved).await;
         let names = crate::offset_wire::id_to_name(&state.topic_ids.lock().await.clone());
         if let Some(resolved) = assignment_partitions(&response, &names) {
             (target, unresolved) = resolved;
@@ -568,6 +662,13 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
             "the assignment names topic ids that the metadata does not name yet"
         );
     }
+    // The topics of a regular expression subscription come from the
+    // assignment, because the coordinator matches the expression. They give
+    // `poll` the topics of its metadata and its fetch filter.
+    let topics: Vec<String> = target.iter().map(|(topic, _)| topic.clone()).collect();
+    state
+        .subscription
+        .send_if_modified(|subscription| subscription.store_assigned_topics(&topics));
     match reconcile(state, &target).await {
         // Kafka acknowledges only a reconciliation that moved partitions. An
         // assignment that repeats what the member owns goes out again with the
@@ -608,6 +709,7 @@ async fn send_heartbeat(
     kind: HeartbeatKind,
 ) -> HeartbeatCall<'_> {
     let mut sent = state.sent_heartbeat_fields.clone();
+    let needs_regex = state.subscription.borrow().regex.is_some();
     let request = build_heartbeat(&heartbeat_fields(state, kind).await, &mut sent);
     state.sent_heartbeat_fields = sent;
     let broker = state.client.broker(
@@ -615,7 +717,11 @@ async fn send_heartbeat(
             .coordinator_id
             .load(std::sync::atomic::Ordering::Relaxed),
     );
-    HeartbeatCall { broker, request }
+    HeartbeatCall {
+        broker,
+        request,
+        needs_regex,
+    }
 }
 
 /// The heartbeat fields of the current member state.
@@ -629,7 +735,18 @@ async fn heartbeat_fields(
     } else {
         owned_by_topic_id(&state.assigned.lock().await, &topic_ids)
     };
-    let subscribed_topic_names = state.subscription.borrow().topics.clone();
+    let (subscribed_topic_names, regex) = {
+        let subscription = state.subscription.borrow();
+        // A regular expression subscription names no topics: Kafka's
+        // `SubscriptionState.subscription()` is empty for
+        // `AUTO_PATTERN_RE2J`, and the coordinator matches the expression.
+        let topics = if subscription.regex.is_some() {
+            Vec::new()
+        } else {
+            subscription.topics.clone()
+        };
+        (topics, subscription.regex.clone())
+    };
     HeartbeatFields {
         group_id: &state.group_id,
         member_id: &state.member_id,
@@ -638,28 +755,92 @@ async fn heartbeat_fields(
         rack_id: state.client_rack.as_deref(),
         rebalance_timeout_ms: crate::consumer::protocol_millis_i32(state.max_poll_interval),
         subscribed_topic_names,
+        regex,
         server_assignor: state.server_assignor.as_deref(),
         owned,
         joining: kind == HeartbeatKind::Join,
     }
 }
 
+/// A `ConsumerGroupHeartbeat` that carries `subscribed_topic_regex`. The
+/// field exists from version 1, so a broker that speaks only version 0 must
+/// fail the call in place of dropping the expression.
+struct RegexHeartbeat(ConsumerGroupHeartbeatRequest);
+
+impl krabka_protocol::Encode for RegexHeartbeat {
+    fn encode<B: bytes::BufMut>(
+        &self,
+        buf: &mut B,
+        version: i16,
+    ) -> Result<(), krabka_protocol::ProtocolError> {
+        self.0.encode(buf, version)
+    }
+
+    fn encoded_len(&self, version: i16) -> usize {
+        self.0.encoded_len(version)
+    }
+}
+
+impl krabka_protocol::ProtocolRequest for RegexHeartbeat {
+    const API_KEY: i16 = krabka_protocol::owned::consumer_group_heartbeat_request::API_KEY;
+    const MIN_VERSION: i16 = 1;
+    const MAX_VERSION: i16 = krabka_protocol::owned::consumer_group_heartbeat_request::MAX_VERSION;
+    const LATEST_STABLE_VERSION: i16 =
+        krabka_protocol::owned::consumer_group_heartbeat_request::LATEST_STABLE_VERSION;
+    const FLEXIBLE_MIN: i16 =
+        krabka_protocol::owned::consumer_group_heartbeat_request::FLEXIBLE_MIN;
+    type Response = ConsumerGroupHeartbeatResponse;
+}
+
 /// One `ConsumerGroupHeartbeat` that is ready to go out.
 struct HeartbeatCall<'a> {
     broker: krabka_client_core::BrokerHandle<'a>,
     request: ConsumerGroupHeartbeatRequest,
+    /// `true` when the member subscribes to a regular expression, which needs
+    /// version 1.
+    needs_regex: bool,
 }
 
 impl HeartbeatCall<'_> {
     async fn send(self) -> Result<ConsumerGroupHeartbeatResponse, krabka_client_core::ClientError> {
+        if self.needs_regex {
+            return self.broker.send(RegexHeartbeat(self.request)).await;
+        }
         self.broker.send(self.request).await
     }
 }
 
 /// Store the topic ids of the metadata, so the member can resolve the topics
 /// of its assignment.
-async fn refresh_topic_ids(state: &crate::coordinator::CoordinatorState) {
-    match state.client.refresh_metadata().await {
+///
+/// A regular expression subscription knows no topic names, so the request
+/// names the `unresolved` topic ids. Kafka's
+/// `ConsumerMetadata.newMetadataRequestBuilder` asks for the assigned topic
+/// ids of such a subscription, and for the topic names of every other one.
+async fn refresh_topic_ids(
+    state: &crate::coordinator::CoordinatorState,
+    unresolved: &HashSet<WireUuid>,
+) {
+    let by_id = state.subscription.borrow().regex.is_some();
+    let request = if by_id {
+        MetadataRequest {
+            topics: Some(
+                unresolved
+                    .iter()
+                    .map(|topic_id| MetadataRequestTopic {
+                        topic_id: *topic_id,
+                        name: None,
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            allow_auto_topic_creation: false,
+            ..Default::default()
+        }
+    } else {
+        state.client.metadata_topics().request()
+    };
+    match state.client.refresh_metadata_with(request).await {
         Ok(metadata) => {
             crate::validate::refresh_tracked_topic_ids(
                 &mut *state.topic_ids.lock().await,
@@ -766,7 +947,7 @@ mod group_protocol_tests {
             list_offsets_response::{
                 ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
             },
-            metadata_request::{self, MetadataRequest},
+            metadata_request,
             metadata_response::{
                 MetadataResponse, MetadataResponsePartition, MetadataResponseTopic,
             },
@@ -881,7 +1062,7 @@ mod group_protocol_tests {
                 (offset_fetch_request::API_KEY, 5),
                 (list_offsets_request::API_KEY, 7),
                 (fetch_request::API_KEY, 12),
-                (consumer_group_heartbeat_request::API_KEY, 0),
+                (consumer_group_heartbeat_request::API_KEY, 1),
             ]
             .into_iter()
             .map(|(api_key, max_version)| ApiVersion {
@@ -1187,6 +1368,91 @@ mod group_protocol_tests {
         assert2::assert!(uuid::Uuid::parse_str(&first.member_id).is_ok());
     }
 
+    /// A broker-side pattern subscription sends the regular expression and no
+    /// topic names, and the member learns the topic of its assignment from a
+    /// metadata request that names the topic id. Kafka's
+    /// `subscribe(SubscriptionPattern)` and
+    /// `ConsumerMetadata.newMetadataRequestBuilder`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_regular_expression_subscription_resolves_its_topics_by_id() {
+        let recorder = Recorder::default();
+        let mock = heartbeat_coordinator_with(vec![assigns(1, &[0, 1])], &recorder, true).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe_regex("orders-.*")
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let assignment = consumer.assignment().await;
+        let subscription = consumer.subscription();
+        consumer.close().await.expect("close");
+        mock.stop();
+        let first = recorder.heartbeats().first().cloned();
+        let first = first.expect("a first heartbeat");
+        assert2::assert!(
+            (
+                first.subscribed_topic_regex,
+                first.subscribed_topic_names,
+                *recorder.asked_by_id.lock().expect("asked lock"),
+                assignment,
+                subscription,
+            ) == (
+                Some("orders-.*".to_owned()),
+                Some(Vec::new()),
+                true,
+                vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
+                vec![TOPIC.to_owned()],
+            )
+        );
+    }
+
+    /// A client-side pattern subscription matches the metadata itself, and the
+    /// member sends the topics that matched. Kafka's
+    /// `AsyncKafkaConsumer.updateAssignmentMetadataIfNeeded`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_side_pattern_sends_the_topics_that_matched() {
+        let recorder = Recorder::default();
+        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe_pattern(crate::TopicPattern::new(|topic| topic.starts_with("ord")))
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let assignment = consumer.assignment().await;
+        consumer.close().await.expect("close");
+        mock.stop();
+        let first = recorder.heartbeats().first().cloned();
+        let first = first.expect("a first heartbeat");
+        assert2::assert!(
+            (
+                first.subscribed_topic_names,
+                first.subscribed_topic_regex,
+                assignment,
+            ) == (
+                Some(vec![TOPIC.to_owned()]),
+                None,
+                vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
+            )
+        );
+    }
+
     /// The kind and partitions of one rebalance listener call.
     type ListenerCall = (crate::rebalance_listener::ListenerCallKind, Vec<i32>);
 
@@ -1328,13 +1594,19 @@ mod group_protocol_tests {
     /// A broker whose `ConsumerGroupHeartbeat` versions do not overlap the
     /// ones of the client.
     async fn classic_only_coordinator() -> MockBroker {
+        coordinator_with_heartbeat_versions(2, 2).await
+    }
+
+    /// A coordinator that speaks `ConsumerGroupHeartbeat` in this version
+    /// range and answers no heartbeat.
+    async fn coordinator_with_heartbeat_versions(min_version: i16, max_version: i16) -> MockBroker {
         MockBroker::start(move |api_key, version, _corr_id, _body| {
             if api_key == api_versions_request::API_KEY {
                 let mut versions = api_versions();
                 for api in &mut versions.api_keys {
                     if api.api_key == consumer_group_heartbeat_request::API_KEY {
-                        api.min_version = 2;
-                        api.max_version = 2;
+                        api.min_version = min_version;
+                        api.max_version = max_version;
                     }
                 }
                 return Some(encode(&versions, 0));
@@ -1348,6 +1620,155 @@ mod group_protocol_tests {
             None
         })
         .await
+    }
+
+    /// A regular expression subscription needs `ConsumerGroupHeartbeat` v1,
+    /// which added `subscribed_topic_regex`. A coordinator that speaks only
+    /// v0 fails the call, because a v0 request would name no topic at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_regular_expression_needs_heartbeat_version_1() {
+        let mock = coordinator_with_heartbeat_versions(0, 0).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe_regex("orders-.*")
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut error = None;
+        while error.is_none() && tokio::time::Instant::now() < deadline {
+            error = consumer
+                .poll(millis(20))
+                .await
+                .err()
+                .map(|error| error.to_string());
+        }
+        consumer.close().await.expect("close");
+        mock.stop();
+        assert2::assert!(
+            error
+                == Some(
+                    "client: incompatible version: broker supports 0..=0, client wants 1..=1 for api_key 68"
+                        .to_owned()
+                )
+        );
+    }
+
+    /// The member fetches the partitions of a regular expression assignment
+    /// also after the application subscribes to the same expression again,
+    /// because the topics of such a subscription come from the assignment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_regular_expression_subscription_keeps_fetching_after_a_resubscribe() {
+        let recorder = Recorder::default();
+        let mock = heartbeat_coordinator_with(vec![assigns(1, &[0, 1])], &recorder, true).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe_regex("orders-.*")
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        // Poll until the member owns the partitions and their positions are
+        // ready, so that the fetch of the next poll would go out.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+            let assigned = consumer.assignment().await;
+            if !assigned.is_empty() && !consumer.group_fetches(&assigned).await.is_empty() {
+                break;
+            }
+        }
+        consumer.subscribe_regex("orders-.*").expect("subscribe");
+        let assigned = consumer.assignment().await;
+        let mut fetched: Vec<(String, i32)> = consumer
+            .group_fetches(&assigned)
+            .await
+            .into_values()
+            .flatten()
+            .flat_map(|(topic, partitions)| {
+                partitions
+                    .into_iter()
+                    .map(move |(partition, ..)| (topic.clone(), partition))
+            })
+            .collect();
+        fetched.sort();
+        consumer.close().await.expect("close");
+        mock.stop();
+        assert2::assert!(
+            (assigned, fetched)
+                == (
+                    vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
+                    vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
+                )
+        );
+    }
+
+    /// `unsubscribe` makes the member leave the group with its leave epoch and
+    /// give up its partitions, and a new `subscribe` joins the group again.
+    /// Kafka's `AbstractMembershipManager.leaveGroup`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsubscribe_leaves_the_group_and_a_new_subscription_joins_again() {
+        let recorder = Recorder::default();
+        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
+        let mut consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .group_id("group-a")
+            .subscribe([TOPIC.to_owned()])
+            .group_protocol(GroupProtocol::Consumer)
+            .heartbeat_interval(millis(20))
+            .request_timeout(secs(5))
+            .build()
+            .await
+            .expect("build");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        consumer.unsubscribe().await.expect("unsubscribe");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !recorder.epochs().contains(&LEAVE_GROUP_MEMBER_EPOCH)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let after_unsubscribe = (consumer.assignment().await, recorder.epochs());
+        consumer
+            .subscribe([TOPIC.to_owned()])
+            .await
+            .expect("subscribe");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+        let joined_again = consumer.assignment().await;
+        consumer.close().await.expect("close");
+        mock.stop();
+        let (left, epochs) = after_unsubscribe;
+        let joins_after_the_leave = epochs
+            .iter()
+            .skip_while(|epoch| **epoch != LEAVE_GROUP_MEMBER_EPOCH)
+            .filter(|epoch| **epoch == JOIN_GROUP_MEMBER_EPOCH)
+            .count();
+        assert2::assert!(
+            (
+                left,
+                epochs.contains(&LEAVE_GROUP_MEMBER_EPOCH),
+                joins_after_the_leave,
+                joined_again
+            ) == (
+                Vec::new(),
+                true,
+                0,
+                vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
+            )
+        );
     }
 
     /// The member leaves the group when the time between two `poll` calls is
@@ -1667,6 +2088,7 @@ mod tests {
             rack_id: Some("az-1"),
             rebalance_timeout_ms: 300_000,
             subscribed_topic_names: vec!["orders".to_owned()],
+            regex: None,
             server_assignor: Some("uniform"),
             owned,
             joining,
@@ -1715,6 +2137,38 @@ mod tests {
                     partitions: vec![0, 1],
                     ..Default::default()
                 }])
+        );
+    }
+
+    /// Kafka's `HeartbeatState.buildRequestData` sends the regular expression
+    /// of a broker-side pattern subscription when the member joins with one
+    /// and when it changed, and sends an empty expression to remove it.
+    #[test]
+    fn a_heartbeat_carries_the_regular_expression_of_the_subscription() {
+        let with_regex = |regex: Option<&'static str>, joining: bool| HeartbeatFields {
+            subscribed_topic_names: Vec::new(),
+            regex: regex.map(str::to_owned),
+            ..fields(i32::from(!joining), joining, BTreeMap::new())
+        };
+        let mut sent = SentFields::default();
+        let join = build_heartbeat(&with_regex(Some("orders-.*"), true), &mut sent);
+        let steady = build_heartbeat(&with_regex(Some("orders-.*"), false), &mut sent);
+        let changed = build_heartbeat(&with_regex(Some("orders-eu-.*"), false), &mut sent);
+        let removed = build_heartbeat(&with_regex(None, false), &mut sent);
+        let actual = [join, steady, changed, removed].map(|request| {
+            (
+                request.subscribed_topic_regex,
+                request.subscribed_topic_names,
+            )
+        });
+        assert2::assert!(
+            actual
+                == [
+                    (Some("orders-.*".to_owned()), Some(Vec::new())),
+                    (None, None),
+                    (Some("orders-eu-.*".to_owned()), None),
+                    (Some(String::new()), None),
+                ]
         );
     }
 
