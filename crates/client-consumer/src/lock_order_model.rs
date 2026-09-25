@@ -49,12 +49,11 @@
 //! network waits and keeps every nested mutex acquisition, because only those
 //! acquisitions can form lock-order cycles.
 //!
-//! A commit that holds `commit_serialization` can wait for a rebalance
-//! (`commit_pending_offsets`, the deferred response). That is a wait for a
-//! notification, not for a lock, so this model does not show it. The commit
-//! marks that wait with `AutoCommit::park`, and `commit_before_join` then stops
-//! its wait for the lock (`commit_turn`). The rebalance timeout also bounds that
-//! wait.
+//! A commit that hits a rebalance-class `OffsetCommit` error code raises
+//! `CommitFailed` or `RebalanceInProgress` from that one response and releases
+//! `commit_serialization`; it never waits inside the lock for a rejoin (issue
+//! #116). `commit_turn` therefore only ever waits for the lock itself, bounded
+//! by the rebalance timeout.
 //!
 //! ### seek task (`seek.rs`)
 //! - `seek_to_position` and `request_offset_reset`: **A → N → P** held
@@ -397,7 +396,7 @@ fn coordinator_program() -> Vec<Op> {
 
 /// A synchronous commit task. CS spans the whole operation. The initial
 /// validation/snapshot holds CI→N. Each attempt then snapshots CI, P, and T in
-/// separate regions, and the deferred-response path snapshots CI once more.
+/// separate regions.
 fn commit_program() -> Vec<Op> {
     vec![
         Acquire(CS),
@@ -418,9 +417,6 @@ fn commit_program() -> Vec<Op> {
         // topic_ids snapshot.
         Acquire(T),
         Release(T),
-        // Deferred response ownership/identity snapshot.
-        Acquire(CI),
-        Release(CI),
         Release(CS),
     ]
 }

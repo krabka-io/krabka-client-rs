@@ -130,6 +130,18 @@ pub enum ConsumerError {
         "offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group"
     )]
     CommitFailed,
+
+    /// The coordinator answered `ILLEGAL_GENERATION` (22), `UNKNOWN_MEMBER_ID`
+    /// (25) or `FENCED_INSTANCE_ID` (82) while the group was still
+    /// `PREPARING_REBALANCE`, or `REBALANCE_IN_PROGRESS` (27). Kafka's
+    /// `ConsumerCoordinator.OffsetCommitResponseHandler` raises
+    /// `RebalanceInProgressException` for these, and `commitOffsetsSync` does
+    /// not retry: the offsets are not committed, and the caller must call
+    /// `poll()` to finish the rebalance before it commits again.
+    #[error(
+        "offset commit cannot be completed since the consumer is undergoing a rebalance for group {0}: call poll() and retry"
+    )]
+    RebalanceInProgress(String),
 }
 
 impl ConsumerError {
@@ -191,6 +203,11 @@ mod tests {
                 "commit failed",
                 ConsumerError::CommitFailed,
                 "offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group",
+            ),
+            (
+                "rebalance in progress",
+                ConsumerError::RebalanceInProgress("group-a".into()),
+                "offset commit cannot be completed since the consumer is undergoing a rebalance for group group-a: call poll() and retry",
             ),
             (
                 "no current assignment",

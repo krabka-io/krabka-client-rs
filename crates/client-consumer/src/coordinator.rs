@@ -2231,7 +2231,7 @@ async fn commit_consumed_before_join(
     auto_commit: &crate::commit::AutoCommit,
 ) {
     let deadline = tokio::time::Instant::now() + state.max_poll_interval.to_std();
-    let Some(_turn) = commit_turn(&state.commit_serialization, auto_commit, deadline).await else {
+    let Some(_turn) = commit_turn(&state.commit_serialization, deadline).await else {
         tracing::error!(
             "auto commit before the rebalance timed out waiting for another commit; joining the group"
         );
@@ -2298,25 +2298,15 @@ async fn commit_consumed_before_join(
     }
 }
 
-/// Wait for the turn of the commit before a `JoinGroup` in the commit order.
-///
-/// The function returns `Some(Some(guard))` when the commit holds
-/// `commit_serialization`. It returns `Some(None)` when the commit that holds
-/// the lock waits for this rebalance. That commit sends nothing before the
-/// rebalance publishes the next assignment, so the commit before the
-/// `JoinGroup` goes first. The function returns `None` at `deadline`.
+/// Wait for the turn of the commit before a `JoinGroup` in the commit order:
+/// `commit_serialization`, up to `deadline`. `None` at the deadline.
 async fn commit_turn(
     commit_serialization: &Arc<Mutex<()>>,
-    auto_commit: &crate::commit::AutoCommit,
     deadline: tokio::time::Instant,
-) -> Option<Option<OwnedMutexGuard<()>>> {
-    let mut parked_commits = auto_commit.parked_commits();
-    tokio::select! {
-        biased;
-        guard = Arc::clone(commit_serialization).lock_owned() => Some(Some(guard)),
-        parked = parked_commits.wait_for(|parked| *parked) => parked.is_ok().then_some(None),
-        () = tokio::time::sleep_until(deadline) => None,
-    }
+) -> Option<OwnedMutexGuard<()>> {
+    tokio::time::timeout_at(deadline, Arc::clone(commit_serialization).lock_owned())
+        .await
+        .ok()
 }
 
 struct JoinOutcome {

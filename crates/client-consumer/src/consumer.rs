@@ -4288,8 +4288,9 @@ mod auto_commit_tests {
                 ],
             ),
             (
-                "a rebalance while commit_sync waits for the rebalance: the rebalance does not \
-                 wait for commit_sync",
+                "a rebalance while commit_sync waits for its response, with a \
+                 REBALANCE_IN_PROGRESS reply: commit_sync fails immediately instead of \
+                 waiting for the rejoin, so the commit before JoinGroup comes after it",
                 minutes(1),
                 vec![
                     Poll,
@@ -4302,10 +4303,10 @@ mod auto_commit_tests {
                 ],
                 vec![
                     commit(1, &received),
+                    CommitSyncReturned,
                     commit(1, &received),
                     JoinGroup,
                     SyncGroup,
-                    CommitSyncReturned,
                 ],
             ),
             (
