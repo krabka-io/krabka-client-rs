@@ -743,9 +743,17 @@ impl Producer {
         self.end_transaction(current == Some(prepared)).await
     }
 
-    /// Finish the current transaction. This flushes all in-flight records,
-    /// then sends `EndTxn(committed)` to the transaction coordinator. On
-    /// success it transitions the producer from `InTransaction` to `Ready`.
+    /// Finish the current transaction, then send `EndTxn(committed)` to the
+    /// transaction coordinator. On success it transitions the producer from
+    /// `InTransaction` to `Ready`.
+    ///
+    /// A commit flushes every record of the transaction first, waiting for
+    /// each to be acknowledged. An abort does not: it fails every batch still
+    /// queued in the accumulators with [`ProducerError::TransactionAborted`],
+    /// sending no `Produce` for it, and waits only for batches already sent
+    /// to the wire. Kafka's `KafkaProducer.abortTransaction` does not flush
+    /// either; `Sender.maybeSendAndPollTransactionalRequest` aborts the
+    /// undrained batches instead of draining them.
     ///
     /// [`Transaction::commit`], [`Transaction::abort`],
     /// [`OwnedTransaction::commit`] and [`OwnedTransaction::abort`] call it.
@@ -793,15 +801,11 @@ impl Producer {
             return Err(error);
         }
 
-        // 1. Flush all in-flight records (block until acks).
-        self.flush().await?;
-
-        // 2. A failed batch, or an abortable coordinator answer, stops a
-        //    commit. Only an abort can clear it.
-        if committed && let Some(error) = self.abortable_error_state() {
-            return Err(error);
-        }
-
+        // Kafka's `KafkaProducer.commitTransaction`/`abortTransaction` move
+        // the `TransactionManager` state (`beginCommit`/`beginAbort`) before
+        // they wake the sender. Do the same here, before either flushing or
+        // aborting undrained batches, so a `send` racing this call observes
+        // the new state at once and fails instead of racing the drain below.
         let mut state = self.txn_state.lock().await;
         let previous_state = *state;
         if !matches!(previous_state, TxnState::InTransaction | TxnState::Prepared) {
@@ -811,6 +815,33 @@ impl Producer {
         }
         *state = TxnState::CommittingOrAborting;
         drop(state);
+
+        if committed {
+            // 1. Flush all in-flight records (block until acks).
+            if let Err(error) = self.flush().await {
+                *self.txn_state.lock().await = previous_state;
+                return Err(error);
+            }
+
+            // 2. A failed batch, or an abortable coordinator answer, stops a
+            //    commit. Only an abort can clear it.
+            if let Some(error) = self.abortable_error_state() {
+                *self.txn_state.lock().await = previous_state;
+                return Err(error);
+            }
+        } else {
+            // 1. Fail every batch still queued in the accumulators (the
+            //    sender has not drained it onto the wire) with
+            //    `TransactionAborted`, and send no `Produce` for it. Then
+            //    wait only for batches already in flight — already sent to
+            //    the wire, awaiting ack — to complete normally. Kafka's
+            //    `Sender.maybeSendAndPollTransactionalRequest`:
+            //    `accumulator.abortUndrainedBatches(new TransactionAbortedException())`.
+            if let Err(error) = self.abort_undrained_batches().await {
+                *self.txn_state.lock().await = previous_state;
+                return Err(error);
+            }
+        }
 
         // 3. Retrieve the cached coordinator connection.
         let coord_guard = self.txn_coord_client.lock().await;
@@ -1767,10 +1798,15 @@ impl Producer {
         // Kafka's `KafkaProducer.doSend` calls `throwIfInPreparedState` before
         // `waitOnMetadata`, so a send after `prepare_transaction` does not
         // wait for metadata. The check before the append covers a
-        // `prepare_transaction` that starts during the wait.
+        // `prepare_transaction` that starts during the wait. It uses
+        // `append_transaction_generation`, not `transaction_generation`
+        // directly, so a fatal or abortable transaction error reports itself
+        // here rather than the generic "no transaction in progress" state
+        // error, matching `TransactionManager.maybeFailWithError` in Kafka's
+        // `maybeAddPartition`.
         if self.transactional_id.is_some() {
             let state = *self.txn_state.lock().await;
-            if let Err(error) = self.transaction_generation(Some(state)) {
+            if let Err(error) = self.append_transaction_generation(Some(state)) {
                 return failed(error);
             }
         }
@@ -2128,6 +2164,41 @@ impl Producer {
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 if self.all_empty().await && self.in_flight.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| ProducerError::FlushTimeout)
+    }
+
+    /// Fail every batch still queued in the accumulators — not yet drained
+    /// onto the wire — with [`ProducerError::TransactionAborted`], sending no
+    /// `Produce` for it. Then wait, up to `flush_timeout`, only for batches
+    /// already in flight (already sent to the wire, awaiting ack) to
+    /// complete normally.
+    ///
+    /// `end_transaction` calls this instead of [`Self::flush`] when aborting,
+    /// matching Kafka's `Sender.maybeSendAndPollTransactionalRequest`:
+    /// `accumulator.abortUndrainedBatches(new TransactionAbortedException())`.
+    /// Kafka's `KafkaProducer.abortTransaction` likewise does not flush.
+    async fn abort_undrained_batches(&self) -> Result<(), ProducerError> {
+        self.is_active()?;
+        for entry in self.accumulators.iter() {
+            let mut a = entry.value().lock().await;
+            a.abort_undrained_batches();
+        }
+
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.flush_timeout.duration())
+            .ok_or(ProducerError::FlushTimeout)?;
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let notified = self.flush_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.in_flight.load(Ordering::Acquire) == 0 {
                     return;
                 }
                 notified.await;

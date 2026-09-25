@@ -230,6 +230,22 @@ impl Accumulator {
         self.ready.len() + usize::from(self.current.as_ref().is_some_and(|batch| !batch.is_empty()))
     }
 
+    /// Fail every undrained batch — the in-progress batch and every batch
+    /// still waiting in `ready` — with [`ProducerError::TransactionAborted`],
+    /// and drop them. No `Produce` is ever sent for them.
+    ///
+    /// Kafka's `RecordAccumulator.abortUndrainedBatches`, which
+    /// `Sender.maybeSendAndPollTransactionalRequest` calls while a
+    /// transaction is aborting, does the same instead of draining them onto
+    /// the wire.
+    pub fn abort_undrained_batches(&mut self) {
+        for batch in self.current.take().into_iter().chain(self.ready.drain(..)) {
+            for record in batch.records {
+                let _ = record.ack.send(Err(ProducerError::TransactionAborted));
+            }
+        }
+    }
+
     /// Move the current in-progress batch into `ready`. The sender calls this
     /// at flush time: on linger expiry, on an explicit flush, or when the batch
     /// is full.

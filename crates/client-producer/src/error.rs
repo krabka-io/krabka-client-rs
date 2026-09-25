@@ -91,7 +91,12 @@ pub enum ProducerError {
     #[error("invalid transaction state: {0}")]
     InvalidTransactionState(&'static str),
 
-    #[error("transaction was aborted by the broker (timeout or fence)")]
+    /// The record's batch was still queued in the accumulator, undrained,
+    /// when the application aborted the transaction. Kafka's
+    /// `Sender.maybeSendAndPollTransactionalRequest` fails every undrained
+    /// batch this way instead of sending it:
+    /// `accumulator.abortUndrainedBatches(new TransactionAbortedException())`.
+    #[error("the transaction was aborted; the record was never sent")]
     TransactionAborted,
 
     #[error("concurrent transactions on the same transactional_id")]
