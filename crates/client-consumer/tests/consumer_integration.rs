@@ -34,12 +34,14 @@
 mod support;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
 use assert2::{assert, check};
-use krabka_client_consumer::{AutoOffsetReset, Consumer, ConsumerError, ConsumerRecord};
+use krabka_client_consumer::{
+    AutoOffsetReset, Consumer, ConsumerError, ConsumerRecord, OffsetAndMetadata,
+};
 use krabka_client_core::Client;
 use krabka_protocol::{
     owned::{
@@ -670,10 +672,17 @@ async fn consumer_resets_on_offset_out_of_range_earliest() {
 
 /// Seat a below-trim committed offset for `group` on partition 0 of `topic`.
 ///
-/// An `Earliest` seed member primes `next_offset` to 0 during assignment and
-/// commits that 0. The caller then trims the log past it. `assignment()` is
-/// checked rather than `poll`, so the seed consumes no record and its position
-/// stays at 0.
+/// An `Earliest` seed member is only used to join the group and take
+/// ownership of partition 0; its actual fetch position stays an unresolved
+/// `BEGINNING_SENTINEL` until a `poll` or `position()` call resolves it, and
+/// `commit_sync` commits only resolved positions (Kafka's
+/// `SubscriptionState.allConsumed` skips a partition without a valid
+/// position). Relying on `commit_sync` here would therefore commit nothing:
+/// the call would return `Ok(())` without ever sending an `OffsetCommit`, and
+/// the caller's below-trim seed offset would never actually be seated. This
+/// commits offset 0 explicitly with `commit_offsets_sync` instead, which
+/// sends the OffsetCommit for exactly the offset the caller asked for,
+/// independent of whether the seed's own fetch position has resolved.
 async fn seed_committed_offset_zero(bootstrap: &str, group: &str, topic: &str) {
     let seed = Consumer::builder()
         .bootstrap(bootstrap)
@@ -688,7 +697,12 @@ async fn seed_committed_offset_zero(bootstrap: &str, group: &str, topic: &str) {
         .await
         .expect("build seed consumer");
     wait_for_assignment(&seed, 1, "seed consumer").await;
-    seed.commit_sync().await.expect("seed commit of offset 0");
+    seed.commit_offsets_sync(HashMap::from([(
+        (topic.to_string(), 0),
+        OffsetAndMetadata::new(0),
+    )]))
+    .await
+    .expect("seed commit of offset 0");
     seed.close().await.expect("close seed consumer");
 }
 
