@@ -4251,8 +4251,8 @@ mod fetch_path_tests {
                     if flexible {
                         body.advance(1);
                     }
-                    let request =
-                        ListOffsetsRequest::decode(&mut body, version).expect("decode list offsets");
+                    let request = ListOffsetsRequest::decode(&mut body, version)
+                        .expect("decode list offsets");
                     let mut response = if flexible { vec![0] } else { Vec::new() };
                     response.extend(encode(
                         &ListOffsetsResponse {
@@ -5275,7 +5275,10 @@ mod fetch_path_tests {
                 let request =
                     ListOffsetsRequest::decode(&mut body, version).expect("decode ListOffsets");
                 let timestamp = request.topics[0].partitions[0].timestamp;
-                list_offsets_timestamps.lock().expect("lock").push(timestamp);
+                list_offsets_timestamps
+                    .lock()
+                    .expect("lock")
+                    .push(timestamp);
                 let answer = ListOffsetsResponse {
                     topics: vec![ListOffsetsTopicResponse {
                         name: "orders".into(),

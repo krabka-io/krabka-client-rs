@@ -4102,7 +4102,11 @@ mod retry_tests {
                 AutoOffsetReset::Latest,
                 crate::poll::LATEST_SENTINEL,
             ),
-            ("none", AutoOffsetReset::None, crate::poll::NO_OFFSET_SENTINEL),
+            (
+                "none",
+                AutoOffsetReset::None,
+                crate::poll::NO_OFFSET_SENTINEL,
+            ),
         ] {
             assert2::assert!(reset_starting_offset(reset) == expected);
         }
