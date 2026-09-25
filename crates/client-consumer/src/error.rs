@@ -142,6 +142,16 @@ pub enum ConsumerError {
         "offset commit cannot be completed since the consumer is undergoing a rebalance for group {0}: call poll() and retry"
     )]
     RebalanceInProgress(String),
+
+    /// A partition has no committed offset and `auto.offset.reset = none`.
+    /// Kafka never auto-resets under `none`
+    /// (`SubscriptionState.resetInitializingPositions`); it raises
+    /// `NoOffsetForPartitionException` from `poll()` and `position()` instead.
+    #[error(
+        "undefined offset with no reset policy for partitions: [{}]",
+        .0.iter().map(|(topic, partition)| format!("{topic}-{partition}")).collect::<Vec<_>>().join(", ")
+    )]
+    NoOffsetForPartition(BTreeSet<(String, i32)>),
 }
 
 impl ConsumerError {
@@ -231,6 +241,14 @@ mod tests {
                     safe_offset: 42,
                 },
                 "log truncation detected on t-3: fetch offset 100 is past the leader's log; safe offset 42",
+            ),
+            (
+                "no offset for partition",
+                ConsumerError::NoOffsetForPartition(BTreeSet::from([
+                    ("orders".to_string(), 0),
+                    ("orders".to_string(), 1),
+                ])),
+                "undefined offset with no reset policy for partitions: [orders-0, orders-1]",
             ),
         ] {
             assert2::assert!(error.to_string() == expected);

@@ -4069,17 +4069,40 @@ mod retry_tests {
         for (_name, committed, reset, expected) in [
             ("committed positive", 12, AutoOffsetReset::Earliest, 12),
             ("committed zero", 0, AutoOffsetReset::Latest, 0),
-            ("missing earliest", -1, AutoOffsetReset::Earliest, 0),
-            ("missing latest", -1, AutoOffsetReset::Latest, i64::MAX),
-            ("missing none", -1, AutoOffsetReset::None, i64::MAX),
+            (
+                "missing earliest",
+                -1,
+                AutoOffsetReset::Earliest,
+                crate::poll::BEGINNING_SENTINEL,
+            ),
+            (
+                "missing latest",
+                -1,
+                AutoOffsetReset::Latest,
+                crate::poll::LATEST_SENTINEL,
+            ),
+            (
+                "missing none",
+                -1,
+                AutoOffsetReset::None,
+                crate::poll::NO_OFFSET_SENTINEL,
+            ),
         ] {
             assert2::assert!(starting_offset(committed, reset) == expected);
         }
 
         for (_name, reset, expected) in [
-            ("earliest", AutoOffsetReset::Earliest, 0),
-            ("latest", AutoOffsetReset::Latest, i64::MAX),
-            ("none", AutoOffsetReset::None, i64::MAX),
+            (
+                "earliest",
+                AutoOffsetReset::Earliest,
+                crate::poll::BEGINNING_SENTINEL,
+            ),
+            (
+                "latest",
+                AutoOffsetReset::Latest,
+                crate::poll::LATEST_SENTINEL,
+            ),
+            ("none", AutoOffsetReset::None, crate::poll::NO_OFFSET_SENTINEL),
         ] {
             assert2::assert!(reset_starting_offset(reset) == expected);
         }

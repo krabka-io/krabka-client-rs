@@ -819,13 +819,27 @@ pub(crate) fn starting_offset(committed: i64, auto_offset_reset: AutoOffsetReset
     }
 }
 
+/// The placeholder that a partition with no committed offset starts at, by
+/// `auto_offset_reset` policy.
+///
+/// Kafka's `AutoOffsetResetStrategy.EARLIEST.timestamp()` is
+/// `ListOffsetsRequest.EARLIEST_TIMESTAMP` (-2): `earliest` always asks the
+/// broker for the true log start with a `ListOffsets` round trip, and never
+/// reports a position before it completes. A hardcoded 0 would be wrong once
+/// retention has moved the log start past it, and the first `Fetch` would
+/// answer `OFFSET_OUT_OF_RANGE`. `none` never auto-resets at all: Kafka's
+/// `SubscriptionState.resetInitializingPositions` raises
+/// `NoOffsetForPartitionException` from `poll()` and `position()` instead
+/// (`OffsetFetcherUtils.offsetResetStrategyWithValidTimestamp`).
 pub(crate) fn reset_starting_offset(auto_offset_reset: AutoOffsetReset) -> i64 {
     match auto_offset_reset {
-        AutoOffsetReset::Earliest => 0,
-        // Resolved by poll() on first call.
-        AutoOffsetReset::Latest | AutoOffsetReset::None | AutoOffsetReset::ByDuration(_) => {
-            i64::MAX
-        }
+        // Resolved by poll() via ListOffsets(-2), the same sentinel as
+        // `seek_to_beginning`.
+        AutoOffsetReset::Earliest => crate::poll::BEGINNING_SENTINEL,
+        // Resolved by poll() via ListOffsets(-1) on first call.
+        AutoOffsetReset::Latest | AutoOffsetReset::ByDuration(_) => crate::poll::LATEST_SENTINEL,
+        // Never resolved: poll() and position() raise NoOffsetForPartition.
+        AutoOffsetReset::None => crate::poll::NO_OFFSET_SENTINEL,
     }
 }
 
@@ -2896,9 +2910,24 @@ mod security_arg_tests {
 
         for (_name, committed, reset, expected) in [
             ("committed offset", 12, AutoOffsetReset::Earliest, 12),
-            ("missing earliest", -1, AutoOffsetReset::Earliest, 0),
-            ("missing latest", -1, AutoOffsetReset::Latest, i64::MAX),
-            ("missing none", -1, AutoOffsetReset::None, i64::MAX),
+            (
+                "missing earliest",
+                -1,
+                AutoOffsetReset::Earliest,
+                crate::poll::BEGINNING_SENTINEL,
+            ),
+            (
+                "missing latest",
+                -1,
+                AutoOffsetReset::Latest,
+                crate::poll::LATEST_SENTINEL,
+            ),
+            (
+                "missing none",
+                -1,
+                AutoOffsetReset::None,
+                crate::poll::NO_OFFSET_SENTINEL,
+            ),
         ] {
             assert2::assert!(starting_offset(committed, reset) == expected);
         }
@@ -3302,6 +3331,10 @@ mod auto_commit_tests {
             join_group_request::{self, JoinGroupRequest},
             leave_group_request::{self, LeaveGroupRequest},
             leave_group_response::LeaveGroupResponse,
+            list_offsets_request,
+            list_offsets_response::{
+                ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
+            },
             metadata_request,
             metadata_response::MetadataResponse,
             offset_commit_request::{
@@ -3361,7 +3394,7 @@ mod auto_commit_tests {
     /// The API versions that the mock advertises: `(api_key, min, max)`. Each
     /// maximum is below the flexible version of its API, so no response needs a
     /// tagged response header.
-    const API_VERSIONS: [(i16, i16, i16); 10] = [
+    const API_VERSIONS: [(i16, i16, i16); 11] = [
         (api_versions_request::API_KEY, 0, 3),
         (metadata_request::API_KEY, 0, 8),
         (find_coordinator_request::API_KEY, 0, 2),
@@ -3372,6 +3405,7 @@ mod auto_commit_tests {
         (offset_commit_request::API_KEY, 2, 7),
         (offset_fetch_request::API_KEY, 1, 5),
         (fetch_request::API_KEY, 4, 11),
+        (list_offsets_request::API_KEY, 1, 5),
     ];
 
     /// A group coordinator that records every group request. It answers each
@@ -3538,6 +3572,46 @@ mod auto_commit_tests {
                 }
                 // No partition has records.
                 fetch_request::API_KEY => Some(encode(&FetchResponse::default(), version)),
+                // Every partition resolves to offset 0, whichever timestamp the
+                // request asked for.
+                list_offsets_request::API_KEY => {
+                    let client_id_len = body.get_i16();
+                    body.advance(usize::try_from(client_id_len.max(0)).expect("client id length"));
+                    let flexible = version >= list_offsets_request::FLEXIBLE_MIN;
+                    if flexible {
+                        // The empty tagged fields of the request header.
+                        body.advance(1);
+                    }
+                    let request = krabka_protocol::owned::list_offsets_request::ListOffsetsRequest::decode(
+                        &mut body, version,
+                    )
+                    .expect("decode list offsets");
+                    let mut response = if flexible { vec![0] } else { Vec::new() };
+                    response.extend(encode(
+                        &ListOffsetsResponse {
+                            topics: request
+                                .topics
+                                .iter()
+                                .map(|topic| ListOffsetsTopicResponse {
+                                    name: topic.name.clone(),
+                                    partitions: topic
+                                        .partitions
+                                        .iter()
+                                        .map(|p| ListOffsetsPartitionResponse {
+                                            partition_index: p.partition_index,
+                                            offset: 0,
+                                            ..Default::default()
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        version,
+                    ));
+                    Some(response)
+                }
                 // No partition has a committed offset.
                 offset_fetch_request::API_KEY => {
                     Some(encode(&OffsetFetchResponse::default(), version))

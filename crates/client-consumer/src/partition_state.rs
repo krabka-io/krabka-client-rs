@@ -557,7 +557,7 @@ mod tests {
                 consumer.assignment().await,
                 rejected
             ) == (
-                vec![(key(0), 5), (key(1), 10), (key(2), 0)],
+                vec![(key(0), 5), (key(1), 10), (key(2), crate::poll::BEGINNING_SENTINEL)],
                 true,
                 -1,
                 String::new(),
