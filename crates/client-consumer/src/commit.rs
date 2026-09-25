@@ -294,13 +294,16 @@ enum CommitOutcome {
 /// `ConsumerCoordinator.OffsetCommitResponseHandler.handle` does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RebalanceCommitFailure {
-    /// The generation changed since the request: the group already moved to a
-    /// new generation, and this commit's offsets were never recorded. Kafka's
+    /// The generation is still the request's: no rebalance completed locally
+    /// since this commit was sent, so the broker's rejection means this
+    /// member has genuinely been removed from the group. Kafka's
     /// `CommitFailedException`.
     CommitFailed,
-    /// `REBALANCE_IN_PROGRESS`, or a generation-changing code seen while the
-    /// generation is still the request's: the group is still
-    /// `PREPARING_REBALANCE`. Kafka's `RebalanceInProgressException`.
+    /// `REBALANCE_IN_PROGRESS`, or a generation-changing code seen after the
+    /// generation changed: a rebalance already completed locally while the
+    /// request was outstanding, and the error is a stale artifact of that
+    /// ordinary, already-resolved rebalance. Kafka's
+    /// `RebalanceInProgressException`.
     RebalanceInProgress,
 }
 
@@ -333,10 +336,13 @@ struct CommitResponseContext<'a> {
 ///   again.
 /// - `FENCED_INSTANCE_ID (82)` with the generation of the request:
 ///   [`ConsumerError::FencedInstanceId`].
-/// - `ILLEGAL_GENERATION (22)`, `UNKNOWN_MEMBER_ID (25)` and `82` after the
-///   generation changed: [`ConsumerError::CommitFailed`].
-/// - `REBALANCE_IN_PROGRESS (27)`, and `22`/`25` seen while the generation is
-///   still the request's (the group is still `PREPARING_REBALANCE`):
+/// - `ILLEGAL_GENERATION (22)`, `UNKNOWN_MEMBER_ID (25)` and `82` seen while
+///   the generation is still the request's (no rebalance completed locally
+///   since this commit was sent, so the broker's rejection means this member
+///   was genuinely removed from the group): [`ConsumerError::CommitFailed`].
+/// - `REBALANCE_IN_PROGRESS (27)`, and `22`/`25`/`82` seen after the
+///   generation changed (a rebalance already completed locally while the
+///   request was outstanding, so the error is a stale artifact of it):
 ///   [`ConsumerError::RebalanceInProgress`].
 /// - Any other code, for example `OFFSET_METADATA_TOO_LARGE (12)` and
 ///   `INVALID_COMMIT_OFFSET_SIZE (28)`: [`ConsumerError::Server`].
@@ -385,8 +391,13 @@ fn commit_response_outcome(
                     ));
                 }
                 PartitionCommitError::Rebalance | PartitionCommitError::FencedInstanceId => {
+                    // `REBALANCE_IN_PROGRESS` always means a rebalance is
+                    // under way. The other codes mean that only once the
+                    // generation has already moved past the request's; while
+                    // it is still the request's, the broker's rejection is
+                    // real: this identity is no longer an active member.
                     let failure = if context.coordinator_alive
-                        && (code == REBALANCE_IN_PROGRESS || context.generation_unchanged)
+                        && (code == REBALANCE_IN_PROGRESS || !context.generation_unchanged)
                     {
                         RebalanceCommitFailure::RebalanceInProgress
                     } else {
@@ -989,41 +1000,54 @@ impl Consumer {
         err
     )]
     /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
+    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails. Returns [`ConsumerError::Timeout`] when the call, including any wait for a concurrent commit and the broker round trip, does not finish within `default_api_timeout`.
     pub async fn commit_sync(&self) -> Result<(), ConsumerError> {
         self.require_group_id()?;
-        let _commit_guard = self.commit_serialization.lock().await;
-        let pending = {
-            let identity = self.commit_identity.lock().await;
-            self.ensure_active_group(&identity)?;
-            let offsets = self.next_offsets.lock().await;
-            let positions = self.positions.lock().await;
-            // Kafka's `commitSync()` commits `SubscriptionState.allConsumed`:
-            // the position and the leader epoch at the call.
-            all_consumed(&identity.ownership_ids, &offsets, &positions)
-                .into_iter()
-                .map(|(partition, position)| {
-                    (
-                        partition,
+        let default_api_timeout = self.default_api_timeout.to_std();
+        let deadline = tokio::time::Instant::now() + default_api_timeout;
+        // `timeout_at` bounds the whole call, including the wait for
+        // `commit_serialization` and the broker round trip inside
+        // `commit_pending_offsets`, not only whether a retry starts.
+        let commit = async {
+            let _commit_guard = self.commit_serialization.lock().await;
+            let pending = {
+                let identity = self.commit_identity.lock().await;
+                self.ensure_active_group(&identity)?;
+                let offsets = self.next_offsets.lock().await;
+                let positions = self.positions.lock().await;
+                // Kafka's `commitSync()` commits `SubscriptionState.allConsumed`:
+                // the position and the leader epoch at the call.
+                all_consumed(&identity.ownership_ids, &offsets, &positions)
+                    .into_iter()
+                    .map(|(partition, position)| {
                         (
-                            OffsetAndMetadata::of_position(position.offset, position.leader_epoch),
-                            position.ownership_id,
-                        ),
-                    )
-                })
-                .collect::<HashMap<_, _>>()
-        };
-        if pending.is_empty() {
-            return Ok(());
-        }
-        tracing::Span::current().record("partitions", pending.len());
+                            partition,
+                            (
+                                OffsetAndMetadata::of_position(
+                                    position.offset,
+                                    position.leader_epoch,
+                                ),
+                                position.ownership_id,
+                            ),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+            if pending.is_empty() {
+                return Ok(());
+            }
+            tracing::Span::current().record("partitions", pending.len());
 
-        self.commit_pending_offsets(
-            pending,
-            RecordSent::BeforeSend,
-            self.default_api_timeout.to_std(),
-        )
-        .await
+            self.commit_pending_offsets(pending, RecordSent::BeforeSend, default_api_timeout)
+                .await
+        };
+        tokio::time::timeout_at(deadline, commit)
+            .await
+            .unwrap_or_else(|_elapsed| {
+                Err(ConsumerError::Timeout(format!(
+                    "commit_sync did not complete within {default_api_timeout:?}"
+                )))
+            })
     }
 
     /// Commit caller-selected offsets for currently assigned partitions.
@@ -1046,35 +1070,47 @@ impl Consumer {
     /// ([`ConsumerError::CommitFailed`] or
     /// [`ConsumerError::RebalanceInProgress`]) is not retried and commits
     /// nothing: call `poll()` and commit again, as Kafka's
-    /// `commitSync` requires.
+    /// `commitSync` requires. Returns [`ConsumerError::Timeout`] when the
+    /// call, including any wait for a concurrent commit and the broker round
+    /// trip, does not finish within `default_api_timeout`.
     pub async fn commit_offsets_sync(
         &self,
         offsets: HashMap<(String, i32), OffsetAndMetadata>,
     ) -> Result<(), ConsumerError> {
         self.require_group_id()?;
-        let _commit_guard = self.commit_serialization.lock().await;
         if offsets.is_empty() {
             return Ok(());
         }
-        let pending = {
-            let identity = self.commit_identity.lock().await;
-            self.ensure_active_group(&identity)?;
-            validate_selected_offsets(&offsets, &identity.ownership_ids)?;
-            offsets
-                .into_iter()
-                .map(|(partition, offset)| {
-                    let ownership_id = identity.ownership_ids[&partition];
-                    (partition, (offset, ownership_id))
-                })
-                .collect::<HashMap<_, _>>()
-        };
+        let default_api_timeout = self.default_api_timeout.to_std();
+        let deadline = tokio::time::Instant::now() + default_api_timeout;
+        // `timeout_at` bounds the whole call, including the wait for
+        // `commit_serialization` and the broker round trip inside
+        // `commit_pending_offsets`, not only whether a retry starts.
+        let commit = async {
+            let _commit_guard = self.commit_serialization.lock().await;
+            let pending = {
+                let identity = self.commit_identity.lock().await;
+                self.ensure_active_group(&identity)?;
+                validate_selected_offsets(&offsets, &identity.ownership_ids)?;
+                offsets
+                    .into_iter()
+                    .map(|(partition, offset)| {
+                        let ownership_id = identity.ownership_ids[&partition];
+                        (partition, (offset, ownership_id))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
 
-        self.commit_pending_offsets(
-            pending,
-            RecordSent::AfterAck,
-            self.default_api_timeout.to_std(),
-        )
-        .await
+            self.commit_pending_offsets(pending, RecordSent::AfterAck, default_api_timeout)
+                .await
+        };
+        tokio::time::timeout_at(deadline, commit)
+            .await
+            .unwrap_or_else(|_elapsed| {
+                Err(ConsumerError::Timeout(format!(
+                    "commit_offsets_sync did not complete within {default_api_timeout:?}"
+                )))
+            })
     }
 
     /// Fail a synchronous commit when the consumer is not part of an active
@@ -2352,16 +2388,16 @@ mod tests {
                 Err("not authorized to access topics: [topic]".into()),
             ),
             (
-                "illegal generation while the group is still preparing a rebalance",
+                "illegal generation with the request's own generation still current: a real kick",
                 &[22][..],
                 running,
-                Err(rebalance_in_progress.clone()),
+                Err(commit_failed.clone()),
             ),
             (
-                "unknown member id while the group is still preparing a rebalance",
+                "unknown member id with the request's own generation still current: a real kick",
                 &[25][..],
                 running,
-                Err(rebalance_in_progress.clone()),
+                Err(commit_failed.clone()),
             ),
             (
                 "rebalance in progress",
@@ -2370,16 +2406,16 @@ mod tests {
                 Err(rebalance_in_progress.clone()),
             ),
             (
-                "illegal generation after a rejoin",
+                "illegal generation after a rejoin already moved the generation on: a stale response",
                 &[22][..],
                 rejoined,
-                Err(commit_failed.clone()),
+                Err(rebalance_in_progress.clone()),
             ),
             (
-                "unknown member id after a rejoin",
+                "unknown member id after a rejoin already moved the generation on: a stale response",
                 &[25][..],
                 rejoined,
-                Err(commit_failed.clone()),
+                Err(rebalance_in_progress.clone()),
             ),
             (
                 "rebalance in progress after a rejoin is still a rebalance error",
@@ -2388,9 +2424,19 @@ mod tests {
                 Err(rebalance_in_progress.clone()),
             ),
             (
-                "unknown member id after the task stopped",
+                "unknown member id after the task stopped, generation still current",
                 &[25][..],
                 stopped,
+                Err(commit_failed.clone()),
+            ),
+            (
+                "unknown member id after the task stopped and a rejoin: no task left to rejoin on",
+                &[25][..],
+                CommitResponseContext {
+                    generation_unchanged: false,
+                    coordinator_alive: false,
+                    ..running
+                },
                 Err(commit_failed.clone()),
             ),
             (
@@ -2406,10 +2452,10 @@ mod tests {
                 Err(ConsumerError::FencedInstanceId("instance-a".into()).to_string()),
             ),
             (
-                "fenced instance id after a rejoin",
+                "fenced instance id after a rejoin already moved the generation on",
                 &[82][..],
                 rejoined,
-                Err(commit_failed.clone()),
+                Err(rebalance_in_progress.clone()),
             ),
             (
                 "fenced instance id after a rejoin and a task stop",
@@ -2579,10 +2625,6 @@ mod tests {
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(1),
         };
-        const EXPIRED: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
-            timeout: Duration::ZERO,
-            ..RETRY
-        };
         /// The backoff is longer than the time that is left.
         const LONG_BACKOFF: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
             timeout: Duration::from_millis(100),
@@ -2636,7 +2678,7 @@ mod tests {
                 "unknown topic or partition past the timeout",
                 vec![Codes(&[("orders", 3)])],
                 false,
-                EXPIRED,
+                LONG_BACKOFF,
                 (Err(ConsumerError::Server(3).to_string()), 1, 0),
             ),
             (
@@ -2664,8 +2706,8 @@ mod tests {
                 "disconnect past the timeout",
                 vec![Close],
                 false,
-                EXPIRED,
-                (Err(ConsumerError::CoordinatorUnavailable.to_string()), 1, 0),
+                LONG_BACKOFF,
+                (Err(ConsumerError::CoordinatorUnavailable.to_string()), 1, 1),
             ),
             (
                 "group authorization failed",
@@ -2728,39 +2770,39 @@ mod tests {
                 (Err(fenced.clone()), 1, 0),
             ),
             (
-                "fenced instance id fails the commit after a rejoin",
+                "fenced instance id is a stale artifact of an already-completed rejoin",
                 vec![Codes(&[("orders", 82)]), Codes(&[])],
                 true,
                 RETRY,
-                (Err(commit_failed.clone()), 1, 0),
+                (Err(rebalance_in_progress.clone()), 1, 0),
             ),
             (
-                "illegal generation while the group is still preparing a rebalance",
+                "illegal generation with the request's own generation still current: a real kick",
                 vec![Codes(&[("orders", 22)])],
                 false,
                 RETRY,
-                (Err(rebalance_in_progress.clone()), 1, 0),
+                (Err(commit_failed.clone()), 1, 0),
             ),
             (
-                "illegal generation fails the commit after a rejoin",
+                "illegal generation is a stale artifact of an already-completed rejoin",
                 vec![Codes(&[("orders", 22)]), Codes(&[])],
                 true,
                 RETRY,
-                (Err(commit_failed.clone()), 1, 0),
-            ),
-            (
-                "unknown member id while the group is still preparing a rebalance",
-                vec![Codes(&[("orders", 25)])],
-                false,
-                RETRY,
                 (Err(rebalance_in_progress.clone()), 1, 0),
             ),
             (
-                "unknown member id fails the commit after a rejoin",
+                "unknown member id with the request's own generation still current: a real kick",
+                vec![Codes(&[("orders", 25)])],
+                false,
+                RETRY,
+                (Err(commit_failed.clone()), 1, 0),
+            ),
+            (
+                "unknown member id is a stale artifact of an already-completed rejoin",
                 vec![Codes(&[("orders", 25)]), Codes(&[])],
                 true,
                 RETRY,
-                (Err(commit_failed.clone()), 1, 0),
+                (Err(rebalance_in_progress.clone()), 1, 0),
             ),
             (
                 "rebalance in progress fails the commit",
@@ -2909,6 +2951,51 @@ mod tests {
             offset_commits.load(Ordering::SeqCst),
             find_coordinators.load(Ordering::SeqCst),
         )
+    }
+
+    /// A silent broker cannot keep `commit_sync` blocked past
+    /// `default_api_timeout`, even when the client's own `request_timeout` is
+    /// far longer. `default_api_timeout` must bound the whole awaited commit
+    /// operation, not only whether another retry attempt starts, exactly as
+    /// Kafka's `commitSync(Duration timeout)` bounds the whole call.
+    #[tokio::test]
+    async fn commit_sync_times_out_near_default_api_timeout_despite_a_silent_broker() {
+        let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions_for_offset_commit((7, 7)));
+            }
+            // Every other request, including `OffsetCommit`, gets no reply at
+            // all: the broker is up but never answers.
+            None
+        })
+        .await;
+
+        let mut consumer = commit_consumer(
+            &mock,
+            commit_identity(7, "member-a"),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicI32::new(7)),
+        )
+        .await;
+        // The client's own request timeout is far longer than the commit's
+        // API timeout, so only `default_api_timeout` can end this call.
+        consumer.client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .request_timeout(secs(30))
+            .build()
+            .await
+            .unwrap();
+        consumer.default_api_timeout = krabka_units::millis(200);
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), consumer.commit_sync())
+            .await
+            .expect("commit_sync must return on its own well before the test's own timeout");
+        let elapsed = started.elapsed();
+
+        mock.stop();
+        check!(matches!(result, Err(ConsumerError::Timeout(_))));
+        check!(elapsed < Duration::from_secs(2));
     }
 
     /// A commit fails without a request after the coordinator task stopped, and
