@@ -2283,10 +2283,29 @@ fn finish_in_flight(cfg: &SenderConfig) {
 /// It returns `Some((pid, epoch))` when the sender should emit a transactional
 /// batch, and `None` for a non-transactional send or a send outside a
 /// transaction.
+///
+/// `TxnState::CommittingOrAborting` counts as active here, alongside
+/// `InTransaction` and `Preparing`: `Producer::end_transaction` moves the
+/// state to `CommittingOrAborting` *before* it flushes, so a `send` racing
+/// the commit/abort call observes the new state at once and is refused (see
+/// `Producer::transaction_generation`). But a batch that a `send` already
+/// queued while the state was still `InTransaction` is still sitting in the
+/// accumulator when that flush drains it. Excluding `CommittingOrAborting`
+/// here would build such an already-queued batch as an ordinary,
+/// non-transactional `Produce` request — with no `is_transactional` attribute
+/// and no request-level `transactional_id` — moments before `EndTxn` lands,
+/// which would let it land outside the transaction. A batch from a stale
+/// transaction generation (a recovered or fenced producer) never reaches this
+/// point: `fail_recovered_accumulator_batches` and `fail_recovered_batches`
+/// remove it from the accumulator, or its retry slot, before the sender
+/// builds it.
 async fn txn_pid_snapshot(cfg: &SenderConfig) -> Option<(i64, i16)> {
     cfg.transactional_id.as_ref()?;
     let state = *cfg.txn_state.lock().await;
-    if matches!(state, TxnState::InTransaction | TxnState::Preparing) {
+    if matches!(
+        state,
+        TxnState::InTransaction | TxnState::Preparing | TxnState::CommittingOrAborting
+    ) {
         Some(*cfg.txn_pid_epoch.lock().await)
     } else {
         None
@@ -3058,6 +3077,11 @@ mod harness {
         /// The `(producer_epoch, base_sequence)` of every `send_produce` call,
         /// in order.
         sent_batches: StdMutex<Vec<(i16, i32)>>,
+        /// The `(transactional_id, is_transactional)` of every `send_produce`
+        /// call's batch, in order — the request-level id and the batch's own
+        /// attribute bit, so a test can assert a batch shipped stamped as
+        /// transactional (or did not).
+        sent_transactional: StdMutex<Vec<(Option<String>, bool)>>,
         /// Signals each entry into `send_produce`, including injected failures
         /// before the broker model applies a request.
         send_started: Notify,
@@ -3119,6 +3143,7 @@ mod harness {
                 sent_leaders: StdMutex::new(Vec::new()),
                 sent_topic_ids: StdMutex::new(Vec::new()),
                 sent_batches: StdMutex::new(Vec::new()),
+                sent_transactional: StdMutex::new(Vec::new()),
                 send_started: Notify::new(),
                 active_sends: AtomicUsize::new(0),
                 peak_active_sends: AtomicUsize::new(0),
@@ -3210,6 +3235,12 @@ mod harness {
         /// The `(producer_epoch, base_sequence)` of every `send_produce` call.
         fn sent_batches(self: &Arc<Self>) -> Vec<(i16, i32)> {
             self.sent_batches.lock().unwrap().clone()
+        }
+
+        /// The `(transactional_id, is_transactional)` of every `send_produce`
+        /// call's batch.
+        fn sent_transactional(self: &Arc<Self>) -> Vec<(Option<String>, bool)> {
+            self.sent_transactional.lock().unwrap().clone()
         }
 
         /// Total Produce transport calls, including failures before the broker
@@ -3339,6 +3370,10 @@ mod harness {
                     .lock()
                     .unwrap()
                     .push((batch.producer_epoch, batch.base_sequence));
+                self.sent_transactional.lock().unwrap().push((
+                    req.transactional_id.clone(),
+                    batch.attributes.is_transactional(),
+                ));
             }
             self.send_started.notify_one();
             self.last_timeout_ms
@@ -3492,6 +3527,10 @@ mod harness {
         recovery_generation: Arc<AtomicU64>,
         producer_epoch: Arc<AtomicI16>,
         txn_error: Arc<TxnErrorSlot>,
+        /// The sender's live transactional state. A test can move it, the way
+        /// `Producer::end_transaction`/`prepare_transaction` do, to simulate a
+        /// commit/abort or a 2PC prepare racing a still-queued batch.
+        txn_state: Arc<Mutex<TxnState>>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -3671,6 +3710,7 @@ mod harness {
         let recovery_required = Arc::new(AtomicBool::new(false));
         let recovery_generation = Arc::new(AtomicU64::new(0));
         let abortable_error = Arc::new(TxnErrorSlot::default());
+        let txn_state_slot = Arc::new(Mutex::new(txn_state));
 
         // Box the same Arc<MockTransport> for the sender; keep a clone for the
         // test to inspect.
@@ -3698,7 +3738,7 @@ mod harness {
             in_flight: Arc::clone(&in_flight),
             shutdown: shutdown.clone(),
             transactional_id,
-            txn_state: Arc::new(Mutex::new(txn_state)),
+            txn_state: Arc::clone(&txn_state_slot),
             txn_pid_epoch: Arc::new(Mutex::new(if mode == BatchMode::Transactional {
                 TXN_PID_EPOCH
             } else {
@@ -3726,6 +3766,7 @@ mod harness {
             recovery_generation,
             producer_epoch,
             txn_error: abortable_error,
+            txn_state: txn_state_slot,
             handle,
         }
     }
@@ -6560,6 +6601,84 @@ mod harness {
             };
             shutdown(h).await;
             assert2::assert!(actual == expected, "{name}");
+        }
+    }
+
+    /// Codex P1: `Producer::end_transaction` and `Producer::prepare_transaction`
+    /// both move `TxnState` off `InTransaction` *before* they flush, so a
+    /// `send` racing the call observes the new state at once and is refused
+    /// (see `Producer::transaction_generation`). A batch that a `send` already
+    /// queued while the state was still `InTransaction` is a different story:
+    /// it sits in the accumulator carrying the transaction's own
+    /// `transaction_generation`, and that same flush drains it. `txn_pid_snapshot`
+    /// must still stamp such a batch as transactional in every state a flush can
+    /// run under — `Preparing` (from `prepare_transaction`) and
+    /// `CommittingOrAborting` (from `end_transaction`) alike — never build it as
+    /// an ordinary, non-transactional `Produce` moments before `EndTxn` lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_batch_still_ships_transactional_once_the_state_moves_on_for_its_flush() {
+        let cases = [
+            ("still in the transaction", TxnState::InTransaction),
+            (
+                "preparing (2PC) — queued before prepare_transaction's flush",
+                TxnState::Preparing,
+            ),
+            (
+                "committing/aborting — queued before end_transaction's flush",
+                TxnState::CommittingOrAborting,
+            ),
+        ];
+        for (name, state_at_flush) in cases {
+            let transport = MockTransport::new(Duration::ZERO);
+            // A long linger: the batch stays queued, exactly as it would while
+            // waiting for its linger to elapse when the commit call races it,
+            // until the test's own `DrainIntent::Force` (standing in for
+            // `Producer::flush`) drains it.
+            let h = spawn_sender_full(
+                transport.clone(),
+                1,
+                secs(30),
+                i32::MAX,
+                secs(30),
+                Acks::All,
+                BatchMode::Transactional,
+            );
+            let accumulator = Arc::new(Mutex::new(Accumulator::new(1024)));
+            h.accumulators
+                .insert(("t".to_string(), 0), Arc::clone(&accumulator));
+            let crate::accumulator::AppendResult { receiver: rx, .. } =
+                accumulator.lock().await.try_append(
+                    None,
+                    Some(bytes::Bytes::from_static(b"queued")),
+                    vec![],
+                    0,
+                    Some(0),
+                );
+
+            // Simulate the caller's state move landing before the flush wakes
+            // the sender, the same order `end_transaction`/`prepare_transaction`
+            // use.
+            *h.txn_state.lock().await = state_at_flush;
+            h.wake_tx
+                .send(DrainIntent::Force)
+                .await
+                .expect("sender is running");
+
+            let acknowledgement = tokio::time::timeout(Duration::from_secs(3), rx)
+                .await
+                .expect("the queued acknowledgement is resolved")
+                .expect("acknowledgement channel remains connected");
+            assert2::assert!(acknowledgement.is_ok(), "{name}");
+            assert2::assert!(
+                transport.sent_transactional() == vec![(Some("txn".to_owned()), true)],
+                "{name}"
+            );
+            assert2::assert!(
+                transport.sent_batches() == vec![(TXN_PID_EPOCH.1, 0)],
+                "{name}: must ship under the transactional (pid, epoch), not the idempotent one"
+            );
+
+            shutdown(h).await;
         }
     }
 
