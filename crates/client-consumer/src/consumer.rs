@@ -391,18 +391,32 @@ impl ConsumerRetryPolicy {
     /// (`retry_backoff_max`) capping both the startup and the coordinator
     /// exponential retry backoff.
     ///
+    /// The fixed startup and coordinator initial backoffs are clamped to
+    /// `retry_backoff_max` so that a low configured maximum caps every
+    /// startup retry instead of failing construction.
+    ///
     /// # Errors
     ///
     /// Returns an error if `retry_backoff_max` does not validate, for example
     /// a negative or fractional-millisecond value.
     pub(crate) fn with_retry_backoff_max(retry_backoff_max: Time) -> Result<Self, String> {
+        let startup_initial_backoff = if millis(500) < retry_backoff_max {
+            millis(500)
+        } else {
+            retry_backoff_max
+        };
+        let coordinator_initial_backoff = if millis(100) < retry_backoff_max {
+            millis(100)
+        } else {
+            retry_backoff_max
+        };
         Self::new(
             secs(90),
             minutes(5),
-            millis(500),
+            startup_initial_backoff,
             retry_backoff_max,
             secs(30),
-            millis(100),
+            coordinator_initial_backoff,
             retry_backoff_max,
         )
     }
@@ -2356,14 +2370,29 @@ mod consumer_retry_policy_tests {
     }
 
     /// Kafka's `retry.backoff.max.ms` caps both the startup and the
-    /// coordinator exponential retry backoff.
+    /// coordinator exponential retry backoff. When it is below the fixed
+    /// 500 ms/100 ms initial backoffs, construction still succeeds and the
+    /// initial backoffs are clamped down to it instead of being rejected.
     #[test]
     fn with_retry_backoff_max_caps_startup_and_coordinator_backoff() {
-        for (name, retry_backoff_max) in [("Kafka's default", millis(1000)), ("custom", secs(3))] {
+        for (name, retry_backoff_max) in [
+            ("Kafka's default", millis(1000)),
+            ("custom, above both fixed initial backoffs", secs(3)),
+            ("below both fixed initial backoffs", millis(100)),
+            ("between the two fixed initial backoffs", millis(250)),
+        ] {
             let policy = ConsumerRetryPolicy::with_retry_backoff_max(retry_backoff_max)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             check!(policy.startup_max_backoff() == retry_backoff_max);
             check!(policy.coordinator_max_backoff() == retry_backoff_max);
+            check!(
+                policy.startup_initial_backoff() <= retry_backoff_max,
+                "{name}: startup initial backoff must not exceed retry_backoff_max"
+            );
+            check!(
+                policy.coordinator_initial_backoff() <= retry_backoff_max,
+                "{name}: coordinator initial backoff must not exceed retry_backoff_max"
+            );
         }
     }
 
@@ -2620,6 +2649,34 @@ mod security_arg_tests {
         );
     }
 
+    /// A `retry_backoff_max` below the fixed 500 ms/100 ms startup and
+    /// coordinator initial backoffs must still build: the initial backoffs
+    /// are clamped down to it rather than making construction fail.
+    #[tokio::test]
+    async fn low_retry_backoff_max_clamps_initial_backoffs_instead_of_failing() {
+        let mock = MockBroker::start(|_api_key, _version, _corr_id, _body| None).await;
+
+        let build = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id("low-retry-backoff-max-consumer")
+            .group_id("low-retry-backoff-max-group")
+            .subscribe(vec!["orders".to_string()])
+            .request_timeout(krabka_units::millis(50))
+            .retry_backoff_max(millis(100))
+            .build();
+        let res = tokio::time::timeout(Duration::from_millis(500), build).await;
+
+        mock.stop();
+
+        let Err(err) = res.expect("a valid low retry_backoff_max must not hang the build") else {
+            panic!("silent broker must time out during build")
+        };
+        assert2::assert!(
+            matches!(err, ConsumerError::Client(ClientError::Timeout(_))),
+            "build must fail on the connection timeout, not on config validation: {err}"
+        );
+    }
+
     /// `retry_backoff_max` (Kafka's `retry.backoff.max.ms`) validates through
     /// the same eager, pre-connection check as the other retry timings.
     #[tokio::test]
@@ -2635,7 +2692,7 @@ mod security_arg_tests {
             .expect("build must fail before any broker lookup")
             .err()
             .expect("a zero retry backoff max must be rejected");
-        assert2::assert!(error.to_string().contains("maximum backoff"));
+        assert2::assert!(error.to_string().contains("backoff"));
     }
 
     /// A build needs exactly one of `subscribe` and `subscribe_pattern`, and
