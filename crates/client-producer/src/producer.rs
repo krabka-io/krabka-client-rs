@@ -1348,13 +1348,18 @@ impl Producer {
         if let Some(error) = self.fatal_error_state() {
             return Err(error);
         }
-        if matches!(
-            *self.txn_state.lock().await,
-            TxnState::Preparing | TxnState::Prepared
-        ) {
-            return Err(ProducerError::InvalidTransactionState(
-                "send_offsets_to_transaction is not allowed after prepare_transaction",
-            ));
+        match *self.txn_state.lock().await {
+            TxnState::InTransaction => {}
+            TxnState::Preparing | TxnState::Prepared => {
+                return Err(ProducerError::InvalidTransactionState(
+                    "send_offsets_to_transaction is not allowed after prepare_transaction",
+                ));
+            }
+            _ => {
+                return Err(ProducerError::InvalidTransactionState(
+                    "cannot send offsets to transaction while no transaction is in progress",
+                ));
+            }
         }
         let offsets_vec: Vec<_> = offsets.into_iter().collect();
         tracing::Span::current().record("offset_count", offsets_vec.len());
@@ -2017,12 +2022,15 @@ impl Producer {
     }
 
     /// The transaction generation that a send takes in `state`: the recovery
-    /// generation inside a transaction, and `None` otherwise.
+    /// generation inside a transaction, and `None` when `state` is `None`
+    /// (a non-transactional or idempotent-only producer).
     ///
     /// # Errors
     ///
-    /// Returns an error when a transaction needs recovery, or when the state
-    /// does not accept a send.
+    /// Returns an error when a transaction needs recovery, or when `state`
+    /// names a transactional producer with no open transaction (`Kafka`'s
+    /// `TransactionManager.maybeAddPartition` throws `IllegalStateException`
+    /// for the same case).
     fn transaction_generation(
         &self,
         state: Option<TxnState>,
@@ -2039,7 +2047,10 @@ impl Producer {
                     "send is not allowed after prepare_transaction",
                 ))
             }
-            _ => Ok(None),
+            Some(_) => Err(ProducerError::InvalidTransactionState(
+                "cannot send records while no transaction is in progress",
+            )),
+            None => Ok(None),
         }
     }
 
