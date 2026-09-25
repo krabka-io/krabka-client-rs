@@ -681,7 +681,7 @@ async fn consumer_resets_on_offset_out_of_range_earliest() {
 /// the call would return `Ok(())` without ever sending an `OffsetCommit`, and
 /// the caller's below-trim seed offset would never actually be seated. This
 /// commits offset 0 explicitly with `commit_offsets_sync` instead, which
-/// sends the OffsetCommit for exactly the offset the caller asked for,
+/// sends the `OffsetCommit` for exactly the offset the caller asked for,
 /// independent of whether the seed's own fetch position has resolved.
 async fn seed_committed_offset_zero(bootstrap: &str, group: &str, topic: &str) {
     let seed = Consumer::builder()

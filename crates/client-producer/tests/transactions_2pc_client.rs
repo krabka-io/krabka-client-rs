@@ -30,7 +30,7 @@
 //!
 //! A runner for this suite needs all of the following:
 //!
-//! - A broker built from Apache Kafka 4.0 or later, in KRaft mode.
+//! - A broker built from Apache Kafka 4.0 or later, in `KRaft` mode.
 //! - The broker property `transaction.two.phase.commit.enable=true`.
 //! - The `transaction.version` feature raised to level 3. The case does that
 //!   step itself with `UpdateFeaturesRequest`, which is the same path a client

@@ -2618,6 +2618,30 @@ mod tests {
     /// Kafka's `commitOffsetsSync` does.
     #[tokio::test]
     async fn commit_sync_handles_each_offset_commit_error_code_as_kafka_does() {
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for (name, answers, rejoin, retry_policy, expected) in offset_commit_error_code_cases() {
+            actual.push((
+                name,
+                scripted_commit_sync(answers, rejoin, retry_policy).await,
+            ));
+            wanted.push((name, expected));
+        }
+        let wanted: Vec<(&str, CommitCodeResult)> = wanted;
+        assert2::assert!(actual == wanted);
+    }
+
+    /// The table of cases for
+    /// [`commit_sync_handles_each_offset_commit_error_code_as_kafka_does`],
+    /// split out to keep that test's own body under clippy's line-count
+    /// limit.
+    fn offset_commit_error_code_cases() -> Vec<(
+        &'static str,
+        Vec<CommitAnswer>,
+        bool,
+        CoordinatorRetryPolicy,
+        CommitCodeResult,
+    )> {
         use CommitAnswer::{Close, Codes, Silent};
 
         const RETRY: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
@@ -2635,9 +2659,7 @@ mod tests {
         let commit_failed = ConsumerError::CommitFailed.to_string();
         let rebalance_in_progress =
             ConsumerError::RebalanceInProgress("group-a".into()).to_string();
-        let mut actual = Vec::new();
-        let mut wanted = Vec::new();
-        for (name, answers, rejoin, retry_policy, expected) in [
+        vec![
             ("success", vec![Codes(&[])], false, RETRY, (Ok(()), 1, 0)),
             (
                 "unknown topic or partition retries",
@@ -2818,15 +2840,7 @@ mod tests {
                 RETRY,
                 (Err(rebalance_in_progress.clone()), 1, 0),
             ),
-        ] {
-            actual.push((
-                name,
-                scripted_commit_sync(answers, rejoin, retry_policy).await,
-            ));
-            wanted.push((name, expected));
-        }
-        let wanted: Vec<(&str, CommitCodeResult)> = wanted;
-        assert2::assert!(actual == wanted);
+        ]
     }
 
     /// Run `commit_sync` against a mock coordinator that gives `answers` to
