@@ -10,6 +10,7 @@ use krabka_protocol::owned::{
     offset_commit_request::{OffsetCommitRequest, OffsetCommitRequestTopic},
     offset_commit_response::OffsetCommitResponse,
 };
+use krabka_units::convert::TimeExt as _;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -954,7 +955,7 @@ impl Consumer {
             if pending.is_empty() {
                 return Ok(());
             }
-            self.commit_pending_offsets(pending, RecordSent::BeforeSend)
+            self.commit_pending_offsets(pending, RecordSent::BeforeSend, self.retry_policy.timeout)
                 .await
         };
         match tokio::time::timeout_at(deadline, commit).await {
@@ -972,7 +973,8 @@ impl Consumer {
 impl Consumer {
     /// Commit the current next-offsets for every assigned partition.
     ///
-    /// This method blocks until the broker acks.
+    /// This method blocks until the broker acks, for at most
+    /// `default_api_timeout` (Kafka's `default.api.timeout.ms`).
     #[cfg_attr(test, mutants::skip)] // cargo-mutants: I/O-bound coordinator RPC, exercised by integration tests
     #[tracing::instrument(
         name = "consumer.commit_sync",
@@ -1016,8 +1018,12 @@ impl Consumer {
         }
         tracing::Span::current().record("partitions", pending.len());
 
-        self.commit_pending_offsets(pending, RecordSent::BeforeSend)
-            .await
+        self.commit_pending_offsets(
+            pending,
+            RecordSent::BeforeSend,
+            self.default_api_timeout.to_std(),
+        )
+        .await
     }
 
     /// Commit caller-selected offsets for currently assigned partitions.
@@ -1026,6 +1032,8 @@ impl Consumer {
     /// The call commits each offset with its leader epoch and metadata. It
     /// does not commit other partitions and does not change the fetch
     /// positions. An offset can be past the consumed position, as in Kafka.
+    /// This method blocks until the broker acks, for at most
+    /// `default_api_timeout` (Kafka's `default.api.timeout.ms`).
     ///
     /// # Errors
     ///
@@ -1061,8 +1069,12 @@ impl Consumer {
                 .collect::<HashMap<_, _>>()
         };
 
-        self.commit_pending_offsets(pending, RecordSent::AfterAck)
-            .await
+        self.commit_pending_offsets(
+            pending,
+            RecordSent::AfterAck,
+            self.default_api_timeout.to_std(),
+        )
+        .await
     }
 
     /// Fail a synchronous commit when the consumer is not part of an active
@@ -1094,6 +1106,7 @@ impl Consumer {
         &self,
         mut pending: HashMap<(String, i32), (OffsetAndMetadata, u64)>,
         record: RecordSent,
+        timeout: Duration,
     ) -> Result<(), ConsumerError> {
         let retry_start = tokio::time::Instant::now();
         let mut retry_backoff = self.retry_policy.initial_backoff;
@@ -1129,7 +1142,7 @@ impl Consumer {
                     if is_retriable_transport_error(&error)
                         || matches!(error, krabka_client_core::ClientError::Timeout(_)) =>
                 {
-                    if retry_deadline_elapsed(retry_start, self.retry_policy.timeout) {
+                    if retry_deadline_elapsed(retry_start, timeout) {
                         return Err(ConsumerError::CoordinatorUnavailable);
                     }
                     tracing::warn!(
@@ -1139,8 +1152,11 @@ impl Consumer {
                     );
                     self.client
                         .evict_broker(self.coordinator_id.load(Ordering::Relaxed));
-                    self.find_coordinator_again(retry_start).await;
-                    if !self.sleep_before_retry(retry_start, retry_backoff).await {
+                    self.find_coordinator_again(retry_start, timeout).await;
+                    if !self
+                        .sleep_before_retry(retry_start, retry_backoff, timeout)
+                        .await
+                    {
                         return Err(ConsumerError::CoordinatorUnavailable);
                     }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
@@ -1174,7 +1190,7 @@ impl Consumer {
                     if pending.is_empty() {
                         return Ok(());
                     }
-                    if retry_deadline_elapsed(retry_start, self.retry_policy.timeout) {
+                    if retry_deadline_elapsed(retry_start, timeout) {
                         return Err(ConsumerError::Server(code));
                     }
                     tracing::warn!(
@@ -1183,9 +1199,12 @@ impl Consumer {
                         "offset commit failed with a retriable error; retrying",
                     );
                     if find_coordinator {
-                        self.find_coordinator_again(retry_start).await;
+                        self.find_coordinator_again(retry_start, timeout).await;
                     }
-                    if !self.sleep_before_retry(retry_start, retry_backoff).await {
+                    if !self
+                        .sleep_before_retry(retry_start, retry_backoff, timeout)
+                        .await
+                    {
                         return Err(ConsumerError::Server(code));
                     }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
@@ -1226,13 +1245,11 @@ impl Consumer {
         &self,
         retry_start: tokio::time::Instant,
         backoff: Duration,
+        timeout: Duration,
     ) -> bool {
-        let remaining = self
-            .retry_policy
-            .timeout
-            .saturating_sub(retry_start.elapsed());
+        let remaining = timeout.saturating_sub(retry_start.elapsed());
         tokio::time::sleep(backoff.min(remaining)).await;
-        !retry_deadline_elapsed(retry_start, self.retry_policy.timeout)
+        !retry_deadline_elapsed(retry_start, timeout)
     }
 
     /// Find the group coordinator again, within the time that is left of a
@@ -1240,12 +1257,9 @@ impl Consumer {
     /// `commitOffsetsSync` does this in `coordinatorUnknownAndUnreadySync` after
     /// `markCoordinatorUnknown`. If the lookup fails, the next attempt uses the
     /// last known coordinator.
-    async fn find_coordinator_again(&self, retry_start: tokio::time::Instant) {
+    async fn find_coordinator_again(&self, retry_start: tokio::time::Instant, timeout: Duration) {
         let retry_policy = crate::coordinator::CoordinatorRetryPolicy {
-            timeout: self
-                .retry_policy
-                .timeout
-                .saturating_sub(retry_start.elapsed()),
+            timeout: timeout.saturating_sub(retry_start.elapsed()),
             ..self.retry_policy
         };
         match find_coordinator(&self.client, &self.group_id, retry_policy).await {
@@ -2881,6 +2895,8 @@ mod tests {
             .unwrap();
         consumer.group_instance_id = Some("instance-a".into());
         consumer.retry_policy = retry_policy;
+        consumer.default_api_timeout =
+            krabka_units::convert::StdDurationExt::as_time(&retry_policy.timeout);
 
         let result = tokio::time::timeout(Duration::from_secs(10), consumer.commit_sync())
             .await
