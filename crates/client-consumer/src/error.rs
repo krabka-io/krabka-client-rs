@@ -58,8 +58,16 @@ pub enum ConsumerError {
 
     /// A call did not complete before its timeout. Kafka's
     /// `TimeoutException`.
-    #[error("timeout: {0}")]
-    Timeout(String),
+    ///
+    /// `cause` is the last retriable error when a retry loop ran out of time,
+    /// as Kafka's `CommitRequestManager.maybeWrapAsTimeoutException` wraps it.
+    /// It is `None` when the call ran out of time while it waited.
+    #[error("timeout: {message}")]
+    Timeout {
+        message: String,
+        #[source]
+        cause: Option<Box<ConsumerError>>,
+    },
 
     #[error("invalid seek offset {0}: must be non-negative")]
     InvalidOffset(i64),
@@ -155,6 +163,14 @@ pub enum ConsumerError {
 }
 
 impl ConsumerError {
+    /// A [`ConsumerError::Timeout`] with no cause.
+    pub(crate) fn timeout(message: impl Into<String>) -> Self {
+        Self::Timeout {
+            message: message.into(),
+            cause: None,
+        }
+    }
+
     /// Whether this is an `OffsetFetch` error that Kafka's consumer does not
     /// retry, so the application must see it.
     pub(crate) fn is_fatal_offset_fetch_error(&self) -> bool {

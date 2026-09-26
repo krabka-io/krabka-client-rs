@@ -133,7 +133,7 @@ impl Consumer {
         tokio::time::timeout_at(deadline, wait)
             .await
             .unwrap_or_else(|_| {
-                Err(ConsumerError::Timeout(format!(
+                Err(ConsumerError::timeout(format!(
                     "the position for partition {}-{} could not be determined",
                     key.0, key.1
                 )))
@@ -201,7 +201,7 @@ impl Consumer {
         let response = tokio::time::timeout_at(deadline, fetch)
             .await
             .map_err(|_| {
-                ConsumerError::Timeout(
+                ConsumerError::timeout(
                     "the last committed offsets could not be determined".to_owned(),
                 )
             })??;

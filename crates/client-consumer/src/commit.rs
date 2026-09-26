@@ -254,6 +254,22 @@ fn async_commit_result(
     }
 }
 
+/// The error of a synchronous commit that did not succeed within `timeout`.
+///
+/// The message is that of the `TimeoutException` that Kafka's
+/// `ClassicKafkaConsumer.commitSync` throws. `cause` is the last retriable
+/// error, as Kafka's `CommitRequestManager.maybeWrapAsTimeoutException` wraps
+/// it, or `None` when the time ran out during an attempt or a wait.
+fn commit_timeout(timeout: Duration, cause: Option<ConsumerError>) -> ConsumerError {
+    ConsumerError::Timeout {
+        message: format!(
+            "Timeout of {}ms expired before successfully committing offsets",
+            timeout.as_millis()
+        ),
+        cause: cause.map(Box::new),
+    }
+}
+
 /// Build the `OffsetCommit` request of a commit. The request names each
 /// topic, so the version is v9 or lower. See [`TopicNameOffsetCommit`].
 pub(crate) fn build_commit_request(
@@ -966,8 +982,12 @@ impl Consumer {
                 return Ok(());
             }
             let retry_deadline = tokio::time::Instant::now() + self.retry_policy.timeout;
-            self.commit_pending_offsets(pending, RecordSent::BeforeSend, retry_deadline)
-                .await
+            self.commit_pending_offsets(
+                pending,
+                RecordSent::BeforeSend,
+                (retry_deadline, self.retry_policy.timeout),
+            )
+            .await
         };
         match tokio::time::timeout_at(deadline, commit).await {
             Ok(Ok(())) => {}
@@ -1000,7 +1020,7 @@ impl Consumer {
         err
     )]
     /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails. Returns [`ConsumerError::Timeout`] when the call, including any wait for a concurrent commit and the broker round trip, does not finish within `default_api_timeout`.
+    /// Returns an error when configuration is invalid, protocol encoding fails, or the broker rejects the commit with an error that is not retriable. A retriable error, such as `NOT_COORDINATOR` or a failed request, is retried. Returns [`ConsumerError::Timeout`] when the call, including any wait for a concurrent commit, the broker round trips and the retries, does not finish within `default_api_timeout`. When a retriable error left no time for another attempt, that error is the timeout's cause, as in Kafka's `commitSync`.
     pub async fn commit_sync(&self) -> Result<(), ConsumerError> {
         self.require_group_id()?;
         let default_api_timeout = self.default_api_timeout.to_std();
@@ -1038,16 +1058,16 @@ impl Consumer {
             }
             tracing::Span::current().record("partitions", pending.len());
 
-            self.commit_pending_offsets(pending, RecordSent::BeforeSend, deadline)
-                .await
+            self.commit_pending_offsets(
+                pending,
+                RecordSent::BeforeSend,
+                (deadline, default_api_timeout),
+            )
+            .await
         };
         tokio::time::timeout_at(deadline, commit)
             .await
-            .unwrap_or_else(|_elapsed| {
-                Err(ConsumerError::Timeout(format!(
-                    "commit_sync did not complete within {default_api_timeout:?}"
-                )))
-            })
+            .unwrap_or_else(|_elapsed| Err(commit_timeout(default_api_timeout, None)))
     }
 
     /// Commit caller-selected offsets for currently assigned partitions.
@@ -1070,9 +1090,12 @@ impl Consumer {
     /// ([`ConsumerError::CommitFailed`] or
     /// [`ConsumerError::RebalanceInProgress`]) is not retried and commits
     /// nothing: call `poll()` and commit again, as Kafka's
-    /// `commitSync` requires. Returns [`ConsumerError::Timeout`] when the
-    /// call, including any wait for a concurrent commit and the broker round
-    /// trip, does not finish within `default_api_timeout`.
+    /// `commitSync` requires. A retriable error, such as `NOT_COORDINATOR` or
+    /// a failed request, is retried. Returns [`ConsumerError::Timeout`] when
+    /// the call, including any wait for a concurrent commit, the broker round
+    /// trips and the retries, does not finish within `default_api_timeout`.
+    /// When a retriable error left no time for another attempt, that error is
+    /// the timeout's cause, as in Kafka's `commitSync`.
     pub async fn commit_offsets_sync(
         &self,
         offsets: HashMap<(String, i32), OffsetAndMetadata>,
@@ -1101,16 +1124,16 @@ impl Consumer {
                     .collect::<HashMap<_, _>>()
             };
 
-            self.commit_pending_offsets(pending, RecordSent::AfterAck, deadline)
-                .await
+            self.commit_pending_offsets(
+                pending,
+                RecordSent::AfterAck,
+                (deadline, default_api_timeout),
+            )
+            .await
         };
         tokio::time::timeout_at(deadline, commit)
             .await
-            .unwrap_or_else(|_elapsed| {
-                Err(ConsumerError::Timeout(format!(
-                    "commit_offsets_sync did not complete within {default_api_timeout:?}"
-                )))
-            })
+            .unwrap_or_else(|_elapsed| Err(commit_timeout(default_api_timeout, None)))
     }
 
     /// Fail a synchronous commit when the consumer is not part of an active
@@ -1140,15 +1163,27 @@ impl Consumer {
 
     /// Commit `pending`, and retry a retriable failure until `deadline`.
     ///
-    /// A synchronous commit passes the deadline of its own `timeout_at`, so
-    /// that the retry loop and the bound of the whole call expire at the same
-    /// instant. The loop then reports the last retriable error at that
-    /// instant, however long the call waited before its first attempt.
+    /// `timeout` is the bound that ends at `deadline`, for the message of the
+    /// error. A synchronous commit passes the deadline of its own
+    /// `timeout_at`, so that the retry loop and the bound of the whole call
+    /// expire at the same instant, however long the call waited before its
+    /// first attempt.
+    ///
+    /// # Errors
+    ///
+    /// A non-retriable error returns at once. When a retriable error leaves
+    /// no time for another attempt, the loop returns
+    /// [`ConsumerError::Timeout`] with that error as its cause. Kafka's
+    /// `ConsumerCoordinator.commitOffsetsSync` retries while
+    /// `timer.notExpired()`, and `ClassicKafkaConsumer.commitSync` then
+    /// throws `TimeoutException`. The async consumer's
+    /// `CommitRequestManager.commitSyncWithRetries` completes with
+    /// `maybeWrapAsTimeoutException` of the last error.
     async fn commit_pending_offsets(
         &self,
         mut pending: HashMap<(String, i32), (OffsetAndMetadata, u64)>,
         record: RecordSent,
-        deadline: tokio::time::Instant,
+        (deadline, timeout): (tokio::time::Instant, Duration),
     ) -> Result<(), ConsumerError> {
         let mut retry_backoff = self.retry_policy.initial_backoff;
         loop {
@@ -1184,7 +1219,7 @@ impl Consumer {
                         || matches!(error, krabka_client_core::ClientError::Timeout(_)) =>
                 {
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(ConsumerError::CoordinatorUnavailable);
+                        return Err(commit_timeout(timeout, Some(ConsumerError::Client(error))));
                     }
                     tracing::warn!(
                         group = %self.group_id,
@@ -1195,7 +1230,7 @@ impl Consumer {
                         .evict_broker(self.coordinator_id.load(Ordering::Relaxed));
                     self.find_coordinator_again(deadline).await;
                     if !self.sleep_before_retry(retry_backoff, deadline).await {
-                        return Err(ConsumerError::CoordinatorUnavailable);
+                        return Err(commit_timeout(timeout, Some(ConsumerError::Client(error))));
                     }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
                     continue;
@@ -1229,7 +1264,7 @@ impl Consumer {
                         return Ok(());
                     }
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(ConsumerError::Server(code));
+                        return Err(commit_timeout(timeout, Some(ConsumerError::Server(code))));
                     }
                     tracing::warn!(
                         group = %self.group_id,
@@ -1240,7 +1275,7 @@ impl Consumer {
                         self.find_coordinator_again(deadline).await;
                     }
                     if !self.sleep_before_retry(retry_backoff, deadline).await {
-                        return Err(ConsumerError::Server(code));
+                        return Err(commit_timeout(timeout, Some(ConsumerError::Server(code))));
                     }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
                 }
@@ -2597,8 +2632,25 @@ mod tests {
     }
 
     /// The result of a synchronous commit, the `OffsetCommit` requests and the
-    /// `FindCoordinator` requests that the coordinator received.
-    type CommitCodeResult = (Result<(), String>, usize, usize);
+    /// `FindCoordinator` requests that the coordinator received. An error is
+    /// [`described`].
+    type CommitCodeResult = (Result<(), (String, Option<String>)>, usize, usize);
+
+    /// The message of a commit that times out after one second, such as a
+    /// commit with a retriable error and a backoff past its timeout. Kafka's
+    /// `commitSync` then throws `TimeoutException`, and the async consumer's
+    /// `CommitRequestManager` gives it the last error as its cause.
+    const COMMIT_TIMED_OUT: &str =
+        "timeout: Timeout of 1000ms expired before successfully committing offsets";
+
+    /// A commit error as its message and the message of its cause, so that a
+    /// test can compare the whole error.
+    fn described(error: &ConsumerError) -> (String, Option<String>) {
+        (
+            error.to_string(),
+            std::error::Error::source(error).map(ToString::to_string),
+        )
+    }
 
     /// `commit_sync` handles each `OffsetCommit` error code as Kafka's
     /// `ConsumerCoordinator.OffsetCommitResponseHandler.handle` and
@@ -2623,6 +2675,22 @@ mod tests {
         assert2::assert!(actual == wanted);
     }
 
+    /// The retry policy of a commit that retries at once.
+    const RETRY: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
+        timeout: Duration::from_secs(2),
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(1),
+    };
+
+    /// The backoff is longer than the time that is left. The timeout leaves
+    /// room for the real round trips to the mock coordinator of a slow,
+    /// instrumented test run before it expires.
+    const LONG_BACKOFF: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
+        timeout: Duration::from_secs(1),
+        initial_backoff: Duration::from_secs(5),
+        max_backoff: Duration::from_secs(5),
+    };
+
     /// The table of cases for
     /// [`commit_sync_handles_each_offset_commit_error_code_as_kafka_does`],
     /// split out to keep that test's own body under clippy's line-count
@@ -2636,23 +2704,19 @@ mod tests {
     )> {
         use CommitAnswer::{Close, Codes, Silent};
 
-        const RETRY: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
-            timeout: Duration::from_secs(2),
-            initial_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(1),
-        };
-        /// The backoff is longer than the time that is left. The timeout
-        /// leaves room for the real round trips to the mock coordinator of a
-        /// slow, instrumented test run before it expires.
-        const LONG_BACKOFF: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
-            timeout: Duration::from_secs(1),
-            initial_backoff: Duration::from_secs(5),
-            max_backoff: Duration::from_secs(5),
-        };
-        let fenced = ConsumerError::FencedInstanceId("instance-a".into()).to_string();
-        let commit_failed = ConsumerError::CommitFailed.to_string();
+        let fenced = described(&ConsumerError::FencedInstanceId("instance-a".into()));
+        let commit_failed = described(&ConsumerError::CommitFailed);
         let rebalance_in_progress =
-            ConsumerError::RebalanceInProgress("group-a".into()).to_string();
+            described(&ConsumerError::RebalanceInProgress("group-a".into()));
+        let timed_out = |cause: ConsumerError| (COMMIT_TIMED_OUT.into(), Some(cause.to_string()));
+        let disconnected = timed_out(ConsumerError::Client(
+            krabka_client_core::ClientError::Disconnected,
+        ));
+        let group_denied = described(&ConsumerError::GroupAuthorizationFailed("group-a".into()));
+        let topics_denied = described(&ConsumerError::TopicAuthorizationFailed(BTreeSet::from([
+            "orders".into(),
+            "payments".into(),
+        ])));
         vec![
             ("success", vec![Codes(&[])], false, RETRY, (Ok(()), 1, 0)),
             (
@@ -2695,14 +2759,14 @@ mod tests {
                 vec![Codes(&[("orders", 3)])],
                 false,
                 LONG_BACKOFF,
-                (Err(ConsumerError::Server(3).to_string()), 1, 0),
+                (Err(timed_out(ConsumerError::Server(3))), 1, 0),
             ),
             (
                 "not coordinator with a backoff past the timeout",
                 vec![Codes(&[("orders", 16)]), Codes(&[])],
                 false,
                 LONG_BACKOFF,
-                (Err(ConsumerError::Server(16).to_string()), 1, 1),
+                (Err(timed_out(ConsumerError::Server(16))), 1, 1),
             ),
             (
                 "disconnect finds the coordinator and retries",
@@ -2723,25 +2787,21 @@ mod tests {
                 vec![Close],
                 false,
                 LONG_BACKOFF,
-                (Err(ConsumerError::CoordinatorUnavailable.to_string()), 1, 1),
+                (Err(disconnected), 1, 1),
             ),
             (
                 "group authorization failed",
                 vec![Codes(&[("orders", 30)])],
                 false,
                 RETRY,
-                (Err("not authorized to access group: group-a".into()), 1, 0),
+                (Err(group_denied), 1, 0),
             ),
             (
                 "topic authorization failed collects every topic",
                 vec![Codes(&[("orders", 29), ("payments", 29)])],
                 false,
                 RETRY,
-                (
-                    Err("not authorized to access topics: [orders, payments]".into()),
-                    1,
-                    0,
-                ),
+                (Err(topics_denied), 1, 0),
             ),
             (
                 "topic authorization failed with a retriable code retries",
@@ -2755,28 +2815,28 @@ mod tests {
                 vec![Codes(&[("orders", 12)])],
                 false,
                 RETRY,
-                (Err(ConsumerError::Server(12).to_string()), 1, 0),
+                (Err(described(&ConsumerError::Server(12))), 1, 0),
             ),
             (
                 "invalid commit offset size",
                 vec![Codes(&[("orders", 28)])],
                 false,
                 RETRY,
-                (Err(ConsumerError::Server(28).to_string()), 1, 0),
+                (Err(described(&ConsumerError::Server(28))), 1, 0),
             ),
             (
                 "unknown topic id is unexpected for a request by topic name",
                 vec![Codes(&[("orders", 100)])],
                 false,
                 RETRY,
-                (Err(ConsumerError::Server(100).to_string()), 1, 0),
+                (Err(described(&ConsumerError::Server(100))), 1, 0),
             ),
             (
                 "not leader or follower is unexpected",
                 vec![Codes(&[("orders", 6)])],
                 false,
                 RETRY,
-                (Err(ConsumerError::Server(6).to_string()), 1, 0),
+                (Err(described(&ConsumerError::Server(6))), 1, 0),
             ),
             (
                 "fenced instance id with the same generation",
@@ -2838,11 +2898,13 @@ mod tests {
     }
 
     /// A synchronous commit that first waits for the commit lock retries
-    /// until the deadline of the whole call, and at that deadline reports the
-    /// last retriable error, as the same commit without the wait does. The
-    /// wait does not move the retry deadline past the bound of the call.
+    /// until the deadline of the whole call, and at that deadline times out
+    /// with the last retriable error as the cause, as the same commit without
+    /// the wait does. The wait does not move the retry deadline past the
+    /// bound of the call.
     #[tokio::test]
-    async fn commit_sync_after_a_wait_for_the_commit_lock_reports_the_last_retriable_error() {
+    async fn commit_sync_after_a_wait_for_the_commit_lock_times_out_with_the_last_retriable_error()
+    {
         let retry_policy = CoordinatorRetryPolicy {
             timeout: Duration::from_secs(1),
             initial_backoff: Duration::from_secs(5),
@@ -2855,7 +2917,11 @@ mod tests {
             Duration::from_millis(50),
         )
         .await;
-        assert2::assert!(result == (Err(ConsumerError::Server(3).to_string()), 1, 0));
+        let timed_out = (
+            COMMIT_TIMED_OUT.into(),
+            Some(ConsumerError::Server(3).to_string()),
+        );
+        assert2::assert!(result == (Err(timed_out), 1, 0));
     }
 
     /// Run `commit_sync` against a mock coordinator that gives `answers` to
@@ -2981,8 +3047,8 @@ mod tests {
             release,
         );
         let result = result
-            .map_err(|_| "commit never finished".to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()));
+            .map_err(|_| ("commit never finished".to_string(), None))
+            .and_then(|result| result.map_err(|error| described(&error)));
 
         mock.stop();
         (
@@ -3033,7 +3099,14 @@ mod tests {
         let elapsed = started.elapsed();
 
         mock.stop();
-        check!(matches!(result, Err(ConsumerError::Timeout(_))));
+        check!(
+            result.map_err(|error| described(&error))
+                == Err((
+                    "timeout: Timeout of 200ms expired before successfully committing offsets"
+                        .into(),
+                    None
+                ))
+        );
         check!(elapsed < Duration::from_secs(2));
     }
 
