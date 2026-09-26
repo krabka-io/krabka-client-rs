@@ -42,11 +42,10 @@ idempotence. Transaction APIs cover
 exactly-once production. They also cover the KIP-447 path that commits consumed
 offsets as part of a producer transaction.
 
-The producer does not push client metrics to the cluster (KIP-714). It has no
-`enable_metrics_push` option, and it never sends `GetTelemetrySubscriptions`
-or `PushTelemetry`. A Java producer pushes its metrics by default when a broker
-client metrics subscription matches it. Issue
-[#106](https://github.com/krabka-io/krabka-client-rs/issues/106) tracks this.
+The producer pushes its client metrics to the cluster (KIP-714) when a broker
+client metrics subscription matches it, as a Java producer does. The pushed
+metrics are the network metrics of its connections. `enable_metrics_push`
+(default `true`) turns this off.
 
 The caller owns serialization. Keys, values, and headers are byte payloads, not
 typed schema values.

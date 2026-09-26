@@ -335,10 +335,13 @@ pub(crate) const EARLIEST_TIMESTAMP: i64 = -2;
 
 /// Placeholder for "reset with `ListOffsets`", resolved before the next Fetch:
 /// the log end, or the offset for the timestamp of `by_duration`.
-const LATEST_SENTINEL: i64 = i64::MAX;
+pub(crate) const LATEST_SENTINEL: i64 = i64::MAX;
 
-/// Placeholder for the reset of [`Consumer::seek_to_beginning`]: Kafka's
-/// `requestOffsetReset(partitions, EARLIEST)`, resolved with `ListOffsets(-2)`.
+/// Placeholder for the reset of [`Consumer::seek_to_beginning`], resolved with
+/// `ListOffsets(-2)`: Kafka's `requestOffsetReset(partitions, EARLIEST)`.
+/// `auto_offset_reset = Earliest` plants the same sentinel at build time and
+/// on `OFFSET_OUT_OF_RANGE`, so `position()` never reports an offset before
+/// the round trip resolves the real log start.
 pub(crate) const BEGINNING_SENTINEL: i64 = i64::MAX - 1;
 
 /// Placeholder for the reset of [`Consumer::seek_to_end`]: Kafka's
@@ -350,12 +353,23 @@ pub(crate) const END_SENTINEL: i64 = i64::MAX - 2;
 /// `TopicPartitionState.shouldInitialize`.
 pub(crate) const COMMITTED_SENTINEL: i64 = i64::MAX - 3;
 
+/// Placeholder for a partition with no committed offset under
+/// `auto_offset_reset = None`. Kafka never auto-resets under `none`
+/// (`SubscriptionState.resetInitializingPositions`,
+/// `OffsetFetcherUtils.offsetResetStrategyWithValidTimestamp`); it raises
+/// `NoOffsetForPartitionException` from `poll()` and `position()` instead of
+/// planting a `ListOffsets` sentinel. This placeholder is therefore never
+/// resolved by [`Consumer::resolve_reset_sentinels`]: it stays until a commit
+/// or a seek gives the partition a real position.
+pub(crate) const NO_OFFSET_SENTINEL: i64 = i64::MAX - 4;
+
 /// Whether `next_offset` is a placeholder that a position update did not
-/// resolve yet: a reset (Kafka's `TopicPartitionState.awaitingReset`) or the
-/// committed offset of a new manual assignment. Such a partition has no valid
-/// position, so the consumer does not fetch or commit it.
+/// resolve yet: a reset (Kafka's `TopicPartitionState.awaitingReset`), the
+/// committed offset of a new manual assignment, or a partition with no offset
+/// under `auto_offset_reset = None`. Such a partition has no valid position,
+/// so the consumer does not fetch or commit it.
 pub(crate) fn is_reset_sentinel(next_offset: i64) -> bool {
-    next_offset >= COMMITTED_SENTINEL
+    next_offset >= NO_OFFSET_SENTINEL
 }
 
 /// The `ListOffsets` timestamp that resolves a [`LATEST_SENTINEL`] for the
@@ -947,11 +961,11 @@ impl Consumer {
                         // way once retention has moved the log start past 0.
                         //
                         // So every policy resolves its position with a ListOffsets
-                        // instead. Earliest and Latest plant a sentinel that
+                        // instead. Latest and by_duration plant a sentinel that
                         // `resolve_reset_sentinels` replaces before the next Fetch.
-                        // None reports the error, and `deferred_out_of_range` carries
-                        // it out of this loop so the true log start can be read once
-                        // the offsets guard is released.
+                        // Earliest and None instead go to `out_of_range`, so the
+                        // true log start can be read once the offsets guard is
+                        // released; None then reports the error instead of using it.
                         match self.auto_offset_reset {
                             AutoOffsetReset::Latest | AutoOffsetReset::ByDuration(_) => {
                                 offsets.insert(key.clone(), LATEST_SENTINEL);
@@ -1493,6 +1507,10 @@ impl Consumer {
             }
             return Err(error);
         }
+        // Kafka's `resetInitializingPositions` throws `NoOffsetForPartitionException`
+        // for every partition that has no committed offset and no reset
+        // policy, before it ever sends a `ListOffsets`.
+        self.fail_partitions_without_offset().await?;
         if let Err(error) = until_woken(wakeup, self.resolve_reset_sentinels()).await? {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
@@ -1746,6 +1764,35 @@ impl Consumer {
         results
             .into_iter()
             .try_for_each(|(_, result)| result.authorization())
+    }
+
+    /// Fail with [`ConsumerError::NoOffsetForPartition`] when a partition has
+    /// no committed offset under `auto_offset_reset = None`.
+    ///
+    /// `auto_offset_reset = None` never plants a `ListOffsets` sentinel: a
+    /// partition without a commit keeps [`NO_OFFSET_SENTINEL`] in
+    /// `next_offsets` until a commit or a seek gives it a real position, so
+    /// this check fires again on every `poll()` and `position()` until then,
+    /// as Kafka's `resetInitializingPositions` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError::NoOffsetForPartition`] naming every partition
+    /// with no offset.
+    async fn fail_partitions_without_offset(&self) -> Result<(), ConsumerError> {
+        let missing: BTreeSet<(String, i32)> = self
+            .next_offsets
+            .lock()
+            .await
+            .iter()
+            .filter(|&(_, &offset)| offset == NO_OFFSET_SENTINEL)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(ConsumerError::NoOffsetForPartition(missing))
+        }
     }
 
     /// Replace each `COMMITTED_SENTINEL` with the committed offset of the
@@ -4041,6 +4088,10 @@ mod fetch_path_tests {
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             fetch_request,
             fetch_response::{FetchableTopicResponse, PartitionData},
+            list_offsets_request::{self, ListOffsetsRequest},
+            list_offsets_response::{
+                ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
+            },
             metadata_request,
             metadata_response::{
                 MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
@@ -4100,6 +4151,7 @@ mod fetch_path_tests {
                             (api_versions_request::API_KEY, 0, 3),
                             (metadata_request::API_KEY, 0, 8),
                             (fetch_request::API_KEY, 4, 11),
+                            (list_offsets_request::API_KEY, 1, 5),
                         ]
                         .into_iter()
                         .map(|(api_key, min_version, max_version)| ApiVersion {
@@ -4189,6 +4241,43 @@ mod fetch_path_tests {
                             version,
                         )),
                     };
+                }
+                // Every partition resolves to offset 0, whichever timestamp
+                // the request asked for.
+                if api_key == list_offsets_request::API_KEY {
+                    let client_id_len = usize::try_from(body.get_i16()).expect("client id");
+                    body.advance(client_id_len);
+                    let flexible = version >= list_offsets_request::FLEXIBLE_MIN;
+                    if flexible {
+                        body.advance(1);
+                    }
+                    let request = ListOffsetsRequest::decode(&mut body, version)
+                        .expect("decode list offsets");
+                    let mut response = if flexible { vec![0] } else { Vec::new() };
+                    response.extend(encode(
+                        &ListOffsetsResponse {
+                            topics: request
+                                .topics
+                                .iter()
+                                .map(|topic| ListOffsetsTopicResponse {
+                                    name: topic.name.clone(),
+                                    partitions: topic
+                                        .partitions
+                                        .iter()
+                                        .map(|p| ListOffsetsPartitionResponse {
+                                            partition_index: p.partition_index,
+                                            offset: 0,
+                                            ..Default::default()
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        version,
+                    ));
+                    return Some(response);
                 }
                 None
             })
@@ -5112,5 +5201,221 @@ mod fetch_path_tests {
         drop(consumer);
         stop(brokers);
         assert2::assert!((records.len(), position) == (0, Some(40)));
+    }
+
+    /// A single mock broker that serves `ApiVersions`, `Metadata`,
+    /// `ListOffsets` (always answering `list_offsets_offset` for `orders-0`)
+    /// and `Fetch` (an empty, error-free response). It never names a
+    /// separately dialable leader address, so every request the consumer
+    /// sends for `orders-0` falls back to this bootstrap connection.
+    ///
+    /// Captures the timestamp of every `ListOffsets` request and the
+    /// `fetch_offset` of every `Fetch` request it decodes.
+    async fn no_committed_offset_broker(
+        list_offsets_offset: i64,
+        list_offsets_timestamps: Arc<std::sync::Mutex<Vec<i64>>>,
+        fetch_offsets: Arc<std::sync::Mutex<Vec<i64>>>,
+    ) -> MockBroker {
+        use krabka_protocol::owned::{
+            list_offsets_request::FLEXIBLE_MIN,
+            list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
+        };
+        const NODE_ID: i32 = 1;
+        MockBroker::start(move |api_key, version, _corr_id, mut body| {
+            if api_key == api_versions_request::API_KEY {
+                let versions = ApiVersionsResponse {
+                    api_keys: [
+                        (api_versions_request::API_KEY, 0, 3),
+                        (metadata_request::API_KEY, 0, 8),
+                        (
+                            list_offsets_request::API_KEY,
+                            0,
+                            list_offsets_request::MAX_VERSION,
+                        ),
+                        (fetch_request::API_KEY, 4, 11),
+                    ]
+                    .into_iter()
+                    .map(|(api_key, min_version, max_version)| ApiVersion {
+                        api_key,
+                        min_version,
+                        max_version,
+                        ..Default::default()
+                    })
+                    .collect(),
+                    ..Default::default()
+                };
+                return Some(encode(&versions, 0));
+            }
+            if api_key == metadata_request::API_KEY {
+                // No `brokers` entry for `NODE_ID`: the pool cannot dial it,
+                // so `orders-0` falls back to the bootstrap connection, which
+                // is this same mock broker.
+                let metadata = MetadataResponse {
+                    topics: vec![MetadataResponseTopic {
+                        name: Some("orders".into()),
+                        topic_id: WireUuid([9; 16]),
+                        partitions: vec![MetadataResponsePartition {
+                            partition_index: 0,
+                            leader_id: NODE_ID,
+                            leader_epoch: 1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                return Some(encode(&metadata, version));
+            }
+            if api_key == list_offsets_request::API_KEY {
+                let client_id_len = usize::try_from(body.get_i16()).expect("client id length");
+                body.advance(client_id_len);
+                if version >= FLEXIBLE_MIN {
+                    body.advance(1);
+                }
+                let request =
+                    ListOffsetsRequest::decode(&mut body, version).expect("decode ListOffsets");
+                let timestamp = request.topics[0].partitions[0].timestamp;
+                list_offsets_timestamps
+                    .lock()
+                    .expect("lock")
+                    .push(timestamp);
+                let answer = ListOffsetsResponse {
+                    topics: vec![ListOffsetsTopicResponse {
+                        name: "orders".into(),
+                        partitions: vec![ListOffsetsPartitionResponse {
+                            partition_index: 0,
+                            error_code: 0,
+                            offset: list_offsets_offset,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let mut bytes = Vec::new();
+                if version >= FLEXIBLE_MIN {
+                    // The flexible response header has an empty tagged-field
+                    // section.
+                    bytes.push(0);
+                }
+                bytes.extend(encode(&answer, version));
+                return Some(bytes);
+            }
+            if api_key == fetch_request::API_KEY {
+                let client_id_len = usize::try_from(body.get_i16()).expect("client id");
+                body.advance(client_id_len);
+                let request = FetchRequest::decode(&mut body, version).expect("decode fetch");
+                if let Some(partition) = request
+                    .topics
+                    .first()
+                    .and_then(|topic| topic.partitions.first())
+                {
+                    fetch_offsets
+                        .lock()
+                        .expect("lock")
+                        .push(partition.fetch_offset);
+                }
+                return Some(encode(&FetchResponse::default(), version));
+            }
+            None
+        })
+        .await
+    }
+
+    /// A consumer of `group-a`, assigned `orders-0` with no committed offset:
+    /// the priming a fresh assignment gets when `OffsetFetch` names no commit
+    /// (`starting_offset`/`reset_starting_offset` in `consumer.rs`).
+    async fn consumer_with_no_committed_offset(
+        broker: &MockBroker,
+        policy: AutoOffsetReset,
+    ) -> Consumer {
+        let client = Client::builder()
+            .bootstrap(broker.addr.to_string())
+            .request_timeout(secs(30))
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = crate::poll::partition_error_tests::consumer_with_client(client);
+        consumer.auto_offset_reset = policy;
+        consumer.next_offsets.lock().await.insert(
+            ("orders".to_owned(), 0),
+            crate::consumer::reset_starting_offset(policy),
+        );
+        consumer
+    }
+
+    /// Kafka's initial position for a fresh assignment with no committed
+    /// offset, by `auto.offset.reset` policy
+    /// (<https://github.com/krabka-io/krabka-client-rs/issues/140>):
+    ///
+    /// - `none` never auto-resets: `poll` fails with
+    ///   `NoOffsetForPartition` and sends no `Fetch`.
+    /// - `earliest` asks `ListOffsets(-2)` before its first `Fetch`, which
+    ///   then starts from the broker's real log start (40 here), never from
+    ///   the literal offset 0.
+    /// - `latest` asks `ListOffsets(-1)`, unchanged by this fix.
+    #[tokio::test]
+    async fn initial_position_follows_the_reset_policy_with_no_committed_offset() {
+        struct Case {
+            name: &'static str,
+            policy: AutoOffsetReset,
+            expected_list_offsets: Vec<i64>,
+            expected_fetch_offsets: Vec<i64>,
+            expect_error: bool,
+        }
+        let cases = [
+            Case {
+                name: "none has no committed offset and no reset policy: poll fails, no Fetch",
+                policy: AutoOffsetReset::None,
+                expected_list_offsets: vec![],
+                expected_fetch_offsets: vec![],
+                expect_error: true,
+            },
+            Case {
+                name: "earliest asks ListOffsets(-2) and fetches from the log start",
+                policy: AutoOffsetReset::Earliest,
+                expected_list_offsets: vec![EARLIEST_TIMESTAMP],
+                expected_fetch_offsets: vec![40],
+                expect_error: false,
+            },
+            Case {
+                name: "latest asks ListOffsets(-1)",
+                policy: AutoOffsetReset::Latest,
+                expected_list_offsets: vec![LATEST_TIMESTAMP],
+                expected_fetch_offsets: vec![40],
+                expect_error: false,
+            },
+        ];
+        let mut actual = Vec::new();
+        let mut wanted = Vec::new();
+        for case in cases {
+            let list_offsets_timestamps: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
+            let fetch_offsets: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
+            let broker = no_committed_offset_broker(
+                40,
+                Arc::clone(&list_offsets_timestamps),
+                Arc::clone(&fetch_offsets),
+            )
+            .await;
+            let mut consumer = consumer_with_no_committed_offset(&broker, case.policy).await;
+            let result = consumer.poll(millis(500)).await;
+            let list_offsets_timestamps = list_offsets_timestamps.lock().expect("lock").clone();
+            let fetch_offsets = fetch_offsets.lock().expect("lock").clone();
+            drop(consumer);
+            broker.stop();
+            actual.push((
+                case.name,
+                list_offsets_timestamps,
+                fetch_offsets,
+                result.is_err(),
+            ));
+            wanted.push((
+                case.name,
+                case.expected_list_offsets,
+                case.expected_fetch_offsets,
+                case.expect_error,
+            ));
+        }
+        assert2::assert!(actual == wanted);
     }
 }

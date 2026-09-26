@@ -8,28 +8,45 @@
 //! The client is built on `krabka_client_core::Connection`'s typed
 //! `send::<R: ProtocolRequest>`, so request-version negotiation is automatic
 //! through the `ApiVersionTable` that connect time populates. The public
-//! modules cover topic CRUD, partition expansion, config changes, SCRAM user
-//! credentials, ACLs, quotas, delegation tokens, and log-dir inspection.
+//! modules cover topic CRUD, listing and description, partition expansion,
+//! config changes and config-resource listing, SCRAM user credentials, ACLs,
+//! client quotas, delegation tokens, metadata-quorum voters, and log-dir
+//! inspection.
 
-use std::{any::Any, collections::BTreeMap, sync::Mutex};
+use std::{
+    any::Any,
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use krabka_client_core::{
     ClientError, Connection, ConnectionOptions, MetadataRecoveryRebootstrapTrigger,
     MetadataRecoveryStrategy, ProtocolRequest as _, connection_target_host,
+    telemetry::{
+        ClientMetrics, ClientTelemetry, ClientTelemetryConfig, NetworkMetrics, TelemetryClientType,
+        TelemetryTiming,
+    },
 };
 use krabka_units::{Time, convert::TimeExt as _};
 use thiserror::Error;
 
 pub mod brokers;
+pub mod cluster;
 mod config;
+pub mod config_resources;
 pub mod configs;
 pub mod delegation_tokens;
+pub mod elections;
 pub mod features;
 pub mod groups;
 pub mod log_dirs;
+pub mod offsets;
+mod partition_leaders;
 pub mod quorum;
 pub mod quotas;
 mod retry;
+mod telemetry;
+pub mod topic_descriptions;
 pub mod topics;
 pub mod transactions;
 pub mod users;
@@ -40,26 +57,46 @@ pub struct MetadataVersionUpdate {
     pub level: i16,
 }
 
+pub use cluster::{ClusterDescription, ClusterNode, DescribeClusterOptions};
 pub use config::{
     AdminClientConfig, DEFAULT_ADMIN_CONNECTIONS_MAX_IDLE, DEFAULT_ADMIN_REQUEST_TIMEOUT,
-    DEFAULT_API_TIMEOUT, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_BACKOFF_MAX,
-    DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT, DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
+    DEFAULT_API_TIMEOUT, DEFAULT_ENABLE_METRICS_PUSH, DEFAULT_RETRY_BACKOFF,
+    DEFAULT_RETRY_BACKOFF_MAX, DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT,
+    DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
 };
+pub use config_resources::{ConfigResourceListing, ConfigResourceType};
 pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
+pub use elections::{ElectionResults, ElectionType};
 pub use features::{FeatureMetadata, FeatureRange, FeatureUpdate, FeatureUpdateOutcome};
-pub use groups::ConsumerGroupOffsetOutcome;
-pub use log_dirs::{
-    BrokerResult, LogDirInfo, LogDirPartitionInfo, LogDirTopicInfo, TopicPartitionReplica,
+pub use groups::{
+    ClassicGroupDescription, ConsumerGroupDescription, ConsumerGroupOffsetOutcome,
+    ShareGroupDescription, ShareGroupOffsetPartition, StreamsGroupDescription,
 };
-pub use quorum::{MetadataQuorum, QuorumReplica};
-pub use quotas::{QuotaOp, UserQuotaConfig, diff_user_quotas};
+pub use log_dirs::{
+    BrokerResult, LogDirInfo, LogDirPartitionInfo, LogDirTopicInfo, ReplicaLogDir,
+    ReplicaLogDirInfo, TopicPartitionReplica,
+};
+pub use offsets::{IsolationLevel, ListedOffset, OffsetSpec};
+pub use quorum::{MetadataQuorum, QuorumReplica, RaftVoterEndpoint};
+pub use quotas::{
+    ClientQuotaAlteration, ClientQuotaEntity, ClientQuotaFilter, ClientQuotaFilterComponent,
+    ClientQuotaMatch, ClientQuotas, ENTITY_CLIENT_ID, ENTITY_IP, ENTITY_USER, QuotaOp,
+    UserQuotaConfig, diff_user_quotas,
+};
+pub use topic_descriptions::{
+    DescribeTopicsOptions, ListTopicsOptions, TopicDescription, TopicDescriptions, TopicListing,
+    TopicPartitionInfo,
+};
 pub use topics::{
     CreatePartitionsOp, CreatePartitionsOutcome, CreateTopicOutcome, CreateTopicSpec,
     DeleteRecordsOp, DeleteRecordsOutcome, DeleteTopicOutcome, PartitionAssignment,
     PartitionAssignmentOutcome, TopicMetadata, TopicMetadataEntry, TopicMutationOptions,
     TopicReplicationStatus,
 };
-pub use transactions::TransactionDescription;
+pub use transactions::{
+    AbortTransactionSpec, ListTransactionsFilter, ProducerStateInfo, TransactionDescription,
+    TransactionListing,
+};
 pub use users::{
     AclEntry, AclEntryFilter, AclOperation, CreateAclOutcome, DEFAULT_SCRAM_ITERATIONS,
     DeleteAclFilterOutcome, MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS, PatternType,
@@ -96,10 +133,11 @@ pub trait AdminClientLike: Send {
             "DescribeQuorum is not implemented by this admin client".into(),
         ))
     }
-    /// Remove one exact metadata-quorum voter identity.
+    /// Remove one exact metadata-quorum voter identity. `cluster_id` is
+    /// Kafka's `RemoveRaftVoterOptions.clusterId`.
     async fn remove_raft_voter(
         &mut self,
-        _cluster_id: uuid::Uuid,
+        _cluster_id: Option<&str>,
         _node_id: i32,
         _directory_id: uuid::Uuid,
     ) -> Result<(), AdminError> {
@@ -252,7 +290,7 @@ impl AdminClientLike for AdminClient {
 
     async fn remove_raft_voter(
         &mut self,
-        cluster_id: uuid::Uuid,
+        cluster_id: Option<&str>,
         node_id: i32,
         directory_id: uuid::Uuid,
     ) -> Result<(), AdminError> {
@@ -530,6 +568,10 @@ pub enum AdminError {
     /// `ConfigException` when it builds the admin client.
     #[error("invalid admin client configuration: {0}")]
     InvalidConfig(String),
+    /// An argument of a call is invalid, as Kafka's admin types throw an
+    /// `IllegalArgumentException` before anything is sent.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("broker returned error: api={api} code={code} ({name}){detail}",
             detail = .message.as_deref().map(|m| format!(" {m:?}")).unwrap_or_default())]
     Broker {
@@ -607,16 +649,29 @@ fn format_host_port(host: &str, port: i32) -> String {
 
 /// Short-lived admin client that targets one cluster's controller. It can
 /// negotiate TLS/SASL through [`AdminClient::connect_secured`].
+///
+/// As Kafka's admin client with `enable.metrics.push` on (the default), it
+/// pushes the client metrics that a broker's client metrics subscription
+/// names (KIP-714) on its bootstrap connection, and its connections count in
+/// the `admin-client-metrics` network metrics.
+/// [`AdminClientConfig::enable_metrics_push`] turns this off. The
+/// constructors without an [`AdminClientConfig`] keep Kafka's default.
+/// [`close`](Self::close) sends the terminating push and waits for it;
+/// dropping the client sends it in the background.
 pub struct AdminClient {
-    pub(crate) conn: RecoveringConnection,
+    pub(crate) conn: Arc<RecoveringConnection>,
     bootstrap_addrs: Vec<String>,
     /// Full connection template carried forward so reconnects preserve
-    /// caller-supplied identity, security, and timeouts.
+    /// caller-supplied identity, security, and timeouts. With metrics push
+    /// on, it carries the network metrics that each new connection counts in.
     options: ConnectionOptions,
     /// The deadline, backoff and retry count of each call
     /// (`default.api.timeout.ms`, `retry.backoff.ms`, `retry.backoff.max.ms`,
     /// `retries`).
     pub(crate) retry: retry::RetryPolicy,
+    /// The KIP-714 reporter, `None` with `enable_metrics_push` off. Dropping
+    /// it starts the terminating push.
+    telemetry: Option<ClientTelemetry>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -632,7 +687,7 @@ struct ConnectedTarget {
 
 /// One controller connection with KIP-919/KIP-1102 bootstrap recovery.
 pub(crate) struct RecoveringConnection {
-    inner: tokio::sync::RwLock<Connection>,
+    inner: tokio::sync::RwLock<Arc<Connection>>,
     bootstrap_addrs: Vec<String>,
     options: ConnectionOptions,
     strategy: MetadataRecoveryStrategy,
@@ -653,7 +708,7 @@ impl RecoveringConnection {
         known_addrs: Vec<String>,
     ) -> Self {
         Self {
-            inner: tokio::sync::RwLock::new(connection),
+            inner: tokio::sync::RwLock::new(Arc::new(connection)),
             bootstrap_addrs,
             options,
             strategy,
@@ -731,7 +786,7 @@ impl RecoveringConnection {
     }
 
     async fn replace(&self, connection: Connection) {
-        *self.inner.write().await = connection;
+        *self.inner.write().await = Arc::new(connection);
     }
 
     async fn send_current<R>(
@@ -931,6 +986,12 @@ impl RecoveringConnection {
         self.target == BootstrapTarget::Controllers
     }
 
+    /// The `(min, max)` versions of `api_key` that the current peer
+    /// advertised, or `None` when it did not advertise the API.
+    pub(crate) async fn advertised_api_range(&self, api_key: i16) -> Option<(i16, i16)> {
+        self.inner.read().await.advertised_api_range(api_key)
+    }
+
     fn begin_metadata_attempt<R: krabka_protocol::ProtocolRequest>(&self) {
         if R::API_KEY != krabka_protocol::owned::metadata_request::MetadataRequest::API_KEY
             || self.strategy == MetadataRecoveryStrategy::None
@@ -1043,6 +1104,7 @@ impl AdminClient {
                 resolved.metadata_recovery_rebootstrap_trigger,
             ),
             BootstrapTarget::Brokers,
+            resolved.enable_metrics_push,
         )
         .await
     }
@@ -1068,6 +1130,7 @@ impl AdminClient {
                 resolved.metadata_recovery_rebootstrap_trigger,
             ),
             BootstrapTarget::Controllers,
+            resolved.enable_metrics_push,
         )
         .await
     }
@@ -1133,6 +1196,7 @@ impl AdminClient {
                 krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
             ),
             BootstrapTarget::Brokers,
+            DEFAULT_ENABLE_METRICS_PUSH,
         )
         .await
     }
@@ -1178,6 +1242,7 @@ impl AdminClient {
                 krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
             ),
             BootstrapTarget::Controllers,
+            DEFAULT_ENABLE_METRICS_PUSH,
         )
         .await
     }
@@ -1201,19 +1266,28 @@ impl AdminClient {
             retry,
             (strategy, rebootstrap_trigger),
             BootstrapTarget::Brokers,
+            DEFAULT_ENABLE_METRICS_PUSH,
         )
         .await
     }
 
     async fn connect_with_metadata_recovery_target(
         bootstrap_addrs: &[String],
-        options: ConnectionOptions,
+        mut options: ConnectionOptions,
         retry: retry::RetryPolicy,
         (strategy, rebootstrap_trigger): (MetadataRecoveryStrategy, Time),
         target: BootstrapTarget,
+        enable_metrics_push: bool,
     ) -> Result<Self, AdminError> {
         let trigger = MetadataRecoveryRebootstrapTrigger::new(rebootstrap_trigger)
             .map_err(AdminError::Protocol)?;
+        // Kafka's `CommonClientConfigs.telemetryReporter`: a reporter only
+        // with `enable.metrics.push`. Every connection of the client counts
+        // in its network metrics.
+        let metrics = enable_metrics_push.then(ClientMetrics::new);
+        options.network_metrics = metrics.as_ref().map(|metrics| {
+            NetworkMetrics::register(metrics, TelemetryClientType::Admin.metric_group())
+        });
         let mut last_error = None;
         for host_port in bootstrap_addrs {
             match Self::connect_target_one_with_discovery(host_port, options.clone(), target).await
@@ -1224,19 +1298,32 @@ impl AdminClient {
                     } else {
                         connected.discovered_addrs
                     };
+                    let conn = Arc::new(RecoveringConnection::new(
+                        connected.connection,
+                        bootstrap_addrs.to_vec(),
+                        options.clone(),
+                        strategy,
+                        trigger,
+                        target,
+                        known_addrs,
+                    ));
+                    let telemetry = metrics.map(|metrics| {
+                        ClientTelemetry::start(
+                            telemetry::AdminTelemetryConnection(Arc::clone(&conn)),
+                            &ClientTelemetryConfig::admin(),
+                            metrics,
+                            TelemetryTiming {
+                                request_timeout: options.request_timeout.to_std(),
+                                reconnect_backoff: options.reconnect_backoff.to_std(),
+                            },
+                        )
+                    });
                     return Ok(Self {
-                        conn: RecoveringConnection::new(
-                            connected.connection,
-                            bootstrap_addrs.to_vec(),
-                            options.clone(),
-                            strategy,
-                            trigger,
-                            target,
-                            known_addrs,
-                        ),
+                        conn,
                         bootstrap_addrs: bootstrap_addrs.to_vec(),
                         options,
                         retry,
+                        telemetry,
                     });
                 }
                 Err(e) if e.is_authentication_failure() => return Err(e),
@@ -1429,24 +1516,48 @@ impl AdminClient {
 /// deadline.
 pub(crate) const NOT_CONTROLLER: i16 = 41;
 
-/// Maps a Kafka error code into a static name string for human-friendly
-/// `AdminError::Broker` output. The table holds only the codes this crate
-/// surfaces today. Unknown codes serialize as `"UNKNOWN"`.
+/// Maps a Kafka error code to the name of its `Errors` constant, for
+/// human-friendly `AdminError::Broker` output.
+///
+/// The table holds every code of Apache Kafka's
+/// `org.apache.kafka.common.protocol.Errors` enum at apache/kafka@3eb0b8c.
+/// A code that Kafka does not define gives `"UNKNOWN"`.
 pub(crate) fn kafka_error_name(code: i16) -> &'static str {
     match code {
         -1 => "UNKNOWN_SERVER_ERROR",
         0 => "NONE",
+        1 => "OFFSET_OUT_OF_RANGE",
+        2 => "CORRUPT_MESSAGE",
         3 => "UNKNOWN_TOPIC_OR_PARTITION",
+        4 => "INVALID_FETCH_SIZE",
+        5 => "LEADER_NOT_AVAILABLE",
         6 => "NOT_LEADER_OR_FOLLOWER",
         7 => "REQUEST_TIMED_OUT",
+        8 => "BROKER_NOT_AVAILABLE",
+        9 => "REPLICA_NOT_AVAILABLE",
+        10 => "MESSAGE_TOO_LARGE",
+        11 => "STALE_CONTROLLER_EPOCH",
+        12 => "OFFSET_METADATA_TOO_LARGE",
         13 => "NETWORK_EXCEPTION",
         14 => "COORDINATOR_LOAD_IN_PROGRESS",
         15 => "COORDINATOR_NOT_AVAILABLE",
         16 => "NOT_COORDINATOR",
         17 => "INVALID_TOPIC_EXCEPTION",
+        18 => "RECORD_LIST_TOO_LARGE",
         19 => "NOT_ENOUGH_REPLICAS",
+        20 => "NOT_ENOUGH_REPLICAS_AFTER_APPEND",
+        21 => "INVALID_REQUIRED_ACKS",
+        22 => "ILLEGAL_GENERATION",
+        23 => "INCONSISTENT_GROUP_PROTOCOL",
+        24 => "INVALID_GROUP_ID",
+        25 => "UNKNOWN_MEMBER_ID",
+        26 => "INVALID_SESSION_TIMEOUT",
         27 => "REBALANCE_IN_PROGRESS",
+        28 => "INVALID_COMMIT_OFFSET_SIZE",
+        29 => "TOPIC_AUTHORIZATION_FAILED",
+        30 => "GROUP_AUTHORIZATION_FAILED",
         31 => "CLUSTER_AUTHORIZATION_FAILED",
+        32 => "INVALID_TIMESTAMP",
         33 => "UNSUPPORTED_SASL_MECHANISM",
         34 => "ILLEGAL_SASL_STATE",
         35 => "UNSUPPORTED_VERSION",
@@ -1457,28 +1568,100 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
         40 => "INVALID_CONFIG",
         41 => "NOT_CONTROLLER",
         42 => "INVALID_REQUEST",
+        43 => "UNSUPPORTED_FOR_MESSAGE_FORMAT",
+        44 => "POLICY_VIOLATION",
+        45 => "OUT_OF_ORDER_SEQUENCE_NUMBER",
+        46 => "DUPLICATE_SEQUENCE_NUMBER",
         47 => "INVALID_PRODUCER_EPOCH",
         48 => "INVALID_TXN_STATE",
         49 => "INVALID_PRODUCER_ID_MAPPING",
+        50 => "INVALID_TRANSACTION_TIMEOUT",
         51 => "CONCURRENT_TRANSACTIONS",
+        52 => "TRANSACTION_COORDINATOR_FENCED",
         53 => "TRANSACTIONAL_ID_AUTHORIZATION_FAILED",
+        54 => "SECURITY_DISABLED",
+        55 => "OPERATION_NOT_ATTEMPTED",
+        56 => "KAFKA_STORAGE_ERROR",
+        57 => "LOG_DIR_NOT_FOUND",
         58 => "SASL_AUTHENTICATION_FAILED",
+        59 => "UNKNOWN_PRODUCER_ID",
         60 => "REASSIGNMENT_IN_PROGRESS",
+        61 => "DELEGATION_TOKEN_AUTH_DISABLED",
+        62 => "DELEGATION_TOKEN_NOT_FOUND",
+        63 => "DELEGATION_TOKEN_OWNER_MISMATCH",
+        64 => "DELEGATION_TOKEN_REQUEST_NOT_ALLOWED",
+        65 => "DELEGATION_TOKEN_AUTHORIZATION_FAILED",
         66 => "DELEGATION_TOKEN_EXPIRED",
+        67 => "INVALID_PRINCIPAL_TYPE",
+        68 => "NON_EMPTY_GROUP",
+        69 => "GROUP_ID_NOT_FOUND",
+        70 => "FETCH_SESSION_ID_NOT_FOUND",
+        71 => "INVALID_FETCH_SESSION_EPOCH",
+        72 => "LISTENER_NOT_FOUND",
+        73 => "TOPIC_DELETION_DISABLED",
+        74 => "FENCED_LEADER_EPOCH",
+        75 => "UNKNOWN_LEADER_EPOCH",
+        76 => "UNSUPPORTED_COMPRESSION_TYPE",
+        77 => "STALE_BROKER_EPOCH",
+        78 => "OFFSET_NOT_AVAILABLE",
+        79 => "MEMBER_ID_REQUIRED",
+        80 => "PREFERRED_LEADER_NOT_AVAILABLE",
+        81 => "GROUP_MAX_SIZE_REACHED",
+        82 => "FENCED_INSTANCE_ID",
         83 => "ELIGIBLE_LEADERS_NOT_AVAILABLE",
         84 => "ELECTION_NOT_NEEDED",
+        85 => "NO_REASSIGNMENT_IN_PROGRESS",
+        86 => "GROUP_SUBSCRIBED_TO_TOPIC",
         87 => "INVALID_RECORD",
+        88 => "UNSTABLE_OFFSET_COMMIT",
         89 => "THROTTLING_QUOTA_EXCEEDED",
         90 => "PRODUCER_FENCED",
         91 => "RESOURCE_NOT_FOUND",
         92 => "DUPLICATE_RESOURCE",
         93 => "UNACCEPTABLE_CREDENTIAL",
+        94 => "INCONSISTENT_VOTER_SET",
         95 => "INVALID_UPDATE_VERSION",
+        96 => "FEATURE_UPDATE_FAILED",
+        97 => "PRINCIPAL_DESERIALIZATION_FAILURE",
+        98 => "SNAPSHOT_NOT_FOUND",
+        99 => "POSITION_OUT_OF_RANGE",
+        100 => "UNKNOWN_TOPIC_ID",
+        101 => "DUPLICATE_BROKER_REGISTRATION",
+        102 => "BROKER_ID_NOT_REGISTERED",
+        103 => "INCONSISTENT_TOPIC_ID",
+        104 => "INCONSISTENT_CLUSTER_ID",
         105 => "TRANSACTIONAL_ID_NOT_FOUND",
+        106 => "FETCH_SESSION_TOPIC_ID_ERROR",
         107 => "INELIGIBLE_REPLICA",
+        108 => "NEW_LEADER_ELECTED",
+        109 => "OFFSET_MOVED_TO_TIERED_STORAGE",
+        110 => "FENCED_MEMBER_EPOCH",
+        111 => "UNRELEASED_INSTANCE_ID",
+        112 => "UNSUPPORTED_ASSIGNOR",
+        113 => "STALE_MEMBER_EPOCH",
         114 => "MISMATCHED_ENDPOINT_TYPE",
         115 => "UNSUPPORTED_ENDPOINT_TYPE",
         116 => "UNKNOWN_CONTROLLER_ID",
+        117 => "UNKNOWN_SUBSCRIPTION_ID",
+        118 => "TELEMETRY_TOO_LARGE",
+        119 => "INVALID_REGISTRATION",
+        120 => "TRANSACTION_ABORTABLE",
+        121 => "INVALID_RECORD_STATE",
+        122 => "SHARE_SESSION_NOT_FOUND",
+        123 => "INVALID_SHARE_SESSION_EPOCH",
+        124 => "FENCED_STATE_EPOCH",
+        125 => "INVALID_VOTER_KEY",
+        126 => "DUPLICATE_VOTER",
+        127 => "VOTER_NOT_FOUND",
+        128 => "INVALID_REGULAR_EXPRESSION",
+        129 => "REBOOTSTRAP_REQUIRED",
+        130 => "STREAMS_INVALID_TOPOLOGY",
+        131 => "STREAMS_INVALID_TOPOLOGY_EPOCH",
+        132 => "STREAMS_TOPOLOGY_FENCED",
+        133 => "SHARE_SESSION_LIMIT_REACHED",
+        134 => "GROUP_DELETION_FAILED",
+        135 => "STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED",
+        136 => "CONTROLLER_ID_NOT_REGISTERED",
         _ => "UNKNOWN",
     }
 }
@@ -1904,23 +2087,48 @@ mod tests {
 
     #[test]
     fn error_names_match_the_codes_that_apache_kafka_defines() {
-        // Every arm of the table, read from Apache Kafka's `Errors` enum. The
-        // list is exhaustive on purpose: a sampled table lets a deleted arm
-        // pass unnoticed, and a wrong name sends an operator to the wrong
-        // cause.
-        let cases: [(i16, &str); 40] = [
+        // Every constant of Apache Kafka's `Errors` enum at
+        // apache/kafka@3eb0b8c, in code order, as `Errors.values()` prints
+        // `code()` and `name()`. The list is exhaustive on purpose: a sampled
+        // table lets a deleted arm pass unnoticed, and a wrong name sends an
+        // operator to the wrong cause.
+        let cases: [(i16, &str); 138] = [
             (-1, "UNKNOWN_SERVER_ERROR"),
             (0, "NONE"),
+            (1, "OFFSET_OUT_OF_RANGE"),
+            (2, "CORRUPT_MESSAGE"),
             (3, "UNKNOWN_TOPIC_OR_PARTITION"),
+            (4, "INVALID_FETCH_SIZE"),
+            (5, "LEADER_NOT_AVAILABLE"),
+            (6, "NOT_LEADER_OR_FOLLOWER"),
             (7, "REQUEST_TIMED_OUT"),
+            (8, "BROKER_NOT_AVAILABLE"),
+            (9, "REPLICA_NOT_AVAILABLE"),
+            (10, "MESSAGE_TOO_LARGE"),
+            (11, "STALE_CONTROLLER_EPOCH"),
+            (12, "OFFSET_METADATA_TOO_LARGE"),
             (13, "NETWORK_EXCEPTION"),
             (14, "COORDINATOR_LOAD_IN_PROGRESS"),
             (15, "COORDINATOR_NOT_AVAILABLE"),
             (16, "NOT_COORDINATOR"),
             (17, "INVALID_TOPIC_EXCEPTION"),
+            (18, "RECORD_LIST_TOO_LARGE"),
             (19, "NOT_ENOUGH_REPLICAS"),
+            (20, "NOT_ENOUGH_REPLICAS_AFTER_APPEND"),
+            (21, "INVALID_REQUIRED_ACKS"),
+            (22, "ILLEGAL_GENERATION"),
+            (23, "INCONSISTENT_GROUP_PROTOCOL"),
+            (24, "INVALID_GROUP_ID"),
+            (25, "UNKNOWN_MEMBER_ID"),
+            (26, "INVALID_SESSION_TIMEOUT"),
+            (27, "REBALANCE_IN_PROGRESS"),
+            (28, "INVALID_COMMIT_OFFSET_SIZE"),
+            (29, "TOPIC_AUTHORIZATION_FAILED"),
+            (30, "GROUP_AUTHORIZATION_FAILED"),
             (31, "CLUSTER_AUTHORIZATION_FAILED"),
+            (32, "INVALID_TIMESTAMP"),
             (33, "UNSUPPORTED_SASL_MECHANISM"),
+            (34, "ILLEGAL_SASL_STATE"),
             (35, "UNSUPPORTED_VERSION"),
             (36, "TOPIC_ALREADY_EXISTS"),
             (37, "INVALID_PARTITIONS"),
@@ -1929,33 +2137,112 @@ mod tests {
             (40, "INVALID_CONFIG"),
             (41, "NOT_CONTROLLER"),
             (42, "INVALID_REQUEST"),
+            (43, "UNSUPPORTED_FOR_MESSAGE_FORMAT"),
+            (44, "POLICY_VIOLATION"),
+            (45, "OUT_OF_ORDER_SEQUENCE_NUMBER"),
+            (46, "DUPLICATE_SEQUENCE_NUMBER"),
             (47, "INVALID_PRODUCER_EPOCH"),
             (48, "INVALID_TXN_STATE"),
             (49, "INVALID_PRODUCER_ID_MAPPING"),
+            (50, "INVALID_TRANSACTION_TIMEOUT"),
             (51, "CONCURRENT_TRANSACTIONS"),
+            (52, "TRANSACTION_COORDINATOR_FENCED"),
             (53, "TRANSACTIONAL_ID_AUTHORIZATION_FAILED"),
+            (54, "SECURITY_DISABLED"),
+            (55, "OPERATION_NOT_ATTEMPTED"),
+            (56, "KAFKA_STORAGE_ERROR"),
+            (57, "LOG_DIR_NOT_FOUND"),
+            (58, "SASL_AUTHENTICATION_FAILED"),
+            (59, "UNKNOWN_PRODUCER_ID"),
             (60, "REASSIGNMENT_IN_PROGRESS"),
+            (61, "DELEGATION_TOKEN_AUTH_DISABLED"),
+            (62, "DELEGATION_TOKEN_NOT_FOUND"),
+            (63, "DELEGATION_TOKEN_OWNER_MISMATCH"),
+            (64, "DELEGATION_TOKEN_REQUEST_NOT_ALLOWED"),
+            (65, "DELEGATION_TOKEN_AUTHORIZATION_FAILED"),
             (66, "DELEGATION_TOKEN_EXPIRED"),
+            (67, "INVALID_PRINCIPAL_TYPE"),
+            (68, "NON_EMPTY_GROUP"),
+            (69, "GROUP_ID_NOT_FOUND"),
+            (70, "FETCH_SESSION_ID_NOT_FOUND"),
+            (71, "INVALID_FETCH_SESSION_EPOCH"),
+            (72, "LISTENER_NOT_FOUND"),
+            (73, "TOPIC_DELETION_DISABLED"),
+            (74, "FENCED_LEADER_EPOCH"),
+            (75, "UNKNOWN_LEADER_EPOCH"),
+            (76, "UNSUPPORTED_COMPRESSION_TYPE"),
+            (77, "STALE_BROKER_EPOCH"),
+            (78, "OFFSET_NOT_AVAILABLE"),
+            (79, "MEMBER_ID_REQUIRED"),
+            (80, "PREFERRED_LEADER_NOT_AVAILABLE"),
+            (81, "GROUP_MAX_SIZE_REACHED"),
+            (82, "FENCED_INSTANCE_ID"),
             (83, "ELIGIBLE_LEADERS_NOT_AVAILABLE"),
             (84, "ELECTION_NOT_NEEDED"),
+            (85, "NO_REASSIGNMENT_IN_PROGRESS"),
+            (86, "GROUP_SUBSCRIBED_TO_TOPIC"),
             (87, "INVALID_RECORD"),
+            (88, "UNSTABLE_OFFSET_COMMIT"),
+            (89, "THROTTLING_QUOTA_EXCEEDED"),
             (90, "PRODUCER_FENCED"),
             (91, "RESOURCE_NOT_FOUND"),
             (92, "DUPLICATE_RESOURCE"),
             (93, "UNACCEPTABLE_CREDENTIAL"),
+            (94, "INCONSISTENT_VOTER_SET"),
             (95, "INVALID_UPDATE_VERSION"),
+            (96, "FEATURE_UPDATE_FAILED"),
+            (97, "PRINCIPAL_DESERIALIZATION_FAILURE"),
+            (98, "SNAPSHOT_NOT_FOUND"),
+            (99, "POSITION_OUT_OF_RANGE"),
+            (100, "UNKNOWN_TOPIC_ID"),
+            (101, "DUPLICATE_BROKER_REGISTRATION"),
+            (102, "BROKER_ID_NOT_REGISTERED"),
+            (103, "INCONSISTENT_TOPIC_ID"),
+            (104, "INCONSISTENT_CLUSTER_ID"),
             (105, "TRANSACTIONAL_ID_NOT_FOUND"),
+            (106, "FETCH_SESSION_TOPIC_ID_ERROR"),
             (107, "INELIGIBLE_REPLICA"),
+            (108, "NEW_LEADER_ELECTED"),
+            (109, "OFFSET_MOVED_TO_TIERED_STORAGE"),
+            (110, "FENCED_MEMBER_EPOCH"),
+            (111, "UNRELEASED_INSTANCE_ID"),
+            (112, "UNSUPPORTED_ASSIGNOR"),
+            (113, "STALE_MEMBER_EPOCH"),
             (114, "MISMATCHED_ENDPOINT_TYPE"),
             (115, "UNSUPPORTED_ENDPOINT_TYPE"),
             (116, "UNKNOWN_CONTROLLER_ID"),
+            (117, "UNKNOWN_SUBSCRIPTION_ID"),
+            (118, "TELEMETRY_TOO_LARGE"),
+            (119, "INVALID_REGISTRATION"),
+            (120, "TRANSACTION_ABORTABLE"),
+            (121, "INVALID_RECORD_STATE"),
+            (122, "SHARE_SESSION_NOT_FOUND"),
+            (123, "INVALID_SHARE_SESSION_EPOCH"),
+            (124, "FENCED_STATE_EPOCH"),
+            (125, "INVALID_VOTER_KEY"),
+            (126, "DUPLICATE_VOTER"),
+            (127, "VOTER_NOT_FOUND"),
+            (128, "INVALID_REGULAR_EXPRESSION"),
+            (129, "REBOOTSTRAP_REQUIRED"),
+            (130, "STREAMS_INVALID_TOPOLOGY"),
+            (131, "STREAMS_INVALID_TOPOLOGY_EPOCH"),
+            (132, "STREAMS_TOPOLOGY_FENCED"),
+            (133, "SHARE_SESSION_LIMIT_REACHED"),
+            (134, "GROUP_DELETION_FAILED"),
+            (135, "STREAMS_TOPOLOGY_DESCRIPTION_UPDATE_FAILED"),
+            (136, "CONTROLLER_ID_NOT_REGISTERED"),
         ];
 
-        for (code, name) in cases {
-            assert2::assert!(kafka_error_name(code) == name, "code {code}");
+        let names = cases
+            .iter()
+            .map(|(code, _)| (*code, kafka_error_name(*code)))
+            .collect::<Vec<_>>();
+        assert2::assert!(names == cases.to_vec());
+        // Kafka's codes are contiguous from -1, so every code outside the
+        // table is one Kafka does not define.
+        for code in [i16::MIN, -2, 137, i16::MAX] {
+            assert2::assert!(kafka_error_name(code) == "UNKNOWN", "code {code}");
         }
-        assert2::assert!(kafka_error_name(i16::MAX) == "UNKNOWN");
-        assert2::assert!(kafka_error_name(-2) == "UNKNOWN");
     }
 
     #[test]

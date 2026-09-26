@@ -58,8 +58,16 @@ pub enum ConsumerError {
 
     /// A call did not complete before its timeout. Kafka's
     /// `TimeoutException`.
-    #[error("timeout: {0}")]
-    Timeout(String),
+    ///
+    /// `cause` is the last retriable error when a retry loop ran out of time,
+    /// as Kafka's `CommitRequestManager.maybeWrapAsTimeoutException` wraps it.
+    /// It is `None` when the call ran out of time while it waited.
+    #[error("timeout: {message}")]
+    Timeout {
+        message: String,
+        #[source]
+        cause: Option<Box<ConsumerError>>,
+    },
 
     #[error("invalid seek offset {0}: must be non-negative")]
     InvalidOffset(i64),
@@ -130,9 +138,39 @@ pub enum ConsumerError {
         "offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group"
     )]
     CommitFailed,
+
+    /// The coordinator answered `ILLEGAL_GENERATION` (22), `UNKNOWN_MEMBER_ID`
+    /// (25) or `FENCED_INSTANCE_ID` (82) while the group was still
+    /// `PREPARING_REBALANCE`, or `REBALANCE_IN_PROGRESS` (27). Kafka's
+    /// `ConsumerCoordinator.OffsetCommitResponseHandler` raises
+    /// `RebalanceInProgressException` for these, and `commitOffsetsSync` does
+    /// not retry: the offsets are not committed, and the caller must call
+    /// `poll()` to finish the rebalance before it commits again.
+    #[error(
+        "offset commit cannot be completed since the consumer is undergoing a rebalance for group {0}: call poll() and retry"
+    )]
+    RebalanceInProgress(String),
+
+    /// A partition has no committed offset and `auto.offset.reset = none`.
+    /// Kafka never auto-resets under `none`
+    /// (`SubscriptionState.resetInitializingPositions`); it raises
+    /// `NoOffsetForPartitionException` from `poll()` and `position()` instead.
+    #[error(
+        "undefined offset with no reset policy for partitions: [{}]",
+        .0.iter().map(|(topic, partition)| format!("{topic}-{partition}")).collect::<Vec<_>>().join(", ")
+    )]
+    NoOffsetForPartition(BTreeSet<(String, i32)>),
 }
 
 impl ConsumerError {
+    /// A [`ConsumerError::Timeout`] with no cause.
+    pub(crate) fn timeout(message: impl Into<String>) -> Self {
+        Self::Timeout {
+            message: message.into(),
+            cause: None,
+        }
+    }
+
     /// Whether this is an `OffsetFetch` error that Kafka's consumer does not
     /// retry, so the application must see it.
     pub(crate) fn is_fatal_offset_fetch_error(&self) -> bool {
@@ -193,6 +231,11 @@ mod tests {
                 "offset commit failed: the consumer is not part of an active group; it is likely that the consumer was kicked out of the group",
             ),
             (
+                "rebalance in progress",
+                ConsumerError::RebalanceInProgress("group-a".into()),
+                "offset commit cannot be completed since the consumer is undergoing a rebalance for group group-a: call poll() and retry",
+            ),
+            (
                 "no current assignment",
                 ConsumerError::NoCurrentAssignment {
                     topic: "t".into(),
@@ -214,6 +257,14 @@ mod tests {
                     safe_offset: 42,
                 },
                 "log truncation detected on t-3: fetch offset 100 is past the leader's log; safe offset 42",
+            ),
+            (
+                "no offset for partition",
+                ConsumerError::NoOffsetForPartition(BTreeSet::from([
+                    ("orders".to_string(), 0),
+                    ("orders".to_string(), 1),
+                ])),
+                "undefined offset with no reset policy for partitions: [orders-0, orders-1]",
             ),
         ] {
             assert2::assert!(error.to_string() == expected);

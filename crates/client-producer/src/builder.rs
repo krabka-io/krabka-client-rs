@@ -41,7 +41,7 @@ use crate::{
     metadata_age::{
         DEFAULT_PRODUCER_METADATA_MAX_AGE, DEFAULT_PRODUCER_METADATA_MAX_IDLE, MetadataAge,
     },
-    partitioner::{BuiltInPartitioner, PartitionerConfig},
+    partitioner::{BuiltInPartitioner, Partitioner, PartitionerConfig},
     producer::{Acks, Producer, ProducerIdentity},
     sender,
     transactional::{TxnErrorSlot, TxnState},
@@ -144,6 +144,9 @@ pub const DEFAULT_PRODUCER_PARTITIONER_ADAPTIVE_PARTITIONING_ENABLE: bool = true
 /// `partitioner.availability.timeout.ms` default is 0, which turns the check
 /// off.
 pub const DEFAULT_PRODUCER_PARTITIONER_AVAILABILITY_TIMEOUT: Duration = Duration::ZERO;
+/// Default of `partitioner_rack_aware`. Kafka's `partitioner.rack.aware`
+/// default is `false`.
+pub const DEFAULT_PRODUCER_PARTITIONER_RACK_AWARE: bool = false;
 /// Default cross-partition in-flight request limit.
 pub const DEFAULT_PRODUCER_MAX_IN_FLIGHT: usize = 5;
 /// Default producer request timeout.
@@ -711,6 +714,339 @@ const PRODUCER_METADATA_SCOPE: krabka_client_core::MetadataScope =
         allow_auto_topic_creation: true,
     };
 
+/// The raw `Producer::start` builder arguments that configuration validation
+/// and derivation consume, before any connection is opened.
+struct RawProducerConfig<'a> {
+    client_id: Option<String>,
+    compression: Compression,
+    compression_gzip_level: i32,
+    compression_lz4_level: i32,
+    compression_zstd_level: i32,
+    enable_idempotence: Option<bool>,
+    acks: Acks,
+    linger: Duration,
+    batch_size: usize,
+    max_in_flight_per_connection: usize,
+    dns_timeout: Time,
+    dispatch_queue_capacity: usize,
+    frame_max: ByteSize,
+    request_timeout: Duration,
+    flush_timeout: Duration,
+    retries: i32,
+    retry_backoff: Duration,
+    retry_backoff_max: Duration,
+    delivery_timeout: Option<Duration>,
+    init_retry_timeout: Duration,
+    metadata_max_idle: Duration,
+    buffer_memory: usize,
+    max_request_size: usize,
+    metadata_recovery_rebootstrap_trigger: Time,
+    transactional_id: Option<&'a str>,
+    transaction_timeout: Option<Duration>,
+    transaction_two_phase_commit_enable: bool,
+}
+
+/// Config resolved and validated from a [`RawProducerConfig`], with Kafka's
+/// `ProducerConfig` rules (idempotence, throughput policy, retry policy,
+/// derived timeouts) applied.
+struct ResolvedProducerConfig {
+    client_id: String,
+    enable_idempotence: bool,
+    dns_timeout: ClientDnsTimeout,
+    dispatch_queue_capacity: ConnectionDispatchQueueCapacity,
+    frame_max: ClientFrameMax,
+    metadata_recovery_rebootstrap_trigger: krabka_client_core::MetadataRecoveryRebootstrapTrigger,
+    compression: Compression,
+    compression_levels: CompressionLevels,
+    linger: Time,
+    batch_size: usize,
+    max_in_flight_per_connection: usize,
+    buffer_pool: BufferPool,
+    max_request_size: usize,
+    retry_policy: ProducerRetryPolicy,
+    request_timeout: Time,
+    retries: i32,
+    retry_backoff: sender::RetryBackoff,
+    first_backoff: Time,
+    delivery_timeout: Time,
+    flush_timeout: ProducerFlushTimeout,
+}
+
+/// Validate a [`RawProducerConfig`] and derive the settings that shape the
+/// inner client, the sender's throughput and retries, and the transaction
+/// timeout, applying Kafka's `ProducerConfig` rules.
+///
+/// # Errors
+/// Returns an error when any raw builder argument violates those rules.
+fn resolve_producer_config(
+    raw: RawProducerConfig<'_>,
+) -> Result<ResolvedProducerConfig, ProducerError> {
+    let enable_idempotence = resolve_idempotence(
+        raw.enable_idempotence,
+        raw.acks,
+        raw.retries,
+        raw.max_in_flight_per_connection,
+        raw.transactional_id,
+    )?;
+    let client_id = resolve_client_id(raw.client_id, raw.transactional_id);
+    crate::metadata_age::validate_metadata_max_idle(raw.metadata_max_idle)?;
+    let transaction_timeout = resolve_transaction_timeout(
+        raw.transaction_two_phase_commit_enable,
+        raw.transaction_timeout,
+        raw.transactional_id,
+    )?;
+    let dns_timeout =
+        ClientDnsTimeout::new(raw.dns_timeout).map_err(ProducerError::InvalidConfig)?;
+    let dispatch_queue_capacity = ConnectionDispatchQueueCapacity::new(raw.dispatch_queue_capacity)
+        .map_err(ProducerError::InvalidConfig)?;
+    let frame_max =
+        ClientFrameMax::try_from(raw.frame_max).map_err(ProducerError::InvalidConfig)?;
+    let metadata_recovery_rebootstrap_trigger =
+        krabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
+            raw.metadata_recovery_rebootstrap_trigger,
+        )
+        .map_err(ProducerError::InvalidConfig)?;
+    let throughput_policy = ProducerThroughputPolicy::new(
+        raw.compression,
+        raw.linger,
+        raw.batch_size,
+        raw.max_in_flight_per_connection,
+    )
+    .map_err(ProducerError::InvalidConfig)?;
+    let compression = throughput_policy.compression();
+    let compression_levels = CompressionLevels::new(
+        raw.compression_gzip_level,
+        raw.compression_lz4_level,
+        raw.compression_zstd_level,
+    )
+    .map_err(ProducerError::InvalidConfig)?;
+    let linger = throughput_policy.linger().as_time();
+    let batch_size = throughput_policy.batch_bytes();
+    let max_in_flight_per_connection = throughput_policy.max_in_flight();
+    let buffer_pool =
+        BufferPool::new(raw.buffer_memory, batch_size).map_err(ProducerError::InvalidConfig)?;
+    let max_request_size = validated_max_request_size(raw.max_request_size)?;
+
+    let retry_policy = ProducerRetryPolicy::new(
+        raw.request_timeout,
+        raw.retries,
+        raw.retry_backoff,
+        raw.retry_backoff_max,
+        raw.init_retry_timeout,
+        transaction_timeout,
+    )
+    .map_err(ProducerError::InvalidConfig)?;
+    let delivery_timeout = resolve_delivery_timeout(
+        raw.delivery_timeout,
+        throughput_policy.linger(),
+        retry_policy.request_timeout(),
+    )
+    .map_err(ProducerError::InvalidConfig)?;
+    // The validated retry policy derives `Eq`, so it holds `Duration`s; the
+    // domain past this point holds quantities.
+    let request_timeout = retry_policy.request_timeout().as_time();
+    let retries = retry_policy.retries();
+    let retry_backoff = sender::RetryBackoff::new(
+        retry_policy.retry_backoff(),
+        retry_policy.retry_backoff_max(),
+    );
+    let first_backoff = retry_policy.first_backoff();
+    let flush_timeout =
+        ProducerFlushTimeout::new(raw.flush_timeout).map_err(ProducerError::InvalidConfig)?;
+
+    Ok(ResolvedProducerConfig {
+        client_id,
+        enable_idempotence,
+        dns_timeout,
+        dispatch_queue_capacity,
+        frame_max,
+        metadata_recovery_rebootstrap_trigger,
+        compression,
+        compression_levels,
+        linger,
+        batch_size,
+        max_in_flight_per_connection,
+        buffer_pool,
+        max_request_size,
+        retry_policy,
+        request_timeout,
+        retries,
+        retry_backoff,
+        first_backoff,
+        delivery_timeout: delivery_timeout.as_time(),
+        flush_timeout,
+    })
+}
+
+/// Inputs to [`spawn_producer_runtime`]: the settings needed to build the
+/// `Arc`-wrapped state that `Producer` shares with its sender task, and to
+/// spawn the background tasks that drive it.
+#[derive(Clone, Copy)]
+struct RuntimeInputs<'a> {
+    retry_policy: ProducerRetryPolicy,
+    metadata_max_age: Duration,
+    metadata_max_idle: Duration,
+    batch_size: usize,
+    partitioner_ignore_keys: bool,
+    partitioner_adaptive_partitioning_enable: bool,
+    partitioner_availability_timeout: Duration,
+    partitioner_rack_aware: bool,
+    producer_id: i64,
+    producer_epoch: i16,
+    acks: Acks,
+    compression: Compression,
+    compression_levels: CompressionLevels,
+    linger: Time,
+    retries: i32,
+    retry_backoff: sender::RetryBackoff,
+    delivery_timeout: Time,
+    max_in_flight_per_connection: usize,
+    transactional_id: Option<&'a str>,
+}
+
+/// The `Arc`-wrapped state that `Producer` shares with its sender task, and
+/// the handle of the sender task itself.
+struct ProducerRuntime {
+    wake_tx: mpsc::Sender<sender::DrainIntent>,
+    shutdown: CancellationToken,
+    state: Arc<AtomicU8>,
+    metadata_cache: Arc<Mutex<HashMap<String, crate::producer::TopicMetadata>>>,
+    metadata_refresh: Arc<crate::metadata_wait::MetadataRefresh>,
+    partition_leaders: Arc<DashMap<(String, i32), i32>>,
+    accumulators: crate::accumulator::AccumulatorMap,
+    next_seq: Arc<DashMap<(String, i32), i32>>,
+    partitioner: Arc<BuiltInPartitioner>,
+    flush_notify: Arc<Notify>,
+    in_flight: Arc<AtomicUsize>,
+    producer_epoch: Arc<AtomicI16>,
+    txn_state: Arc<Mutex<TxnState>>,
+    txn_recovery_required: Arc<AtomicBool>,
+    txn_recovery_generation: Arc<AtomicU64>,
+    txn_guard_generation: Arc<AtomicU64>,
+    txn_pid_epoch: Arc<Mutex<(i64, i16)>>,
+    prepared_transaction_state: Arc<Mutex<Option<crate::transactional::PreparedTransactionState>>>,
+    txn_error: Arc<TxnErrorSlot>,
+    transaction_v2: Arc<AtomicBool>,
+    sender_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Build the shared state of a [`ProducerRuntime`] and spawn the metadata-age
+/// and sender background tasks that drive it.
+fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> ProducerRuntime {
+    let RuntimeInputs {
+        retry_policy,
+        metadata_max_age,
+        metadata_max_idle,
+        batch_size,
+        partitioner_ignore_keys,
+        partitioner_adaptive_partitioning_enable,
+        partitioner_availability_timeout,
+        partitioner_rack_aware,
+        producer_id,
+        producer_epoch,
+        acks,
+        compression,
+        compression_levels,
+        linger,
+        retries,
+        retry_backoff,
+        delivery_timeout,
+        max_in_flight_per_connection,
+        transactional_id,
+    } = inputs;
+
+    let (wake_tx, wake_rx) = mpsc::channel(SENDER_WAKE_CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
+    let state = Arc::new(AtomicU8::new(0));
+    let metadata_cache = Arc::new(Mutex::new(HashMap::new()));
+    let partition_leaders = Arc::new(DashMap::new());
+    let accumulators = Arc::new(DashMap::new());
+    let next_seq = Arc::new(DashMap::new());
+    let partitioner = Arc::new(BuiltInPartitioner::new(PartitionerConfig {
+        sticky_batch_size: batch_size,
+        ignore_keys: partitioner_ignore_keys,
+        adaptive_partitioning: partitioner_adaptive_partitioning_enable,
+        availability_timeout: partitioner_availability_timeout,
+        rack_aware: partitioner_rack_aware,
+    }));
+    let flush_notify = Arc::new(Notify::new());
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let producer_epoch = Arc::new(AtomicI16::new(producer_epoch));
+
+    let txn_state = Arc::new(Mutex::new(TxnState::Uninitialized));
+    let txn_recovery_required = Arc::new(AtomicBool::new(false));
+    let txn_recovery_generation = Arc::new(AtomicU64::new(0));
+    let txn_guard_generation = Arc::new(AtomicU64::new(0));
+    let txn_pid_epoch = Arc::new(Mutex::new(initial_txn_pid_epoch()));
+    let prepared_transaction_state = Arc::new(Mutex::new(None));
+    let txn_error = Arc::new(TxnErrorSlot::default());
+    let transaction_v2 = Arc::new(AtomicBool::new(false));
+
+    let metadata_refresh = Arc::new(crate::metadata_wait::MetadataRefresh::default());
+    MetadataAge::new(client, &retry_policy)
+        .with_ages(metadata_max_age, metadata_max_idle)
+        .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
+        .with_queues((&accumulators, &in_flight))
+        .spawn(shutdown.clone());
+    let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
+        transport: Box::new(ClientTransport::new(
+            client.clone(),
+            Arc::clone(&transaction_v2),
+        )),
+        producer_id,
+        producer_epoch: Arc::clone(&producer_epoch),
+        acks,
+        compression,
+        compression_level: compression_levels.level(compression),
+        linger,
+        request_timeout_ms: retry_policy.request_timeout_ms(),
+        retries,
+        retry_backoff,
+        delivery_timeout,
+        max_in_flight: max_in_flight_per_connection,
+        metadata_cache: Arc::clone(&metadata_cache),
+        partition_leaders: Arc::clone(&partition_leaders),
+        partitioner: Arc::clone(&partitioner),
+        accumulators: Arc::clone(&accumulators),
+        next_seq: Arc::clone(&next_seq),
+        state: Arc::clone(&state),
+        wake_rx,
+        flush_notify: Arc::clone(&flush_notify),
+        in_flight: Arc::clone(&in_flight),
+        shutdown: shutdown.clone(),
+        transactional_id: transactional_id.map(str::to_owned),
+        txn_state: Arc::clone(&txn_state),
+        txn_pid_epoch: Arc::clone(&txn_pid_epoch),
+        txn_recovery_required: Arc::clone(&txn_recovery_required),
+        txn_recovery_generation: Arc::clone(&txn_recovery_generation),
+        txn_error: Arc::clone(&txn_error),
+    }));
+
+    ProducerRuntime {
+        wake_tx,
+        shutdown,
+        state,
+        metadata_cache,
+        metadata_refresh,
+        partition_leaders,
+        accumulators,
+        next_seq,
+        partitioner,
+        flush_notify,
+        in_flight,
+        producer_epoch,
+        txn_state,
+        txn_recovery_required,
+        txn_recovery_generation,
+        txn_guard_generation,
+        txn_pid_epoch,
+        prepared_transaction_state,
+        txn_error,
+        transaction_v2,
+        sender_handle,
+    }
+}
+
 #[bon::bon]
 impl Producer {
     /// Build a [`Producer`] pointed at the given bootstrap address.
@@ -723,10 +1059,11 @@ impl Producer {
     /// idempotent producer accepts at most 5 in-flight requests per
     /// connection, and a `transactional_id` requires idempotence.
     ///
-    /// The builder has no `enable_metrics_push` option. The producer does not
-    /// push client metrics (KIP-714), so it never sends
-    /// `GetTelemetrySubscriptions` or `PushTelemetry`. Kafka's
-    /// `enable.metrics.push` is `true` by default.
+    /// `enable_metrics_push` (Kafka's `enable.metrics.push`, default `true`)
+    /// pushes the client metrics that a broker's client metrics subscription
+    /// names (KIP-714), with a terminating push on close. When it is `false`,
+    /// the producer sends neither `GetTelemetrySubscriptions` nor
+    /// `PushTelemetry`.
     ///
     /// `send` fails a record whose serialized size is larger than
     /// `max_request_size` (default 1 MiB, Kafka's `max.request.size`) or
@@ -777,6 +1114,13 @@ impl Producer {
         partitioner_adaptive_partitioning_enable: bool,
         #[builder(default = DEFAULT_PRODUCER_PARTITIONER_AVAILABILITY_TIMEOUT)]
         partitioner_availability_timeout: Duration,
+        /// Kafka's `partitioner.class`. Set, `send` calls it instead of the
+        /// built-in partitioner for a record with no explicit partition, and
+        /// adaptive partitioning turns off. See
+        /// [`Partitioner`](crate::partitioner::Partitioner).
+        partitioner: Option<Arc<dyn Partitioner>>,
+        #[builder(into)] client_rack: Option<String>,
+        #[builder(default = DEFAULT_PRODUCER_PARTITIONER_RACK_AWARE)] partitioner_rack_aware: bool,
         #[builder(default = DEFAULT_CLIENT_DNS_TIMEOUT)] dns_timeout: Time,
         #[builder(default = DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
@@ -802,79 +1146,63 @@ impl Producer {
         transaction_timeout: Option<Duration>,
         #[builder(default)] transaction_two_phase_commit_enable: bool,
         security: Option<krabka_client_core::security::ClientSecurity>,
+        #[builder(default = true)] enable_metrics_push: bool,
     ) -> Result<Self, ProducerError> {
-        let enable_idempotence = resolve_idempotence(
-            enable_idempotence,
-            acks,
-            retries,
-            max_in_flight_per_connection,
-            transactional_id.as_deref(),
-        )?;
-        let client_id = resolve_client_id(client_id, transactional_id.as_deref());
-        crate::metadata_age::validate_metadata_max_idle(metadata_max_idle)?;
-        let transaction_timeout = resolve_transaction_timeout(
-            transaction_two_phase_commit_enable,
-            transaction_timeout,
-            transactional_id.as_deref(),
-        )?;
-        let dns_timeout =
-            ClientDnsTimeout::new(dns_timeout).map_err(ProducerError::InvalidConfig)?;
-        let dispatch_queue_capacity = ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
-            .map_err(ProducerError::InvalidConfig)?;
-        let frame_max =
-            ClientFrameMax::try_from(frame_max).map_err(ProducerError::InvalidConfig)?;
-        let metadata_recovery_rebootstrap_trigger =
-            krabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
-                metadata_recovery_rebootstrap_trigger,
+        let telemetry = enable_metrics_push.then(|| {
+            krabka_client_core::telemetry::ClientTelemetryConfig::producer(
+                transactional_id.as_deref(),
             )
-            .map_err(ProducerError::InvalidConfig)?;
-        let throughput_policy = ProducerThroughputPolicy::new(
+        });
+        let ResolvedProducerConfig {
+            client_id,
+            enable_idempotence,
+            dns_timeout,
+            dispatch_queue_capacity,
+            frame_max,
+            metadata_recovery_rebootstrap_trigger,
             compression,
+            compression_levels,
             linger,
             batch_size,
             max_in_flight_per_connection,
-        )
-        .map_err(ProducerError::InvalidConfig)?;
-        let compression = throughput_policy.compression();
-        let compression_levels = CompressionLevels::new(
-            compression_gzip_level,
-            compression_lz4_level,
-            compression_zstd_level,
-        )
-        .map_err(ProducerError::InvalidConfig)?;
-        let linger = throughput_policy.linger().as_time();
-        let batch_size = throughput_policy.batch_bytes();
-        let max_in_flight_per_connection = throughput_policy.max_in_flight();
-        let buffer_pool =
-            BufferPool::new(buffer_memory, batch_size).map_err(ProducerError::InvalidConfig)?;
-        let max_request_size = validated_max_request_size(max_request_size)?;
-
-        let retry_policy = ProducerRetryPolicy::new(
+            buffer_pool,
+            max_request_size,
+            retry_policy,
             request_timeout,
             retries,
             retry_backoff,
-            retry_backoff_max,
-            init_retry_timeout,
-            transaction_timeout,
-        )
-        .map_err(ProducerError::InvalidConfig)?;
-        let delivery_timeout = resolve_delivery_timeout(
+            first_backoff,
             delivery_timeout,
-            throughput_policy.linger(),
-            retry_policy.request_timeout(),
-        )
-        .map_err(ProducerError::InvalidConfig)?;
-        // The validated retry policy derives `Eq`, so it holds `Duration`s;
-        // the domain past this point holds quantities.
-        let request_timeout = retry_policy.request_timeout().as_time();
-        let retries = retry_policy.retries();
-        let retry_backoff = sender::RetryBackoff::new(
-            retry_policy.retry_backoff(),
-            retry_policy.retry_backoff_max(),
-        );
-        let first_backoff = retry_policy.first_backoff();
-        let flush_timeout =
-            ProducerFlushTimeout::new(flush_timeout).map_err(ProducerError::InvalidConfig)?;
+            flush_timeout,
+        } = resolve_producer_config(RawProducerConfig {
+            client_id,
+            compression,
+            compression_gzip_level,
+            compression_lz4_level,
+            compression_zstd_level,
+            enable_idempotence,
+            acks,
+            linger,
+            batch_size,
+            max_in_flight_per_connection,
+            dns_timeout,
+            dispatch_queue_capacity,
+            frame_max,
+            request_timeout,
+            flush_timeout,
+            retries,
+            retry_backoff,
+            retry_backoff_max,
+            delivery_timeout,
+            init_retry_timeout,
+            metadata_max_idle,
+            buffer_memory,
+            max_request_size,
+            metadata_recovery_rebootstrap_trigger,
+            transactional_id: transactional_id.as_deref(),
+            transaction_timeout,
+            transaction_two_phase_commit_enable,
+        })?;
 
         // 1. Build inner client. `security` is cloned (not moved) so it can be
         //    retained on the `Producer` and reused for the secondary
@@ -891,6 +1219,7 @@ impl Producer {
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
             .maybe_security(security.clone())
             .metadata_scope(PRODUCER_METADATA_SCOPE)
+            .maybe_telemetry(telemetry)
             .build()
             .await?;
 
@@ -918,72 +1247,58 @@ impl Producer {
             disabled_idempotence_identity()
         };
 
-        // 3. Spawn the sender.
-        let (wake_tx, wake_rx) = mpsc::channel(SENDER_WAKE_CHANNEL_CAPACITY);
-        let shutdown = CancellationToken::new();
-        let state = Arc::new(AtomicU8::new(0));
-        let metadata_cache = Arc::new(Mutex::new(HashMap::new()));
-        let partition_leaders = Arc::new(DashMap::new());
-        let accumulators = Arc::new(DashMap::new());
-        let next_seq = Arc::new(DashMap::new());
-        let partitioner = Arc::new(BuiltInPartitioner::new(PartitionerConfig {
-            sticky_batch_size: batch_size,
-            ignore_keys: partitioner_ignore_keys,
-            adaptive_partitioning: partitioner_adaptive_partitioning_enable,
-            availability_timeout: partitioner_availability_timeout,
-        }));
-        let flush_notify = Arc::new(Notify::new());
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let producer_epoch = Arc::new(AtomicI16::new(producer_epoch));
-
-        let txn_state = Arc::new(Mutex::new(TxnState::Uninitialized));
-        let txn_recovery_required = Arc::new(AtomicBool::new(false));
-        let txn_recovery_generation = Arc::new(AtomicU64::new(0));
-        let txn_guard_generation = Arc::new(AtomicU64::new(0));
-        let txn_pid_epoch = Arc::new(Mutex::new(initial_txn_pid_epoch()));
-        let prepared_transaction_state = Arc::new(Mutex::new(None));
-        let txn_error = Arc::new(TxnErrorSlot::default());
-        let transaction_v2 = Arc::new(AtomicBool::new(false));
-
-        let metadata_refresh = Arc::new(crate::metadata_wait::MetadataRefresh::default());
-        MetadataAge::new(&client, &retry_policy)
-            .with_ages(metadata_max_age, metadata_max_idle)
-            .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
-            .with_queues((&accumulators, &in_flight))
-            .spawn(shutdown.clone());
-        let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
-            transport: Box::new(ClientTransport::new(
-                client.clone(),
-                Arc::clone(&transaction_v2),
-            )),
-            producer_id,
-            producer_epoch: Arc::clone(&producer_epoch),
-            acks,
-            compression,
-            compression_level: compression_levels.level(compression),
-            linger,
-            request_timeout_ms: retry_policy.request_timeout_ms(),
-            retries,
-            retry_backoff,
-            delivery_timeout: delivery_timeout.as_time(),
-            max_in_flight: max_in_flight_per_connection,
-            metadata_cache: Arc::clone(&metadata_cache),
-            partition_leaders: Arc::clone(&partition_leaders),
-            partitioner: Arc::clone(&partitioner),
-            accumulators: Arc::clone(&accumulators),
-            next_seq: Arc::clone(&next_seq),
-            state: Arc::clone(&state),
-            wake_rx,
-            flush_notify: Arc::clone(&flush_notify),
-            in_flight: Arc::clone(&in_flight),
-            shutdown: shutdown.clone(),
-            transactional_id: transactional_id.clone(),
-            txn_state: Arc::clone(&txn_state),
-            txn_pid_epoch: Arc::clone(&txn_pid_epoch),
-            txn_recovery_required: Arc::clone(&txn_recovery_required),
-            txn_recovery_generation: Arc::clone(&txn_recovery_generation),
-            txn_error: Arc::clone(&txn_error),
-        }));
+        // 3. Spawn the sender. The runtime binds the built-in partitioner to
+        //    `partitioner`, so the `partitioner.class` plugin moves aside first.
+        let partitioner_plugin = partitioner;
+        let ProducerRuntime {
+            wake_tx,
+            shutdown,
+            state,
+            metadata_cache,
+            metadata_refresh,
+            partition_leaders,
+            accumulators,
+            next_seq,
+            partitioner,
+            flush_notify,
+            in_flight,
+            producer_epoch,
+            txn_state,
+            txn_recovery_required,
+            txn_recovery_generation,
+            txn_guard_generation,
+            txn_pid_epoch,
+            prepared_transaction_state,
+            txn_error,
+            transaction_v2,
+            sender_handle,
+        } = spawn_producer_runtime(
+            &client,
+            RuntimeInputs {
+                retry_policy,
+                metadata_max_age,
+                metadata_max_idle,
+                batch_size,
+                partitioner_ignore_keys,
+                // Kafka's constructor: `enableAdaptivePartitioning =
+                // partitionerPlugin.get() == null && ...`.
+                partitioner_adaptive_partitioning_enable: partitioner_adaptive_partitioning_enable
+                    && partitioner_plugin.is_none(),
+                partitioner_availability_timeout,
+                partitioner_rack_aware,
+                producer_id,
+                producer_epoch,
+                acks,
+                compression,
+                compression_levels,
+                linger,
+                retries,
+                retry_backoff,
+                delivery_timeout,
+                max_in_flight_per_connection,
+                transactional_id: transactional_id.as_deref(),
+            },
+        );
 
         Ok(Producer {
             client,
@@ -1009,9 +1324,12 @@ impl Producer {
             metadata_cache,
             metadata_refresh,
             partition_leaders,
+            broker_racks: Arc::new(DashMap::new()),
             accumulators,
             next_seq,
             partitioner,
+            custom_partitioner: partitioner_plugin,
+            client_rack,
             state,
             wake_tx,
             flush_notify,

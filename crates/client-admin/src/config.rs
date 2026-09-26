@@ -24,6 +24,8 @@ pub const DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT: Time = secs(10);
 pub const DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX: Time = secs(30);
 /// Kafka's admin client `connections.max.idle.ms` default (5 minutes).
 pub const DEFAULT_ADMIN_CONNECTIONS_MAX_IDLE: Time = krabka_units::minutes(5);
+/// Kafka's `enable.metrics.push` default.
+pub const DEFAULT_ENABLE_METRICS_PUSH: bool = true;
 
 /// `CommonClientConfigs.RETRY_BACKOFF_JITTER`.
 const RETRY_BACKOFF_JITTER: f64 = 0.2;
@@ -74,6 +76,12 @@ pub struct AdminClientConfig {
     pub metadata_recovery_strategy: MetadataRecoveryStrategy,
     /// `metadata.recovery.rebootstrap.trigger.ms` (KIP-1102).
     pub metadata_recovery_rebootstrap_trigger: Time,
+    /// `enable.metrics.push` (KIP-714, default `true`): push the client
+    /// metrics that a broker's client metrics subscription names, with a
+    /// terminating push on close. When it is `false`, the client sends
+    /// neither `GetTelemetrySubscriptions` nor `PushTelemetry`, and
+    /// `client_instance_id` fails.
+    pub enable_metrics_push: bool,
 }
 
 impl Default for AdminClientConfig {
@@ -92,6 +100,7 @@ impl Default for AdminClientConfig {
             security: None,
             metadata_recovery_strategy: MetadataRecoveryStrategy::default(),
             metadata_recovery_rebootstrap_trigger: DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
+            enable_metrics_push: DEFAULT_ENABLE_METRICS_PUSH,
         }
     }
 }
@@ -103,6 +112,7 @@ pub(crate) struct ResolvedAdminConfig {
     pub(crate) retry: RetryPolicy,
     pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
     pub(crate) metadata_recovery_rebootstrap_trigger: Time,
+    pub(crate) enable_metrics_push: bool,
 }
 
 impl AdminClientConfig {
@@ -175,6 +185,7 @@ impl AdminClientConfig {
             },
             metadata_recovery_strategy: self.metadata_recovery_strategy,
             metadata_recovery_rebootstrap_trigger: self.metadata_recovery_rebootstrap_trigger,
+            enable_metrics_push: self.enable_metrics_push,
         })
     }
 }
