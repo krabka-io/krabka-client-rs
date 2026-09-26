@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 use krabka_client_core::{Connection, telemetry::TelemetryConnections};
+use krabka_units::Time;
 
-use crate::{AdminClient, RecoveringConnection};
+use crate::{AdminClient, AdminError, RecoveringConnection};
 
 /// The connection that the admin client's reporter sends on. It has no
 /// broker id in the metadata, so the reporter sees it as `-1`, as a
@@ -26,6 +27,34 @@ impl TelemetryConnections for AdminTelemetryConnection {
 }
 
 impl AdminClient {
+    /// The client instance id that the broker assigned for metrics push
+    /// (KIP-714), as Kafka's `KafkaAdminClient.clientInstanceId` returns it.
+    ///
+    /// The call waits up to `timeout` for the first
+    /// `GetTelemetrySubscriptions` response. It returns `Ok(None)` when none
+    /// has come by then, as Kafka returns `null`. A zero `timeout` does not
+    /// wait.
+    ///
+    /// # Errors
+    /// Returns [`AdminError::Transport`] with
+    /// [`ClientError::InvalidArgument`] for a negative `timeout`, and with
+    /// [`ClientError::TelemetryDisabled`] when
+    /// [`AdminClientConfig::enable_metrics_push`] is `false`, as Kafka throws
+    /// an `IllegalArgumentException` and an `IllegalStateException`.
+    ///
+    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
+    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
+    /// [`AdminClientConfig::enable_metrics_push`]: crate::AdminClientConfig::enable_metrics_push
+    pub async fn client_instance_id(
+        &self,
+        timeout: Time,
+    ) -> Result<Option<uuid::Uuid>, AdminError> {
+        Ok(
+            krabka_client_core::telemetry::client_instance_id(self.telemetry.as_ref(), timeout)
+                .await?,
+        )
+    }
+
     /// Close the client: send the terminating telemetry push (KIP-714), if
     /// the client pushes metrics and has a subscription, and wait for it, as
     /// Kafka's `KafkaAdminClient.close` does. The wait is at most about two
@@ -181,10 +210,15 @@ mod tests {
 
     /// Kafka's admin client with `enable.metrics.push`: it asks for the
     /// subscription, pushes the subscribed metrics (its one open
-    /// connection), and sends a terminating push on close. With the setting
-    /// off, or with a broker without KIP-714, it sends no telemetry request.
+    /// connection), returns the assigned id from `clientInstanceId`, and
+    /// sends a terminating push on close. With the setting off, or with a
+    /// broker without KIP-714, it sends no telemetry request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn admin_client_pushes_metrics() {
+    async fn admin_client_pushes_metrics_and_reports_its_instance_id() {
+        let disabled =
+            "client-core: Telemetry is not enabled. Set config `enable.metrics.push` to \
+                        `true`."
+                .to_owned();
         let push = |terminating| Seen::Push {
             client_instance_id: INSTANCE,
             terminating,
@@ -196,12 +230,21 @@ mod tests {
                 true,
                 true,
                 2,
+                Ok(Some(uuid::Uuid::from_bytes(INSTANCE.0))),
                 vec![Seen::Subscriptions(WireUuid::ZERO), push(false), push(true)],
             ),
-            ("enable.metrics.push=false", false, true, 0, vec![]),
-            ("broker without KIP-714", true, false, 0, vec![]),
+            (
+                "enable.metrics.push=false",
+                false,
+                true,
+                0,
+                Err(disabled),
+                vec![],
+            ),
+            ("broker without KIP-714", true, false, 0, Ok(None), vec![]),
         ];
-        for (name, enable_metrics_push, advertise_telemetry, count, expected) in cases {
+        for (name, enable_metrics_push, advertise_telemetry, count, expected_id, expected) in cases
+        {
             let (broker, mut seen) = start_broker(advertise_telemetry).await;
             let admin = crate::AdminClient::connect_with_config(
                 &[broker.addr.to_string()],
@@ -212,13 +255,18 @@ mod tests {
             )
             .await
             .expect("admin connects");
+            let timeout = if count == 0 {
+                krabka_units::millis(300)
+            } else {
+                krabka_units::secs(10)
+            };
+            let id = admin
+                .client_instance_id(timeout)
+                .await
+                .map_err(|error| error.to_string());
             let mut requests = Vec::new();
             for _ in 0..count {
                 requests.push(next(&mut seen).await);
-            }
-            if count == 0 {
-                // Nothing should arrive: give the reporter time to send.
-                tokio::time::sleep(Duration::from_millis(300)).await;
             }
             tokio::time::timeout(Duration::from_secs(20), admin.close())
                 .await
@@ -227,7 +275,7 @@ mod tests {
             while let Ok(request) = seen.try_recv() {
                 requests.push(request);
             }
-            assert!(requests == expected, "{name}");
+            assert!((id, requests) == (expected_id, expected), "{name}");
         }
     }
 }

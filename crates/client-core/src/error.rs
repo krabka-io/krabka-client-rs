@@ -58,6 +58,17 @@ pub enum ClientError {
     #[error("invalid client configuration: {0}")]
     InvalidConfig(String),
 
+    /// An argument of a call is invalid, as Kafka's clients throw an
+    /// `IllegalArgumentException`.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// The client does not push metrics (`enable_metrics_push` is `false`),
+    /// so it has no client instance id. Kafka's clients throw an
+    /// `IllegalStateException` with this message from `clientInstanceId`.
+    #[error("Telemetry is not enabled. Set config `enable.metrics.push` to `true`.")]
+    TelemetryDisabled,
+
     #[error("request timed out after {}", .0.human())]
     Timeout(Time),
 

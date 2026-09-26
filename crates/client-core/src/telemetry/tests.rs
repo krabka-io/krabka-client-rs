@@ -417,3 +417,58 @@ async fn push_errors_refetch_the_subscription_or_stop() {
         assert!(seen == expected, "{error_code}");
     }
 }
+
+/// Kafka's `clientInstanceId`: the broker-assigned id once a subscription
+/// loads, `null` when none loads within the timeout, and an
+/// `IllegalStateException` with `enable.metrics.push=false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_instance_id_waits_for_the_subscription() {
+    let instance = uuid::Uuid::from_bytes(INSTANCE.0);
+    let disabled = "Telemetry is not enabled. Set config `enable.metrics.push` to `true`.";
+    let cases = [
+        (
+            "subscription",
+            true,
+            Some(producer()),
+            krabka_units::secs(10),
+            Ok(Some(instance)),
+        ),
+        (
+            "broker without KIP-714",
+            false,
+            Some(producer()),
+            krabka_units::millis(200),
+            Ok(None),
+        ),
+        (
+            "enable.metrics.push=false",
+            true,
+            None,
+            krabka_units::secs(10),
+            Err(disabled.to_owned()),
+        ),
+        (
+            "negative timeout",
+            true,
+            Some(producer()),
+            -krabka_units::millis(1),
+            Err("invalid argument: The timeout cannot be negative.".to_owned()),
+        ),
+    ];
+    for (name, advertise_telemetry, telemetry, timeout, expected) in cases {
+        let (broker, _seen) = start_broker(BrokerScript {
+            advertise_telemetry,
+            subscription: subscription(&[PREFIX], vec![]),
+            push_errors: vec![],
+        })
+        .await;
+        let client = client(&broker, telemetry).await;
+        let id = client
+            .client_instance_id(timeout)
+            .await
+            .map_err(|error| error.to_string());
+        client.close();
+        broker.stop();
+        assert!(id == expected, "{name}");
+    }
+}

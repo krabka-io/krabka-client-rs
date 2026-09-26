@@ -585,6 +585,30 @@ impl ShareConsumer {
         self.client.close_telemetry().await;
         Ok(())
     }
+
+    /// The client instance id that the broker assigned for metrics push
+    /// (KIP-714), as Kafka's `KafkaShareConsumer.clientInstanceId` returns
+    /// it.
+    ///
+    /// The call waits up to `timeout` for the first
+    /// `GetTelemetrySubscriptions` response. It returns `Ok(None)` when none
+    /// has come by then, as Kafka returns `null`. A zero `timeout` does not
+    /// wait.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::TelemetryDisabled`] when `enable_metrics_push`
+    /// is `false`, and [`ClientError::InvalidArgument`] for a negative
+    /// `timeout`, as Kafka throws an `IllegalStateException` and an
+    /// `IllegalArgumentException`.
+    ///
+    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
+    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
+    pub async fn client_instance_id(
+        &self,
+        timeout: Time,
+    ) -> Result<Option<uuid::Uuid>, ConsumerError> {
+        Ok(self.client.client_instance_id(timeout).await?)
+    }
 }
 
 #[cfg(test)]

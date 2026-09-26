@@ -313,6 +313,22 @@ impl Client {
         }
     }
 
+    /// The client instance id that the broker assigned for metrics push
+    /// (KIP-714), waiting up to `timeout` for the first subscription, as
+    /// Kafka's `clientInstanceId` does. `Ok(None)` when no subscription has
+    /// loaded by then, as Kafka returns `null`.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::InvalidArgument`] for a negative `timeout`, and
+    /// [`ClientError::TelemetryDisabled`] for a client that does not push
+    /// metrics.
+    pub async fn client_instance_id(
+        &self,
+        timeout: Time,
+    ) -> Result<Option<uuid::Uuid>, ClientError> {
+        crate::telemetry::client_instance_id(self.telemetry.as_deref(), timeout).await
+    }
+
     /// Send a request that has no fixed target broker.
     ///
     /// Before the first metadata response, the request goes to a bootstrap

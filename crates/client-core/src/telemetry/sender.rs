@@ -182,6 +182,14 @@ impl TelemetrySender {
         self.state
     }
 
+    /// The client instance id of the last subscription, `None` before the
+    /// first one loads (`subscription.clientInstanceId()`).
+    pub(crate) fn client_instance_id(&self) -> Option<Uuid> {
+        self.subscription
+            .as_ref()
+            .map(|subscription| subscription.client_instance_id)
+    }
+
     /// The wait before [`create_request`](Self::create_request), or `None`
     /// when no request will follow (`timeToNextUpdate`).
     pub(crate) fn time_to_next_update(

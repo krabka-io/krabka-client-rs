@@ -36,6 +36,7 @@ refined_type = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 # `mock` exposes MockBroker so the ClientTransport adapter can be tested against

@@ -30,7 +30,8 @@ mod sender;
 use std::{sync::Arc, time::Duration};
 
 use krabka_protocol::ProtocolRequest;
-use tokio::time::Instant;
+use krabka_units::{Time, convert::TimeExt as _};
+use tokio::{sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use self::metrics::ConnectionMetrics;
@@ -160,6 +161,9 @@ pub struct TelemetryTiming {
 pub struct ClientTelemetry {
     close: CancellationToken,
     done: CancellationToken,
+    /// The client instance id of the last subscription, `None` until the
+    /// first one loads. The reporter task publishes it.
+    instance_id: Arc<watch::Sender<Option<uuid::Uuid>>>,
 }
 
 impl ClientTelemetry {
@@ -177,15 +181,33 @@ impl ClientTelemetry {
     ) -> Self {
         let close = CancellationToken::new();
         let done = CancellationToken::new();
+        let instance_id = Arc::new(watch::Sender::new(None));
         let sender = TelemetrySender::new(Collector::new(metrics, config.resource()));
         tokio::spawn(run(
             connections,
             sender,
             timing,
-            close.clone(),
-            done.clone(),
+            Arc::clone(&instance_id),
+            (close.clone(), done.clone()),
         ));
-        Self { close, done }
+        Self {
+            close,
+            done,
+            instance_id,
+        }
+    }
+
+    /// The client instance id that the broker assigned, waiting up to
+    /// `timeout` for the first subscription to load. `None` when none has
+    /// loaded by then, as Kafka's `ClientTelemetrySender.clientInstanceId`
+    /// returns an empty `Optional`. A zero `timeout` does not wait.
+    pub async fn client_instance_id(&self, timeout: Duration) -> Option<uuid::Uuid> {
+        let mut loaded = self.instance_id.subscribe();
+        tokio::time::timeout(timeout, loaded.wait_for(Option::is_some))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|id| *id)
     }
 
     /// Send the terminating push, if the client has a subscription, and wait
@@ -204,14 +226,37 @@ impl Drop for ClientTelemetry {
     }
 }
 
+/// Kafka's `clientInstanceId` of a producer, consumer or admin client
+/// (`ClientTelemetryUtils.fetchClientInstanceId`): the broker-assigned
+/// client instance id, waiting up to `timeout` for the first subscription.
+/// `Ok(None)` when none has loaded by then, as Kafka returns `null`.
+///
+/// # Errors
+/// Returns [`ClientError::InvalidArgument`] for a negative or non-finite
+/// `timeout`, and [`ClientError::TelemetryDisabled`] when the client does not
+/// push metrics (`telemetry` is `None`), as Kafka throws an
+/// `IllegalArgumentException` and an `IllegalStateException`.
+pub async fn client_instance_id(
+    telemetry: Option<&ClientTelemetry>,
+    timeout: Time,
+) -> Result<Option<uuid::Uuid>, ClientError> {
+    if !timeout.secs_f64().is_finite() || timeout < Time::ZERO {
+        return Err(ClientError::InvalidArgument(
+            "The timeout cannot be negative.".to_owned(),
+        ));
+    }
+    let telemetry = telemetry.ok_or(ClientError::TelemetryDisabled)?;
+    Ok(telemetry.client_instance_id(timeout.to_std()).await)
+}
+
 /// The reporter task: Kafka's `NetworkClient.TelemetrySender.maybeUpdate`
 /// in a loop.
 async fn run(
     connections: impl TelemetryConnections,
     mut sender: TelemetrySender,
     timing: TelemetryTiming,
-    close: CancellationToken,
-    done: CancellationToken,
+    instance_id: Arc<watch::Sender<Option<uuid::Uuid>>>,
+    (close, done): (CancellationToken, CancellationToken),
 ) {
     let mut closing: Option<Instant> = None;
     let mut sticky: Option<i32> = None;
@@ -266,6 +311,17 @@ async fn run(
                         Instant::now(),
                         crate::backoff::random_unit(),
                     );
+                    // Kafka's `subscriptionLoaded.signalAll()`.
+                    let loaded = sender
+                        .client_instance_id()
+                        .map(|id| uuid::Uuid::from_bytes(id.0));
+                    instance_id.send_if_modified(|current| {
+                        let changed = loaded.is_some() && *current != loaded;
+                        if changed {
+                            *current = loaded;
+                        }
+                        changed
+                    });
                     None
                 }
                 Err(failure) => Some(failure),
