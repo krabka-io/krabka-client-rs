@@ -41,7 +41,7 @@ use crate::{
     metadata_age::{
         DEFAULT_PRODUCER_METADATA_MAX_AGE, DEFAULT_PRODUCER_METADATA_MAX_IDLE, MetadataAge,
     },
-    partitioner::{BuiltInPartitioner, PartitionerConfig},
+    partitioner::{BuiltInPartitioner, Partitioner, PartitionerConfig},
     producer::{Acks, Producer, ProducerIdentity},
     sender,
     transactional::{TxnErrorSlot, TxnState},
@@ -144,6 +144,9 @@ pub const DEFAULT_PRODUCER_PARTITIONER_ADAPTIVE_PARTITIONING_ENABLE: bool = true
 /// `partitioner.availability.timeout.ms` default is 0, which turns the check
 /// off.
 pub const DEFAULT_PRODUCER_PARTITIONER_AVAILABILITY_TIMEOUT: Duration = Duration::ZERO;
+/// Default of `partitioner_rack_aware`. Kafka's `partitioner.rack.aware`
+/// default is `false`.
+pub const DEFAULT_PRODUCER_PARTITIONER_RACK_AWARE: bool = false;
 /// Default cross-partition in-flight request limit.
 pub const DEFAULT_PRODUCER_MAX_IN_FLIGHT: usize = 5;
 /// Default producer request timeout.
@@ -887,6 +890,7 @@ struct RuntimeInputs<'a> {
     partitioner_ignore_keys: bool,
     partitioner_adaptive_partitioning_enable: bool,
     partitioner_availability_timeout: Duration,
+    partitioner_rack_aware: bool,
     producer_id: i64,
     producer_epoch: i16,
     acks: Acks,
@@ -937,6 +941,7 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
         partitioner_ignore_keys,
         partitioner_adaptive_partitioning_enable,
         partitioner_availability_timeout,
+        partitioner_rack_aware,
         producer_id,
         producer_epoch,
         acks,
@@ -962,6 +967,7 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
         ignore_keys: partitioner_ignore_keys,
         adaptive_partitioning: partitioner_adaptive_partitioning_enable,
         availability_timeout: partitioner_availability_timeout,
+        rack_aware: partitioner_rack_aware,
     }));
     let flush_notify = Arc::new(Notify::new());
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -1107,6 +1113,13 @@ impl Producer {
         partitioner_adaptive_partitioning_enable: bool,
         #[builder(default = DEFAULT_PRODUCER_PARTITIONER_AVAILABILITY_TIMEOUT)]
         partitioner_availability_timeout: Duration,
+        /// Kafka's `partitioner.class`. Set, `send` calls it instead of the
+        /// built-in partitioner for a record with no explicit partition, and
+        /// adaptive partitioning turns off. See
+        /// [`Partitioner`](crate::partitioner::Partitioner).
+        partitioner: Option<Arc<dyn Partitioner>>,
+        #[builder(into)] client_rack: Option<String>,
+        #[builder(default = DEFAULT_PRODUCER_PARTITIONER_RACK_AWARE)] partitioner_rack_aware: bool,
         #[builder(default = DEFAULT_CLIENT_DNS_TIMEOUT)] dns_timeout: Time,
         #[builder(default = DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
@@ -1226,7 +1239,9 @@ impl Producer {
             disabled_idempotence_identity()
         };
 
-        // 3. Spawn the sender.
+        // 3. Spawn the sender. The runtime binds the built-in partitioner to
+        //    `partitioner`, so the `partitioner.class` plugin moves aside first.
+        let partitioner_plugin = partitioner;
         let ProducerRuntime {
             wake_tx,
             shutdown,
@@ -1257,8 +1272,12 @@ impl Producer {
                 metadata_max_idle,
                 batch_size,
                 partitioner_ignore_keys,
-                partitioner_adaptive_partitioning_enable,
+                // Kafka's constructor: `enableAdaptivePartitioning =
+                // partitionerPlugin.get() == null && ...`.
+                partitioner_adaptive_partitioning_enable: partitioner_adaptive_partitioning_enable
+                    && partitioner_plugin.is_none(),
                 partitioner_availability_timeout,
+                partitioner_rack_aware,
                 producer_id,
                 producer_epoch,
                 acks,
@@ -1297,9 +1316,12 @@ impl Producer {
             metadata_cache,
             metadata_refresh,
             partition_leaders,
+            broker_racks: Arc::new(DashMap::new()),
             accumulators,
             next_seq,
             partitioner,
+            custom_partitioner: partitioner_plugin,
+            client_rack,
             state,
             wake_tx,
             flush_notify,

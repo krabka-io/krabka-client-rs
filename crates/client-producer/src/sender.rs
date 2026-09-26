@@ -4538,6 +4538,7 @@ mod harness {
                     ignore_keys: false,
                     adaptive_partitioning: row.adaptive,
                     availability_timeout: Duration::from_millis(100),
+                    rack_aware: false,
                 },
                 randoms,
             );
@@ -4607,6 +4608,7 @@ mod harness {
             ignore_keys: false,
             adaptive_partitioning: true,
             availability_timeout: Duration::from_millis(100),
+            rack_aware: false,
         }));
         let (mut cfg, _transport) = direct_config(partitioner, 5);
         for (partition, leader) in [(0, 1), (1, 2), (2, 3)] {
@@ -4662,6 +4664,7 @@ mod harness {
             ignore_keys: false,
             adaptive_partitioning: true,
             availability_timeout: Duration::from_millis(100),
+            rack_aware: false,
         }));
         // One Produce per cycle, and three partitions on three brokers.
         let (mut cfg, _transport) = direct_config(partitioner, 1);

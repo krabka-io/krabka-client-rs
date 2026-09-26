@@ -28,6 +28,14 @@ pub enum ProducerError {
     #[error("Invalid timestamp: {0}. Timestamp should always be non-negative or null.")]
     InvalidTimestamp(i64),
 
+    /// A custom partitioner (`partitioner.class`) returned a negative
+    /// partition. Kafka's `KafkaProducer.partition` throws
+    /// `IllegalArgumentException` with the same message.
+    #[error(
+        "The partitioner generated an invalid partition number: {0}. Partition number should always be non-negative."
+    )]
+    InvalidPartitionerResult(i32),
+
     #[error("batch too large: {batch_size} > max")]
     BatchTooLarge { batch_size: usize },
 

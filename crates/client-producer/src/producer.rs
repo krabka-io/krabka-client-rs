@@ -50,7 +50,10 @@ use crate::{
     compression::{Compression, CompressionLevels},
     error::{ProducerError, RecordSizeLimit},
     metadata_wait::{MetadataRefresh, MetadataWait, metadata_request},
-    partitioner::{BuiltInPartitioner, StickyPartition, TopicPartitions},
+    partitioner::{
+        BuiltInPartitioner, PartitionInfo, Partitioner, RackPreference, StickyPartition,
+        TopicPartitions,
+    },
     record::{ProducerRecord, RecordMetadata},
     sender::DrainIntent,
     transactional::{
@@ -341,9 +344,21 @@ pub struct Producer {
     /// to the bootstrap connection. A leader id `< 0` also counts as unknown.
     /// An `Arc` shares the cache with the sender task.
     pub(crate) partition_leaders: Arc<DashMap<(String, i32), i32>>,
+    /// Rack of each broker (node) id, keyed by `leader_id`. `partition_count`
+    /// fills it from each `Metadata` response's `brokers` list.
+    /// `partitioner.rack.aware` reads it through [`Producer::leader_rack`].
+    pub(crate) broker_racks: Arc<DashMap<i32, Option<String>>>,
     pub(crate) accumulators: AccumulatorMap,
     pub(crate) next_seq: Arc<DashMap<(String, i32), i32>>,
     pub(crate) partitioner: Arc<BuiltInPartitioner>,
+    /// A caller-supplied `partitioner.class` hook. When set, `send` calls it
+    /// for a record with no partition instead of the built-in partitioner.
+    /// See [`Partitioner`].
+    pub(crate) custom_partitioner: Option<Arc<dyn Partitioner>>,
+    /// Kafka's `client.rack`. With `partitioner.rack.aware`
+    /// (`self.partitioner.config().rack_aware`), the built-in partitioner's
+    /// sticky pick prefers a partition whose leader is in this rack.
+    pub(crate) client_rack: Option<String>,
     pub(crate) state: Arc<AtomicU8>,
     pub(crate) wake_tx: tokio::sync::mpsc::Sender<DrainIntent>,
     pub(crate) flush_notify: Arc<Notify>,
@@ -1818,13 +1833,31 @@ impl Producer {
             Ok(count) => count,
             Err(error) => return failed(error),
         };
-        // A record that names no partition and has no key that picks one goes
-        // to the sticky partition. Kafka's `KafkaProducer.partition` and
-        // `RecordAccumulator.append`.
-        let fixed_partition = record.partition.or_else(|| {
-            self.partitioner
-                .keyed_partition(record.key.as_deref(), partition_count)
-        });
+        // A record that names no partition goes to a custom partitioner when
+        // one is set (Kafka's `KafkaProducer.partition`), or otherwise to its
+        // keyed partition, or to the sticky partition when it has neither.
+        let fixed_partition = match record.partition {
+            Some(partition) => Some(partition),
+            None => match &self.custom_partitioner {
+                Some(partitioner) => {
+                    let (available, all) = self.partition_infos(&record.topic, partition_count);
+                    let picked = partitioner.partition(
+                        &record.topic,
+                        record.key.as_deref(),
+                        record.value.as_deref(),
+                        &available,
+                        &all,
+                    );
+                    if picked < 0 {
+                        return failed(ProducerError::InvalidPartitionerResult(picked));
+                    }
+                    Some(picked)
+                }
+                None => self
+                    .partitioner
+                    .keyed_partition(record.key.as_deref(), partition_count),
+            },
+        };
         let has_leader = |partition: i32| {
             self.partition_leaders
                 .get(&(record.topic.clone(), partition))
@@ -1870,7 +1903,7 @@ impl Producer {
             // Memory is not bound to a partition, so it serves the new one.
             let sticky = fixed_partition
                 .is_none()
-                .then(|| self.partitioner.peek(&record.topic, &partitions));
+                .then(|| self.peek_sticky(&record.topic, &partitions));
             let partition = fixed_partition
                 .or(sticky.map(StickyPartition::partition))
                 .unwrap_or_default();
@@ -1980,7 +2013,7 @@ impl Producer {
             );
             if let Some(sticky) = sticky {
                 // Kafka's `RecordAccumulator.updatePartitionInfoOnAppend`.
-                self.partitioner.update(
+                self.update_sticky(
                     &record.topic,
                     sticky,
                     record_size,
@@ -2015,10 +2048,103 @@ impl Producer {
             return true;
         }
         if accumulator.all_batches_full() {
-            self.partitioner.update(topic, sticky, 0, partitions, true);
+            self.update_sticky(topic, sticky, 0, partitions, true);
             return self.partitioner.is_changed(topic, sticky);
         }
         false
+    }
+
+    /// The rack of the leader of `partition` of `topic`, or `None` when the
+    /// leader is unknown or has no rack. `partitioner.rack.aware` uses it to
+    /// keep the sticky partition of the built-in partitioner in
+    /// [`Self::client_rack`].
+    fn leader_rack(&self, topic: &str, partition: i32) -> Option<String> {
+        let leader = *self.partition_leaders.get(&(topic.to_owned(), partition))?;
+        if leader < 0 {
+            return None;
+        }
+        self.broker_racks.get(&leader).and_then(|rack| rack.clone())
+    }
+
+    /// [`BuiltInPartitioner::peek`], with `partitioner.rack.aware` when
+    /// `client_rack` is set and the built-in partitioner's config asks for it.
+    fn peek_sticky(&self, topic: &str, partitions: &TopicPartitions<'_>) -> StickyPartition {
+        match self.client_rack.as_deref() {
+            Some(client_rack) if self.partitioner.config().rack_aware => {
+                let leader_rack = |partition: i32| self.leader_rack(topic, partition);
+                let rack = RackPreference {
+                    leader_rack: &leader_rack,
+                    client_rack,
+                };
+                self.partitioner.peek_rack_aware(topic, partitions, rack)
+            }
+            _ => self.partitioner.peek(topic, partitions),
+        }
+    }
+
+    /// [`BuiltInPartitioner::update`], with the same rack preference as
+    /// [`Self::peek_sticky`].
+    fn update_sticky(
+        &self,
+        topic: &str,
+        sticky: StickyPartition,
+        appended: usize,
+        partitions: &TopicPartitions<'_>,
+        enable_switch: bool,
+    ) {
+        match self.client_rack.as_deref() {
+            Some(client_rack) if self.partitioner.config().rack_aware => {
+                let leader_rack = |partition: i32| self.leader_rack(topic, partition);
+                let rack = RackPreference {
+                    leader_rack: &leader_rack,
+                    client_rack,
+                };
+                self.partitioner.update_rack_aware(
+                    topic,
+                    sticky,
+                    appended,
+                    partitions,
+                    enable_switch,
+                    rack,
+                );
+            }
+            _ => self
+                .partitioner
+                .update(topic, sticky, appended, partitions, enable_switch),
+        }
+    }
+
+    /// The partitions of `topic` as Kafka's `Cluster` gives them to a custom
+    /// [`Partitioner`]: every partition (`all_partitions`), and the subset
+    /// with a known leader (`available_partitions`).
+    fn partition_infos(&self, topic: &str, count: i32) -> (Vec<PartitionInfo>, Vec<PartitionInfo>) {
+        let all: Vec<PartitionInfo> = (0..count)
+            .map(|partition| {
+                let leader_id = self
+                    .partition_leaders
+                    .get(&(topic.to_owned(), partition))
+                    .map(|leader| *leader)
+                    .filter(|leader| *leader >= 0);
+                let leader_rack = leader_id.and_then(|id| self.leader_rack_of_broker(id));
+                PartitionInfo {
+                    partition,
+                    leader_id,
+                    leader_rack,
+                }
+            })
+            .collect();
+        let available = all
+            .iter()
+            .filter(|info| info.leader_id.is_some())
+            .cloned()
+            .collect();
+        (available, all)
+    }
+
+    /// The rack of broker `id`, or `None` when it is not known or the broker
+    /// has none.
+    fn leader_rack_of_broker(&self, id: i32) -> Option<String> {
+        self.broker_racks.get(&id).and_then(|rack| rack.clone())
     }
 
     /// The limit that a record of `serialized_size` bytes is larger than, in
@@ -2122,8 +2248,19 @@ impl Producer {
             retry_backoff: self.init_retry_backoff.to_std(),
             max_backoff: self.retry_backoff_max.to_std(),
         }
-        .partition_count(topic, partition, |topics| {
-            self.client.refresh_metadata_with(metadata_request(topics))
+        .partition_count(topic, partition, |topics| async move {
+            let response = self
+                .client
+                .refresh_metadata_with(metadata_request(topics))
+                .await?;
+            // Kafka's `Cluster` keeps each broker's rack alongside its
+            // partition leaders. `partitioner.rack.aware` reads it through
+            // `leader_rack`.
+            for broker in &response.brokers {
+                self.broker_racks
+                    .insert(broker.node_id, broker.rack.clone());
+            }
+            Ok(response)
         })
         .await?;
         tracing::Span::current().record("num_partitions", count);
@@ -2311,8 +2448,94 @@ mod tests {
         accumulator::{Accumulator, AppendResult},
         compression::Compression,
         error::ProducerError,
-        partitioner::partition_for_key,
+        partitioner::{PartitionInfo, Partitioner, partition_for_key},
     };
+
+    /// A custom partitioner that always picks one partition, and records the
+    /// partitions it was shown.
+    struct FixedPartitioner {
+        pick: i32,
+        shown: Mutex<Vec<(Vec<PartitionInfo>, Vec<PartitionInfo>)>>,
+    }
+
+    impl Partitioner for FixedPartitioner {
+        fn partition(
+            &self,
+            _topic: &str,
+            _key: Option<&[u8]>,
+            _value: Option<&[u8]>,
+            available_partitions: &[PartitionInfo],
+            all_partitions: &[PartitionInfo],
+        ) -> i32 {
+            self.shown
+                .lock()
+                .unwrap()
+                .push((available_partitions.to_vec(), all_partitions.to_vec()));
+            self.pick
+        }
+    }
+
+    /// Kafka's `KafkaProducer.partition`: a custom partitioner picks the
+    /// partition of a record that names none, keyed or not. A negative pick
+    /// fails the send with Kafka's message, and no Produce goes out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_custom_partitioner_picks_the_partition_and_a_negative_pick_fails_the_send() {
+        let negative = "The partitioner generated an invalid partition number: -1. Partition \
+                        number should always be non-negative.";
+        let leader = |partition| PartitionInfo {
+            partition,
+            leader_id: Some(1),
+            leader_rack: None,
+        };
+        let shown_partitions = (0..4).map(leader).collect::<Vec<_>>();
+        let cases = [
+            ("keyless, pick 2", None, 2, Ok(2), vec![2]),
+            (
+                "keyed, pick 2",
+                Some(b"kafka".as_slice()),
+                2,
+                Ok(2),
+                vec![2],
+            ),
+            ("pick -1", None, -1, Err(negative.to_owned()), vec![]),
+        ];
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (name, key, pick, delivered, produced_partitions) in cases {
+            let partitioner = Arc::new(FixedPartitioner {
+                pick,
+                shown: Mutex::new(Vec::new()),
+            });
+            let outcome = send_with_partitioner(
+                vec![MetadataAnswer::Topic {
+                    error_code: 0,
+                    partitions: 4,
+                }],
+                Duration::from_secs(5),
+                ProducerRecord {
+                    topic: METADATA_TOPIC.into(),
+                    key: key.map(Bytes::from_static),
+                    value: Some(Bytes::from_static(b"v")),
+                    ..Default::default()
+                },
+                Some(Arc::clone(&partitioner) as Arc<dyn Partitioner>),
+            )
+            .await;
+            actual.push((
+                name,
+                outcome.delivered,
+                outcome.produced_partitions,
+                partitioner.shown.lock().unwrap().clone(),
+            ));
+            expected.push((
+                name,
+                delivered,
+                produced_partitions,
+                vec![(shown_partitions.clone(), shown_partitions.clone())],
+            ));
+        }
+        assert2::assert!(actual == expected);
+    }
 
     /// Both halves of the pair must be non-negative. Kafka writes `-1` in
     /// either half for "no producer", so a check of one half alone would
@@ -2769,6 +2992,16 @@ mod tests {
         max_block: Duration,
         record: ProducerRecord,
     ) -> SendOutcome {
+        send_with_partitioner(answers, max_block, record, None).await
+    }
+
+    /// [`send_against_scripted_metadata`], with a custom partitioner.
+    async fn send_with_partitioner(
+        answers: Vec<MetadataAnswer>,
+        max_block: Duration,
+        record: ProducerRecord,
+        partitioner: Option<Arc<dyn Partitioner>>,
+    ) -> SendOutcome {
         let port = Arc::new(AtomicU16::new(0));
         let handler_port = Arc::clone(&port);
         let metadata_requests = AtomicUsize::new(0);
@@ -2845,6 +3078,7 @@ mod tests {
             // the producer's own wait must ask again.
             .metadata_recovery_strategy(krabka_client_core::MetadataRecoveryStrategy::None)
             .max_block(max_block)
+            .maybe_partitioner(partitioner)
             .build()
             .await
             .expect("producer connects to mock broker");
