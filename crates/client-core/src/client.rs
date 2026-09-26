@@ -214,6 +214,8 @@ impl Client {
             dispatch_queue_capacity,
             frame_max,
             security: security.map(Box::new),
+            // `start_with_options` sets it for a client that pushes metrics.
+            network_metrics: None,
         };
         Self::start_with_options(
             bootstrap,
@@ -238,7 +240,7 @@ impl Client {
     )]
     async fn start_with_options(
         bootstrap: String,
-        options: ConnectionOptions,
+        mut options: ConnectionOptions,
         (metadata_recovery_strategy, metadata_recovery_rebootstrap_trigger): (
             MetadataRecoveryStrategy,
             MetadataRecoveryRebootstrapTrigger,
@@ -253,17 +255,14 @@ impl Client {
         )
         .await?;
         let metrics = telemetry.as_ref().map(|_| ClientMetrics::new());
-        let network_metrics = telemetry
-            .as_ref()
-            .zip(metrics.as_ref())
-            .map(|(config, metrics)| {
-                NetworkMetrics::register(metrics, config.client_type.metric_group())
-            });
-        let pool = Arc::new(BrokerPool::new_with_metrics(
-            addrs,
-            options.clone(),
-            network_metrics,
-        ));
+        options.network_metrics =
+            telemetry
+                .as_ref()
+                .zip(metrics.as_ref())
+                .map(|(config, metrics)| {
+                    NetworkMetrics::register(metrics, config.client_type.metric_group())
+                });
+        let pool = Arc::new(BrokerPool::new_with_server_names(addrs, options.clone()));
         let client = Client {
             bootstrap,
             pool,

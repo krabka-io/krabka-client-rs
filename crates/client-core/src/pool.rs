@@ -20,7 +20,6 @@ use crate::{
     bootstrap::{bounded_lookup, filter_preferred_addresses},
     connection::{Connection, ConnectionOptions},
     error::ClientError,
-    telemetry::NetworkMetrics,
     version::FinalizedFeatures,
 };
 
@@ -72,8 +71,6 @@ pub trait BrokerConnector: Send + Sync {
 #[derive(Debug)]
 pub struct TcpConnector {
     options: ConnectionOptions,
-    /// The client's network metrics, which each new connection counts in.
-    metrics: Option<NetworkMetrics>,
 }
 
 #[async_trait::async_trait]
@@ -92,11 +89,7 @@ impl BrokerConnector for TcpConnector {
         if let Some(security) = options.security.as_mut() {
             **security = security.for_target_host(server_name);
         }
-        let connection = Connection::connect_with_options(addr, options).await?;
-        if let Some(metrics) = &self.metrics {
-            connection.attach_metrics(metrics);
-        }
-        Ok(connection)
+        Connection::connect_with_options(addr, options).await
     }
 
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ClientError> {
@@ -303,18 +296,8 @@ impl BrokerPool<TcpConnector> {
         bootstrap: Vec<(SocketAddr, String)>,
         options: ConnectionOptions,
     ) -> Self {
-        Self::new_with_metrics(bootstrap, options, None)
-    }
-
-    /// Create a pool whose connections count in `metrics`.
-    #[must_use]
-    pub fn new_with_metrics(
-        bootstrap: Vec<(SocketAddr, String)>,
-        options: ConnectionOptions,
-        metrics: Option<NetworkMetrics>,
-    ) -> Self {
         let policy = ConnectPolicy::new(&options);
-        BrokerPool::with_connector_and_names(bootstrap, TcpConnector { options, metrics }, policy)
+        BrokerPool::with_connector_and_names(bootstrap, TcpConnector { options }, policy)
     }
 }
 

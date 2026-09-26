@@ -13,11 +13,19 @@
 //! client quotas, delegation tokens, metadata-quorum voters, and log-dir
 //! inspection.
 
-use std::{any::Any, collections::BTreeMap, sync::Mutex};
+use std::{
+    any::Any,
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use krabka_client_core::{
     ClientError, Connection, ConnectionOptions, MetadataRecoveryRebootstrapTrigger,
     MetadataRecoveryStrategy, ProtocolRequest as _, connection_target_host,
+    telemetry::{
+        ClientMetrics, ClientTelemetry, ClientTelemetryConfig, NetworkMetrics, TelemetryClientType,
+        TelemetryTiming,
+    },
 };
 use krabka_units::{Time, convert::TimeExt as _};
 use thiserror::Error;
@@ -37,6 +45,7 @@ mod partition_leaders;
 pub mod quorum;
 pub mod quotas;
 mod retry;
+mod telemetry;
 pub mod topic_descriptions;
 pub mod topics;
 pub mod transactions;
@@ -51,8 +60,9 @@ pub struct MetadataVersionUpdate {
 pub use cluster::{ClusterDescription, ClusterNode, DescribeClusterOptions};
 pub use config::{
     AdminClientConfig, DEFAULT_ADMIN_CONNECTIONS_MAX_IDLE, DEFAULT_ADMIN_REQUEST_TIMEOUT,
-    DEFAULT_API_TIMEOUT, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_BACKOFF_MAX,
-    DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT, DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
+    DEFAULT_API_TIMEOUT, DEFAULT_ENABLE_METRICS_PUSH, DEFAULT_RETRY_BACKOFF,
+    DEFAULT_RETRY_BACKOFF_MAX, DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT,
+    DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
 };
 pub use config_resources::{ConfigResourceListing, ConfigResourceType};
 pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
@@ -638,16 +648,29 @@ fn format_host_port(host: &str, port: i32) -> String {
 
 /// Short-lived admin client that targets one cluster's controller. It can
 /// negotiate TLS/SASL through [`AdminClient::connect_secured`].
+///
+/// As Kafka's admin client with `enable.metrics.push` on (the default), it
+/// pushes the client metrics that a broker's client metrics subscription
+/// names (KIP-714) on its bootstrap connection, and its connections count in
+/// the `admin-client-metrics` network metrics.
+/// [`AdminClientConfig::enable_metrics_push`] turns this off. The
+/// constructors without an [`AdminClientConfig`] keep Kafka's default.
+/// [`close`](Self::close) sends the terminating push and waits for it;
+/// dropping the client sends it in the background.
 pub struct AdminClient {
-    pub(crate) conn: RecoveringConnection,
+    pub(crate) conn: Arc<RecoveringConnection>,
     bootstrap_addrs: Vec<String>,
     /// Full connection template carried forward so reconnects preserve
-    /// caller-supplied identity, security, and timeouts.
+    /// caller-supplied identity, security, and timeouts. With metrics push
+    /// on, it carries the network metrics that each new connection counts in.
     options: ConnectionOptions,
     /// The deadline, backoff and retry count of each call
     /// (`default.api.timeout.ms`, `retry.backoff.ms`, `retry.backoff.max.ms`,
     /// `retries`).
     pub(crate) retry: retry::RetryPolicy,
+    /// The KIP-714 reporter, `None` with `enable_metrics_push` off. Dropping
+    /// it starts the terminating push.
+    telemetry: Option<ClientTelemetry>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -663,7 +686,7 @@ struct ConnectedTarget {
 
 /// One controller connection with KIP-919/KIP-1102 bootstrap recovery.
 pub(crate) struct RecoveringConnection {
-    inner: tokio::sync::RwLock<Connection>,
+    inner: tokio::sync::RwLock<Arc<Connection>>,
     bootstrap_addrs: Vec<String>,
     options: ConnectionOptions,
     strategy: MetadataRecoveryStrategy,
@@ -684,7 +707,7 @@ impl RecoveringConnection {
         known_addrs: Vec<String>,
     ) -> Self {
         Self {
-            inner: tokio::sync::RwLock::new(connection),
+            inner: tokio::sync::RwLock::new(Arc::new(connection)),
             bootstrap_addrs,
             options,
             strategy,
@@ -762,7 +785,7 @@ impl RecoveringConnection {
     }
 
     async fn replace(&self, connection: Connection) {
-        *self.inner.write().await = connection;
+        *self.inner.write().await = Arc::new(connection);
     }
 
     async fn send_current<R>(
@@ -1080,6 +1103,7 @@ impl AdminClient {
                 resolved.metadata_recovery_rebootstrap_trigger,
             ),
             BootstrapTarget::Brokers,
+            resolved.enable_metrics_push,
         )
         .await
     }
@@ -1105,6 +1129,7 @@ impl AdminClient {
                 resolved.metadata_recovery_rebootstrap_trigger,
             ),
             BootstrapTarget::Controllers,
+            resolved.enable_metrics_push,
         )
         .await
     }
@@ -1170,6 +1195,7 @@ impl AdminClient {
                 krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
             ),
             BootstrapTarget::Brokers,
+            DEFAULT_ENABLE_METRICS_PUSH,
         )
         .await
     }
@@ -1215,6 +1241,7 @@ impl AdminClient {
                 krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
             ),
             BootstrapTarget::Controllers,
+            DEFAULT_ENABLE_METRICS_PUSH,
         )
         .await
     }
@@ -1238,19 +1265,28 @@ impl AdminClient {
             retry,
             (strategy, rebootstrap_trigger),
             BootstrapTarget::Brokers,
+            DEFAULT_ENABLE_METRICS_PUSH,
         )
         .await
     }
 
     async fn connect_with_metadata_recovery_target(
         bootstrap_addrs: &[String],
-        options: ConnectionOptions,
+        mut options: ConnectionOptions,
         retry: retry::RetryPolicy,
         (strategy, rebootstrap_trigger): (MetadataRecoveryStrategy, Time),
         target: BootstrapTarget,
+        enable_metrics_push: bool,
     ) -> Result<Self, AdminError> {
         let trigger = MetadataRecoveryRebootstrapTrigger::new(rebootstrap_trigger)
             .map_err(AdminError::Protocol)?;
+        // Kafka's `CommonClientConfigs.telemetryReporter`: a reporter only
+        // with `enable.metrics.push`. Every connection of the client counts
+        // in its network metrics.
+        let metrics = enable_metrics_push.then(ClientMetrics::new);
+        options.network_metrics = metrics.as_ref().map(|metrics| {
+            NetworkMetrics::register(metrics, TelemetryClientType::Admin.metric_group())
+        });
         let mut last_error = None;
         for host_port in bootstrap_addrs {
             match Self::connect_target_one_with_discovery(host_port, options.clone(), target).await
@@ -1261,19 +1297,32 @@ impl AdminClient {
                     } else {
                         connected.discovered_addrs
                     };
+                    let conn = Arc::new(RecoveringConnection::new(
+                        connected.connection,
+                        bootstrap_addrs.to_vec(),
+                        options.clone(),
+                        strategy,
+                        trigger,
+                        target,
+                        known_addrs,
+                    ));
+                    let telemetry = metrics.map(|metrics| {
+                        ClientTelemetry::start(
+                            telemetry::AdminTelemetryConnection(Arc::clone(&conn)),
+                            &ClientTelemetryConfig::admin(),
+                            metrics,
+                            TelemetryTiming {
+                                request_timeout: options.request_timeout.to_std(),
+                                reconnect_backoff: options.reconnect_backoff.to_std(),
+                            },
+                        )
+                    });
                     return Ok(Self {
-                        conn: RecoveringConnection::new(
-                            connected.connection,
-                            bootstrap_addrs.to_vec(),
-                            options.clone(),
-                            strategy,
-                            trigger,
-                            target,
-                            known_addrs,
-                        ),
+                        conn,
                         bootstrap_addrs: bootstrap_addrs.to_vec(),
                         options,
                         retry,
+                        telemetry,
                     });
                 }
                 Err(e) if e.is_authentication_failure() => return Err(e),

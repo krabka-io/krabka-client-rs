@@ -247,6 +247,10 @@ pub struct ConnectionOptions {
     /// futures, and `ClientSecurity` carries several `String`/`PathBuf`
     /// fields that would otherwise make every such future large.
     pub security: Option<Box<crate::security::ClientSecurity>>,
+    /// The network metrics of a client that pushes its metrics (KIP-714).
+    /// [`Connection::connect_with_options`] counts the new connection in
+    /// them. `None` counts nowhere.
+    pub network_metrics: Option<crate::telemetry::NetworkMetrics>,
 }
 
 impl Default for ConnectionOptions {
@@ -266,6 +270,7 @@ impl Default for ConnectionOptions {
             dispatch_queue_capacity: ConnectionDispatchQueueCapacity::default(),
             frame_max: ClientFrameMax::default(),
             security: None,
+            network_metrics: None,
         }
     }
 }
@@ -441,13 +446,18 @@ impl Connection {
         addr: SocketAddr,
         options: ConnectionOptions,
     ) -> Result<Self, ClientError> {
+        let metrics = options.network_metrics.clone();
         // The TLS and SASL handshakes make a large future. Boxing it keeps the
         // futures of the callers small, and it keeps the type depth of a
         // caller that nests several connections below the compiler limit.
-        match options.security.clone() {
+        let connection = match options.security.clone() {
             Some(sec) => Box::pin(Self::connect_secured(addr, options, sec.as_ref())).await,
             None => Box::pin(Self::connect(addr, options)).await,
+        }?;
+        if let Some(metrics) = &metrics {
+            connection.attach_metrics(metrics);
         }
+        Ok(connection)
     }
 
     /// Connect to `addr` and apply `security` (TLS then SASL) before the
