@@ -37,6 +37,7 @@ use krabka_units::{Time, convert::TimeExt as _};
 
 use crate::{
     AdminClient, AdminError, KafkaError, format_host_port, kafka_error_name,
+    partition_leaders::{PartitionKey, PartitionResults, complete_results},
     retry::{CoordinatorRetry, RetryAction, RetryDeadline, RetryPolicy, connection_failure_action},
 };
 
@@ -53,8 +54,6 @@ const LEADER_NOT_AVAILABLE: i16 = 5;
 /// `NOT_LEADER_OR_FOLLOWER`: the broker is no longer (or not yet) the leader
 /// of a partition.
 const NOT_LEADER_OR_FOLLOWER: i16 = 6;
-/// `UNKNOWN_SERVER_ERROR`: a response omitted a result this client asked for.
-const UNKNOWN_SERVER_ERROR: i16 = -1;
 
 /// Map the result of one `DescribeTransactions` attempt to a retry action, as
 /// Kafka's `DescribeTransactionsHandler.handleError` does. 14 retries on the
@@ -516,21 +515,12 @@ fn producer_state_info(state: &WireProducerState) -> ProducerStateInfo {
 /// partition that the response omits gets `UNKNOWN_SERVER_ERROR`, as Kafka's
 /// `DescribeProducersHandler.handleResponse` does for a missing result.
 fn describe_producers_results(
-    keys: &[(String, i32)],
+    keys: &[PartitionKey],
     response: DescribeProducersResponse,
-) -> BTreeMap<(String, i32), Result<Vec<ProducerStateInfo>, KafkaError>> {
+) -> PartitionResults<Vec<ProducerStateInfo>> {
     let mut out = BTreeMap::new();
     for topic in response.topics {
         for partition in topic.partitions {
-            let key = (topic.name.clone(), partition.partition_index);
-            if !keys.contains(&key) {
-                tracing::warn!(
-                    topic = %key.0,
-                    partition = key.1,
-                    "the DescribeProducers response names a partition that is not in the request"
-                );
-                continue;
-            }
             let result = if partition.error_code == 0 {
                 Ok(partition
                     .active_producers
@@ -544,112 +534,29 @@ fn describe_producers_results(
                     message: partition.error_message,
                 })
             };
-            out.insert(key, result);
+            out.insert((topic.name.clone(), partition.partition_index), result);
         }
     }
-    for key in keys {
-        out.entry(key.clone()).or_insert_with(|| {
-            Err(KafkaError {
-                code: UNKNOWN_SERVER_ERROR,
-                name: kafka_error_name(UNKNOWN_SERVER_ERROR),
-                message: Some(format!(
-                    "the DescribeProducers response did not contain a result for partition \
-                     {}-{}",
-                    key.0, key.1
-                )),
-            })
-        });
-    }
-    out
+    complete_results("DescribeProducers", keys, out)
 }
 
-/// The [`KafkaError`] that every partition of a group gets when the call to
-/// its leader fails entirely, such as a metadata lookup or connection
-/// failure.
-fn broker_call_error(error: &AdminError) -> KafkaError {
-    match error {
-        AdminError::Broker {
-            code,
-            name,
-            message,
-            ..
-        } => KafkaError {
-            code: *code,
-            name,
-            message: message.clone(),
-        },
-        other => KafkaError {
-            code: UNKNOWN_SERVER_ERROR,
-            name: kafka_error_name(UNKNOWN_SERVER_ERROR),
-            message: Some(other.to_string()),
-        },
-    }
+/// Whether a `DescribeProducers` partition code sends the partition back to
+/// the leader lookup. Kafka's `DescribeProducersHandler.handlePartitionError`
+/// unmaps the partition on `NOT_LEADER_OR_FOLLOWER` only.
+const fn describe_producers_retry_code(code: i16) -> bool {
+    code == NOT_LEADER_OR_FOLLOWER
 }
 
-/// One attempt of a `DescribeProducers` call to the fixed leader address of
-/// one group of partitions. Unlike the coordinator calls above, the address
-/// does not change between attempts: a connection failure retries the same
-/// address, as Kafka's `AdminApiDriver` retries a lookup-free request until a
-/// fresh `Metadata` round names a different leader on the next
-/// `describe_producers` call.
-async fn describe_producers_attempt(
-    address: &str,
-    options: &ConnectionOptions,
-    request: DescribeProducersRequest,
-    connection: &mut Option<Connection>,
-) -> RetryAction<DescribeProducersResponse> {
-    if connection.is_none() {
-        match AdminClient::connect_one(address, options.clone()).await {
-            Ok(new_connection) => *connection = Some(new_connection),
-            Err(error) => return connection_failure_action(error),
-        }
-    }
-    let Some(current) = connection.as_ref() else {
-        return RetryAction::SameCoordinator(Err(AdminError::Transport(
-            krabka_client_core::ClientError::Disconnected,
-        )));
-    };
-    match current.send(request).await {
-        Ok(response) => RetryAction::Done(Ok(response)),
-        Err(error) => {
-            *connection = None;
-            connection_failure_action(error.into())
-        }
-    }
-}
-
-/// Runs one `DescribeProducers` call to the leader at `address` for `keys`,
-/// under the shared deadline `deadline`.
-async fn describe_producers_group(
+/// Sends one `DescribeProducers` request for `keys` to the leader at
+/// `address`.
+async fn describe_producers_on_leader(
     address: String,
     options: ConnectionOptions,
-    keys: Vec<(String, i32)>,
-    deadline: RetryDeadline,
-) -> BTreeMap<(String, i32), Result<Vec<ProducerStateInfo>, KafkaError>> {
-    let request = describe_producers_request(&keys);
-    let mut retry = CoordinatorRetry::from_deadline(deadline);
-    let mut connection: Option<Connection> = None;
-    loop {
-        let action = retry
-            .run(describe_producers_attempt(
-                &address,
-                &options,
-                request.clone(),
-                &mut connection,
-            ))
-            .await;
-        if let Some(result) = retry.next(action).await {
-            return match result {
-                Ok(response) => describe_producers_results(&keys, response),
-                Err(error) => {
-                    let kafka_error = broker_call_error(&error);
-                    keys.into_iter()
-                        .map(|key| (key, Err(kafka_error.clone())))
-                        .collect()
-                }
-            };
-        }
-    }
+    keys: Vec<PartitionKey>,
+) -> Result<PartitionResults<Vec<ProducerStateInfo>>, AdminError> {
+    let connection = AdminClient::connect_one(&address, options).await?;
+    let response = connection.send(describe_producers_request(&keys)).await?;
+    Ok(describe_producers_results(&keys, response))
 }
 
 /// The `ListTransactions` request of `filter`, as Kafka's
@@ -929,63 +836,40 @@ impl AdminClient {
     /// Reads the producer state of each requested partition, as Kafka's
     /// `describeProducers` operation does (KIP-664).
     ///
-    /// The client groups `partitions` by the current leader of each partition
-    /// (one `Metadata` lookup for every distinct topic in `partitions`) and
+    /// The client finds the leader of each partition with `Metadata` and
     /// sends one `DescribeProducers` request to each leader, all at the same
-    /// time, batching every partition of that leader into it. The result has
-    /// one entry for each requested `(topic, partition)` pair.
+    /// time, batching every partition of that leader into it, as Kafka's
+    /// `DescribeProducersHandler` with its `PartitionLeaderStrategy` does. The
+    /// result has one entry for each requested `(topic, partition)` pair.
     ///
-    /// Unlike the coordinator calls of this module, a connection failure to a
-    /// leader retries the same address rather than looking the leader up
-    /// again; a partition whose leader moved gets a fresh address only on the
-    /// next `describe_producers` call. A slow or failed leader does not delay
-    /// the other leaders, and each result reports its own broker error rather
-    /// than failing the whole call, as Kafka's per-partition futures do.
+    /// A partition goes back to the leader lookup, and the call finds its
+    /// leader again after the backoff, when:
+    ///
+    /// - the lookup names no leader yet, such as for an unknown topic or a
+    ///   partition with `LEADER_NOT_AVAILABLE`;
+    /// - the connection to its leader fails or is lost;
+    /// - the leader answers `NOT_LEADER_OR_FOLLOWER` (6) for it.
+    ///
+    /// A slow or failed leader does not delay the other leaders. The call
+    /// stops at Kafka's default `default.api.timeout.ms` (60 s), where each
+    /// unresolved partition gets `REQUEST_TIMED_OUT` (7).
     ///
     /// # Errors
     ///
-    /// The call itself fails only when the initial `Metadata` lookup does.
-    /// Every partition whose topic is missing from that metadata, or whose
-    /// leader lookup or `DescribeProducers` call fails, gets its own
-    /// [`KafkaError`] in the result instead of failing the call.
+    /// The call itself does not fail. Each partition gets its own
+    /// [`KafkaError`] in the result, such as the final lookup or
+    /// `DescribeProducers` error of that partition.
     pub async fn describe_producers(
         &self,
         partitions: &[(String, i32)],
-    ) -> Result<BTreeMap<(String, i32), Result<Vec<ProducerStateInfo>, KafkaError>>, AdminError>
-    {
-        if partitions.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let deadline = self.retry.start();
-        let mut topic_names = partitions
-            .iter()
-            .map(|(topic, _)| topic.as_str())
-            .collect::<Vec<_>>();
-        topic_names.sort_unstable();
-        topic_names.dedup();
-
-        let metadata = self.conn.send(build_topic_metadata(&topic_names)).await?;
-
-        let mut groups = BTreeMap::<String, Vec<(String, i32)>>::new();
-        let mut out = BTreeMap::new();
-        for (topic, partition) in partitions.iter().cloned() {
-            match partition_leader_address(&topic, partition, &metadata) {
-                Ok(address) => groups.entry(address).or_default().push((topic, partition)),
-                Err(error) => {
-                    out.insert((topic, partition), Err(broker_call_error(&error)));
-                }
-            }
-        }
-
-        let options = self.options.clone();
-        let answers = futures_util::future::join_all(groups.into_iter().map(|(address, keys)| {
-            describe_producers_group(address, options.clone(), keys, deadline)
-        }))
-        .await;
-        for group_result in answers {
-            out.extend(group_result);
-        }
-        Ok(out)
+    ) -> BTreeMap<(String, i32), Result<Vec<ProducerStateInfo>, KafkaError>> {
+        self.call_partition_leaders(
+            "DescribeProducers",
+            partitions,
+            describe_producers_retry_code,
+            |address, keys| describe_producers_on_leader(address, self.options.clone(), keys),
+        )
+        .await
     }
 
     /// Lists every transaction that the cluster's coordinators currently
@@ -1275,6 +1159,9 @@ mod tests {
     };
 
     use super::*;
+    use crate::partition_leaders::test_support::{
+        Seen, fast_admin as leader_fast_admin, leader_broker as partition_leader_broker,
+    };
 
     fn state_row(transactional_id: &str, error_code: i16) -> TransactionState {
         TransactionState {
@@ -2435,7 +2322,7 @@ mod tests {
         expected.insert(
             ("orders".to_owned(), 2),
             Err(KafkaError {
-                code: UNKNOWN_SERVER_ERROR,
+                code: -1,
                 name: "UNKNOWN_SERVER_ERROR",
                 message: Some(
                     "the DescribeProducers response did not contain a result for partition \
@@ -2502,7 +2389,6 @@ mod tests {
                     api_version(api_versions_request::API_KEY, 0, 0),
                     api_version(metadata_request::API_KEY, 13, 13),
                     api_version(write_txn_markers_request::API_KEY, 1, 2),
-                    api_version(describe_producers_request::API_KEY, 0, 0),
                     api_version(list_transactions_request::API_KEY, 0, 2),
                 ],
                 ..Default::default()
@@ -2522,8 +2408,6 @@ mod tests {
         write_requests: Vec<WriteTxnMarkersRequest>,
         /// The `Metadata` requests that the broker received.
         metadata_requests: usize,
-        /// The `DescribeProducers` requests that the broker received.
-        describe_requests: Vec<DescribeProducersRequest>,
         /// The `ListTransactions` requests that the broker received.
         list_requests: Vec<ListTransactionsRequest>,
         /// The `ListTransactions` answer of the broker.
@@ -2568,12 +2452,6 @@ mod tests {
                         version,
                         true,
                     ))
-                }
-                describe_producers_request::API_KEY => {
-                    script
-                        .describe_requests
-                        .push(decode_request(body, version, true));
-                    Some(encode_response(&orders_producers(), version, true))
                 }
                 list_transactions_request::API_KEY => {
                     script
@@ -2666,46 +2544,130 @@ mod tests {
         assert2::assert!(script.lock().expect("script lock").metadata_requests == 0);
     }
 
+    /// The `DescribeProducers` answer to `request`: the producers of
+    /// [`orders_producers`] on `orders`-0, and `orders_1_code` on `orders`-1.
+    fn producers_answer(
+        request: &DescribeProducersRequest,
+        orders_1_code: i16,
+    ) -> DescribeProducersResponse {
+        let orders_0 = orders_producers().topics[0].partitions[0].clone();
+        DescribeProducersResponse {
+            topics: request
+                .topics
+                .iter()
+                .map(|topic| TopicResponse {
+                    name: topic.name.clone(),
+                    partitions: topic
+                        .partition_indexes
+                        .iter()
+                        .map(|&partition_index| {
+                            if partition_index == 0 {
+                                orders_0.clone()
+                            } else {
+                                PartitionResponse {
+                                    partition_index,
+                                    error_code: orders_1_code,
+                                    error_message: (orders_1_code != 0)
+                                        .then(|| "refused".to_owned()),
+                                    ..Default::default()
+                                }
+                            }
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     /// Apache Kafka's `DescribeProducersHandler` batches the partitions of
-    /// one leader into one request and gives each partition its own result.
+    /// one leader into one request, gives each partition its own result, and
+    /// sends a partition back to the `PartitionLeaderStrategy` lookup after
+    /// `NOT_LEADER_OR_FOLLOWER` or a lost connection to its leader.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn describe_producers_batches_partitions_per_leader() {
-        let script = Arc::new(Mutex::new(LeaderScript::default()));
-        let cluster = Arc::new(Mutex::new(Vec::new()));
-        let broker = leader_broker(Arc::clone(&script), Arc::clone(&cluster)).await;
-        cluster.lock().expect("cluster lock").push(broker.addr);
-        let admin = fast_admin(broker.addr).await;
+    async fn describe_producers_finds_the_leader_again_as_kafka_does() {
+        let both = vec![("orders".to_owned(), 0), ("orders".to_owned(), 1)];
+        let only_1 = vec![("orders".to_owned(), 1)];
+        let refused = refused_address().await;
+        let producers_0 = orders_producer_results()[&both[0]].clone();
+        for (name, leaders, orders_1_codes, expected) in [
+            (
+                "success",
+                vec![None],
+                vec![0],
+                (Ok(Vec::new()), 1, vec![both.clone()]),
+            ),
+            (
+                "not leader or follower finds the leader again",
+                vec![None],
+                vec![NOT_LEADER_OR_FOLLOWER, 0],
+                (Ok(Vec::new()), 2, vec![both.clone(), only_1.clone()]),
+            ),
+            (
+                "a refused connection finds the leader again",
+                vec![Some(refused), None],
+                vec![0],
+                (Ok(Vec::new()), 2, vec![both.clone()]),
+            ),
+            (
+                "topic authorization failed is final",
+                vec![None],
+                vec![29],
+                (
+                    Err(KafkaError {
+                        code: 29,
+                        name: "UNKNOWN",
+                        message: Some("refused".to_owned()),
+                    }),
+                    1,
+                    vec![both.clone()],
+                ),
+            ),
+        ] {
+            let seen = Arc::new(Mutex::new(Seen::default()));
+            let broker = partition_leader_broker(
+                vec![(describe_producers_request::API_KEY, 0, 0)],
+                describe_producers_request::API_KEY,
+                leaders,
+                Arc::clone(&seen),
+                move |n, version, body| {
+                    let request: DescribeProducersRequest = decode_request(body, version, true);
+                    let code = orders_1_codes[n.min(orders_1_codes.len() - 1)];
+                    encode_response(&producers_answer(&request, code), version, true)
+                },
+            )
+            .await;
+            let admin = leader_fast_admin(broker.addr, krabka_units::secs(5)).await;
 
-        let result = admin
-            .describe_producers(&[
-                ("orders".to_owned(), 0),
-                ("orders".to_owned(), 1),
-                ("missing".to_owned(), 0),
-            ])
-            .await
-            .expect("metadata lookup succeeds");
+            let result = admin.describe_producers(&both).await;
 
-        broker.stop();
-        let mut expected = orders_producer_results();
-        expected.insert(
-            ("missing".to_owned(), 0),
-            Err(KafkaError {
-                code: 3,
-                name: "UNKNOWN_TOPIC_OR_PARTITION",
-                message: None,
-            }),
-        );
-        let script = script.lock().expect("script lock");
-        assert2::assert!(
-            (result, script.describe_requests.clone())
-                == (
-                    expected,
-                    vec![describe_producers_request(&[
-                        ("orders".to_owned(), 0),
-                        ("orders".to_owned(), 1),
-                    ])]
-                )
-        );
+            broker.stop();
+            let seen = seen.lock().expect("seen lock");
+            let requests = seen
+                .requests
+                .iter()
+                .map(|(version, body)| {
+                    decode_request::<DescribeProducersRequest>(body, *version, true)
+                })
+                .collect::<Vec<_>>();
+            assert2::assert!(
+                (result, seen.metadata_requests, requests)
+                    == (
+                        BTreeMap::from([
+                            (both[0].clone(), producers_0.clone()),
+                            (both[1].clone(), expected.0),
+                        ]),
+                        expected.1,
+                        expected
+                            .2
+                            .iter()
+                            .map(|keys| describe_producers_request(keys))
+                            .collect::<Vec<_>>(),
+                    ),
+                "case {name}"
+            );
+        }
     }
 
     /// A `ListTransactions` answer with `error_code` and one transaction per

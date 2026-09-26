@@ -21,12 +21,16 @@ use krabka_units::{Time, convert::TimeExt as _};
 use thiserror::Error;
 
 pub mod brokers;
+pub mod cluster;
 mod config;
 pub mod configs;
 pub mod delegation_tokens;
+pub mod elections;
 pub mod features;
 pub mod groups;
 pub mod log_dirs;
+pub mod offsets;
+mod partition_leaders;
 pub mod quorum;
 pub mod quotas;
 mod retry;
@@ -40,12 +44,14 @@ pub struct MetadataVersionUpdate {
     pub level: i16,
 }
 
+pub use cluster::{ClusterDescription, ClusterNode, DescribeClusterOptions};
 pub use config::{
     AdminClientConfig, DEFAULT_ADMIN_CONNECTIONS_MAX_IDLE, DEFAULT_ADMIN_REQUEST_TIMEOUT,
     DEFAULT_API_TIMEOUT, DEFAULT_RETRY_BACKOFF, DEFAULT_RETRY_BACKOFF_MAX,
     DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT, DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
 };
 pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
+pub use elections::{ElectionResults, ElectionType};
 pub use features::{FeatureMetadata, FeatureRange, FeatureUpdate, FeatureUpdateOutcome};
 pub use groups::{
     ClassicGroupDescription, ConsumerGroupDescription, ConsumerGroupOffsetOutcome,
@@ -54,6 +60,7 @@ pub use groups::{
 pub use log_dirs::{
     BrokerResult, LogDirInfo, LogDirPartitionInfo, LogDirTopicInfo, TopicPartitionReplica,
 };
+pub use offsets::{IsolationLevel, ListedOffset, OffsetSpec};
 pub use quorum::{MetadataQuorum, QuorumReplica};
 pub use quotas::{QuotaOp, UserQuotaConfig, diff_user_quotas};
 pub use topics::{

@@ -246,6 +246,12 @@ impl ControllerRetry {
         }
     }
 
+    /// The milliseconds left before the call deadline, which Kafka's
+    /// `Call.createRequest` passes as the request timeout.
+    pub(crate) fn remaining_millis(&self) -> i32 {
+        self.deadline.remaining_millis()
+    }
+
     /// Run one request of the call, but not past the call deadline. A request
     /// still in flight at the deadline gives `REQUEST_TIMED_OUT` (7), as
     /// Kafka's `KafkaAdminClient` times out a call in flight.
