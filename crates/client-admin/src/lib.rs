@@ -59,7 +59,10 @@ pub use topics::{
     PartitionAssignmentOutcome, TopicMetadata, TopicMetadataEntry, TopicMutationOptions,
     TopicReplicationStatus,
 };
-pub use transactions::TransactionDescription;
+pub use transactions::{
+    AbortTransactionSpec, ListTransactionsFilter, ProducerStateInfo, TransactionDescription,
+    TransactionListing,
+};
 pub use users::{
     AclEntry, AclEntryFilter, AclOperation, CreateAclOutcome, DEFAULT_SCRAM_ITERATIONS,
     DeleteAclFilterOutcome, MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS, PatternType,
