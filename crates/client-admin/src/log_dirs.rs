@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use krabka_client_core::{Connection, ConnectionOptions};
 use krabka_protocol::{
     ProtocolRequest,
@@ -236,18 +237,29 @@ impl AdminClient {
     /// `DescribeLogDirs` request that names only its partitions, all at the
     /// same time. Each broker is found and retried as in
     /// [`Self::describe_log_dirs`]. The result has one entry for each
-    /// replica:
+    /// replica, and the brokers complete their replicas in the order they
+    /// answer, as Kafka completes the replica futures:
     ///
     /// - The log dirs that the broker reports for the partition. A log dir
     ///   with `KAFKA_STORAGE_ERROR` (56) is offline and skipped, as Kafka
-    ///   does, so a replica that lives only there has neither log dir.
-    /// - The error of the broker call for every replica of a broker that
-    ///   fails, and `REQUEST_TIMED_OUT` (7) at `default.api.timeout.ms`.
-    /// - The top-level error of a `DescribeLogDirs` v3+ answer, such as
-    ///   `CLUSTER_AUTHORIZATION_FAILED` (31), for every replica of that
-    ///   broker.
-    /// - For every replica of a broker that reports any other log-dir error,
-    ///   that error, as Kafka fails the call with an `IllegalStateException`.
+    ///   does, so a replica that lives only there has neither log dir. A
+    ///   replica that the answer does not name has neither log dir.
+    /// - The top-level error code of the answer is not read, as Kafka's
+    ///   `describeReplicaLogDirs` does not read it: a `DescribeLogDirs` v3+
+    ///   answer with `CLUSTER_AUTHORIZATION_FAILED` (31) and no log dir gives
+    ///   each replica of that broker neither log dir.
+    /// - A log dir with any other error fails the call, as Kafka's
+    ///   `handleFailure` with an `IllegalStateException` completes every
+    ///   replica future of the call that is still pending: the replicas of
+    ///   that broker and of every broker that has not answered yet get that
+    ///   error. The replicas of brokers that answered before keep their log
+    ///   dirs.
+    /// - A broker call that fails, with `REQUEST_TIMED_OUT` (7) at
+    ///   `default.api.timeout.ms` or another error, fails every pending
+    ///   replica of the call in the same way.
+    ///
+    /// The call returns once no replica is pending; it does not wait for the
+    /// brokers that have not answered after a failure.
     pub async fn describe_replica_log_dirs(
         &mut self,
         replicas: &[TopicPartitionReplica],
@@ -272,42 +284,106 @@ impl AdminClient {
                 .insert(replica.partition);
         }
         let (conn, options) = (&self.conn, &self.options);
-        let answers =
-            futures_util::future::join_all(by_broker.iter().map(|(broker_id, topics)| {
-                call_broker(
+        let mut results = ReplicaResults::new(&by_broker);
+        let mut answers = by_broker
+            .iter()
+            .map(|(broker_id, topics)| async move {
+                let answer = call_broker(
                     conn,
                     *broker_id,
                     options,
                     replica_request(topics),
                     CoordinatorRetry::from_deadline(start),
                 )
-            }))
-            .await;
+                .await;
+                (
+                    *broker_id,
+                    topics,
+                    answer.and_then(|response| replica_log_dirs(*broker_id, topics, response)),
+                )
+            })
+            .collect::<FuturesUnordered<_>>();
+        while !results.is_complete()
+            && let Some((broker_id, topics, answer)) = answers.next().await
+        {
+            results.complete(broker_id, topics, answer);
+        }
+        results.finish()
+    }
+}
 
-        let mut out = BTreeMap::new();
-        for ((broker_id, topics), answer) in by_broker.into_iter().zip(answers) {
-            let infos = answer.and_then(|response| replica_log_dirs(broker_id, &topics, response));
-            for (topic, partitions) in topics {
-                for partition in partitions {
-                    let result = match &infos {
-                        Ok(infos) => Ok(infos
-                            .get(&(topic.clone(), partition))
-                            .cloned()
-                            .unwrap_or_default()),
-                        Err(error) => Err(error.clone()),
-                    };
-                    out.insert(
-                        TopicPartitionReplica {
+/// The result of each replica of a `describe_replica_log_dirs` call, as
+/// Kafka's replica futures: a broker's answer completes the replicas of that
+/// broker that are still pending, and a failure completes every replica of
+/// the call that is still pending (`completeAllExceptionally`).
+#[derive(Debug)]
+struct ReplicaResults {
+    pending: BTreeSet<TopicPartitionReplica>,
+    done: BTreeMap<TopicPartitionReplica, BrokerResult<ReplicaLogDirInfo>>,
+}
+
+impl ReplicaResults {
+    fn new(by_broker: &BTreeMap<i32, BTreeMap<String, BTreeSet<i32>>>) -> Self {
+        let pending = by_broker
+            .iter()
+            .flat_map(|(broker_id, topics)| {
+                topics.iter().flat_map(move |(topic, partitions)| {
+                    partitions
+                        .iter()
+                        .map(move |partition| TopicPartitionReplica {
                             topic: topic.clone(),
-                            partition,
+                            partition: *partition,
+                            broker_id: *broker_id,
+                        })
+                })
+            })
+            .collect();
+        Self {
+            pending,
+            done: BTreeMap::new(),
+        }
+    }
+
+    /// Complete the replicas with the answer of broker `broker_id`, which the
+    /// request asked about `topics`.
+    fn complete(
+        &mut self,
+        broker_id: i32,
+        topics: &BTreeMap<String, BTreeSet<i32>>,
+        answer: BrokerResult<BTreeMap<(String, i32), ReplicaLogDirInfo>>,
+    ) {
+        match answer {
+            Ok(mut infos) => {
+                for (topic, partitions) in topics {
+                    for partition in partitions {
+                        let replica = TopicPartitionReplica {
+                            topic: topic.clone(),
+                            partition: *partition,
                             broker_id,
-                        },
-                        result,
-                    );
+                        };
+                        if self.pending.remove(&replica) {
+                            let info = infos
+                                .remove(&(topic.clone(), *partition))
+                                .unwrap_or_default();
+                            self.done.insert(replica, Ok(info));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                for replica in std::mem::take(&mut self.pending) {
+                    self.done.insert(replica, Err(error.clone()));
                 }
             }
         }
-        out
+    }
+
+    fn is_complete(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn finish(self) -> BTreeMap<TopicPartitionReplica, BrokerResult<ReplicaLogDirInfo>> {
+        self.done
     }
 }
 
@@ -330,16 +406,14 @@ fn replica_request(topics: &BTreeMap<String, BTreeSet<i32>>) -> DescribeLogDirsR
 }
 
 /// The log dirs of each asked-for partition in one broker's answer, as
-/// Kafka's `describeReplicaLogDirs` `handleResponse` reads them. A partition
+/// Kafka's `describeReplicaLogDirs` `handleResponse` reads them. The
+/// top-level error code is not read, as Kafka does not read it. A partition
 /// that the request did not name is skipped with a warning.
 fn replica_log_dirs(
     broker_id: i32,
     topics: &BTreeMap<String, BTreeSet<i32>>,
     response: DescribeLogDirsResponse,
 ) -> BrokerResult<BTreeMap<(String, i32), ReplicaLogDirInfo>> {
-    if let Some(error) = kafka_error_if(response.error_code, None) {
-        return Err(error);
-    }
     let mut out = BTreeMap::<(String, i32), ReplicaLogDirInfo>::new();
     for dir in response.results {
         if dir.error_code == KAFKA_STORAGE_ERROR {
@@ -1270,7 +1344,7 @@ mod tests {
                 BTreeMap::from([(replica(1, 2), Ok(ReplicaLogDirInfo::default()))]),
             ),
             (
-                "an unreachable broker fails only its replicas",
+                "an unreachable broker fails the replicas still pending",
                 Behavior::Down,
                 vec![replica(0, 1), replica(1, 2)],
                 SHORT,
@@ -1302,7 +1376,8 @@ mod tests {
 
     /// How Kafka's `describeReplicaLogDirs` `handleResponse` reads one
     /// answer: a future replica fills the future slot, an offline log dir is
-    /// skipped, and any other log-dir error fails the broker.
+    /// skipped, any other log-dir error fails the answer, and the top-level
+    /// error code is not read.
     #[test]
     fn replica_log_dirs_reads_current_and_future_replicas() {
         let dir =
@@ -1388,14 +1463,16 @@ mod tests {
                 }),
             ),
             (
-                "a top-level error fails the broker",
+                "the top-level error is not read",
                 CLUSTER_AUTHORIZATION_FAILED,
-                vec![],
-                Err(KafkaError {
-                    code: CLUSTER_AUTHORIZATION_FAILED,
-                    name: "CLUSTER_AUTHORIZATION_FAILED",
-                    message: None,
-                }),
+                vec![dir("/a", 0, vec![(1, 0, false)])],
+                Ok(BTreeMap::from([(
+                    ("orders".to_owned(), 1),
+                    ReplicaLogDirInfo {
+                        current: at("/a", 0),
+                        future: None,
+                    },
+                )])),
             ),
         ] {
             let response = DescribeLogDirsResponse {
@@ -1405,6 +1482,96 @@ mod tests {
             };
             assert!(
                 replica_log_dirs(1, &asked, response) == expected,
+                "case {name}"
+            );
+        }
+    }
+
+    /// Kafka's replica futures: an answer completes the pending replicas of
+    /// its broker, and a failure (an illegal log-dir error or a failed call)
+    /// completes every replica of the call that is still pending with that
+    /// error. Replicas that are complete keep their result.
+    #[test]
+    fn a_failure_fails_every_replica_still_pending() {
+        let asked = |partitions: &[i32]| {
+            BTreeMap::from([(
+                "orders".to_owned(),
+                partitions.iter().copied().collect::<BTreeSet<_>>(),
+            )])
+        };
+        let by_broker = BTreeMap::from([(1, asked(&[0, 5])), (2, asked(&[1]))]);
+        let found = |partition: i32, broker_id: i32| {
+            (
+                ("orders".to_owned(), partition),
+                ReplicaLogDirInfo {
+                    current: Some(ReplicaLogDir {
+                        path: log_dir(broker_id),
+                        offset_lag: 0,
+                    }),
+                    future: None,
+                },
+            )
+        };
+        let answer = |broker_id: i32, partition: i32| {
+            (broker_id, Ok(BTreeMap::from([found(partition, broker_id)])))
+        };
+        let illegal = KafkaError {
+            code: 57,
+            name: "LOG_DIR_NOT_FOUND",
+            message: Some("illegal".to_owned()),
+        };
+        let timed_out = KafkaError {
+            code: REQUEST_TIMED_OUT,
+            name: "REQUEST_TIMED_OUT",
+            message: None,
+        };
+        let hosted = |partition, broker_id| Ok(found(partition, broker_id).1);
+        for (name, answers, expected) in [
+            (
+                "every broker answers",
+                vec![answer(2, 1), answer(1, 0)],
+                BTreeMap::from([
+                    (replica(0, 1), hosted(0, 1)),
+                    (replica(5, 1), Ok(ReplicaLogDirInfo::default())),
+                    (replica(1, 2), hosted(1, 2)),
+                ]),
+            ),
+            (
+                "an illegal log dir after an answer",
+                vec![answer(1, 0), (2, Err(illegal.clone()))],
+                BTreeMap::from([
+                    (replica(0, 1), hosted(0, 1)),
+                    (replica(5, 1), Ok(ReplicaLogDirInfo::default())),
+                    (replica(1, 2), Err(illegal.clone())),
+                ]),
+            ),
+            (
+                "an illegal log dir before an answer",
+                vec![(2, Err(illegal.clone())), answer(1, 0)],
+                BTreeMap::from([
+                    (replica(0, 1), Err(illegal.clone())),
+                    (replica(5, 1), Err(illegal.clone())),
+                    (replica(1, 2), Err(illegal.clone())),
+                ]),
+            ),
+            (
+                "a failed call before an answer",
+                vec![(1, Err(timed_out.clone())), answer(2, 1)],
+                BTreeMap::from([
+                    (replica(0, 1), Err(timed_out.clone())),
+                    (replica(5, 1), Err(timed_out.clone())),
+                    (replica(1, 2), Err(timed_out.clone())),
+                ]),
+            ),
+        ] {
+            let mut results = ReplicaResults::new(&by_broker);
+            let mut completed_after = Vec::new();
+            for (broker_id, answer) in answers {
+                results.complete(broker_id, &by_broker[&broker_id], answer);
+                completed_after.push(results.is_complete());
+            }
+            assert!(
+                (completed_after.last().copied(), results.finish()) == (Some(true), expected),
                 "case {name}"
             );
         }
