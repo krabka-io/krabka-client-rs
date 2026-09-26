@@ -18,7 +18,6 @@ use crate::{
     coordinator::{
         COORDINATOR_LOAD_IN_PROGRESS, COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR, find_coordinator,
         is_retriable_coordinator_code, is_retriable_transport_error, next_backoff,
-        retry_deadline_elapsed,
     },
     error::ConsumerError,
     offset_wire::{TopicNameOffsetCommit, build_commit_topics},
@@ -966,7 +965,8 @@ impl Consumer {
             if pending.is_empty() {
                 return Ok(());
             }
-            self.commit_pending_offsets(pending, RecordSent::BeforeSend, self.retry_policy.timeout)
+            let retry_deadline = tokio::time::Instant::now() + self.retry_policy.timeout;
+            self.commit_pending_offsets(pending, RecordSent::BeforeSend, retry_deadline)
                 .await
         };
         match tokio::time::timeout_at(deadline, commit).await {
@@ -1038,7 +1038,7 @@ impl Consumer {
             }
             tracing::Span::current().record("partitions", pending.len());
 
-            self.commit_pending_offsets(pending, RecordSent::BeforeSend, default_api_timeout)
+            self.commit_pending_offsets(pending, RecordSent::BeforeSend, deadline)
                 .await
         };
         tokio::time::timeout_at(deadline, commit)
@@ -1101,7 +1101,7 @@ impl Consumer {
                     .collect::<HashMap<_, _>>()
             };
 
-            self.commit_pending_offsets(pending, RecordSent::AfterAck, default_api_timeout)
+            self.commit_pending_offsets(pending, RecordSent::AfterAck, deadline)
                 .await
         };
         tokio::time::timeout_at(deadline, commit)
@@ -1138,13 +1138,18 @@ impl Consumer {
         Ok(())
     }
 
+    /// Commit `pending`, and retry a retriable failure until `deadline`.
+    ///
+    /// A synchronous commit passes the deadline of its own `timeout_at`, so
+    /// that the retry loop and the bound of the whole call expire at the same
+    /// instant. The loop then reports the last retriable error at that
+    /// instant, however long the call waited before its first attempt.
     async fn commit_pending_offsets(
         &self,
         mut pending: HashMap<(String, i32), (OffsetAndMetadata, u64)>,
         record: RecordSent,
-        timeout: Duration,
+        deadline: tokio::time::Instant,
     ) -> Result<(), ConsumerError> {
-        let retry_start = tokio::time::Instant::now();
         let mut retry_backoff = self.retry_policy.initial_backoff;
         loop {
             let identity = self.commit_identity.lock().await.clone();
@@ -1178,7 +1183,7 @@ impl Consumer {
                     if is_retriable_transport_error(&error)
                         || matches!(error, krabka_client_core::ClientError::Timeout(_)) =>
                 {
-                    if retry_deadline_elapsed(retry_start, timeout) {
+                    if tokio::time::Instant::now() >= deadline {
                         return Err(ConsumerError::CoordinatorUnavailable);
                     }
                     tracing::warn!(
@@ -1188,11 +1193,8 @@ impl Consumer {
                     );
                     self.client
                         .evict_broker(self.coordinator_id.load(Ordering::Relaxed));
-                    self.find_coordinator_again(retry_start, timeout).await;
-                    if !self
-                        .sleep_before_retry(retry_start, retry_backoff, timeout)
-                        .await
-                    {
+                    self.find_coordinator_again(deadline).await;
+                    if !self.sleep_before_retry(retry_backoff, deadline).await {
                         return Err(ConsumerError::CoordinatorUnavailable);
                     }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
@@ -1226,7 +1228,7 @@ impl Consumer {
                     if pending.is_empty() {
                         return Ok(());
                     }
-                    if retry_deadline_elapsed(retry_start, timeout) {
+                    if tokio::time::Instant::now() >= deadline {
                         return Err(ConsumerError::Server(code));
                     }
                     tracing::warn!(
@@ -1235,12 +1237,9 @@ impl Consumer {
                         "offset commit failed with a retriable error; retrying",
                     );
                     if find_coordinator {
-                        self.find_coordinator_again(retry_start, timeout).await;
+                        self.find_coordinator_again(deadline).await;
                     }
-                    if !self
-                        .sleep_before_retry(retry_start, retry_backoff, timeout)
-                        .await
-                    {
+                    if !self.sleep_before_retry(retry_backoff, deadline).await {
                         return Err(ConsumerError::Server(code));
                     }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
@@ -1272,30 +1271,23 @@ impl Consumer {
         auto_commit.record_sent(pending_positions(&acked)).await;
     }
 
-    /// Wait `backoff` before the next attempt of a synchronous commit that
-    /// started at `retry_start`, but not past the retry timeout. Return whether
-    /// time is left for the next attempt. Kafka's `commitOffsetsSync` does
-    /// `timer.sleep(backoff)` and then sends again only while
-    /// `timer.notExpired()`.
-    async fn sleep_before_retry(
-        &self,
-        retry_start: tokio::time::Instant,
-        backoff: Duration,
-        timeout: Duration,
-    ) -> bool {
-        let remaining = timeout.saturating_sub(retry_start.elapsed());
-        tokio::time::sleep(backoff.min(remaining)).await;
-        !retry_deadline_elapsed(retry_start, timeout)
+    /// Wait `backoff` before the next attempt of a synchronous commit, but not
+    /// past its retry `deadline`. Return whether time is left for the next
+    /// attempt. Kafka's `commitOffsetsSync` does `timer.sleep(backoff)` and
+    /// then sends again only while `timer.notExpired()`.
+    async fn sleep_before_retry(&self, backoff: Duration, deadline: tokio::time::Instant) -> bool {
+        tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
+        tokio::time::Instant::now() < deadline
     }
 
     /// Find the group coordinator again, within the time that is left of a
-    /// synchronous commit that started at `retry_start`. Kafka's
+    /// synchronous commit with the retry `deadline`. Kafka's
     /// `commitOffsetsSync` does this in `coordinatorUnknownAndUnreadySync` after
     /// `markCoordinatorUnknown`. If the lookup fails, the next attempt uses the
     /// last known coordinator.
-    async fn find_coordinator_again(&self, retry_start: tokio::time::Instant, timeout: Duration) {
+    async fn find_coordinator_again(&self, deadline: tokio::time::Instant) {
         let retry_policy = crate::coordinator::CoordinatorRetryPolicy {
-            timeout: timeout.saturating_sub(retry_start.elapsed()),
+            timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
             ..self.retry_policy
         };
         match find_coordinator(&self.client, &self.group_id, retry_policy).await {
@@ -2623,7 +2615,7 @@ mod tests {
         for (name, answers, rejoin, retry_policy, expected) in offset_commit_error_code_cases() {
             actual.push((
                 name,
-                scripted_commit_sync(answers, rejoin, retry_policy).await,
+                scripted_commit_sync(answers, rejoin, retry_policy, Duration::ZERO).await,
             ));
             wanted.push((name, expected));
         }
@@ -2649,9 +2641,11 @@ mod tests {
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(1),
         };
-        /// The backoff is longer than the time that is left.
+        /// The backoff is longer than the time that is left. The timeout
+        /// leaves room for the real round trips to the mock coordinator of a
+        /// slow, instrumented test run before it expires.
         const LONG_BACKOFF: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
-            timeout: Duration::from_millis(100),
+            timeout: Duration::from_secs(1),
             initial_backoff: Duration::from_secs(5),
             max_backoff: Duration::from_secs(5),
         };
@@ -2843,14 +2837,37 @@ mod tests {
         ]
     }
 
+    /// A synchronous commit that first waits for the commit lock retries
+    /// until the deadline of the whole call, and at that deadline reports the
+    /// last retriable error, as the same commit without the wait does. The
+    /// wait does not move the retry deadline past the bound of the call.
+    #[tokio::test]
+    async fn commit_sync_after_a_wait_for_the_commit_lock_reports_the_last_retriable_error() {
+        let retry_policy = CoordinatorRetryPolicy {
+            timeout: Duration::from_secs(1),
+            initial_backoff: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(5),
+        };
+        let result = scripted_commit_sync(
+            vec![CommitAnswer::Codes(&[("orders", 3)])],
+            false,
+            retry_policy,
+            Duration::from_millis(50),
+        )
+        .await;
+        assert2::assert!(result == (Err(ConsumerError::Server(3).to_string()), 1, 0));
+    }
+
     /// Run `commit_sync` against a mock coordinator that gives `answers` to
     /// the `OffsetCommit` requests in order and repeats the last answer. With
     /// `rejoin`, the coordinator task joins the group again with generation 8
-    /// before the first answer.
+    /// before the first answer. Another holder keeps the commit lock for
+    /// `commit_lock_held` after `commit_sync` starts.
     async fn scripted_commit_sync(
         answers: Vec<CommitAnswer>,
         rejoin: bool,
         retry_policy: CoordinatorRetryPolicy,
+        commit_lock_held: Duration,
     ) -> CommitCodeResult {
         use CommitAnswer::{Close, Codes, Silent};
         use krabka_protocol::owned::{
@@ -2954,8 +2971,16 @@ mod tests {
         consumer.default_api_timeout =
             krabka_units::convert::StdDurationExt::as_time(&retry_policy.timeout);
 
-        let result = tokio::time::timeout(Duration::from_secs(10), consumer.commit_sync())
-            .await
+        let held = consumer.commit_serialization.lock().await;
+        let release = async move {
+            tokio::time::sleep(commit_lock_held).await;
+            drop(held);
+        };
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(10), consumer.commit_sync()),
+            release,
+        );
+        let result = result
             .map_err(|_| "commit never finished".to_string())
             .and_then(|result| result.map_err(|error| error.to_string()));
 
