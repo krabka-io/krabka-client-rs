@@ -605,7 +605,7 @@ mod tests {
                 orders_1_spec: OffsetSpec::Latest,
                 expected: Err(KafkaError {
                     code: 29,
-                    name: "UNKNOWN",
+                    name: "TOPIC_AUTHORIZATION_FAILED",
                     message: None,
                 }),
                 metadata_requests: 1,

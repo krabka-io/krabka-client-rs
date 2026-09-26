@@ -401,7 +401,8 @@ pub(crate) mod test_support {
     }
 
     /// An `ApiVersions` answer that advertises `ApiVersions` v0, `Metadata`
-    /// v12 and each `(api_key, min, max)` of `apis`.
+    /// v12 unless `apis` names `Metadata`, and each `(api_key, min, max)` of
+    /// `apis`.
     pub(crate) fn api_versions(apis: &[(i16, i16, i16)]) -> Vec<u8> {
         let api_version = |api_key, min_version, max_version| ApiVersion {
             api_key,
@@ -409,10 +410,13 @@ pub(crate) mod test_support {
             max_version,
             ..Default::default()
         };
-        let mut api_keys = vec![
-            api_version(api_versions_request::API_KEY, 0, 0),
-            api_version(metadata_request::API_KEY, 12, 12),
-        ];
+        let mut api_keys = vec![api_version(api_versions_request::API_KEY, 0, 0)];
+        if !apis
+            .iter()
+            .any(|(api_key, _, _)| *api_key == metadata_request::API_KEY)
+        {
+            api_keys.push(api_version(metadata_request::API_KEY, 12, 12));
+        }
         api_keys.extend(
             apis.iter()
                 .map(|(api_key, min, max)| api_version(*api_key, *min, *max)),
@@ -519,6 +523,34 @@ pub(crate) mod test_support {
         broker
     }
 
+    /// A mock broker that advertises `apis` (see [`api_versions`]) and
+    /// answers every other request with `answer(api_key, version, body,
+    /// own_address)`. Unless `answer` handles `Metadata` itself, it answers
+    /// `Metadata` with [`orders_metadata`] naming itself as broker 1 and
+    /// controller, so that a controller refresh reconnects to it.
+    pub(crate) async fn scripted_broker(
+        apis: Vec<(i16, i16, i16)>,
+        mut answer: impl FnMut(i16, i16, &[u8], SocketAddr) -> MockReply + Send + 'static,
+    ) -> MockBroker {
+        let port = Arc::new(AtomicU16::new(0));
+        let handler_port = Arc::clone(&port);
+        let broker = MockBroker::start_with_replies(move |key, version, _, body| {
+            let own = SocketAddr::from(([127, 0, 0, 1], handler_port.load(Ordering::SeqCst)));
+            if key == api_versions_request::API_KEY {
+                return MockReply::Respond(api_versions(&apis));
+            }
+            match answer(key, version, body, own) {
+                MockReply::Silent if key == metadata_request::API_KEY => {
+                    MockReply::Respond(encode_response(&orders_metadata(own), version, true))
+                }
+                reply => reply,
+            }
+        })
+        .await;
+        port.store(broker.addr.port(), Ordering::SeqCst);
+        broker
+    }
+
     /// An admin client on `bootstrap` that retries after 1 ms and gives up
     /// after `api_timeout`, which is also its request timeout.
     pub(crate) async fn fast_admin(
@@ -587,7 +619,7 @@ mod tests {
                 1,
                 LeaderLookup::Failed(KafkaError {
                     code: 29,
-                    name: "UNKNOWN",
+                    name: "TOPIC_AUTHORIZATION_FAILED",
                     message: None,
                 }),
             ),

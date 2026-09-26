@@ -37,6 +37,9 @@ const UNKNOWN_SERVER_ERROR: i16 = -1;
 const REQUEST_TIMED_OUT: i16 = 7;
 /// `CLUSTER_AUTHORIZATION_FAILED`.
 const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
+/// `KAFKA_STORAGE_ERROR`: the log dir is offline, or the broker does not
+/// host the replica.
+const KAFKA_STORAGE_ERROR: i16 = 56;
 
 /// One replica of a partition on one broker, as Kafka's
 /// `TopicPartitionReplica`.
@@ -80,6 +83,29 @@ pub struct LogDirPartitionInfo {
 
 /// The result of one broker: its value, or the Kafka error of the broker.
 pub type BrokerResult<T> = Result<T, KafkaError>;
+
+/// Where one replica of a partition lives on its broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaLogDir {
+    /// The absolute path of the log dir.
+    pub path: String,
+    /// How far the replica lags behind the log end offset of the partition
+    /// on this broker (for the current replica) or behind the current
+    /// replica (for a future replica).
+    pub offset_lag: i64,
+}
+
+/// The log dirs of one replica, as Kafka's
+/// `DescribeReplicaLogDirsResult.ReplicaLogDirInfo`. A replica that the
+/// broker does not hold, or holds only in an offline log dir, has neither.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicaLogDirInfo {
+    /// The log dir of the current replica.
+    pub current: Option<ReplicaLogDir>,
+    /// The log dir that an `AlterReplicaLogDirs` move is copying the replica
+    /// to (KIP-113).
+    pub future: Option<ReplicaLogDir>,
+}
 
 impl AdminClient {
     /// `AlterReplicaLogDirs` (KIP-113): moves replicas between the
@@ -201,6 +227,166 @@ impl AdminClient {
         .await;
         broker_ids.into_iter().zip(answers).collect()
     }
+
+    /// `DescribeLogDirs` for single replicas: finds the log dir of each
+    /// replica of `replicas`, and of its future replica when one is being
+    /// moved, as Kafka's `KafkaAdminClient.describeReplicaLogDirs` does.
+    ///
+    /// The call groups the replicas by broker id and sends each broker one
+    /// `DescribeLogDirs` request that names only its partitions, all at the
+    /// same time. Each broker is found and retried as in
+    /// [`Self::describe_log_dirs`]. The result has one entry for each
+    /// replica:
+    ///
+    /// - The log dirs that the broker reports for the partition. A log dir
+    ///   with `KAFKA_STORAGE_ERROR` (56) is offline and skipped, as Kafka
+    ///   does, so a replica that lives only there has neither log dir.
+    /// - The error of the broker call for every replica of a broker that
+    ///   fails, and `REQUEST_TIMED_OUT` (7) at `default.api.timeout.ms`.
+    /// - The top-level error of a `DescribeLogDirs` v3+ answer, such as
+    ///   `CLUSTER_AUTHORIZATION_FAILED` (31), for every replica of that
+    ///   broker.
+    /// - For every replica of a broker that reports any other log-dir error,
+    ///   that error, as Kafka fails the call with an `IllegalStateException`.
+    pub async fn describe_replica_log_dirs(
+        &mut self,
+        replicas: &[TopicPartitionReplica],
+    ) -> BTreeMap<TopicPartitionReplica, BrokerResult<ReplicaLogDirInfo>> {
+        self.describe_replica_log_dirs_with_retry(replicas, self.retry)
+            .await
+    }
+
+    async fn describe_replica_log_dirs_with_retry(
+        &mut self,
+        replicas: &[TopicPartitionReplica],
+        retry: RetryPolicy,
+    ) -> BTreeMap<TopicPartitionReplica, BrokerResult<ReplicaLogDirInfo>> {
+        let start = retry.start();
+        let mut by_broker = BTreeMap::<i32, BTreeMap<String, BTreeSet<i32>>>::new();
+        for replica in replicas {
+            by_broker
+                .entry(replica.broker_id)
+                .or_default()
+                .entry(replica.topic.clone())
+                .or_default()
+                .insert(replica.partition);
+        }
+        let (conn, options) = (&self.conn, &self.options);
+        let answers =
+            futures_util::future::join_all(by_broker.iter().map(|(broker_id, topics)| {
+                call_broker(
+                    conn,
+                    *broker_id,
+                    options,
+                    replica_request(topics),
+                    CoordinatorRetry::from_deadline(start),
+                )
+            }))
+            .await;
+
+        let mut out = BTreeMap::new();
+        for ((broker_id, topics), answer) in by_broker.into_iter().zip(answers) {
+            let infos = answer.and_then(|response| replica_log_dirs(broker_id, &topics, response));
+            for (topic, partitions) in topics {
+                for partition in partitions {
+                    let result = match &infos {
+                        Ok(infos) => Ok(infos
+                            .get(&(topic.clone(), partition))
+                            .cloned()
+                            .unwrap_or_default()),
+                        Err(error) => Err(error.clone()),
+                    };
+                    out.insert(
+                        TopicPartitionReplica {
+                            topic: topic.clone(),
+                            partition,
+                            broker_id,
+                        },
+                        result,
+                    );
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The `DescribeLogDirs` request of one broker for the partitions of
+/// `topics`, as Kafka's `describeReplicaLogDirs` builds it.
+fn replica_request(topics: &BTreeMap<String, BTreeSet<i32>>) -> DescribeLogDirsRequest {
+    DescribeLogDirsRequest {
+        topics: Some(
+            topics
+                .iter()
+                .map(|(topic, partitions)| DescribableLogDirTopic {
+                    topic: topic.clone(),
+                    partitions: partitions.iter().copied().collect(),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
+/// The log dirs of each asked-for partition in one broker's answer, as
+/// Kafka's `describeReplicaLogDirs` `handleResponse` reads them. A partition
+/// that the request did not name is skipped with a warning.
+fn replica_log_dirs(
+    broker_id: i32,
+    topics: &BTreeMap<String, BTreeSet<i32>>,
+    response: DescribeLogDirsResponse,
+) -> BrokerResult<BTreeMap<(String, i32), ReplicaLogDirInfo>> {
+    if let Some(error) = kafka_error_if(response.error_code, None) {
+        return Err(error);
+    }
+    let mut out = BTreeMap::<(String, i32), ReplicaLogDirInfo>::new();
+    for dir in response.results {
+        if dir.error_code == KAFKA_STORAGE_ERROR {
+            continue;
+        }
+        if dir.error_code != 0 {
+            return Err(KafkaError {
+                code: dir.error_code,
+                name: kafka_error_name(dir.error_code),
+                message: Some(format!(
+                    "the error {} for log directory {} in the response from broker {broker_id} \
+                     is illegal",
+                    kafka_error_name(dir.error_code),
+                    dir.log_dir
+                )),
+            });
+        }
+        for topic in dir.topics {
+            for partition in topic.partitions {
+                let asked = topics
+                    .get(&topic.name)
+                    .is_some_and(|partitions| partitions.contains(&partition.partition_index));
+                if !asked {
+                    tracing::warn!(
+                        broker_id,
+                        topic = %topic.name,
+                        partition = partition.partition_index,
+                        "the DescribeLogDirs response names a partition that is not in the request"
+                    );
+                    continue;
+                }
+                let info = out
+                    .entry((topic.name.clone(), partition.partition_index))
+                    .or_default();
+                let location = Some(ReplicaLogDir {
+                    path: dir.log_dir.clone(),
+                    offset_lag: partition.offset_lag,
+                });
+                if partition.is_future_key {
+                    info.future = location;
+                } else {
+                    info.current = location;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Send `request` to broker `broker_id` until it answers, the error is
@@ -502,9 +688,6 @@ mod tests {
 
     use super::*;
 
-    /// `KAFKA_STORAGE_ERROR`: a broker answers it for a replica it does not
-    /// host.
-    const KAFKA_STORAGE_ERROR: i16 = 56;
     const LONG: Duration = Duration::from_secs(5);
     const SHORT: Duration = Duration::from_millis(300);
 
@@ -1009,6 +1192,219 @@ mod tests {
             let received = cluster.stop();
             assert!(
                 (result, received) == (expected, expected_requests),
+                "case {name}"
+            );
+        }
+    }
+
+    fn replica_request_of(broker: &[(&str, &[i32])]) -> DescribeLogDirsRequest {
+        DescribeLogDirsRequest {
+            topics: Some(
+                broker
+                    .iter()
+                    .map(|(topic, partitions)| DescribableLogDirTopic {
+                        topic: (*topic).to_owned(),
+                        partitions: partitions.to_vec(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// The current log dir of the replica that broker `broker_id` hosts in
+    /// the mock cluster.
+    fn hosted(broker_id: i32) -> ReplicaLogDirInfo {
+        ReplicaLogDirInfo {
+            current: Some(ReplicaLogDir {
+                path: log_dir(broker_id),
+                offset_lag: 0,
+            }),
+            future: None,
+        }
+    }
+
+    /// Kafka's `describeReplicaLogDirs` sends each broker one
+    /// `DescribeLogDirs` that names only its replicas, finds a moved broker
+    /// again, gives an empty `ReplicaLogDirInfo` to a replica the broker does
+    /// not report, and times out a broker it cannot reach.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn describe_replica_log_dirs_asks_the_broker_of_each_replica() {
+        for (name, broker_2, replicas, timeout, expected_requests, expected) in [
+            (
+                "each replica is asked of its broker",
+                Behavior::Normal,
+                vec![replica(0, 1), replica(5, 1), replica(1, 2)],
+                LONG,
+                vec![
+                    Received::Describe(1, replica_request_of(&[("orders", &[0, 5])])),
+                    Received::Describe(2, replica_request_of(&[("orders", &[1])])),
+                ],
+                BTreeMap::from([
+                    (replica(0, 1), Ok(hosted(1))),
+                    (replica(5, 1), Ok(ReplicaLogDirInfo::default())),
+                    (replica(1, 2), Ok(hosted(2))),
+                ]),
+            ),
+            (
+                "a broker at a new address is found again",
+                Behavior::Moved,
+                vec![replica(1, 2)],
+                LONG,
+                vec![Received::Describe(
+                    2,
+                    replica_request_of(&[("orders", &[1])]),
+                )],
+                BTreeMap::from([(replica(1, 2), Ok(hosted(2)))]),
+            ),
+            (
+                "a broker with no log dir reports no replica",
+                Behavior::NoLogDirs,
+                vec![replica(1, 2)],
+                LONG,
+                vec![Received::Describe(
+                    2,
+                    replica_request_of(&[("orders", &[1])]),
+                )],
+                BTreeMap::from([(replica(1, 2), Ok(ReplicaLogDirInfo::default()))]),
+            ),
+            (
+                "an unreachable broker fails only its replicas",
+                Behavior::Down,
+                vec![replica(0, 1), replica(1, 2)],
+                SHORT,
+                vec![Received::Describe(
+                    1,
+                    replica_request_of(&[("orders", &[0])]),
+                )],
+                BTreeMap::from([
+                    (replica(0, 1), Ok(hosted(1))),
+                    (replica(1, 2), Err(REQUEST_TIMED_OUT)),
+                ]),
+            ),
+        ] {
+            let mut cluster = Cluster::start(broker_2).await;
+            let result = cluster
+                .admin
+                .describe_replica_log_dirs_with_retry(&replicas, policy(timeout))
+                .await
+                .into_iter()
+                .map(|(replica, result)| (replica, result.map_err(|error| error.code)))
+                .collect::<BTreeMap<_, _>>();
+            let received = cluster.stop();
+            assert!(
+                (result, received) == (expected, expected_requests),
+                "case {name}"
+            );
+        }
+    }
+
+    /// How Kafka's `describeReplicaLogDirs` `handleResponse` reads one
+    /// answer: a future replica fills the future slot, an offline log dir is
+    /// skipped, and any other log-dir error fails the broker.
+    #[test]
+    fn replica_log_dirs_reads_current_and_future_replicas() {
+        let dir =
+            |path: &str, error_code, partitions: Vec<(i32, i64, bool)>| DescribeLogDirsResult {
+                error_code,
+                log_dir: path.to_owned(),
+                topics: vec![DescribeLogDirsTopic {
+                    name: "orders".into(),
+                    partitions: partitions
+                        .into_iter()
+                        .map(|(partition_index, offset_lag, is_future_key)| {
+                            DescribeLogDirsPartition {
+                                partition_index,
+                                offset_lag,
+                                is_future_key,
+                                ..Default::default()
+                            }
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+        let at = |path: &str, offset_lag| {
+            Some(ReplicaLogDir {
+                path: path.to_owned(),
+                offset_lag,
+            })
+        };
+        let asked = BTreeMap::from([("orders".to_owned(), BTreeSet::from([0, 1]))]);
+        for (name, error_code, results, expected) in [
+            (
+                "a replica being moved has a current and a future log dir",
+                0,
+                vec![
+                    dir("/a", 0, vec![(0, 0, false), (1, 3, false)]),
+                    dir("/b", 0, vec![(0, 42, true), (9, 0, false)]),
+                ],
+                Ok(BTreeMap::from([
+                    (
+                        ("orders".to_owned(), 0),
+                        ReplicaLogDirInfo {
+                            current: at("/a", 0),
+                            future: at("/b", 42),
+                        },
+                    ),
+                    (
+                        ("orders".to_owned(), 1),
+                        ReplicaLogDirInfo {
+                            current: at("/a", 3),
+                            future: None,
+                        },
+                    ),
+                ])),
+            ),
+            (
+                "an offline log dir is skipped",
+                0,
+                vec![
+                    dir("/offline", KAFKA_STORAGE_ERROR, vec![(0, 0, false)]),
+                    dir("/a", 0, vec![(1, 0, false)]),
+                ],
+                Ok(BTreeMap::from([(
+                    ("orders".to_owned(), 1),
+                    ReplicaLogDirInfo {
+                        current: at("/a", 0),
+                        future: None,
+                    },
+                )])),
+            ),
+            (
+                "another log dir error fails the broker",
+                0,
+                vec![dir("/a", 57, vec![])],
+                Err(KafkaError {
+                    code: 57,
+                    name: "LOG_DIR_NOT_FOUND",
+                    message: Some(
+                        "the error LOG_DIR_NOT_FOUND for log directory /a in the response from \
+                         broker 1 is illegal"
+                            .to_owned(),
+                    ),
+                }),
+            ),
+            (
+                "a top-level error fails the broker",
+                CLUSTER_AUTHORIZATION_FAILED,
+                vec![],
+                Err(KafkaError {
+                    code: CLUSTER_AUTHORIZATION_FAILED,
+                    name: "CLUSTER_AUTHORIZATION_FAILED",
+                    message: None,
+                }),
+            ),
+        ] {
+            let response = DescribeLogDirsResponse {
+                error_code,
+                results,
+                ..Default::default()
+            };
+            assert!(
+                replica_log_dirs(1, &asked, response) == expected,
                 "case {name}"
             );
         }

@@ -2617,7 +2617,7 @@ mod tests {
                 (
                     Err(KafkaError {
                         code: 29,
-                        name: "UNKNOWN",
+                        name: "TOPIC_AUTHORIZATION_FAILED",
                         message: Some("refused".to_owned()),
                     }),
                     1,

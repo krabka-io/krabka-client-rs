@@ -78,7 +78,7 @@ fn cluster_node(broker: DescribeClusterBroker) -> ClusterNode {
 /// The operations of an authorized-operations bit field, as Kafka's
 /// `KafkaAdminClient.validAclOperations` reads it: `None` for
 /// `Integer.MIN_VALUE`, and without `UNKNOWN`, `ANY` and `ALL`.
-fn authorized_operations(bits: i32) -> Option<BTreeSet<AclOperation>> {
+pub(crate) fn authorized_operations(bits: i32) -> Option<BTreeSet<AclOperation>> {
     if bits == AUTHORIZED_OPERATIONS_OMITTED {
         return None;
     }
