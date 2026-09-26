@@ -1953,6 +1953,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "krabka-compression",
  "krabka-ids",
  "krabka-protocol",
  "krabka-security",

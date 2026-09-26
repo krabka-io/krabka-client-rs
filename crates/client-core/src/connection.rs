@@ -286,6 +286,9 @@ struct ConnectionInner {
     /// SASL re-authentication state (KIP-368), for a connection whose broker
     /// sent a session lifetime.
     reauth: Option<crate::reauth::Reauth>,
+    /// The network metrics of the client, once attached. They count the
+    /// requests after the `ApiVersions` exchange.
+    metrics: std::sync::OnceLock<crate::telemetry::ConnectionMetrics>,
     _reader: JoinHandle<()>,
     _writer: JoinHandle<()>,
 }
@@ -593,6 +596,7 @@ impl Connection {
                 writer_tx,
                 shutdown,
                 reauth,
+                metrics: std::sync::OnceLock::new(),
                 _reader: reader_handle,
                 _writer: writer_handle,
             }),
@@ -702,6 +706,9 @@ impl Connection {
         );
         req.encode(&mut frame, version)?;
         let guard = self.reauthenticate_if_due().await?;
+        if let Some(metrics) = self.inner.metrics.get() {
+            metrics.request(frame.len());
+        }
         let sent = self
             .inner
             .writer_tx
@@ -820,9 +827,24 @@ impl Connection {
             pending: &self.inner.pending,
             corr_id,
         };
+        let metrics = self.inner.metrics.get();
+        if let Some(metrics) = metrics {
+            metrics.request(frame.len());
+        }
         let rx = self.enqueue(corr_id, frame).await?;
         drop(guard);
-        self.await_response(corr_id, rx).await
+        let response = self.await_response(corr_id, rx).await?;
+        if let Some(metrics) = metrics {
+            metrics.response(response.len());
+        }
+        Ok(response)
+    }
+
+    /// Count this connection in the client's network metrics from now on.
+    /// A connection counts in one set of metrics; a second call does
+    /// nothing.
+    pub fn attach_metrics(&self, metrics: &crate::telemetry::NetworkMetrics) {
+        self.inner.metrics.get_or_init(|| metrics.opened());
     }
 
     /// Send a frame and wait for its response, with no re-authentication

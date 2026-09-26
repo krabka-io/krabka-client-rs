@@ -1059,10 +1059,11 @@ impl Producer {
     /// idempotent producer accepts at most 5 in-flight requests per
     /// connection, and a `transactional_id` requires idempotence.
     ///
-    /// The builder has no `enable_metrics_push` option. The producer does not
-    /// push client metrics (KIP-714), so it never sends
-    /// `GetTelemetrySubscriptions` or `PushTelemetry`. Kafka's
-    /// `enable.metrics.push` is `true` by default.
+    /// `enable_metrics_push` (Kafka's `enable.metrics.push`, default `true`)
+    /// pushes the client metrics that a broker's client metrics subscription
+    /// names (KIP-714), with a terminating push on close. When it is `false`,
+    /// the producer sends neither `GetTelemetrySubscriptions` nor
+    /// `PushTelemetry`.
     ///
     /// `send` fails a record whose serialized size is larger than
     /// `max_request_size` (default 1 MiB, Kafka's `max.request.size`) or
@@ -1145,7 +1146,13 @@ impl Producer {
         transaction_timeout: Option<Duration>,
         #[builder(default)] transaction_two_phase_commit_enable: bool,
         security: Option<krabka_client_core::security::ClientSecurity>,
+        #[builder(default = true)] enable_metrics_push: bool,
     ) -> Result<Self, ProducerError> {
+        let telemetry = enable_metrics_push.then(|| {
+            krabka_client_core::telemetry::ClientTelemetryConfig::producer(
+                transactional_id.as_deref(),
+            )
+        });
         let ResolvedProducerConfig {
             client_id,
             enable_idempotence,
@@ -1212,6 +1219,7 @@ impl Producer {
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
             .maybe_security(security.clone())
             .metadata_scope(PRODUCER_METADATA_SCOPE)
+            .maybe_telemetry(telemetry)
             .build()
             .await?;
 

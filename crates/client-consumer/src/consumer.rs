@@ -243,6 +243,9 @@ struct StartConfig {
     auto_commit_interval: Option<Duration>,
     /// Kafka's `allow.auto.create.topics`.
     allow_auto_create_topics: bool,
+    /// The KIP-714 reporter of the consumer's client, or `None` when Kafka's
+    /// `enable.metrics.push` is off.
+    telemetry: Option<krabka_client_core::telemetry::ClientTelemetryConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1150,6 +1153,11 @@ impl Consumer {
         /// `auto.create.topics.enable=true` create a missing one.
         #[builder(default = true)]
         allow_auto_create_topics: bool,
+        /// Kafka's `enable.metrics.push` (default `true`): push the client
+        /// metrics that a broker's client metrics subscription names
+        /// (KIP-714), and a terminating push on close.
+        #[builder(default = true)]
+        enable_metrics_push: bool,
     ) -> Result<Self, ConsumerError> {
         // Fail fast on misconfig — before any retry loop.
         // Kafka treats an empty `group.id` as no group id.
@@ -1274,6 +1282,13 @@ impl Consumer {
             .map_err(ConsumerError::InvalidConfig)?;
 
         let client_id = consumer_client_id(client_id, &group_id, group_instance_id.as_deref());
+        let telemetry = enable_metrics_push.then(|| {
+            krabka_client_core::telemetry::ClientTelemetryConfig::consumer(
+                Some(group_id.as_str()),
+                group_instance_id.as_deref(),
+                client_rack.as_deref(),
+            )
+        });
         let config = StartConfig {
             bootstrap,
             client_id,
@@ -1320,6 +1335,7 @@ impl Consumer {
             retry_policy,
             auto_commit_interval,
             allow_auto_create_topics,
+            telemetry,
         };
 
         Self::retry_start_until_success(config, rebalance_listener).await
@@ -1423,6 +1439,7 @@ impl Consumer {
             return start_without_subscription(config).await;
         }
         let finish_config = config.clone();
+        let telemetry = config.telemetry.clone();
         let StartConfig {
             bootstrap,
             client_id,
@@ -1464,6 +1481,7 @@ impl Consumer {
             .socket_connection_setup_timeout(socket_connection_setup_timeout)
             .socket_connection_setup_timeout_max(socket_connection_setup_timeout_max)
             .metadata_scope(subscription_metadata_scope(allow_auto_create_topics))
+            .maybe_telemetry(telemetry)
             .build()
             .await?;
         client.metadata_topics().set(subscribe.iter().cloned());
@@ -1803,6 +1821,7 @@ async fn start_without_subscription(config: StartConfig) -> Result<Consumer, Con
         .socket_connection_setup_timeout(config.socket_connection_setup_timeout)
         .socket_connection_setup_timeout_max(config.socket_connection_setup_timeout_max)
         .metadata_scope(subscription_metadata_scope(config.allow_auto_create_topics))
+        .maybe_telemetry(config.telemetry.clone())
         .build()
         .await?;
     let coordinator_id = if config.group_id.is_empty() {
@@ -2265,6 +2284,9 @@ impl Consumer {
             .saturating_sub(started.elapsed())
             .min(request_timeout);
         self.close_fetch_sessions(left).await;
+        // The terminating telemetry push (KIP-714), within the time left.
+        let left = timeout.saturating_sub(started.elapsed());
+        let _ = tokio::time::timeout(left, self.client.close_telemetry()).await;
         listener_result
     }
 
@@ -3848,57 +3870,59 @@ mod auto_commit_tests {
                     },
                     version,
                 )),
-                offset_commit_request::API_KEY => {
-                    let client_id_len = body.get_i16();
-                    body.advance(usize::try_from(client_id_len.max(0)).expect("client id length"));
-                    let mut request =
-                        OffsetCommitRequest::decode(&mut body, version).expect("decode commit");
-                    request.topics.sort_by(|a, b| a.name.cmp(&b.name));
-                    for topic in &mut request.topics {
-                        topic.partitions.sort_by_key(|p| p.partition_index);
-                    }
-                    if self.rebalance_on_commit.swap(false, Ordering::SeqCst) {
-                        self.heartbeat_error
-                            .store(REBALANCE_IN_PROGRESS, Ordering::SeqCst);
-                    }
-                    let error_code = match self
-                        .commit_replies
-                        .lock()
-                        .expect("commit replies lock")
-                        .pop_front()
-                    {
-                        None => 0,
-                        Some(CommitReply::Error(code)) => code,
-                        Some(CommitReply::Drop) => {
-                            self.record(GroupRequest::OffsetCommit(request));
-                            return None;
-                        }
-                    };
-                    let response = OffsetCommitResponse {
-                        topics: request
-                            .topics
+                offset_commit_request::API_KEY => self.respond_offset_commit(version, body),
+                _ => None,
+            }
+        }
+
+        fn respond_offset_commit(&self, version: i16, mut body: &[u8]) -> Option<Vec<u8>> {
+            let client_id_len = body.get_i16();
+            body.advance(usize::try_from(client_id_len.max(0)).expect("client id length"));
+            let mut request =
+                OffsetCommitRequest::decode(&mut body, version).expect("decode commit");
+            request.topics.sort_by(|a, b| a.name.cmp(&b.name));
+            for topic in &mut request.topics {
+                topic.partitions.sort_by_key(|p| p.partition_index);
+            }
+            if self.rebalance_on_commit.swap(false, Ordering::SeqCst) {
+                self.heartbeat_error
+                    .store(REBALANCE_IN_PROGRESS, Ordering::SeqCst);
+            }
+            let error_code = match self
+                .commit_replies
+                .lock()
+                .expect("commit replies lock")
+                .pop_front()
+            {
+                None => 0,
+                Some(CommitReply::Error(code)) => code,
+                Some(CommitReply::Drop) => {
+                    self.record(GroupRequest::OffsetCommit(request));
+                    return None;
+                }
+            };
+            let response = OffsetCommitResponse {
+                topics: request
+                    .topics
+                    .iter()
+                    .map(|topic| OffsetCommitResponseTopic {
+                        name: topic.name.clone(),
+                        partitions: topic
+                            .partitions
                             .iter()
-                            .map(|topic| OffsetCommitResponseTopic {
-                                name: topic.name.clone(),
-                                partitions: topic
-                                    .partitions
-                                    .iter()
-                                    .map(|p| OffsetCommitResponsePartition {
-                                        partition_index: p.partition_index,
-                                        error_code,
-                                        ..Default::default()
-                                    })
-                                    .collect(),
+                            .map(|p| OffsetCommitResponsePartition {
+                                partition_index: p.partition_index,
+                                error_code,
                                 ..Default::default()
                             })
                             .collect(),
                         ..Default::default()
-                    };
-                    self.record(GroupRequest::OffsetCommit(request));
-                    Some(encode(&response, version))
-                }
-                _ => None,
-            }
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            self.record(GroupRequest::OffsetCommit(request));
+            Some(encode(&response, version))
         }
     }
 
@@ -4171,6 +4195,7 @@ mod auto_commit_tests {
             retry_policy: ConsumerRetryPolicy::default(),
             auto_commit_interval: auto_commit.then_some(AUTO_COMMIT_INTERVAL),
             allow_auto_create_topics: true,
+            telemetry: None,
         }
     }
 

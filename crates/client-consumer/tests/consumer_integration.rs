@@ -388,7 +388,7 @@ async fn eager_rebalance_reacquires_and_primes() {
     support::produce_to_partition(&producer, &topic, 0, &["a0"]).await;
     support::produce_to_partition(&producer, &topic, 1, &["a1"]).await;
 
-    let (mut m1, mut m2) = two_member_split(&kafka.bootstrap, &group, &topic).await;
+    let (mut m1, mut m2) = Box::pin(two_member_split(&kafka.bootstrap, &group, &topic)).await;
 
     // Each member reads its own partition and commits. Those two commits are
     // the positions the eager rejoin must prime from.
@@ -448,7 +448,7 @@ async fn commit_succeeds_after_rebalance_bumps_generation() {
     let producer = support::bootstrap_client(&kafka.bootstrap).await;
     support::create_topic_with_partitions(&producer, &topic, 2).await;
 
-    let (mut m1, m2) = two_member_split(&kafka.bootstrap, &group, &topic).await;
+    let (mut m1, m2) = Box::pin(two_member_split(&kafka.bootstrap, &group, &topic)).await;
     let gen_after_split = m1.generation_id();
 
     drop_member_and_reacquire(&mut m1, m2).await;

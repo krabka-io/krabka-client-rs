@@ -2277,6 +2277,8 @@ impl Producer {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn close(mut self) -> Result<(), ProducerError> {
         self.flush().await?;
+        // The terminating telemetry push (KIP-714).
+        self.client.close_telemetry().await;
         self.state.store(STATE_CLOSED, Ordering::Release);
         self.sender_shutdown.cancel();
         if let Some(h) = self.sender_handle.take() {
