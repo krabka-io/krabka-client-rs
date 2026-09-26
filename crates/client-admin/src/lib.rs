@@ -47,7 +47,10 @@ pub use config::{
 };
 pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
 pub use features::{FeatureMetadata, FeatureRange, FeatureUpdate, FeatureUpdateOutcome};
-pub use groups::ConsumerGroupOffsetOutcome;
+pub use groups::{
+    ClassicGroupDescription, ConsumerGroupDescription, ConsumerGroupOffsetOutcome,
+    ShareGroupDescription, ShareGroupOffsetPartition, StreamsGroupDescription,
+};
 pub use log_dirs::{
     BrokerResult, LogDirInfo, LogDirPartitionInfo, LogDirTopicInfo, TopicPartitionReplica,
 };
