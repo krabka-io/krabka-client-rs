@@ -133,10 +133,11 @@ pub trait AdminClientLike: Send {
             "DescribeQuorum is not implemented by this admin client".into(),
         ))
     }
-    /// Remove one exact metadata-quorum voter identity.
+    /// Remove one exact metadata-quorum voter identity. `cluster_id` is
+    /// Kafka's `RemoveRaftVoterOptions.clusterId`.
     async fn remove_raft_voter(
         &mut self,
-        _cluster_id: uuid::Uuid,
+        _cluster_id: Option<&str>,
         _node_id: i32,
         _directory_id: uuid::Uuid,
     ) -> Result<(), AdminError> {
@@ -289,7 +290,7 @@ impl AdminClientLike for AdminClient {
 
     async fn remove_raft_voter(
         &mut self,
-        cluster_id: uuid::Uuid,
+        cluster_id: Option<&str>,
         node_id: i32,
         directory_id: uuid::Uuid,
     ) -> Result<(), AdminError> {

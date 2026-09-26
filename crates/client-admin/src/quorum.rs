@@ -112,6 +112,21 @@ fn add_raft_voter_request(
     }
 }
 
+/// The `RemoveRaftVoter` request of one voter, as Kafka's `removeRaftVoter`
+/// `createRequest` builds it: the cluster ID as the caller gave it, or null.
+fn remove_raft_voter_request(
+    cluster_id: Option<&str>,
+    voter_id: i32,
+    voter_directory_id: uuid::Uuid,
+) -> RemoveRaftVoterRequest {
+    RemoveRaftVoterRequest {
+        cluster_id: cluster_id.map(str::to_owned),
+        voter_id,
+        voter_directory_id: ProtoUuid(*voter_directory_id.as_bytes()),
+        ..Default::default()
+    }
+}
+
 /// `Ok` for code 0, and the broker error of `api` for any other code.
 fn voter_result(api: &'static str, code: i16, message: Option<String>) -> Result<(), AdminError> {
     if code == 0 {
@@ -261,6 +276,10 @@ impl AdminClient {
     /// Remove one exact node and directory identity from the metadata quorum,
     /// as Kafka's `removeRaftVoter` operation does.
     ///
+    /// `cluster_id` is Kafka's `RemoveRaftVoterOptions.clusterId`, the
+    /// cluster ID string as `meta.properties` holds it; `None` sends a null
+    /// cluster ID, which the controller does not check.
+    ///
     /// `NOT_CONTROLLER` (41) makes the client find the controller again and
     /// resend the request with the backoff until `default.api.timeout.ms`
     /// (60 s), as Kafka's `handleNotControllerError` does.
@@ -270,16 +289,11 @@ impl AdminClient {
     /// and `REQUEST_TIMED_OUT` (7) at the deadline.
     pub async fn remove_raft_voter(
         &mut self,
-        cluster_id: uuid::Uuid,
+        cluster_id: Option<&str>,
         node_id: i32,
         directory_id: uuid::Uuid,
     ) -> Result<(), AdminError> {
-        let request = RemoveRaftVoterRequest {
-            cluster_id: Some(cluster_id.to_string()),
-            voter_id: node_id,
-            voter_directory_id: ProtoUuid(*directory_id.as_bytes()),
-            ..Default::default()
-        };
+        let request = remove_raft_voter_request(cluster_id, node_id, directory_id);
         let mut retry = ControllerRetry::new("RemoveRaftVoter", self.retry);
         loop {
             let response = retry.bounded(self.conn.send(request.clone())).await?;
@@ -378,6 +392,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remove_request_sends_the_cluster_id_as_given() {
+        for (name, cluster_id) in [
+            ("with cluster id", Some("MkU3OEVBNTcwNTJENDM2Qk")),
+            ("without cluster id", None),
+        ] {
+            assert2::assert!(
+                remove_raft_voter_request(cluster_id, 3, DIRECTORY)
+                    == RemoveRaftVoterRequest {
+                        cluster_id: cluster_id.map(str::to_owned),
+                        voter_id: 3,
+                        voter_directory_id: ProtoUuid(*DIRECTORY.as_bytes()),
+                        ..Default::default()
+                    },
+                "case {name}"
+            );
+        }
+    }
+
     /// Kafka's `addRaftVoter` and `removeRaftVoter` resend after
     /// `NOT_CONTROLLER` and fail at once on every other error code.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -462,9 +495,7 @@ mod tests {
                     .add_raft_voter(None, 3, DIRECTORY, &[endpoint("CONTROLLER", "c3", 9093)])
                     .await
             } else {
-                admin
-                    .remove_raft_voter(uuid::Uuid::nil(), 3, DIRECTORY)
-                    .await
+                admin.remove_raft_voter(None, 3, DIRECTORY).await
             }
             .map_err(|error| match error {
                 AdminError::Broker {
