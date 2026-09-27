@@ -46,6 +46,27 @@
 //! builder's `.security(...)`) to negotiate TLS then SASL before the
 //! API-versions bootstrap. `None` (the default) is plaintext.
 //!
+//! Sockets: [`transport::dial`] opens every outbound TCP connection. An
+//! embedder that supplies its own sockets installs a
+//! [`transport::Connector`].
+//!
+//! ## WebAssembly
+//!
+//! The crate builds for `wasm32-wasip1` with `--cfg tokio_unstable`, which
+//! tokio needs for its `net` feature on WebAssembly. It runs on a
+//! current-thread tokio runtime. On that target:
+//!
+//! - WASI preview 1 has no `connect` call, so the embedder installs a
+//!   [`transport::Connector`] before the first connection.
+//! - WASI has no name resolution, so broker addresses are IP address
+//!   literals, such as `10.0.0.1:9092`.
+//! - `client.dns.lookup=resolve_canonical_bootstrap_servers_only` does no
+//!   reverse lookup, so each bootstrap address keeps its IP address text.
+//! - A TLS connection needs a configured trust store, because there is no
+//!   platform trust store.
+//! - SASL/GSSAPI fails with
+//!   [`SaslAuthenticationError::UnsupportedMechanism`].
+//!
 //! ## Cargo features
 //!
 //! - `mock` — exposes `MockBroker` beyond `#[cfg(test)]` for downstream
@@ -58,6 +79,7 @@ mod connection;
 mod coordinator;
 mod error;
 mod fetch;
+mod framing;
 mod metadata_topics;
 pub mod oauth;
 mod offset_for_leader_epoch;
@@ -67,7 +89,7 @@ mod request;
 pub mod sasl;
 pub mod security;
 pub mod telemetry;
-mod transport;
+pub mod transport;
 mod version;
 
 #[cfg(any(test, feature = "mock"))]

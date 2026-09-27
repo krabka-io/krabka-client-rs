@@ -106,6 +106,86 @@ jobs:
           path: bazel-bin/crates/**/*.rustdoc
           if-no-files-found: error
 
+  # The client libraries on `wasm32-wasip1`, the target of the Cluster Lab on
+  # the Krabka website. Bazel builds only the native triples of MODULE.bazel,
+  # so this is a Cargo job, shaped like the Cargo jobs of krabka-broker.
+  #
+  # The C code of `ring` and of the zstd and LZ4 codecs compiles with the
+  # runner's clang and LLVM archiver against the WASI sysroot of wasi-sdk. The
+  # runner image puts `clang` on PATH, but not an unversioned `llvm-ar`, so a
+  # step finds the archiver that belongs to that clang. .cargo/config.toml
+  # gives the target the `--cfg tokio_unstable` that tokio needs for `net` on
+  # WebAssembly. A `RUSTFLAGS` variable replaces that table, so this job sets
+  # none.
+  #
+  # Each crate is checked alone, so the features that one crate turns on
+  # cannot hide an error in another.
+  wasm:
+    name: clippy · wasm32-wasip1
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # `rust-toolchain.toml` is the single pin, so read the channel out of it
+      # rather than restating it here.
+      - id: toolchain
+        run: |
+          set -euo pipefail
+          channel="$(sed -ne 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "${channel}"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: wasm32-wasip1
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: WASI sysroot
+        env:
+          WASI_SYSROOT_URL: https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sysroot-25.0.tar.gz
+        run: |
+          set -euo pipefail
+          curl -LsSf --retry 5 --retry-all-errors \
+            --output "${RUNNER_TEMP}/wasi-sysroot.tar.gz" "${WASI_SYSROOT_URL}"
+          tar -xzf "${RUNNER_TEMP}/wasi-sysroot.tar.gz" -C "${RUNNER_TEMP}"
+          sysroot="${RUNNER_TEMP}/wasi-sysroot-25.0"
+          test -d "${sysroot}/include"
+          {
+            echo "CC_wasm32_wasip1=clang"
+            echo "CFLAGS_wasm32_wasip1=--sysroot=${sysroot}"
+          } >> "${GITHUB_ENV}"
+
+      # `clang -print-prog-name` gives the path of the archiver that clang
+      # finds for itself, or only the bare name when it finds none. For a bare
+      # name, take the `llvm-ar` of the newest LLVM on the runner.
+      - name: LLVM archiver
+        run: |
+          set -euo pipefail
+          command -v clang
+          ar="$(clang -print-prog-name=llvm-ar)"
+          if ! command -v "${ar}" >/dev/null 2>&1; then
+            ar="$(ls /usr/lib/llvm-*/bin/llvm-ar | sort -V | tail -n 1)"
+          fi
+          "${ar}" --version
+          echo "AR_wasm32_wasip1=${ar}" >> "${GITHUB_ENV}"
+
+      - name: clippy
+        run: |
+          set -euo pipefail
+          for crate in \
+            krabka-client-core \
+            krabka-client-consumer \
+            krabka-client-producer \
+            krabka-client-admin \
+            krabka-client-coordination; do
+            cargo clippy --locked --target wasm32-wasip1 -p "${crate}" --lib -- -D warnings
+          done
+
   # A mutation sweep rebuilds and re-runs a crate's unit tests once per mutant,
   # so it is far too slow to gate a pull request.
   #

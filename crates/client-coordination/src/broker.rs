@@ -66,6 +66,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    io,
     net::SocketAddr,
     sync::Arc,
 };
@@ -78,7 +79,7 @@ use krabka_client_admin::{
 use krabka_client_core::{
     BrokerInfo, BrokerPool, ClientDnsTimeout, ClientError, ClientSecurity, Connection,
     ConnectionOptions, DEFAULT_FETCH_RESPONSE_MAX, FetchMinBytes, FetchedRecord, IsolatedFetch,
-    connection_target_host, fetch_partition_with_isolation_progress,
+    connection_target_host, fetch_partition_with_isolation_progress, transport::resolve,
 };
 use krabka_client_producer::{
     Acks, Producer, ProducerError, ProducerRecord, RecordMetadata, partition_for_key,
@@ -93,7 +94,10 @@ use krabka_protocol::{
     primitives::uuid::Uuid as WireUuid,
 };
 use krabka_units::{ByteSize, Time, convert::TimeExt as _, mebibytes, millis, secs};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::{
+    sync::{Mutex, OnceCell},
+    time::error::Elapsed,
+};
 
 use crate::{
     error::CoordinationError,
@@ -718,18 +722,12 @@ async fn resolve_addresses(
 ) -> Result<Vec<(SocketAddr, String)>, CoordinationError> {
     let mut resolved = Vec::new();
     for address in addresses {
-        let lookup = tokio::time::timeout(
-            dns_timeout.time().to_std(),
-            tokio::net::lookup_host(address),
-        )
-        .await
-        .map_err(|_elapsed| {
-            CoordinationError::InvalidConfig(format!("the DNS lookup of {address} timed out"))
-        })?
-        .map_err(|error| {
-            CoordinationError::InvalidConfig(format!("the DNS lookup of {address} failed: {error}"))
-        })?;
-        resolved.extend(lookup.map(|socket| (socket, connection_target_host(address).to_owned())));
+        let lookup = tokio::time::timeout(dns_timeout.time().to_std(), resolve(address)).await;
+        resolved.extend(
+            lookup_addresses(address, lookup)?
+                .into_iter()
+                .map(|socket| (socket, connection_target_host(address).to_owned())),
+        );
     }
     if resolved.is_empty() {
         return Err(CoordinationError::InvalidConfig(format!(
@@ -737,6 +735,21 @@ async fn resolve_addresses(
         )));
     }
     Ok(resolved)
+}
+
+/// The addresses one bootstrap lookup found, or the configuration error it
+/// ended in: the DNS deadline passed, or the resolver refused the address.
+fn lookup_addresses(
+    address: &str,
+    lookup: Result<io::Result<Vec<SocketAddr>>, Elapsed>,
+) -> Result<Vec<SocketAddr>, CoordinationError> {
+    lookup
+        .map_err(|_elapsed| {
+            CoordinationError::InvalidConfig(format!("the DNS lookup of {address} timed out"))
+        })?
+        .map_err(|error| {
+            CoordinationError::InvalidConfig(format!("the DNS lookup of {address} failed: {error}"))
+        })
 }
 
 /// The partition that holds every record of `role`.
@@ -1178,6 +1191,30 @@ mod tests {
         // An empty bootstrap list resolves to nothing, which is a config fault.
         let empty = resolve_addresses(&[], timeout).await;
         check!(matches!(empty, Err(CoordinationError::InvalidConfig(_))));
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_lookup_that_fails_or_times_out_is_a_config_error() {
+        // The resolver refuses an address without a port.
+        let failed = resolve_addresses(
+            &["broker-without-port".to_owned()],
+            ClientDnsTimeout::default(),
+        )
+        .await;
+        assert!(let Err(CoordinationError::InvalidConfig(message)) = failed);
+        check!(message == "the DNS lookup of broker-without-port failed: invalid socket address");
+
+        // A lookup still running at the deadline times out.
+        let unanswered = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            std::future::pending::<io::Result<Vec<SocketAddr>>>(),
+        )
+        .await;
+        assert!(
+            let Err(CoordinationError::InvalidConfig(message)) =
+                lookup_addresses("broker:9092", unanswered)
+        );
+        check!(message == "the DNS lookup of broker:9092 timed out");
     }
 
     use assert2::{assert, check};

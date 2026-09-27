@@ -24,12 +24,12 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
 };
-use tokio::{
-    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::security::{Password, TlsConnectorConfig};
+use crate::{
+    security::{Password, TlsConnectorConfig},
+    transport::{SocketOptions, dial},
+};
 
 /// The future of [`OAuthBearerTokenProvider::token`].
 pub type TokenFuture<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
@@ -976,7 +976,7 @@ async fn post_to_endpoint(
     request: &TokenRequest,
 ) -> Result<String, Failure> {
     let endpoint = &request.endpoint;
-    let connect = TcpStream::connect((endpoint.host.as_str(), endpoint.port));
+    let connect = dial(&endpoint.host, endpoint.port, SocketOptions::default());
     let tcp = within(connect_timeout, connect)
         .await
         .map_err(|()| Failure::Retriable("token endpoint connect timed out".into()))?

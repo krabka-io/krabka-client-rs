@@ -7,7 +7,9 @@
 //! tests. It supports PLAIN with one round-trip, SCRAM-SHA-256/512 with two
 //! round-trips and server-final verification, OAUTHBEARER with the RFC 7628
 //! success/failure exchange, and GSSAPI with multi-round AP-REQ / AP-REP plus
-//! RFC 4752 security-layer negotiation.
+//! RFC 4752 security-layer negotiation. The GSSAPI client needs an operating
+//! system: a WebAssembly build fails GSSAPI with
+//! [`SaslAuthenticationError::UnsupportedMechanism`].
 //!
 //! This is the shared implementation the broker's inter-broker dialer
 //! and the public clients both call. The only difference is the
@@ -18,7 +20,7 @@ mod scram;
 use std::{
     collections::BTreeMap,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
@@ -38,7 +40,6 @@ use krabka_protocol::{
     },
 };
 use krabka_security::SaslMechanism;
-use krabka_units::{ByteSize, kibibytes};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -173,7 +174,8 @@ fn sasl_versions(response: &ApiVersionsResponse) -> (i16, Option<i16>) {
 /// choice. Auth-only QOP wraps no data after the handshake, so the value only
 /// needs to be a reasonable non-zero buffer. It mirrors the server's offer
 /// size.
-const GSSAPI_MAX_RECV: ByteSize = kibibytes(64);
+#[cfg(not(target_family = "wasm"))]
+const GSSAPI_MAX_RECV: krabka_units::ByteSize = krabka_units::kibibytes(64);
 
 /// Outbound SASL credentials.
 ///
@@ -195,7 +197,8 @@ pub enum SaslCredentials {
         delegation_token: bool,
     },
     /// SASL/GSSAPI: authenticate as `client_principal` with the long-term
-    /// key in `keytab_path`. This mechanism needs no password.
+    /// key in `keytab_path`. This mechanism needs no password. A WebAssembly
+    /// build fails it with [`SaslAuthenticationError::UnsupportedMechanism`].
     Gssapi {
         keytab_path: PathBuf,
         client_principal: String,
@@ -428,6 +431,7 @@ where
             )
             .await
         }
+        #[cfg(not(target_family = "wasm"))]
         SaslCredentials::Gssapi {
             keytab_path,
             client_principal,
@@ -445,12 +449,18 @@ where
             )
             .await
         }
+        // The Kerberos client of `krabka-security` needs an operating system.
+        #[cfg(target_family = "wasm")]
+        SaslCredentials::Gssapi { .. } => Err(SaslAuthenticationError::UnsupportedMechanism(
+            format!("GSSAPI to {server_name}: a WebAssembly build has no Kerberos client"),
+        )
+        .into()),
         SaslCredentials::OAuthBearer { token, extensions } => {
             // Each exchange gets the token again, so a re-authentication sends
             // a refreshed token.
             let token = match token {
                 OAuthBearerTokenSource::File(token_path) => {
-                    tokio::fs::read(token_path).await.map_err(|error| {
+                    read_token_file(token_path).await.map_err(|error| {
                         mechanism_failure(format!(
                             "cannot read OAUTHBEARER token {}: {error}",
                             token_path.display()
@@ -473,6 +483,19 @@ where
         session_lifetime_ms: (lifetime > 0).then_some(lifetime),
         ..versions
     })
+}
+
+/// Read the OAUTHBEARER token file at `path` on the blocking pool.
+#[cfg(not(target_os = "wasi"))]
+async fn read_token_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    tokio::fs::read(path).await
+}
+
+/// Read the OAUTHBEARER token file at `path` on the calling thread. WASI has
+/// no threads for a blocking pool, and a token file is small.
+#[cfg(target_os = "wasi")]
+fn read_token_file(path: &Path) -> std::future::Ready<std::io::Result<Vec<u8>>> {
+    std::future::ready(std::fs::read(path))
 }
 
 /// Run the RFC 7628 OAUTHBEARER client exchange.
@@ -739,6 +762,7 @@ where
 ///
 /// The first initiator step does the synchronous AS/TGS exchange with the
 /// KDC. Later steps only process tokens locally.
+#[cfg(not(target_family = "wasm"))]
 async fn run_gssapi_client<S>(
     stream: &mut S,
     keytab_path: &std::path::Path,
