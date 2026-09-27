@@ -5,7 +5,7 @@
 //! OAuth token endpoint. By default it connects through the operating system.
 //!
 //! An embedder that supplies its own sockets installs a [`Connector`] once per
-//! process with [`install_connector`]. After that, [`dial`] takes every
+//! process with [`install_connector`]. After that, [`dial`] gets every
 //! connection from the connector. WASI preview 1 has no `connect` call, so on
 //! `target_os = "wasi"` a connector is the only source of connections.
 //!
@@ -14,8 +14,10 @@
 //! resolution, so on WASI a host name is an error.
 
 use std::{
+    future::Future,
     io,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::OnceLock,
 };
 
@@ -28,6 +30,9 @@ use tokio::net::TcpStream;
 #[cfg_attr(target_os = "wasi", path = "transport/wasi.rs")]
 mod platform;
 
+/// The future of [`Connector::connect`].
+pub type ConnectFuture = Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'static>>;
+
 /// A source of outbound TCP connections in place of the operating system.
 ///
 /// An embedder implements this trait when it supplies the sockets itself, for
@@ -38,34 +43,40 @@ mod platform;
 /// # Examples
 ///
 /// ```
-/// use std::{io, net::TcpStream};
-///
-/// use krabka_client_core::transport::{Connector, install_connector};
+/// use krabka_client_core::transport::{ConnectFuture, Connector, install_connector};
+/// use tokio::net::TcpStream;
 ///
 /// /// Connects every broker address to the same port on this machine.
 /// struct Loopback;
 ///
 /// impl Connector for Loopback {
-///     fn connect(&self, _host: &str, port: u16) -> io::Result<TcpStream> {
-///         TcpStream::connect(("127.0.0.1", port))
+///     fn connect(&self, _host: &str, port: u16) -> ConnectFuture {
+///         Box::pin(TcpStream::connect(("127.0.0.1", port)))
 ///     }
 /// }
 ///
 /// install_connector(Box::new(Loopback)).expect("no other connector in this process");
 /// ```
 pub trait Connector: Send + Sync + 'static {
-    /// Open a TCP connection to `host` at `port`.
+    /// Start a TCP connection to `host` at `port`, and return the future of
+    /// the connection.
     ///
     /// `host` is the text that the caller dials: a host name or an IP address
-    /// literal, with no resolution. The returned socket can still be
-    /// connecting. A refused connection then shows as an error on the first
-    /// read or write.
+    /// literal, with no resolution. The future owns the data that it needs,
+    /// so it can outlive `host`.
+    ///
+    /// An implementation must not block the thread, in this call or in a
+    /// poll of the future. [`dial`] awaits the future, so the timeouts of its
+    /// callers stop a connection that does not open, and other tasks on the
+    /// same runtime continue. The stream can still be connecting when the
+    /// future completes. A refused connection then shows as an error on the
+    /// first read or write.
     ///
     /// # Errors
     ///
-    /// Returns the error that stops the connection, for example an unknown
-    /// host. [`dial`] gives this error to its caller.
-    fn connect(&self, host: &str, port: u16) -> io::Result<std::net::TcpStream>;
+    /// The future fails with the error that stops the connection, for
+    /// example an unknown host. [`dial`] gives this error to its caller.
+    fn connect(&self, host: &str, port: u16) -> ConnectFuture;
 }
 
 /// The error of [`install_connector`] when the process already has a
@@ -113,10 +124,9 @@ pub struct SocketOptions {
 
 /// Open a TCP connection to `host` at `port`.
 ///
-/// With an installed [`Connector`], `dial` takes the socket from the
-/// connector, makes it non-blocking, and registers it with the tokio runtime.
-/// The socket can still be connecting, so a refused connection shows as an
-/// error on the first read or write.
+/// With an installed [`Connector`], `dial` awaits the future of
+/// [`Connector::connect`]. The stream can still be connecting, so a refused
+/// connection can show as an error on the first read or write.
 ///
 /// With no connector, `dial` resolves `host` as [`resolve`] does and connects
 /// to each address in turn with `options`. It returns the first connection
@@ -130,7 +140,7 @@ pub struct SocketOptions {
 /// WASI, returns an error of kind [`io::ErrorKind::Unsupported`].
 pub async fn dial(host: &str, port: u16, options: SocketOptions) -> io::Result<TcpStream> {
     match CONNECTOR.get() {
-        Some(connector) => adopt(connector.connect(host, port)?),
+        Some(connector) => connector.connect(host, port).await,
         None => platform::connect(host, port, options).await,
     }
 }
@@ -150,12 +160,6 @@ fn host_text(address: SocketAddr) -> String {
         SocketAddr::V6(v6) if v6.scope_id() != 0 => format!("{}%{}", v6.ip(), v6.scope_id()),
         address => address.ip().to_string(),
     }
-}
-
-/// Register a socket from a [`Connector`] with the tokio runtime.
-fn adopt(stream: std::net::TcpStream) -> io::Result<TcpStream> {
-    stream.set_nonblocking(true)?;
-    TcpStream::from_std(stream)
 }
 
 /// Resolve a `host:port` address to the socket addresses to connect to, in

@@ -9,8 +9,12 @@
 use std::{
     collections::HashMap,
     io::{self, Read as _},
-    net::{SocketAddr, TcpListener, TcpStream},
-    sync::{LazyLock, Mutex},
+    net::{SocketAddr, TcpListener},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
 };
 
 use assert2::{assert, check};
@@ -18,7 +22,9 @@ use bytes::BytesMut;
 use futures_util::{SinkExt as _, StreamExt as _};
 use krabka_client_core::{
     ClientError, Connection, ConnectionOptions,
-    transport::{Connector, ConnectorAlreadyInstalled, SocketOptions, dial, install_connector},
+    transport::{
+        ConnectFuture, Connector, ConnectorAlreadyInstalled, SocketOptions, dial, install_connector,
+    },
 };
 use krabka_protocol::{
     Encode as _,
@@ -27,13 +33,23 @@ use krabka_protocol::{
         api_versions_response::{ApiVersion, ApiVersionsResponse},
     },
 };
-use tokio::io::AsyncWriteExt as _;
+use krabka_units::millis;
+use tokio::{io::AsyncWriteExt as _, net::TcpStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+// Where the router sends a dial.
+#[derive(Clone, Copy)]
+enum Route {
+    // Connect to this local listener.
+    Listener(SocketAddr),
+    // Never connect: the future of the connection stays pending.
+    Stall,
+}
 
 // The routes and the dials of this test process.
 #[derive(Default)]
 struct Router {
-    routes: Mutex<HashMap<(String, u16), SocketAddr>>,
+    routes: Mutex<HashMap<(String, u16), Route>>,
     dials: Mutex<Vec<(String, u16)>>,
 }
 
@@ -43,23 +59,24 @@ static ROUTER: LazyLock<Router> = LazyLock::new(|| {
     Router::default()
 });
 
-// Connects each dial to the listener that `ROUTER` has for it.
+// Connects each dial as `ROUTER` routes it.
 struct RouterConnector;
 
 impl Connector for RouterConnector {
-    fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
+    fn connect(&self, host: &str, port: u16) -> ConnectFuture {
         let key = (host.to_owned(), port);
         ROUTER.dials.lock().unwrap().push(key.clone());
-        let target = ROUTER.routes.lock().unwrap().get(&key).copied();
-        target.map_or_else(
-            || {
-                Err(io::Error::new(
+        let route = ROUTER.routes.lock().unwrap().get(&key).copied();
+        Box::pin(async move {
+            match route {
+                Some(Route::Listener(target)) => TcpStream::connect(target).await,
+                Some(Route::Stall) => std::future::pending().await,
+                None => Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
-                    format!("no route to {host}:{port}"),
-                ))
-            },
-            TcpStream::connect,
-        )
+                    format!("no route to {}:{}", key.0, key.1),
+                )),
+            }
+        })
     }
 }
 
@@ -67,8 +84,10 @@ impl Connector for RouterConnector {
 struct Refusing;
 
 impl Connector for Refusing {
-    fn connect(&self, _host: &str, _port: u16) -> io::Result<TcpStream> {
-        Err(io::Error::other("the refused connector is in use"))
+    fn connect(&self, _host: &str, _port: u16) -> ConnectFuture {
+        Box::pin(std::future::ready(Err(io::Error::other(
+            "the refused connector is in use",
+        ))))
     }
 }
 
@@ -76,12 +95,16 @@ impl Connector for Refusing {
 fn listen(host: &str, port: u16) -> TcpListener {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let local = listener.local_addr().unwrap();
+    route(host, port, Route::Listener(local));
+    listener
+}
+
+fn route(host: &str, port: u16, route: Route) {
     ROUTER
         .routes
         .lock()
         .unwrap()
-        .insert((host.to_owned(), port), local);
-    listener
+        .insert((host.to_owned(), port), route);
 }
 
 // The dials of this process to `host`, in order.
@@ -175,6 +198,45 @@ async fn a_connector_error_fails_the_dial_and_the_connection() {
     check!(dial_error.kind() == io::ErrorKind::ConnectionRefused);
     assert!(let Err(ClientError::Connect { addr: failed, source }) = connected);
     check!((failed, source.kind()) == (addr, io::ErrorKind::ConnectionRefused));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_connector_blocks_neither_the_runtime_nor_the_deadlines() {
+    route("stalled.connector.test", 9092, Route::Stall);
+    route("192.0.2.20", 9092, Route::Stall);
+    let ticks = Arc::new(AtomicU32::new(0));
+    let ticker = tokio::spawn({
+        let ticks = Arc::clone(&ticks);
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+    let started = tokio::time::Instant::now();
+
+    let dialed = tokio::time::timeout(
+        Duration::from_millis(100),
+        dial("stalled.connector.test", 9092, SocketOptions::default()),
+    )
+    .await;
+    let connected = Connection::connect(
+        "192.0.2.20:9092".parse().unwrap(),
+        ConnectionOptions {
+            socket_connection_setup_timeout: millis(100),
+            ..ConnectionOptions::default()
+        },
+    )
+    .await;
+    ticker.abort();
+
+    check!(dialed.is_err());
+    assert!(let Err(ClientError::Timeout(timeout)) = connected);
+    check!(timeout == millis(100));
+    check!(started.elapsed() == Duration::from_millis(200));
+    // The ticker ran while both dials waited.
+    check!(ticks.load(Ordering::Relaxed) >= 18);
 }
 
 #[tokio::test]
