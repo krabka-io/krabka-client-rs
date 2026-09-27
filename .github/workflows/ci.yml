@@ -111,7 +111,9 @@ jobs:
   # so this is a Cargo job, shaped like the Cargo jobs of krabka-broker.
   #
   # The C code of `ring` and of the zstd and LZ4 codecs compiles with the
-  # runner's clang against the WASI sysroot of wasi-sdk. .cargo/config.toml
+  # runner's clang and LLVM archiver against the WASI sysroot of wasi-sdk. The
+  # runner image puts `clang` on PATH, but not an unversioned `llvm-ar`, so a
+  # step finds the archiver that belongs to that clang. .cargo/config.toml
   # gives the target the `--cfg tokio_unstable` that tokio needs for `net` on
   # WebAssembly. A `RUSTFLAGS` variable replaces that table, so this job sets
   # none.
@@ -148,7 +150,6 @@ jobs:
           WASI_SYSROOT_URL: https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sysroot-25.0.tar.gz
         run: |
           set -euo pipefail
-          command -v clang llvm-ar
           curl -LsSf --retry 5 --retry-all-errors \
             --output "${RUNNER_TEMP}/wasi-sysroot.tar.gz" "${WASI_SYSROOT_URL}"
           tar -xzf "${RUNNER_TEMP}/wasi-sysroot.tar.gz" -C "${RUNNER_TEMP}"
@@ -156,9 +157,22 @@ jobs:
           test -d "${sysroot}/include"
           {
             echo "CC_wasm32_wasip1=clang"
-            echo "AR_wasm32_wasip1=llvm-ar"
             echo "CFLAGS_wasm32_wasip1=--sysroot=${sysroot}"
           } >> "${GITHUB_ENV}"
+
+      # `clang -print-prog-name` gives the path of the archiver that clang
+      # finds for itself, or only the bare name when it finds none. For a bare
+      # name, take the `llvm-ar` of the newest LLVM on the runner.
+      - name: LLVM archiver
+        run: |
+          set -euo pipefail
+          command -v clang
+          ar="$(clang -print-prog-name=llvm-ar)"
+          if ! command -v "${ar}" >/dev/null 2>&1; then
+            ar="$(ls /usr/lib/llvm-*/bin/llvm-ar | sort -V | tail -n 1)"
+          fi
+          "${ar}" --version
+          echo "AR_wasm32_wasip1=${ar}" >> "${GITHUB_ENV}"
 
       - name: clippy
         run: |
