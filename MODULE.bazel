@@ -45,7 +45,6 @@ bazel_dep(name = "aspect_rules_lint", version = "2.9.0")
 # It registers `@default_rust_toolchains`, which the toolchain block below
 # configures.
 bazel_dep(name = "aspect_rules_lint_rust", version = "0.0.3")
-
 bazel_dep(name = "buildifier_prebuilt", version = "10.1.0")
 
 # `sh_test`. //bazel/defs.bzl is shared verbatim across the three repositories,
