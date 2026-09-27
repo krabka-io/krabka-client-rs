@@ -33,6 +33,15 @@ git_override(
 # cc_wrapper leaves a mutant link without `DEVELOPER_DIR`.
 bazel_dep(name = "llvm", version = "0.8.24")
 
+# rules_rs merges coverage with this module's llvm-profdata, which reads only
+# the raw profile version of its own LLVM. rustc writes the version of the LLVM
+# it was built on, so the two majors must match: 22.x for Rust 1.98 (`rustc
+# -vV` prints it). The module's own default, 23.x, fails every test in `bazel
+# coverage` with "raw profile version mismatch". Move this with the toolchain.
+llvm = use_extension("@llvm//extensions:llvm.bzl", "llvm")
+llvm.version(llvm_version = "22.1.8")
+use_repo(llvm, "llvm-project")
+
 register_toolchains("@llvm//toolchain:all")
 
 # ---------------------------------------------------------------------------
