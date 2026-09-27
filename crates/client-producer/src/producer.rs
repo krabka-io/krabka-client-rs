@@ -1512,7 +1512,7 @@ impl Producer {
             producer_id,
             producer_epoch,
             group_id: group_meta.group_id.clone(),
-            generation_id: group_meta.generation_id,
+            generation_id_or_member_epoch: group_meta.generation_id,
             member_id: group_meta.member_id.clone(),
             group_instance_id: group_meta.group_instance_id.clone(),
             topics: build_topics_payload(offsets),

@@ -102,9 +102,9 @@ krabka-units = "0.4.0"
 # against crates.io above and in the member manifests; the patch below is
 # the single place a sibling revision is bumped.
 [patch.crates-io]
-krabka-compression = { git = "https://github.com/krabka-io/krabka-protocol", rev = "5b85a5afbd3aa1e32366d13a574af6ff38bcc427" }
-krabka-ids = { git = "https://github.com/krabka-io/krabka-protocol", rev = "5b85a5afbd3aa1e32366d13a574af6ff38bcc427" }
-krabka-metadata = { git = "https://github.com/krabka-io/krabka-protocol", rev = "5b85a5afbd3aa1e32366d13a574af6ff38bcc427" }
-krabka-protocol = { git = "https://github.com/krabka-io/krabka-protocol", rev = "5b85a5afbd3aa1e32366d13a574af6ff38bcc427" }
-krabka-security = { git = "https://github.com/krabka-io/krabka-protocol", rev = "5b85a5afbd3aa1e32366d13a574af6ff38bcc427" }
-krabka-units = { git = "https://github.com/krabka-io/krabka-protocol", rev = "5b85a5afbd3aa1e32366d13a574af6ff38bcc427" }
+krabka-compression = { git = "https://github.com/krabka-io/krabka-protocol", rev = "d4e2fe530c70e7459825ea51cc24c638623c5d23" }
+krabka-ids = { git = "https://github.com/krabka-io/krabka-protocol", rev = "d4e2fe530c70e7459825ea51cc24c638623c5d23" }
+krabka-metadata = { git = "https://github.com/krabka-io/krabka-protocol", rev = "d4e2fe530c70e7459825ea51cc24c638623c5d23" }
+krabka-protocol = { git = "https://github.com/krabka-io/krabka-protocol", rev = "d4e2fe530c70e7459825ea51cc24c638623c5d23" }
+krabka-security = { git = "https://github.com/krabka-io/krabka-protocol", rev = "d4e2fe530c70e7459825ea51cc24c638623c5d23" }
+krabka-units = { git = "https://github.com/krabka-io/krabka-protocol", rev = "d4e2fe530c70e7459825ea51cc24c638623c5d23" }

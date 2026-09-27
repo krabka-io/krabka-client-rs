@@ -2143,7 +2143,8 @@ fn offset_commit_request(
                 partition_index: *partition,
                 committed_offset: *offset,
                 committed_leader_epoch: -1,
-                committed_metadata: None,
+                // Kafka's `OffsetAndMetadata` metadata defaults to "", which
+                // is also the schema default this row takes.
                 ..Default::default()
             });
     }

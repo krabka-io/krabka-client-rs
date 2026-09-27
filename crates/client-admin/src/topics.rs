@@ -1838,6 +1838,7 @@ mod tests {
                 CreatableTopicResult {
                     name: "throttled".into(),
                     error_code: THROTTLING_QUOTA_EXCEEDED,
+                    error_message: None,
                     ..Default::default()
                 },
             ],
