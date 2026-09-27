@@ -10,6 +10,7 @@ use krabka_protocol::owned::{
     offset_commit_request::{OffsetCommitRequest, OffsetCommitRequestTopic},
     offset_commit_response::OffsetCommitResponse,
 };
+use krabka_units::convert::TimeExt as _;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -17,7 +18,6 @@ use crate::{
     coordinator::{
         COORDINATOR_LOAD_IN_PROGRESS, COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR, find_coordinator,
         is_retriable_coordinator_code, is_retriable_transport_error, next_backoff,
-        retry_deadline_elapsed,
     },
     error::ConsumerError,
     offset_wire::{TopicNameOffsetCommit, build_commit_topics},
@@ -254,6 +254,22 @@ fn async_commit_result(
     }
 }
 
+/// The error of a synchronous commit that did not succeed within `timeout`.
+///
+/// The message is that of the `TimeoutException` that Kafka's
+/// `ClassicKafkaConsumer.commitSync` throws. `cause` is the last retriable
+/// error, as Kafka's `CommitRequestManager.maybeWrapAsTimeoutException` wraps
+/// it, or `None` when the time ran out during an attempt or a wait.
+fn commit_timeout(timeout: Duration, cause: Option<ConsumerError>) -> ConsumerError {
+    ConsumerError::Timeout {
+        message: format!(
+            "Timeout of {}ms expired before successfully committing offsets",
+            timeout.as_millis()
+        ),
+        cause: cause.map(Box::new),
+    }
+}
+
 /// Build the `OffsetCommit` request of a commit. The request names each
 /// topic, so the version is v9 or lower. See [`TopicNameOffsetCommit`].
 pub(crate) fn build_commit_request(
@@ -276,12 +292,6 @@ pub(crate) fn build_commit_request(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CommitOutcome {
     Acked(HashSet<(String, i32)>),
-    /// A rebalance moved the group away from the identity of the request. The
-    /// commit waits for the coordinator task to join the group again.
-    Deferred {
-        code: i16,
-        acknowledged: HashSet<(String, i32)>,
-    },
     /// Kafka's `OffsetCommitResponseHandler` raises a retriable error, and
     /// `commitOffsetsSync` sends the commit again until the timeout.
     Retriable {
@@ -291,6 +301,25 @@ enum CommitOutcome {
         /// attempt finds the coordinator again.
         find_coordinator: bool,
     },
+}
+
+/// What a rebalance-class partition error (`ILLEGAL_GENERATION`,
+/// `UNKNOWN_MEMBER_ID`, `REBALANCE_IN_PROGRESS` and a `FENCED_INSTANCE_ID`
+/// that followed a generation change) raises, as Kafka's
+/// `ConsumerCoordinator.OffsetCommitResponseHandler.handle` does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebalanceCommitFailure {
+    /// The generation is still the request's: no rebalance completed locally
+    /// since this commit was sent, so the broker's rejection means this
+    /// member has genuinely been removed from the group. Kafka's
+    /// `CommitFailedException`.
+    CommitFailed,
+    /// `REBALANCE_IN_PROGRESS`, or a generation-changing code seen after the
+    /// generation changed: a rebalance already completed locally while the
+    /// request was outstanding, and the error is a stale artifact of that
+    /// ordinary, already-resolved rebalance. Kafka's
+    /// `RebalanceInProgressException`.
+    RebalanceInProgress,
 }
 
 /// The consumer state that decides what an `OffsetCommit` partition error
@@ -322,32 +351,34 @@ struct CommitResponseContext<'a> {
 ///   again.
 /// - `FENCED_INSTANCE_ID (82)` with the generation of the request:
 ///   [`ConsumerError::FencedInstanceId`].
-/// - `ILLEGAL_GENERATION (22)`, `UNKNOWN_MEMBER_ID (25)`,
-///   `REBALANCE_IN_PROGRESS (27)`, and `82` after the generation changed:
-///   deferred while the coordinator task runs. Otherwise
-///   [`ConsumerError::CommitFailed`].
+/// - `ILLEGAL_GENERATION (22)`, `UNKNOWN_MEMBER_ID (25)` and `82` seen while
+///   the generation is still the request's (no rebalance completed locally
+///   since this commit was sent, so the broker's rejection means this member
+///   was genuinely removed from the group): [`ConsumerError::CommitFailed`].
+/// - `REBALANCE_IN_PROGRESS (27)`, and `22`/`25`/`82` seen after the
+///   generation changed (a rebalance already completed locally while the
+///   request was outstanding, so the error is a stale artifact of it):
+///   [`ConsumerError::RebalanceInProgress`].
 /// - Any other code, for example `OFFSET_METADATA_TOO_LARGE (12)` and
 ///   `INVALID_COMMIT_OFFSET_SIZE (28)`: [`ConsumerError::Server`].
 ///
-/// Kafka's classic consumer raises `CommitFailedException` or
-/// `RebalanceInProgressException` for the rebalance codes. It can only join
-/// the group again inside `poll`. The krabka coordinator task joins the group
-/// in the background, so the commit waits for the new generation and sends the
-/// offsets of the partitions that the consumer still owns again. A long-running
-/// commit loop thus continues through a routine rebalance, and the commit
-/// does not report an offset that the coordinator did not acknowledge as
-/// committed. When the task has stopped, no new generation comes, and the
-/// commit fails as Kafka's does.
+/// This follows Kafka's classic consumer exactly: `commitOffsetsSync` does not
+/// retry a rebalance-class error, and it commits nothing for the request that
+/// hit it. The krabka coordinator task still joins the group again in the
+/// background regardless of this outcome, so a caller that calls `poll()`
+/// after the error and commits again finds a consumer that is at, or well on
+/// its way to, the next generation.
 ///
 /// Kafka stops at the first partition error other than `29`, so its result
 /// for a response with errors of more than one class depends on the partition
-/// order. This function gives a final error precedence over a deferral, a
-/// deferral over a retriable error, and a retriable error over `29`.
+/// order. This function gives a final error precedence over a rebalance-class
+/// error, a rebalance-class error over a retriable error, and a retriable
+/// error over `29`.
 fn commit_response_outcome(
     resp: &OffsetCommitResponse,
     context: CommitResponseContext<'_>,
 ) -> Result<CommitOutcome, ConsumerError> {
-    let mut deferred = None;
+    let mut rebalance = None;
     let mut retriable = None;
     let mut find_coordinator = false;
     let mut unauthorized_topics = BTreeSet::new();
@@ -375,10 +406,19 @@ fn commit_response_outcome(
                     ));
                 }
                 PartitionCommitError::Rebalance | PartitionCommitError::FencedInstanceId => {
-                    if !context.coordinator_alive {
-                        return Err(ConsumerError::CommitFailed);
-                    }
-                    deferred.get_or_insert(code);
+                    // `REBALANCE_IN_PROGRESS` always means a rebalance is
+                    // under way. The other codes mean that only once the
+                    // generation has already moved past the request's; while
+                    // it is still the request's, the broker's rejection is
+                    // real: this identity is no longer an active member.
+                    let failure = if context.coordinator_alive
+                        && (code == REBALANCE_IN_PROGRESS || !context.generation_unchanged)
+                    {
+                        RebalanceCommitFailure::RebalanceInProgress
+                    } else {
+                        RebalanceCommitFailure::CommitFailed
+                    };
+                    rebalance.get_or_insert(failure);
                 }
                 PartitionCommitError::GroupAuthorization => {
                     return Err(ConsumerError::GroupAuthorizationFailed(
@@ -389,8 +429,11 @@ fn commit_response_outcome(
             }
         }
     }
-    match (deferred, retriable) {
-        (Some(code), _) => Ok(CommitOutcome::Deferred { code, acknowledged }),
+    match (rebalance, retriable) {
+        (Some(RebalanceCommitFailure::CommitFailed), _) => Err(ConsumerError::CommitFailed),
+        (Some(RebalanceCommitFailure::RebalanceInProgress), _) => Err(
+            ConsumerError::RebalanceInProgress(context.group_id.to_owned()),
+        ),
         (None, Some(code)) => Ok(CommitOutcome::Retriable {
             code,
             acknowledged,
@@ -673,27 +716,6 @@ pub(crate) struct AutoCommit {
     /// committed offset back behind it. Kafka's `allConsumed` is never behind a
     /// `commitSync()` of the same ownership, because both read the positions.
     polled: Arc<Mutex<ConsumedPositions>>,
-    /// `true` while a commit that holds `commit_serialization` waits for the
-    /// coordinator task to finish a rebalance. See [`AutoCommit::park`].
-    commit_parked: Arc<tokio::sync::watch::Sender<bool>>,
-}
-
-/// A commit that holds `commit_serialization` and waits for a rebalance.
-///
-/// The commit before a `JoinGroup` waits for `commit_serialization`. A commit
-/// that holds the lock and waits for the rebalance would block that rebalance
-/// until its deadline. While this guard lives, the commit before a `JoinGroup`
-/// does not wait for the lock. The waiting commit sends nothing until the
-/// coordinator task publishes the next assignment, so the order of the commits
-/// stays the same.
-pub(crate) struct ParkedCommit {
-    commit_parked: Arc<tokio::sync::watch::Sender<bool>>,
-}
-
-impl Drop for ParkedCommit {
-    fn drop(&mut self) {
-        self.commit_parked.send_replace(false);
-    }
 }
 
 impl AutoCommit {
@@ -702,23 +724,7 @@ impl AutoCommit {
             interval,
             next_due: Arc::new(Mutex::new(tokio::time::Instant::now() + interval)),
             polled: Arc::new(Mutex::new(HashMap::new())),
-            commit_parked: Arc::new(tokio::sync::watch::Sender::new(false)),
         }
-    }
-
-    /// Mark that the commit that holds `commit_serialization` waits for a
-    /// rebalance, until the returned guard drops.
-    pub(crate) fn park(&self) -> ParkedCommit {
-        self.commit_parked.send_replace(true);
-        ParkedCommit {
-            commit_parked: Arc::clone(&self.commit_parked),
-        }
-    }
-
-    /// A receiver that sees when a commit that holds `commit_serialization`
-    /// waits for a rebalance.
-    pub(crate) fn parked_commits(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.commit_parked.subscribe()
     }
 
     /// Move the positions for the commit before a `JoinGroup` after `poll`
@@ -975,8 +981,13 @@ impl Consumer {
             if pending.is_empty() {
                 return Ok(());
             }
-            self.commit_pending_offsets(pending, RecordSent::BeforeSend)
-                .await
+            let retry_deadline = tokio::time::Instant::now() + self.retry_policy.timeout;
+            self.commit_pending_offsets(
+                pending,
+                RecordSent::BeforeSend,
+                (retry_deadline, self.retry_policy.timeout),
+            )
+            .await
         };
         match tokio::time::timeout_at(deadline, commit).await {
             Ok(Ok(())) => {}
@@ -993,7 +1004,8 @@ impl Consumer {
 impl Consumer {
     /// Commit the current next-offsets for every assigned partition.
     ///
-    /// This method blocks until the broker acks.
+    /// This method blocks until the broker acks, for at most
+    /// `default_api_timeout` (Kafka's `default.api.timeout.ms`).
     #[cfg_attr(test, mutants::skip)] // cargo-mutants: I/O-bound coordinator RPC, exercised by integration tests
     #[tracing::instrument(
         name = "consumer.commit_sync",
@@ -1008,37 +1020,54 @@ impl Consumer {
         err
     )]
     /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
+    /// Returns an error when configuration is invalid, protocol encoding fails, or the broker rejects the commit with an error that is not retriable. A retriable error, such as `NOT_COORDINATOR` or a failed request, is retried. Returns [`ConsumerError::Timeout`] when the call, including any wait for a concurrent commit, the broker round trips and the retries, does not finish within `default_api_timeout`. When a retriable error left no time for another attempt, that error is the timeout's cause, as in Kafka's `commitSync`.
     pub async fn commit_sync(&self) -> Result<(), ConsumerError> {
         self.require_group_id()?;
-        let _commit_guard = self.commit_serialization.lock().await;
-        let pending = {
-            let identity = self.commit_identity.lock().await;
-            self.ensure_active_group(&identity)?;
-            let offsets = self.next_offsets.lock().await;
-            let positions = self.positions.lock().await;
-            // Kafka's `commitSync()` commits `SubscriptionState.allConsumed`:
-            // the position and the leader epoch at the call.
-            all_consumed(&identity.ownership_ids, &offsets, &positions)
-                .into_iter()
-                .map(|(partition, position)| {
-                    (
-                        partition,
+        let default_api_timeout = self.default_api_timeout.to_std();
+        let deadline = tokio::time::Instant::now() + default_api_timeout;
+        // `timeout_at` bounds the whole call, including the wait for
+        // `commit_serialization` and the broker round trip inside
+        // `commit_pending_offsets`, not only whether a retry starts.
+        let commit = async {
+            let _commit_guard = self.commit_serialization.lock().await;
+            let pending = {
+                let identity = self.commit_identity.lock().await;
+                self.ensure_active_group(&identity)?;
+                let offsets = self.next_offsets.lock().await;
+                let positions = self.positions.lock().await;
+                // Kafka's `commitSync()` commits `SubscriptionState.allConsumed`:
+                // the position and the leader epoch at the call.
+                all_consumed(&identity.ownership_ids, &offsets, &positions)
+                    .into_iter()
+                    .map(|(partition, position)| {
                         (
-                            OffsetAndMetadata::of_position(position.offset, position.leader_epoch),
-                            position.ownership_id,
-                        ),
-                    )
-                })
-                .collect::<HashMap<_, _>>()
-        };
-        if pending.is_empty() {
-            return Ok(());
-        }
-        tracing::Span::current().record("partitions", pending.len());
+                            partition,
+                            (
+                                OffsetAndMetadata::of_position(
+                                    position.offset,
+                                    position.leader_epoch,
+                                ),
+                                position.ownership_id,
+                            ),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+            if pending.is_empty() {
+                return Ok(());
+            }
+            tracing::Span::current().record("partitions", pending.len());
 
-        self.commit_pending_offsets(pending, RecordSent::BeforeSend)
+            self.commit_pending_offsets(
+                pending,
+                RecordSent::BeforeSend,
+                (deadline, default_api_timeout),
+            )
             .await
+        };
+        tokio::time::timeout_at(deadline, commit)
+            .await
+            .unwrap_or_else(|_elapsed| Err(commit_timeout(default_api_timeout, None)))
     }
 
     /// Commit caller-selected offsets for currently assigned partitions.
@@ -1047,6 +1076,8 @@ impl Consumer {
     /// The call commits each offset with its leader epoch and metadata. It
     /// does not commit other partitions and does not change the fetch
     /// positions. An offset can be past the consumed position, as in Kafka.
+    /// This method blocks until the broker acks, for at most
+    /// `default_api_timeout` (Kafka's `default.api.timeout.ms`).
     ///
     /// # Errors
     ///
@@ -1055,32 +1086,54 @@ impl Consumer {
     /// the new owner will safely replay from the prior committed offset.
     ///
     /// Returns an error if an offset is negative, targets an unassigned
-    /// partition, or the coordinator rejects the commit with a non-rebalance
-    /// error.
+    /// partition, or the coordinator rejects the commit. A rebalance error
+    /// ([`ConsumerError::CommitFailed`] or
+    /// [`ConsumerError::RebalanceInProgress`]) is not retried and commits
+    /// nothing: call `poll()` and commit again, as Kafka's
+    /// `commitSync` requires. A retriable error, such as `NOT_COORDINATOR` or
+    /// a failed request, is retried. Returns [`ConsumerError::Timeout`] when
+    /// the call, including any wait for a concurrent commit, the broker round
+    /// trips and the retries, does not finish within `default_api_timeout`.
+    /// When a retriable error left no time for another attempt, that error is
+    /// the timeout's cause, as in Kafka's `commitSync`.
     pub async fn commit_offsets_sync(
         &self,
         offsets: HashMap<(String, i32), OffsetAndMetadata>,
     ) -> Result<(), ConsumerError> {
         self.require_group_id()?;
-        let _commit_guard = self.commit_serialization.lock().await;
         if offsets.is_empty() {
             return Ok(());
         }
-        let pending = {
-            let identity = self.commit_identity.lock().await;
-            self.ensure_active_group(&identity)?;
-            validate_selected_offsets(&offsets, &identity.ownership_ids)?;
-            offsets
-                .into_iter()
-                .map(|(partition, offset)| {
-                    let ownership_id = identity.ownership_ids[&partition];
-                    (partition, (offset, ownership_id))
-                })
-                .collect::<HashMap<_, _>>()
-        };
+        let default_api_timeout = self.default_api_timeout.to_std();
+        let deadline = tokio::time::Instant::now() + default_api_timeout;
+        // `timeout_at` bounds the whole call, including the wait for
+        // `commit_serialization` and the broker round trip inside
+        // `commit_pending_offsets`, not only whether a retry starts.
+        let commit = async {
+            let _commit_guard = self.commit_serialization.lock().await;
+            let pending = {
+                let identity = self.commit_identity.lock().await;
+                self.ensure_active_group(&identity)?;
+                validate_selected_offsets(&offsets, &identity.ownership_ids)?;
+                offsets
+                    .into_iter()
+                    .map(|(partition, offset)| {
+                        let ownership_id = identity.ownership_ids[&partition];
+                        (partition, (offset, ownership_id))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
 
-        self.commit_pending_offsets(pending, RecordSent::AfterAck)
+            self.commit_pending_offsets(
+                pending,
+                RecordSent::AfterAck,
+                (deadline, default_api_timeout),
+            )
             .await
+        };
+        tokio::time::timeout_at(deadline, commit)
+            .await
+            .unwrap_or_else(|_elapsed| Err(commit_timeout(default_api_timeout, None)))
     }
 
     /// Fail a synchronous commit when the consumer is not part of an active
@@ -1108,12 +1161,30 @@ impl Consumer {
         Ok(())
     }
 
+    /// Commit `pending`, and retry a retriable failure until `deadline`.
+    ///
+    /// `timeout` is the bound that ends at `deadline`, for the message of the
+    /// error. A synchronous commit passes the deadline of its own
+    /// `timeout_at`, so that the retry loop and the bound of the whole call
+    /// expire at the same instant, however long the call waited before its
+    /// first attempt.
+    ///
+    /// # Errors
+    ///
+    /// A non-retriable error returns at once. When a retriable error leaves
+    /// no time for another attempt, the loop returns
+    /// [`ConsumerError::Timeout`] with that error as its cause. Kafka's
+    /// `ConsumerCoordinator.commitOffsetsSync` retries while
+    /// `timer.notExpired()`, and `ClassicKafkaConsumer.commitSync` then
+    /// throws `TimeoutException`. The async consumer's
+    /// `CommitRequestManager.commitSyncWithRetries` completes with
+    /// `maybeWrapAsTimeoutException` of the last error.
     async fn commit_pending_offsets(
         &self,
         mut pending: HashMap<(String, i32), (OffsetAndMetadata, u64)>,
         record: RecordSent,
+        (deadline, timeout): (tokio::time::Instant, Duration),
     ) -> Result<(), ConsumerError> {
-        let retry_start = tokio::time::Instant::now();
         let mut retry_backoff = self.retry_policy.initial_backoff;
         loop {
             let identity = self.commit_identity.lock().await.clone();
@@ -1123,8 +1194,6 @@ impl Consumer {
                 return Ok(());
             }
 
-            let mut assignment_changed = Box::pin(self.assignment_changed.notified());
-            assignment_changed.as_mut().enable();
             if record == RecordSent::BeforeSend
                 && let Some(auto_commit) = &self.auto_commit
             {
@@ -1149,8 +1218,8 @@ impl Consumer {
                     if is_retriable_transport_error(&error)
                         || matches!(error, krabka_client_core::ClientError::Timeout(_)) =>
                 {
-                    if retry_deadline_elapsed(retry_start, self.retry_policy.timeout) {
-                        return Err(ConsumerError::CoordinatorUnavailable);
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(commit_timeout(timeout, Some(ConsumerError::Client(error))));
                     }
                     tracing::warn!(
                         group = %self.group_id,
@@ -1159,9 +1228,9 @@ impl Consumer {
                     );
                     self.client
                         .evict_broker(self.coordinator_id.load(Ordering::Relaxed));
-                    self.find_coordinator_again(retry_start).await;
-                    if !self.sleep_before_retry(retry_start, retry_backoff).await {
-                        return Err(ConsumerError::CoordinatorUnavailable);
+                    self.find_coordinator_again(deadline).await;
+                    if !self.sleep_before_retry(retry_backoff, deadline).await {
+                        return Err(commit_timeout(timeout, Some(ConsumerError::Client(error))));
                     }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
                     continue;
@@ -1180,32 +1249,6 @@ impl Consumer {
                         "offset commit response omitted requested partitions".into(),
                     ));
                 }
-                CommitOutcome::Deferred { code, acknowledged } => {
-                    tracing::warn!(
-                        group = %self.group_id,
-                        error_code = code,
-                        "offset commit deferred until the coordinator rejoins",
-                    );
-                    self.record_acknowledged(record, &pending, &acknowledged)
-                        .await;
-                    pending.retain(|partition, _| !acknowledged.contains(partition));
-                    let current_identity = self.commit_identity.lock().await.clone();
-                    retain_continuously_owned(&mut pending, &current_identity.ownership_ids);
-                    if pending.is_empty() {
-                        return Ok(());
-                    }
-                    if current_identity.generation == identity.generation
-                        && current_identity.member_id == identity.member_id
-                    {
-                        let _parked = self.auto_commit.as_ref().map(AutoCommit::park);
-                        tokio::select! {
-                            () = &mut assignment_changed => {}
-                            () = self.coordinator_shutdown.cancelled() => {
-                                return Err(ConsumerError::CommitFailed);
-                            }
-                        }
-                    }
-                }
                 CommitOutcome::Retriable {
                     code,
                     acknowledged,
@@ -1220,8 +1263,8 @@ impl Consumer {
                     if pending.is_empty() {
                         return Ok(());
                     }
-                    if retry_deadline_elapsed(retry_start, self.retry_policy.timeout) {
-                        return Err(ConsumerError::Server(code));
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(commit_timeout(timeout, Some(ConsumerError::Server(code))));
                     }
                     tracing::warn!(
                         group = %self.group_id,
@@ -1229,10 +1272,10 @@ impl Consumer {
                         "offset commit failed with a retriable error; retrying",
                     );
                     if find_coordinator {
-                        self.find_coordinator_again(retry_start).await;
+                        self.find_coordinator_again(deadline).await;
                     }
-                    if !self.sleep_before_retry(retry_start, retry_backoff).await {
-                        return Err(ConsumerError::Server(code));
+                    if !self.sleep_before_retry(retry_backoff, deadline).await {
+                        return Err(commit_timeout(timeout, Some(ConsumerError::Server(code))));
                     }
                     retry_backoff = next_backoff(retry_backoff, self.retry_policy.max_backoff);
                 }
@@ -1263,35 +1306,23 @@ impl Consumer {
         auto_commit.record_sent(pending_positions(&acked)).await;
     }
 
-    /// Wait `backoff` before the next attempt of a synchronous commit that
-    /// started at `retry_start`, but not past the retry timeout. Return whether
-    /// time is left for the next attempt. Kafka's `commitOffsetsSync` does
-    /// `timer.sleep(backoff)` and then sends again only while
-    /// `timer.notExpired()`.
-    async fn sleep_before_retry(
-        &self,
-        retry_start: tokio::time::Instant,
-        backoff: Duration,
-    ) -> bool {
-        let remaining = self
-            .retry_policy
-            .timeout
-            .saturating_sub(retry_start.elapsed());
-        tokio::time::sleep(backoff.min(remaining)).await;
-        !retry_deadline_elapsed(retry_start, self.retry_policy.timeout)
+    /// Wait `backoff` before the next attempt of a synchronous commit, but not
+    /// past its retry `deadline`. Return whether time is left for the next
+    /// attempt. Kafka's `commitOffsetsSync` does `timer.sleep(backoff)` and
+    /// then sends again only while `timer.notExpired()`.
+    async fn sleep_before_retry(&self, backoff: Duration, deadline: tokio::time::Instant) -> bool {
+        tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
+        tokio::time::Instant::now() < deadline
     }
 
     /// Find the group coordinator again, within the time that is left of a
-    /// synchronous commit that started at `retry_start`. Kafka's
+    /// synchronous commit with the retry `deadline`. Kafka's
     /// `commitOffsetsSync` does this in `coordinatorUnknownAndUnreadySync` after
     /// `markCoordinatorUnknown`. If the lookup fails, the next attempt uses the
     /// last known coordinator.
-    async fn find_coordinator_again(&self, retry_start: tokio::time::Instant) {
+    async fn find_coordinator_again(&self, deadline: tokio::time::Instant) {
         let retry_policy = crate::coordinator::CoordinatorRetryPolicy {
-            timeout: self
-                .retry_policy
-                .timeout
-                .saturating_sub(retry_start.elapsed()),
+            timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
             ..self.retry_policy
         };
         match find_coordinator(&self.client, &self.group_id, retry_policy).await {
@@ -1346,13 +1377,6 @@ impl Consumer {
                     && current.member_id == member_id,
             },
         )?;
-        if let CommitOutcome::Deferred { code, .. } = outcome {
-            tracing::warn!(
-                group = %self.group_id,
-                error_code = code,
-                "offset commit deferred: group rebalancing; will recommit after the coordinator rejoins",
-            );
-        }
         Ok(outcome)
     }
 
@@ -2294,10 +2318,13 @@ mod tests {
     }
 
     /// `commit_response_outcome` gives a final error precedence over a
-    /// deferral, a deferral over a retriable error, and a retriable error over
-    /// `TOPIC_AUTHORIZATION_FAILED`, where Kafka's result depends on the
-    /// partition order. The rebalance codes and `FENCED_INSTANCE_ID` depend on
-    /// the generation and on the coordinator task.
+    /// rebalance-class error, a rebalance-class error over a retriable error,
+    /// and a retriable error over `TOPIC_AUTHORIZATION_FAILED`, where Kafka's
+    /// result depends on the partition order. Whether a rebalance-class error
+    /// raises `CommitFailed` or `RebalanceInProgress` depends on the code, the
+    /// generation and the coordinator task, exactly as Kafka's
+    /// `commitOffsetsSync` never retries either and raises the matching
+    /// exception straight through.
     #[test]
     fn commit_response_outcome_orders_errors_and_reads_the_consumer_state() {
         let running = CommitResponseContext {
@@ -2319,6 +2346,8 @@ mod tests {
             ..rejoined
         };
         let commit_failed = ConsumerError::CommitFailed.to_string();
+        let rebalance_in_progress =
+            ConsumerError::RebalanceInProgress("group-a".into()).to_string();
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for (name, errors, context, expected) in [
@@ -2352,22 +2381,19 @@ mod tests {
                 }),
             ),
             (
-                "deferral takes precedence over a retriable code",
+                "a rebalance error takes precedence over a retriable code",
                 &[3, 27][..],
                 running,
-                Ok(CommitOutcome::Deferred {
-                    code: 27,
-                    acknowledged: HashSet::new(),
-                }),
+                Err(rebalance_in_progress.clone()),
             ),
             (
-                "final code takes precedence over a deferral",
+                "final code takes precedence over a rebalance error",
                 &[27, 42][..],
                 running,
                 Err(ConsumerError::Server(42).to_string()),
             ),
             (
-                "group authorization takes precedence over a deferral",
+                "group authorization takes precedence over a rebalance error",
                 &[22, 30][..],
                 running,
                 Err("not authorized to access group: group-a".into()),
@@ -2389,9 +2415,55 @@ mod tests {
                 Err("not authorized to access topics: [topic]".into()),
             ),
             (
-                "unknown member id after the task stopped",
+                "illegal generation with the request's own generation still current: a real kick",
+                &[22][..],
+                running,
+                Err(commit_failed.clone()),
+            ),
+            (
+                "unknown member id with the request's own generation still current: a real kick",
+                &[25][..],
+                running,
+                Err(commit_failed.clone()),
+            ),
+            (
+                "rebalance in progress",
+                &[27][..],
+                running,
+                Err(rebalance_in_progress.clone()),
+            ),
+            (
+                "illegal generation after a rejoin already moved the generation on: a stale response",
+                &[22][..],
+                rejoined,
+                Err(rebalance_in_progress.clone()),
+            ),
+            (
+                "unknown member id after a rejoin already moved the generation on: a stale response",
+                &[25][..],
+                rejoined,
+                Err(rebalance_in_progress.clone()),
+            ),
+            (
+                "rebalance in progress after a rejoin is still a rebalance error",
+                &[27][..],
+                rejoined,
+                Err(rebalance_in_progress.clone()),
+            ),
+            (
+                "unknown member id after the task stopped, generation still current",
                 &[25][..],
                 stopped,
+                Err(commit_failed.clone()),
+            ),
+            (
+                "unknown member id after the task stopped and a rejoin: no task left to rejoin on",
+                &[25][..],
+                CommitResponseContext {
+                    generation_unchanged: false,
+                    coordinator_alive: false,
+                    ..running
+                },
                 Err(commit_failed.clone()),
             ),
             (
@@ -2407,13 +2479,10 @@ mod tests {
                 Err(ConsumerError::FencedInstanceId("instance-a".into()).to_string()),
             ),
             (
-                "fenced instance id after a rejoin",
+                "fenced instance id after a rejoin already moved the generation on",
                 &[82][..],
                 rejoined,
-                Ok(CommitOutcome::Deferred {
-                    code: 82,
-                    acknowledged: HashSet::new(),
-                }),
+                Err(rebalance_in_progress.clone()),
             ),
             (
                 "fenced instance id after a rejoin and a task stop",
@@ -2563,38 +2632,92 @@ mod tests {
     }
 
     /// The result of a synchronous commit, the `OffsetCommit` requests and the
-    /// `FindCoordinator` requests that the coordinator received.
-    type CommitCodeResult = (Result<(), String>, usize, usize);
+    /// `FindCoordinator` requests that the coordinator received. An error is
+    /// [`described`].
+    type CommitCodeResult = (Result<(), (String, Option<String>)>, usize, usize);
+
+    /// The message of a commit that times out after one second, such as a
+    /// commit with a retriable error and a backoff past its timeout. Kafka's
+    /// `commitSync` then throws `TimeoutException`, and the async consumer's
+    /// `CommitRequestManager` gives it the last error as its cause.
+    const COMMIT_TIMED_OUT: &str =
+        "timeout: Timeout of 1000ms expired before successfully committing offsets";
+
+    /// A commit error as its message and the message of its cause, so that a
+    /// test can compare the whole error.
+    fn described(error: &ConsumerError) -> (String, Option<String>) {
+        (
+            error.to_string(),
+            std::error::Error::source(error).map(ToString::to_string),
+        )
+    }
 
     /// `commit_sync` handles each `OffsetCommit` error code as Kafka's
     /// `ConsumerCoordinator.OffsetCommitResponseHandler.handle` and
     /// `commitOffsetsSync` do. Retriable codes and failed requests retry until
     /// the timeout. `7`, `15`, `16` and a failed request find the coordinator
-    /// again first. The rebalance codes wait for the coordinator task to join
-    /// the group again.
+    /// again first. The rebalance codes (`22`, `25`, `27`, `82` after a rejoin)
+    /// are not retried: `commit_sync` raises `RebalanceInProgress` or
+    /// `CommitFailed` straight through, with no offsets committed, exactly as
+    /// Kafka's `commitOffsetsSync` does.
     #[tokio::test]
     async fn commit_sync_handles_each_offset_commit_error_code_as_kafka_does() {
-        use CommitAnswer::{Close, Codes, Silent};
-
-        const RETRY: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
-            timeout: Duration::from_secs(2),
-            initial_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(1),
-        };
-        const EXPIRED: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
-            timeout: Duration::ZERO,
-            ..RETRY
-        };
-        /// The backoff is longer than the time that is left.
-        const LONG_BACKOFF: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
-            timeout: Duration::from_millis(100),
-            initial_backoff: Duration::from_secs(5),
-            max_backoff: Duration::from_secs(5),
-        };
-        let fenced = ConsumerError::FencedInstanceId("instance-a".into()).to_string();
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
-        for (name, answers, rejoin, retry_policy, expected) in [
+        for (name, answers, rejoin, retry_policy, expected) in offset_commit_error_code_cases() {
+            actual.push((
+                name,
+                scripted_commit_sync(answers, rejoin, retry_policy, Duration::ZERO).await,
+            ));
+            wanted.push((name, expected));
+        }
+        let wanted: Vec<(&str, CommitCodeResult)> = wanted;
+        assert2::assert!(actual == wanted);
+    }
+
+    /// The retry policy of a commit that retries at once.
+    const RETRY: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
+        timeout: Duration::from_secs(2),
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(1),
+    };
+
+    /// The backoff is longer than the time that is left. The timeout leaves
+    /// room for the real round trips to the mock coordinator of a slow,
+    /// instrumented test run before it expires.
+    const LONG_BACKOFF: CoordinatorRetryPolicy = CoordinatorRetryPolicy {
+        timeout: Duration::from_secs(1),
+        initial_backoff: Duration::from_secs(5),
+        max_backoff: Duration::from_secs(5),
+    };
+
+    /// The table of cases for
+    /// [`commit_sync_handles_each_offset_commit_error_code_as_kafka_does`],
+    /// split out to keep that test's own body under clippy's line-count
+    /// limit.
+    fn offset_commit_error_code_cases() -> Vec<(
+        &'static str,
+        Vec<CommitAnswer>,
+        bool,
+        CoordinatorRetryPolicy,
+        CommitCodeResult,
+    )> {
+        use CommitAnswer::{Close, Codes, Silent};
+
+        let fenced = described(&ConsumerError::FencedInstanceId("instance-a".into()));
+        let commit_failed = described(&ConsumerError::CommitFailed);
+        let rebalance_in_progress =
+            described(&ConsumerError::RebalanceInProgress("group-a".into()));
+        let timed_out = |cause: ConsumerError| (COMMIT_TIMED_OUT.into(), Some(cause.to_string()));
+        let disconnected = timed_out(ConsumerError::Client(
+            krabka_client_core::ClientError::Disconnected,
+        ));
+        let group_denied = described(&ConsumerError::GroupAuthorizationFailed("group-a".into()));
+        let topics_denied = described(&ConsumerError::TopicAuthorizationFailed(BTreeSet::from([
+            "orders".into(),
+            "payments".into(),
+        ])));
+        vec![
             ("success", vec![Codes(&[])], false, RETRY, (Ok(()), 1, 0)),
             (
                 "unknown topic or partition retries",
@@ -2635,15 +2758,15 @@ mod tests {
                 "unknown topic or partition past the timeout",
                 vec![Codes(&[("orders", 3)])],
                 false,
-                EXPIRED,
-                (Err(ConsumerError::Server(3).to_string()), 1, 0),
+                LONG_BACKOFF,
+                (Err(timed_out(ConsumerError::Server(3))), 1, 0),
             ),
             (
                 "not coordinator with a backoff past the timeout",
                 vec![Codes(&[("orders", 16)]), Codes(&[])],
                 false,
                 LONG_BACKOFF,
-                (Err(ConsumerError::Server(16).to_string()), 1, 1),
+                (Err(timed_out(ConsumerError::Server(16))), 1, 1),
             ),
             (
                 "disconnect finds the coordinator and retries",
@@ -2663,26 +2786,22 @@ mod tests {
                 "disconnect past the timeout",
                 vec![Close],
                 false,
-                EXPIRED,
-                (Err(ConsumerError::CoordinatorUnavailable.to_string()), 1, 0),
+                LONG_BACKOFF,
+                (Err(disconnected), 1, 1),
             ),
             (
                 "group authorization failed",
                 vec![Codes(&[("orders", 30)])],
                 false,
                 RETRY,
-                (Err("not authorized to access group: group-a".into()), 1, 0),
+                (Err(group_denied), 1, 0),
             ),
             (
                 "topic authorization failed collects every topic",
                 vec![Codes(&[("orders", 29), ("payments", 29)])],
                 false,
                 RETRY,
-                (
-                    Err("not authorized to access topics: [orders, payments]".into()),
-                    1,
-                    0,
-                ),
+                (Err(topics_denied), 1, 0),
             ),
             (
                 "topic authorization failed with a retriable code retries",
@@ -2696,28 +2815,28 @@ mod tests {
                 vec![Codes(&[("orders", 12)])],
                 false,
                 RETRY,
-                (Err(ConsumerError::Server(12).to_string()), 1, 0),
+                (Err(described(&ConsumerError::Server(12))), 1, 0),
             ),
             (
                 "invalid commit offset size",
                 vec![Codes(&[("orders", 28)])],
                 false,
                 RETRY,
-                (Err(ConsumerError::Server(28).to_string()), 1, 0),
+                (Err(described(&ConsumerError::Server(28))), 1, 0),
             ),
             (
                 "unknown topic id is unexpected for a request by topic name",
                 vec![Codes(&[("orders", 100)])],
                 false,
                 RETRY,
-                (Err(ConsumerError::Server(100).to_string()), 1, 0),
+                (Err(described(&ConsumerError::Server(100))), 1, 0),
             ),
             (
                 "not leader or follower is unexpected",
                 vec![Codes(&[("orders", 6)])],
                 false,
                 RETRY,
-                (Err(ConsumerError::Server(6).to_string()), 1, 0),
+                (Err(described(&ConsumerError::Server(6))), 1, 0),
             ),
             (
                 "fenced instance id with the same generation",
@@ -2727,52 +2846,94 @@ mod tests {
                 (Err(fenced.clone()), 1, 0),
             ),
             (
-                "fenced instance id after a rejoin commits again",
+                "fenced instance id is a stale artifact of an already-completed rejoin",
                 vec![Codes(&[("orders", 82)]), Codes(&[])],
                 true,
                 RETRY,
-                (Ok(()), 2, 0),
+                (Err(rebalance_in_progress.clone()), 1, 0),
             ),
             (
-                "illegal generation commits again after the rejoin",
+                "illegal generation with the request's own generation still current: a real kick",
+                vec![Codes(&[("orders", 22)])],
+                false,
+                RETRY,
+                (Err(commit_failed.clone()), 1, 0),
+            ),
+            (
+                "illegal generation is a stale artifact of an already-completed rejoin",
                 vec![Codes(&[("orders", 22)]), Codes(&[])],
                 true,
                 RETRY,
-                (Ok(()), 2, 0),
+                (Err(rebalance_in_progress.clone()), 1, 0),
             ),
             (
-                "unknown member id commits again after the rejoin",
+                "unknown member id with the request's own generation still current: a real kick",
+                vec![Codes(&[("orders", 25)])],
+                false,
+                RETRY,
+                (Err(commit_failed.clone()), 1, 0),
+            ),
+            (
+                "unknown member id is a stale artifact of an already-completed rejoin",
                 vec![Codes(&[("orders", 25)]), Codes(&[])],
                 true,
                 RETRY,
-                (Ok(()), 2, 0),
+                (Err(rebalance_in_progress.clone()), 1, 0),
             ),
             (
-                "rebalance in progress commits again after the rejoin",
+                "rebalance in progress fails the commit",
+                vec![Codes(&[("orders", 27)])],
+                false,
+                RETRY,
+                (Err(rebalance_in_progress.clone()), 1, 0),
+            ),
+            (
+                "rebalance in progress fails the commit even after a rejoin",
                 vec![Codes(&[("orders", 27)]), Codes(&[])],
                 true,
                 RETRY,
-                (Ok(()), 2, 0),
+                (Err(rebalance_in_progress.clone()), 1, 0),
             ),
-        ] {
-            actual.push((
-                name,
-                scripted_commit_sync(answers, rejoin, retry_policy).await,
-            ));
-            wanted.push((name, expected));
-        }
-        let wanted: Vec<(&str, CommitCodeResult)> = wanted;
-        assert2::assert!(actual == wanted);
+        ]
+    }
+
+    /// A synchronous commit that first waits for the commit lock retries
+    /// until the deadline of the whole call, and at that deadline times out
+    /// with the last retriable error as the cause, as the same commit without
+    /// the wait does. The wait does not move the retry deadline past the
+    /// bound of the call.
+    #[tokio::test]
+    async fn commit_sync_after_a_wait_for_the_commit_lock_times_out_with_the_last_retriable_error()
+    {
+        let retry_policy = CoordinatorRetryPolicy {
+            timeout: Duration::from_secs(1),
+            initial_backoff: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(5),
+        };
+        let result = scripted_commit_sync(
+            vec![CommitAnswer::Codes(&[("orders", 3)])],
+            false,
+            retry_policy,
+            Duration::from_millis(50),
+        )
+        .await;
+        let timed_out = (
+            COMMIT_TIMED_OUT.into(),
+            Some(ConsumerError::Server(3).to_string()),
+        );
+        assert2::assert!(result == (Err(timed_out), 1, 0));
     }
 
     /// Run `commit_sync` against a mock coordinator that gives `answers` to
     /// the `OffsetCommit` requests in order and repeats the last answer. With
     /// `rejoin`, the coordinator task joins the group again with generation 8
-    /// before the first answer.
+    /// before the first answer. Another holder keeps the commit lock for
+    /// `commit_lock_held` after `commit_sync` starts.
     async fn scripted_commit_sync(
         answers: Vec<CommitAnswer>,
         rejoin: bool,
         retry_policy: CoordinatorRetryPolicy,
+        commit_lock_held: Duration,
     ) -> CommitCodeResult {
         use CommitAnswer::{Close, Codes, Silent};
         use krabka_protocol::owned::{
@@ -2873,11 +3034,21 @@ mod tests {
             .unwrap();
         consumer.group_instance_id = Some("instance-a".into());
         consumer.retry_policy = retry_policy;
+        consumer.default_api_timeout =
+            krabka_units::convert::StdDurationExt::as_time(&retry_policy.timeout);
 
-        let result = tokio::time::timeout(Duration::from_secs(10), consumer.commit_sync())
-            .await
-            .map_err(|_| "commit never finished".to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()));
+        let held = consumer.commit_serialization.lock().await;
+        let release = async move {
+            tokio::time::sleep(commit_lock_held).await;
+            drop(held);
+        };
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(10), consumer.commit_sync()),
+            release,
+        );
+        let result = result
+            .map_err(|_| ("commit never finished".to_string(), None))
+            .and_then(|result| result.map_err(|error| described(&error)));
 
         mock.stop();
         (
@@ -2885,6 +3056,58 @@ mod tests {
             offset_commits.load(Ordering::SeqCst),
             find_coordinators.load(Ordering::SeqCst),
         )
+    }
+
+    /// A silent broker cannot keep `commit_sync` blocked past
+    /// `default_api_timeout`, even when the client's own `request_timeout` is
+    /// far longer. `default_api_timeout` must bound the whole awaited commit
+    /// operation, not only whether another retry attempt starts, exactly as
+    /// Kafka's `commitSync(Duration timeout)` bounds the whole call.
+    #[tokio::test]
+    async fn commit_sync_times_out_near_default_api_timeout_despite_a_silent_broker() {
+        let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions_for_offset_commit((7, 7)));
+            }
+            // Every other request, including `OffsetCommit`, gets no reply at
+            // all: the broker is up but never answers.
+            None
+        })
+        .await;
+
+        let mut consumer = commit_consumer(
+            &mock,
+            commit_identity(7, "member-a"),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicI32::new(7)),
+        )
+        .await;
+        // The client's own request timeout is far longer than the commit's
+        // API timeout, so only `default_api_timeout` can end this call.
+        consumer.client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .request_timeout(secs(30))
+            .build()
+            .await
+            .unwrap();
+        consumer.default_api_timeout = krabka_units::millis(200);
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), consumer.commit_sync())
+            .await
+            .expect("commit_sync must return on its own well before the test's own timeout");
+        let elapsed = started.elapsed();
+
+        mock.stop();
+        check!(
+            result.map_err(|error| described(&error))
+                == Err((
+                    "timeout: Timeout of 200ms expired before successfully committing offsets"
+                        .into(),
+                    None
+                ))
+        );
+        check!(elapsed < Duration::from_secs(2));
     }
 
     /// A commit fails without a request after the coordinator task stopped, and
@@ -3033,8 +3256,11 @@ mod tests {
         }
     }
 
+    /// Issue #116: a rebalance-class code does not wait for the coordinator
+    /// task to rejoin and resend. `commit_offsets_sync` raises the error from
+    /// the one response it got, even though a rejoin happened concurrently.
     #[tokio::test]
-    async fn selected_commit_retries_a_continuously_owned_partition_after_rejoin() {
+    async fn selected_commit_fails_immediately_on_rebalance_in_progress_without_retrying() {
         let identity = commit_identity(7, "member-a");
         let changed = Arc::new(tokio::sync::Notify::new());
         let generation = Arc::new(AtomicI32::new(7));
@@ -3046,13 +3272,14 @@ mod tests {
             Arc::clone(&requests),
             false,
             |identity, generation, _request_generation, _request_member_id| {
+                // The coordinator task rejoins concurrently with the response.
                 identity.try_lock().unwrap().generation = 8;
                 generation.store(8, Ordering::Relaxed);
             },
         )
         .await;
 
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             consumer.commit_offsets_sync(HashMap::from([(
                 ("topic".into(), 0),
@@ -3060,85 +3287,19 @@ mod tests {
             )])),
         )
         .await
-        .expect("selected commit completes after retained rejoin")
-        .expect("retained offset is acknowledged");
+        .expect("commit does not wait for a rejoin");
 
         mock.stop();
-        assert2::assert!(requests.load(Ordering::SeqCst) == 2);
+        assert2::assert!(
+            result.map_err(|error| error.to_string())
+                == Err(ConsumerError::RebalanceInProgress("group-a".into()).to_string())
+        );
+        assert2::assert!(requests.load(Ordering::SeqCst) == 1);
     }
 
-    #[tokio::test]
-    async fn selected_commit_drops_revoked_or_reassigned_ownership_without_stale_retry() {
-        for reassigned in [false, true] {
-            let identity = commit_identity(7, "member-a");
-            let changed = Arc::new(tokio::sync::Notify::new());
-            let generation = Arc::new(AtomicI32::new(7));
-            let requests = Arc::new(AtomicUsize::new(0));
-            let (consumer, mock, _) = selected_commit_consumer(
-                identity,
-                changed,
-                generation,
-                Arc::clone(&requests),
-                false,
-                move |identity, generation, _request_generation, _request_member_id| {
-                    let mut identity = identity.try_lock().expect("identity lock available");
-                    identity.ownership_ids.clear();
-                    if reassigned {
-                        identity.ownership_ids.insert(("topic".into(), 0), 2);
-                    }
-                    identity.generation = 8;
-                    generation.store(8, Ordering::Relaxed);
-                },
-            )
-            .await;
-
-            consumer
-                .commit_offsets_sync(HashMap::from([(
-                    ("topic".into(), 0),
-                    OffsetAndMetadata::new(12),
-                )]))
-                .await
-                .expect("revocation safely ends the old ownership commit");
-
-            mock.stop();
-            check!(
-                requests.load(Ordering::SeqCst) == 1,
-                "reassigned={reassigned}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn selected_commit_registers_rejoin_notification_before_sending() {
-        let identity = commit_identity(7, "member-a");
-        let changed = Arc::new(tokio::sync::Notify::new());
-        let generation = Arc::new(AtomicI32::new(7));
-        let requests = Arc::new(AtomicUsize::new(0));
-        let (consumer, mock, _) = selected_commit_consumer(
-            identity,
-            changed,
-            generation,
-            Arc::clone(&requests),
-            false,
-            |_ownership, _generation, _request_generation, _request_member_id| {},
-        )
-        .await;
-
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            consumer.commit_offsets_sync(HashMap::from([(
-                ("topic".into(), 0),
-                OffsetAndMetadata::new(12),
-            )])),
-        )
-        .await
-        .expect("notification sent before response is not lost")
-        .expect("selected offset is acknowledged on retry");
-
-        mock.stop();
-        assert2::assert!(requests.load(Ordering::SeqCst) == 2);
-    }
-
+    /// The request that fails with a rebalance code still carries the
+    /// generation and the member id that `commit_offsets_sync` snapshotted at
+    /// its call, not the ones a concurrent rejoin published afterward.
     #[tokio::test]
     async fn selected_commit_uses_snapshot_generation_if_ownership_changes_before_rpc() {
         let identity = commit_identity(7, "member-a");
@@ -3170,24 +3331,22 @@ mod tests {
             OffsetAndMetadata::new(12),
         )]));
 
-        let outcome = consumer
+        let error = consumer
             .commit_topics_once(topics, (7, "member-a".into()))
             .await
-            .expect("rebalance response is deferred");
+            .expect_err("rebalance in progress fails the commit");
 
         mock.stop();
         assert2::assert!(
-            outcome
-                == CommitOutcome::Deferred {
-                    code: 27,
-                    acknowledged: HashSet::new(),
-                }
+            error.to_string() == ConsumerError::RebalanceInProgress("group-a".into()).to_string()
         );
         assert2::assert!(seen_generation.load(Ordering::Relaxed) == 7);
     }
 
+    /// The one request a selected commit sends carries the live member id from
+    /// `commit_identity`, even though it is never retried.
     #[tokio::test]
-    async fn selected_commit_uses_live_member_id_after_from_scratch_rejoin() {
+    async fn selected_commit_uses_live_member_id_even_without_a_retry() {
         let identity = commit_identity(8, "member-new");
         let changed = Arc::new(tokio::sync::Notify::new());
         let generation = Arc::new(AtomicI32::new(7));
@@ -3206,20 +3365,23 @@ mod tests {
             },
         )
         .await;
-        consumer
+        let result = consumer
             .commit_offsets_sync(HashMap::from([(
                 ("topic".into(), 0),
                 OffsetAndMetadata::new(12),
             )]))
-            .await
-            .expect("selected commit retries with live member identity");
+            .await;
 
         mock.stop();
+        assert2::assert!(result.is_err());
         assert2::assert!(seen_new_member.load(Ordering::Relaxed));
     }
 
+    /// A rebalance code on any one partition of a mixed response fails the
+    /// whole commit, even though another partition of the same response
+    /// acknowledged.
     #[tokio::test]
-    async fn bulk_commit_retries_only_deferred_partitions_from_a_mixed_response() {
+    async fn commit_sync_fails_on_any_rebalance_code_in_a_mixed_response() {
         let identity = Arc::new(Mutex::new(CommitIdentity {
             generation: 7,
             member_id: "member-a".into(),
@@ -3242,17 +3404,21 @@ mod tests {
         )
         .await;
 
-        consumer
-            .commit_sync()
-            .await
-            .expect("the deferred partition is acknowledged on retry");
+        let result = consumer.commit_sync().await;
 
         mock.stop();
-        assert2::assert!(requests.load(Ordering::SeqCst) == 2);
+        assert2::assert!(
+            result.map_err(|error| error.to_string())
+                == Err(ConsumerError::RebalanceInProgress("group-a".into()).to_string())
+        );
+        assert2::assert!(requests.load(Ordering::SeqCst) == 1);
     }
 
+    /// A commit that fails with a rebalance error still releases
+    /// `commit_serialization` so a newer commit for the same partition sends
+    /// only after it, never before.
     #[tokio::test]
-    async fn deferred_commit_finishes_before_a_newer_commit_for_the_same_partition() {
+    async fn a_failed_commit_releases_the_lock_before_a_newer_commit_for_the_same_partition() {
         let identity = commit_identity(7, "member-a");
         let changed = Arc::new(tokio::sync::Notify::new());
         let generation = Arc::new(AtomicI32::new(7));
@@ -3299,11 +3465,21 @@ mod tests {
         tokio::task::yield_now().await;
         drop(blocker);
 
-        older.await.unwrap().unwrap();
-        newer.await.unwrap().unwrap();
+        let older_error = older
+            .await
+            .unwrap()
+            .expect_err("the response for the older commit is a rebalance error");
+        newer
+            .await
+            .unwrap()
+            .expect("the newer commit sends once the older one released the lock");
 
         mock.stop();
-        assert2::assert!(*seen_offsets.lock().unwrap() == vec![(0, 10), (0, 10), (0, 12)]);
+        assert2::assert!(
+            older_error.to_string()
+                == ConsumerError::RebalanceInProgress("group-a".into()).to_string()
+        );
+        assert2::assert!(*seen_offsets.lock().unwrap() == vec![(0, 10), (0, 12)]);
     }
 
     #[tokio::test]

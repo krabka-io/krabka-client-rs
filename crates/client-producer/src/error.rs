@@ -28,6 +28,14 @@ pub enum ProducerError {
     #[error("Invalid timestamp: {0}. Timestamp should always be non-negative or null.")]
     InvalidTimestamp(i64),
 
+    /// A custom partitioner (`partitioner.class`) returned a negative
+    /// partition. Kafka's `KafkaProducer.partition` throws
+    /// `IllegalArgumentException` with the same message.
+    #[error(
+        "The partitioner generated an invalid partition number: {0}. Partition number should always be non-negative."
+    )]
+    InvalidPartitionerResult(i32),
+
     #[error("batch too large: {batch_size} > max")]
     BatchTooLarge { batch_size: usize },
 
@@ -91,7 +99,12 @@ pub enum ProducerError {
     #[error("invalid transaction state: {0}")]
     InvalidTransactionState(&'static str),
 
-    #[error("transaction was aborted by the broker (timeout or fence)")]
+    /// The record's batch was still queued in the accumulator, undrained,
+    /// when the application aborted the transaction. Kafka's
+    /// `Sender.maybeSendAndPollTransactionalRequest` fails every undrained
+    /// batch this way instead of sending it:
+    /// `accumulator.abortUndrainedBatches(new TransactionAbortedException())`.
+    #[error("the transaction was aborted; the record was never sent")]
     TransactionAborted,
 
     #[error("concurrent transactions on the same transactional_id")]

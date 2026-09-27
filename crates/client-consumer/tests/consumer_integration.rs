@@ -34,12 +34,14 @@
 mod support;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
 use assert2::{assert, check};
-use krabka_client_consumer::{AutoOffsetReset, Consumer, ConsumerError, ConsumerRecord};
+use krabka_client_consumer::{
+    AutoOffsetReset, Consumer, ConsumerError, ConsumerRecord, OffsetAndMetadata,
+};
 use krabka_client_core::Client;
 use krabka_protocol::{
     owned::{
@@ -59,7 +61,7 @@ use krabka_units::{millis, secs};
 /// Outer bound for any wait that depends on the container. A rebalance, a
 /// metadata refresh and a log recovery all run in the broker process, and a
 /// cold runner is far slower than the in-process broker this suite came from.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SETTLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Pause between two attempts at a condition the broker owns.
 ///
@@ -386,7 +388,7 @@ async fn eager_rebalance_reacquires_and_primes() {
     support::produce_to_partition(&producer, &topic, 0, &["a0"]).await;
     support::produce_to_partition(&producer, &topic, 1, &["a1"]).await;
 
-    let (mut m1, mut m2) = two_member_split(&kafka.bootstrap, &group, &topic).await;
+    let (mut m1, mut m2) = Box::pin(two_member_split(&kafka.bootstrap, &group, &topic)).await;
 
     // Each member reads its own partition and commits. Those two commits are
     // the positions the eager rejoin must prime from.
@@ -446,7 +448,7 @@ async fn commit_succeeds_after_rebalance_bumps_generation() {
     let producer = support::bootstrap_client(&kafka.bootstrap).await;
     support::create_topic_with_partitions(&producer, &topic, 2).await;
 
-    let (mut m1, m2) = two_member_split(&kafka.bootstrap, &group, &topic).await;
+    let (mut m1, m2) = Box::pin(two_member_split(&kafka.bootstrap, &group, &topic)).await;
     let gen_after_split = m1.generation_id();
 
     drop_member_and_reacquire(&mut m1, m2).await;
@@ -523,8 +525,8 @@ struct OutOfRangeCase {
     /// out of range and the recovery branch never runs at all. The committed 0
     /// is what puts the consumer below the trimmed log start.
     ///
-    /// `Earliest` needs none. It primes an uncommitted partition to 0 by
-    /// itself, and the trim puts that 0 below the log start.
+    /// `Earliest` needs none. It resolves an uncommitted partition to the
+    /// broker's log start by itself, on its very first `Fetch`.
     seed_committed_zero: bool,
     /// Records produced after the reset has settled. `Latest` needs them,
     /// because its reset lands at the live log end and leaves nothing older to
@@ -535,13 +537,16 @@ struct OutOfRangeCase {
     expected: &'static [&'static str],
 }
 
-/// Drive one `OFFSET_OUT_OF_RANGE` recovery scenario.
+/// Drive one `OFFSET_OUT_OF_RANGE` recovery scenario, or (for `Earliest`) the
+/// equivalent initial-position case.
 ///
-/// A consumer sits at offset 0 while `DeleteRecords` moves the log start to 5.
-/// The next `Fetch` from 0 is below the log start, so the broker returns
-/// `OFFSET_OUT_OF_RANGE` (code 1). The error-first poll loop then resets by
-/// policy. Neither policy may surface an error, and neither may deliver a
-/// record below the new log start.
+/// `Latest` sits at a committed offset of 0 while `DeleteRecords` moves the
+/// log start to 5, so its next `Fetch` from 0 is below the log start and the
+/// broker returns `OFFSET_OUT_OF_RANGE` (code 1); the error-first poll loop
+/// then resets it to the live log end. `Earliest` has no committed offset, so
+/// it resolves straight to the trimmed log start before its first `Fetch` and
+/// never sees `OFFSET_OUT_OF_RANGE`. Neither policy may surface an error, and
+/// neither may deliver a record below the new log start.
 async fn run_out_of_range_reset(case: &OutOfRangeCase) {
     support::init_tracing();
     let kafka = support::start_kafka().await;
@@ -642,13 +647,17 @@ async fn consumer_resets_on_offset_out_of_range_latest() {
     .await;
 }
 
-/// `OFFSET_OUT_OF_RANGE` recovery under `auto.offset.reset=earliest`.
+/// Initial position under `auto.offset.reset=earliest` when the log was
+/// already trimmed past 0 before the consumer even starts.
 ///
-/// `Earliest` must reset to the `log_start_offset` in the response, which is 5
-/// here, and NOT to the literal 0. A reset to 0 would cause
-/// `OFFSET_OUT_OF_RANGE` again without end, and that is the root cause this
-/// case catches. After recovery the consumer starts again from the new log
-/// start and delivers the records that survived the trim.
+/// `Earliest` must land on the broker's real log start (5 here), and never on
+/// the literal offset 0: `reset_starting_offset` plants the same sentinel as
+/// `seek_to_beginning`, so `prepare_poll` resolves it with `ListOffsets(-2)`
+/// before the first `Fetch` goes out, and the fetch never sees
+/// `OFFSET_OUT_OF_RANGE` at all. A literal 0 would instead need a doomed first
+/// `Fetch` and a recovery round trip, or worse, silently under-report the
+/// position as 0 in between. The consumer delivers the records that survived
+/// the trim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn consumer_resets_on_offset_out_of_range_earliest() {
@@ -663,10 +672,17 @@ async fn consumer_resets_on_offset_out_of_range_earliest() {
 
 /// Seat a below-trim committed offset for `group` on partition 0 of `topic`.
 ///
-/// An `Earliest` seed member primes `next_offset` to 0 during assignment and
-/// commits that 0. The caller then trims the log past it. `assignment()` is
-/// checked rather than `poll`, so the seed consumes no record and its position
-/// stays at 0.
+/// An `Earliest` seed member is only used to join the group and take
+/// ownership of partition 0; its actual fetch position stays an unresolved
+/// `BEGINNING_SENTINEL` until a `poll` or `position()` call resolves it, and
+/// `commit_sync` commits only resolved positions (Kafka's
+/// `SubscriptionState.allConsumed` skips a partition without a valid
+/// position). Relying on `commit_sync` here would therefore commit nothing:
+/// the call would return `Ok(())` without ever sending an `OffsetCommit`, and
+/// the caller's below-trim seed offset would never actually be seated. This
+/// commits offset 0 explicitly with `commit_offsets_sync` instead, which
+/// sends the `OffsetCommit` for exactly the offset the caller asked for,
+/// independent of whether the seed's own fetch position has resolved.
 async fn seed_committed_offset_zero(bootstrap: &str, group: &str, topic: &str) {
     let seed = Consumer::builder()
         .bootstrap(bootstrap)
@@ -681,7 +697,12 @@ async fn seed_committed_offset_zero(bootstrap: &str, group: &str, topic: &str) {
         .await
         .expect("build seed consumer");
     wait_for_assignment(&seed, 1, "seed consumer").await;
-    seed.commit_sync().await.expect("seed commit of offset 0");
+    seed.commit_offsets_sync(HashMap::from([(
+        (topic.to_string(), 0),
+        OffsetAndMetadata::new(0),
+    )]))
+    .await
+    .expect("seed commit of offset 0");
     seed.close().await.expect("close seed consumer");
 }
 
@@ -697,12 +718,13 @@ async fn seed_committed_offset_zero(bootstrap: &str, group: &str, topic: &str) {
 /// out-of-range fetch offset and, as the `safe_offset`, the `log_start_offset`
 /// from the response.
 ///
-/// A new `None` consumer starts at the `i64::MAX` sentinel, which resolves to
-/// the live log end, so it is never out of range. To seat a below-trim position
-/// deterministically, an `Earliest` seed consumer first commits offset 0 for
-/// the group BEFORE the trim. `DeleteRecords` then moves the log start forward
-/// past that committed 0. The `None` consumer inherits the below-trim committed
-/// offset and gets `OFFSET_OUT_OF_RANGE`.
+/// A new `None` consumer with no committed offset never reaches
+/// `OFFSET_OUT_OF_RANGE` at all: `poll` fails at once with
+/// `NoOffsetForPartition`, because `None` never auto-resets. To seat a
+/// below-trim position deterministically, an `Earliest` seed consumer first
+/// commits offset 0 for the group BEFORE the trim. `DeleteRecords` then moves
+/// the log start forward past that committed 0. The `None` consumer inherits
+/// the below-trim committed offset and gets `OFFSET_OUT_OF_RANGE`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn consumer_none_policy_surfaces_log_truncation() {

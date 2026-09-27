@@ -66,6 +66,7 @@ mod reauth;
 mod request;
 pub mod sasl;
 pub mod security;
+pub mod telemetry;
 mod transport;
 mod version;
 

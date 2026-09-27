@@ -651,6 +651,33 @@ impl<C: BrokerConnector> BrokerPool<C> {
         }
     }
 
+    /// An open connection with its id, without a new connection attempt: the
+    /// one of `preferred` while it is open, or else the one with the fewest
+    /// requests in flight. The bootstrap connection has id `-1`.
+    pub fn open_connection(&self, preferred: Option<i32>) -> Option<(i32, Arc<C::Conn>)> {
+        let open = |id: i32, node: &Node<C::Conn>| {
+            node.state()
+                .connection
+                .as_ref()
+                .filter(|connection| C::is_open(connection))
+                .map(|connection| (id, Arc::clone(connection)))
+        };
+        if let Some((id, node)) = preferred.and_then(|id| Some((id, self.nodes.get(&id)?)))
+            && let Some(found) = open(id, &node)
+        {
+            return Some(found);
+        }
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect::<Vec<_>>();
+        nodes
+            .into_iter()
+            .filter_map(|(id, node)| open(id, &node))
+            .min_by_key(|(id, connection)| (C::in_flight(connection), *id))
+    }
+
     /// Update the (id, host, port) registry from a list of brokers, which
     /// usually comes from a `MetadataResponse`. This method opens no new
     /// connections, and it does not resolve the hosts: the pool resolves a

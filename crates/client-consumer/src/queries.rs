@@ -440,7 +440,7 @@ impl Consumer {
         )
         .await
         .unwrap_or_else(|_| {
-            Err(ConsumerError::Timeout(format!(
+            Err(ConsumerError::timeout(format!(
                 "Failed to get offsets by times in {}ms",
                 started.elapsed().as_millis()
             )))
@@ -520,7 +520,7 @@ impl Consumer {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(ConsumerError::Timeout(format!(
+                return Err(ConsumerError::timeout(format!(
                     "Failed to get offsets by times in {}ms",
                     started.elapsed().as_millis()
                 )));
@@ -585,7 +585,7 @@ impl Consumer {
         tokio::time::timeout_at(deadline, self.topic_metadata_until(request, deadline))
             .await
             .unwrap_or_else(|_| {
-                Err(ConsumerError::Timeout(
+                Err(ConsumerError::timeout(
                     "Timeout expired while fetching topic metadata".to_owned(),
                 ))
             })
@@ -608,7 +608,7 @@ impl Consumer {
                 Err(error) => return Err(error.into()),
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(ConsumerError::Timeout(
+                return Err(ConsumerError::timeout(
                     "Timeout expired while fetching topic metadata".to_owned(),
                 ));
             }
@@ -994,7 +994,7 @@ mod tests {
             }
             .unwrap_or_else(|error| match error {
                 // The message names the elapsed time.
-                ConsumerError::Timeout(_) => Answer::Error("timeout".into()),
+                ConsumerError::Timeout { .. } => Answer::Error("timeout".into()),
                 error => Answer::Error(error.to_string()),
             });
             broker.stop();

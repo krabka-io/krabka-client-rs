@@ -2231,7 +2231,7 @@ async fn commit_consumed_before_join(
     auto_commit: &crate::commit::AutoCommit,
 ) {
     let deadline = tokio::time::Instant::now() + state.max_poll_interval.to_std();
-    let Some(_turn) = commit_turn(&state.commit_serialization, auto_commit, deadline).await else {
+    let Some(_turn) = commit_turn(&state.commit_serialization, deadline).await else {
         tracing::error!(
             "auto commit before the rebalance timed out waiting for another commit; joining the group"
         );
@@ -2298,25 +2298,15 @@ async fn commit_consumed_before_join(
     }
 }
 
-/// Wait for the turn of the commit before a `JoinGroup` in the commit order.
-///
-/// The function returns `Some(Some(guard))` when the commit holds
-/// `commit_serialization`. It returns `Some(None)` when the commit that holds
-/// the lock waits for this rebalance. That commit sends nothing before the
-/// rebalance publishes the next assignment, so the commit before the
-/// `JoinGroup` goes first. The function returns `None` at `deadline`.
+/// Wait for the turn of the commit before a `JoinGroup` in the commit order:
+/// `commit_serialization`, up to `deadline`. `None` at the deadline.
 async fn commit_turn(
     commit_serialization: &Arc<Mutex<()>>,
-    auto_commit: &crate::commit::AutoCommit,
     deadline: tokio::time::Instant,
-) -> Option<Option<OwnedMutexGuard<()>>> {
-    let mut parked_commits = auto_commit.parked_commits();
-    tokio::select! {
-        biased;
-        guard = Arc::clone(commit_serialization).lock_owned() => Some(Some(guard)),
-        parked = parked_commits.wait_for(|parked| *parked) => parked.is_ok().then_some(None),
-        () = tokio::time::sleep_until(deadline) => None,
-    }
+) -> Option<OwnedMutexGuard<()>> {
+    tokio::time::timeout_at(deadline, Arc::clone(commit_serialization).lock_owned())
+        .await
+        .ok()
 }
 
 struct JoinOutcome {
@@ -4079,17 +4069,44 @@ mod retry_tests {
         for (_name, committed, reset, expected) in [
             ("committed positive", 12, AutoOffsetReset::Earliest, 12),
             ("committed zero", 0, AutoOffsetReset::Latest, 0),
-            ("missing earliest", -1, AutoOffsetReset::Earliest, 0),
-            ("missing latest", -1, AutoOffsetReset::Latest, i64::MAX),
-            ("missing none", -1, AutoOffsetReset::None, i64::MAX),
+            (
+                "missing earliest",
+                -1,
+                AutoOffsetReset::Earliest,
+                crate::poll::BEGINNING_SENTINEL,
+            ),
+            (
+                "missing latest",
+                -1,
+                AutoOffsetReset::Latest,
+                crate::poll::LATEST_SENTINEL,
+            ),
+            (
+                "missing none",
+                -1,
+                AutoOffsetReset::None,
+                crate::poll::NO_OFFSET_SENTINEL,
+            ),
         ] {
             assert2::assert!(starting_offset(committed, reset) == expected);
         }
 
         for (_name, reset, expected) in [
-            ("earliest", AutoOffsetReset::Earliest, 0),
-            ("latest", AutoOffsetReset::Latest, i64::MAX),
-            ("none", AutoOffsetReset::None, i64::MAX),
+            (
+                "earliest",
+                AutoOffsetReset::Earliest,
+                crate::poll::BEGINNING_SENTINEL,
+            ),
+            (
+                "latest",
+                AutoOffsetReset::Latest,
+                crate::poll::LATEST_SENTINEL,
+            ),
+            (
+                "none",
+                AutoOffsetReset::None,
+                crate::poll::NO_OFFSET_SENTINEL,
+            ),
         ] {
             assert2::assert!(reset_starting_offset(reset) == expected);
         }

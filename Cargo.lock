@@ -1953,6 +1953,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "krabka-compression",
  "krabka-ids",
  "krabka-protocol",
  "krabka-security",
@@ -1981,6 +1982,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "x509-cert",
 ]
 
@@ -2012,6 +2014,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

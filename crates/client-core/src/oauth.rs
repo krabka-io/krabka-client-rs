@@ -1,15 +1,20 @@
-//! OAUTHBEARER tokens: the token provider seam and an OAuth 2 client
-//! credentials provider (KIP-768).
+//! OAUTHBEARER tokens: the token provider seam, an OAuth 2 client credentials
+//! provider and a jwt-bearer client assertion provider (KIP-768), and a
+//! background refresh task for either.
 //!
 //! Kafka's `OAuthBearerLoginCallbackHandler` gets a token from a
 //! `JwtRetriever`. `ClientCredentialsJwtRetriever` posts a
-//! `client_credentials` grant to `sasl.oauthbearer.token.endpoint.url`, and
-//! `ExpiringCredentialRefreshingLogin` fetches a new token before the old one
-//! expires.
+//! `client_credentials` grant to `sasl.oauthbearer.token.endpoint.url`,
+//! `JwtBearerJwtRetriever` instead posts the
+//! `urn:ietf:params:oauth:grant-type:jwt-bearer` grant with a signed client
+//! assertion, and `ExpiringCredentialRefreshingLogin` fetches a new token
+//! before the old one expires. [`spawn_background_refresh`] is this crate's
+//! equivalent of that last part.
 
 use std::{
-    fmt,
+    fmt, fs,
     future::Future,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -29,6 +34,9 @@ use crate::security::{Password, TlsConnectorConfig};
 /// The future of [`OAuthBearerTokenProvider::token`].
 pub type TokenFuture<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 
+/// The future of [`OAuthBearerTokenProvider::refresh_at`].
+pub type RefreshFuture<'a> = Pin<Box<dyn Future<Output = Option<SystemTime>> + Send + 'a>>;
+
 /// A source of OAUTHBEARER tokens, as Kafka's `sasl.login.callback.handler.class`
 /// with an `OAuthBearerTokenCallback` is.
 ///
@@ -39,6 +47,77 @@ pub trait OAuthBearerTokenProvider: fmt::Debug + Send + Sync {
     /// # Errors
     /// Returns a description when no token is available.
     fn token(&self) -> TokenFuture<'_>;
+
+    /// Fetch a new token even when a cached one has not reached its refresh
+    /// time, as Kafka's `ExpiringCredentialRefreshingLogin` re-logs in once
+    /// its refresh timer fires. [`spawn_background_refresh`] calls this at
+    /// each [`Self::refresh_at`]; a provider that caches nothing can leave
+    /// the default, which is [`Self::token`].
+    ///
+    /// # Errors
+    /// Returns a description when no token is available.
+    fn refresh(&self) -> TokenFuture<'_> {
+        self.token()
+    }
+
+    /// The time a cached token should next be refreshed, once
+    /// [`Self::token`] has fetched one. [`spawn_background_refresh`] polls
+    /// this to know when to wake up and fetch proactively; a provider that
+    /// caches nothing can leave the default, which never schedules a
+    /// background fetch.
+    fn refresh_at(&self) -> RefreshFuture<'_> {
+        Box::pin(async { None })
+    }
+
+    /// Whether [`spawn_background_refresh`] should run a background task for
+    /// this provider.
+    ///
+    /// Kafka's `ExpiringCredentialRefreshingLogin` background thread always
+    /// runs once a login completes. krabka instead makes starting the
+    /// equivalent task an explicit call, so building a provider outside a
+    /// Tokio runtime never panics; this flag is each provider's own opt-in
+    /// for that call, and it defaults to `true` so a caller that does invoke
+    /// [`spawn_background_refresh`] gets Kafka's normal, always-on behavior
+    /// unless it explicitly turns the flag off.
+    fn background_refresh_enabled(&self) -> bool {
+        true
+    }
+}
+
+/// Starts a background task that keeps `provider`'s token fresh by calling
+/// [`OAuthBearerTokenProvider::refresh`] at the time
+/// [`OAuthBearerTokenProvider::refresh_at`] reports, rather than waiting for
+/// the next SASL exchange to notice the cached token needs a refresh. This is
+/// krabka's equivalent of Kafka's `ExpiringCredentialRefreshingLogin`
+/// background thread.
+///
+/// Returns `None` when
+/// [`background_refresh_enabled`](OAuthBearerTokenProvider::background_refresh_enabled)
+/// says not to. Otherwise the task runs until its `JoinHandle` is dropped or
+/// aborted, so the caller should abort it (dropping the last reference to
+/// `provider`) once the client using it shuts down.
+#[must_use]
+pub fn spawn_background_refresh(
+    provider: Arc<dyn OAuthBearerTokenProvider>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !provider.background_refresh_enabled() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut result = provider.token().await;
+        loop {
+            if let Err(error) = result {
+                tracing::warn!(error = %error, "background OAUTHBEARER token refresh failed");
+            }
+            let wait = provider
+                .refresh_at()
+                .await
+                .and_then(|refresh_at| refresh_at.duration_since(SystemTime::now()).ok())
+                .unwrap_or(DEFAULT_LOGIN_RETRY_BACKOFF_MAX);
+            tokio::time::sleep(wait).await;
+            result = provider.refresh().await;
+        }
+    }))
 }
 
 /// Kafka's `sasl.login.retry.backoff.ms` default.
@@ -91,6 +170,8 @@ pub struct ClientCredentialsConfig {
     pub refresh_min_period: Duration,
     /// `sasl.login.refresh.buffer.seconds`.
     pub refresh_buffer: Duration,
+    /// [`OAuthBearerTokenProvider::background_refresh_enabled`].
+    pub background_refresh: bool,
 }
 
 impl ClientCredentialsConfig {
@@ -117,6 +198,7 @@ impl ClientCredentialsConfig {
             refresh_window_jitter: DEFAULT_LOGIN_REFRESH_WINDOW_JITTER,
             refresh_min_period: DEFAULT_LOGIN_REFRESH_MIN_PERIOD,
             refresh_buffer: DEFAULT_LOGIN_REFRESH_BUFFER,
+            background_refresh: true,
         }
     }
 }
@@ -180,32 +262,36 @@ impl ClientCredentialsTokenProvider {
         }))
     }
 
+    /// Fetch a new token as of `now` and store it with its refresh time in
+    /// `cached`.
+    async fn fetch_into(
+        &self,
+        cached: &mut Option<Cached>,
+        now: SystemTime,
+    ) -> Result<String, String> {
+        let token = self.fetch().await?;
+        let claims = token_times(&token)?;
+        let refresh_at = self.refresh_at(
+            now,
+            claims.0.unwrap_or(now),
+            claims.1,
+            crate::backoff::random_unit(),
+        );
+        *cached = Some(Cached {
+            token: token.clone(),
+            refresh_at,
+        });
+        Ok(token)
+    }
+
     async fn fetch(&self) -> Result<String, String> {
         let request = self.request()?;
-        // Kafka's `Retry.execute`: retry until `retry.backoff.max.ms` passed,
-        // doubling the wait.
-        let started = tokio::time::Instant::now();
-        let end = started + self.config.retry_backoff_max;
-        let mut attempt = 0_u32;
-        loop {
-            attempt += 1;
-            match self.post(&request).await {
-                Ok(body) => return parse_token(&body),
-                Err(Failure::Final(error)) => return Err(error),
-                Err(Failure::Retriable(error)) => {
-                    let wait = self
-                        .config
-                        .retry_backoff
-                        .saturating_mul(2_u32.saturating_pow(attempt - 1))
-                        .min(end.saturating_duration_since(tokio::time::Instant::now()));
-                    if wait.is_zero() {
-                        return Err(error);
-                    }
-                    tracing::warn!(attempt, error = %error, "token endpoint request failed");
-                    tokio::time::sleep(wait).await;
-                }
-            }
-        }
+        retry_token_request(
+            self.config.retry_backoff,
+            self.config.retry_backoff_max,
+            || Box::pin(self.post(&request)),
+        )
+        .await
     }
 
     /// The headers and body of `ClientSecretRequestFormatter`.
@@ -233,49 +319,22 @@ impl ClientCredentialsTokenProvider {
         }
         Ok(TokenRequest {
             endpoint: Endpoint::parse(&self.config.token_endpoint_url)?,
-            authorization: format!(
+            authorization: Some(format!(
                 "Basic {}",
                 B64.encode(format!("{client_id}:{client_secret}"))
-            ),
+            )),
             body,
         })
     }
 
     async fn post(&self, request: &TokenRequest) -> Result<String, Failure> {
-        let endpoint = &request.endpoint;
-        let connect = TcpStream::connect((endpoint.host.as_str(), endpoint.port));
-        let tcp = within(self.config.connect_timeout, connect)
-            .await
-            .map_err(|()| Failure::Retriable("token endpoint connect timed out".into()))?
-            .map_err(|error| Failure::Retriable(format!("token endpoint connect: {error}")))?;
-        let exchange = async {
-            if endpoint.https {
-                let connector = self
-                    .config
-                    .tls
-                    .connector()
-                    .map_err(|error| Failure::Final(error.to_string()))?;
-                // `tls.server_name` overrides the SNI name, as it does on a
-                // broker connection.
-                let server_name = if self.config.tls.server_name.is_empty() {
-                    endpoint.host.clone()
-                } else {
-                    self.config.tls.server_name.clone()
-                };
-                let name = rustls::pki_types::ServerName::try_from(server_name)
-                    .map_err(|error| Failure::Final(format!("invalid endpoint host: {error}")))?;
-                let stream = connector
-                    .connect(name, tcp)
-                    .await
-                    .map_err(|error| Failure::Retriable(format!("token endpoint TLS: {error}")))?;
-                http_post(stream, request).await
-            } else {
-                http_post(tcp, request).await
-            }
-        };
-        within(self.config.read_timeout, exchange)
-            .await
-            .map_err(|()| Failure::Retriable("token endpoint read timed out".into()))?
+        post_to_endpoint(
+            &self.config.tls,
+            self.config.connect_timeout,
+            self.config.read_timeout,
+            request,
+        )
+        .await
     }
 
     /// The refresh time of Kafka's
@@ -288,25 +347,18 @@ impl ClientCredentialsTokenProvider {
         expire: SystemTime,
         unit: f64,
     ) -> SystemTime {
-        let config = &self.config;
-        let factor = config.refresh_window_factor + config.refresh_window_jitter * unit;
-        if now + config.refresh_min_period + config.refresh_buffer > expire {
-            return now
-                + expire
-                    .duration_since(now)
-                    .unwrap_or_default()
-                    .mul_f64(factor);
-        }
-        let proposed = start
-            + expire
-                .duration_since(start)
-                .unwrap_or_default()
-                .mul_f64(factor);
-        let buffer_start = expire - config.refresh_buffer;
-        if proposed > buffer_start {
-            return buffer_start;
-        }
-        proposed.max(now + config.refresh_min_period)
+        expiring_credential_refresh_at(
+            now,
+            start,
+            expire,
+            unit,
+            &RefreshWindow {
+                factor: self.config.refresh_window_factor,
+                jitter: self.config.refresh_window_jitter,
+                min_period: self.config.refresh_min_period,
+                buffer: self.config.refresh_buffer,
+            },
+        )
     }
 }
 
@@ -320,21 +372,547 @@ impl OAuthBearerTokenProvider for ClientCredentialsTokenProvider {
             {
                 return Ok(current.token.clone());
             }
-            let token = self.fetch().await?;
-            let claims = token_times(&token)?;
-            let refresh_at = self.refresh_at(
-                now,
-                claims.0.unwrap_or(now),
-                claims.1,
-                crate::backoff::random_unit(),
-            );
-            *cached = Some(Cached {
-                token: token.clone(),
-                refresh_at,
-            });
-            Ok(token)
+            self.fetch_into(&mut cached, now).await
         })
     }
+
+    fn refresh(&self) -> TokenFuture<'_> {
+        Box::pin(async move {
+            let mut cached = self.cached.lock().await;
+            self.fetch_into(&mut cached, SystemTime::now()).await
+        })
+    }
+
+    fn refresh_at(&self) -> RefreshFuture<'_> {
+        Box::pin(async move {
+            self.cached
+                .lock()
+                .await
+                .as_ref()
+                .map(|cached| cached.refresh_at)
+        })
+    }
+
+    fn background_refresh_enabled(&self) -> bool {
+        self.config.background_refresh
+    }
+}
+
+/// The window settings of Kafka's `ExpiringCredentialRefreshConfig`:
+/// `sasl.login.refresh.window.factor`, `.jitter`, `sasl.login.refresh.min.period.seconds`
+/// and `sasl.login.refresh.buffer.seconds`.
+#[derive(Clone, Copy, Debug)]
+struct RefreshWindow {
+    factor: f64,
+    jitter: f64,
+    min_period: Duration,
+    buffer: Duration,
+}
+
+/// Kafka's `ExpiringCredentialRefreshingLogin.refreshMs` for a token issued at
+/// `start` and expiring at `expire`, now being `now`, with `window`'s factor
+/// plus `window.jitter * unit`, no sooner than `window.min_period` from `now`
+/// and no later than `window.buffer` before `expire`.
+fn expiring_credential_refresh_at(
+    now: SystemTime,
+    start: SystemTime,
+    expire: SystemTime,
+    unit: f64,
+    window: &RefreshWindow,
+) -> SystemTime {
+    let factor = window.factor + window.jitter * unit;
+    if now + window.min_period + window.buffer > expire {
+        return now
+            + expire
+                .duration_since(now)
+                .unwrap_or_default()
+                .mul_f64(factor);
+    }
+    let proposed = start
+        + expire
+            .duration_since(start)
+            .unwrap_or_default()
+            .mul_f64(factor);
+    let buffer_start = expire - window.buffer;
+    if proposed > buffer_start {
+        return buffer_start;
+    }
+    proposed.max(now + window.min_period)
+}
+
+/// Kafka's `urn:ietf:params:oauth:grant-type:jwt-bearer` grant type.
+const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+/// The settings of [`JwtBearerTokenProvider`], as Kafka's `SaslConfigs` names
+/// them.
+#[derive(Clone, Debug)]
+pub struct JwtBearerConfig {
+    /// `sasl.oauthbearer.token.endpoint.url`, an `http` or `https` URL.
+    pub token_endpoint_url: String,
+    /// `sasl.oauthbearer.assertion.algorithm`. Only `RS256` is implemented.
+    pub algorithm: String,
+    /// `sasl.oauthbearer.assertion.claim.exp.seconds`: how far past `iat` the
+    /// assertion's `exp` claim is set.
+    pub exp_seconds: u64,
+    /// `sasl.oauthbearer.assertion.claim.nbf.seconds`: how far before `iat`
+    /// the assertion's `nbf` claim is set.
+    pub nbf_seconds: u64,
+    /// `sasl.oauthbearer.assertion.claim.jti.include`: add a random `jti`
+    /// claim to the assertion.
+    pub include_jti: bool,
+    /// `sasl.oauthbearer.assertion.claim.iss`.
+    pub iss: Option<String>,
+    /// `sasl.oauthbearer.assertion.claim.sub`.
+    pub sub: Option<String>,
+    /// `sasl.oauthbearer.assertion.claim.aud`.
+    pub aud: Option<String>,
+    /// `sasl.oauthbearer.scope`. `None` requests the default scope.
+    pub scope: Option<String>,
+    /// `sasl.oauthbearer.assertion.private.key.file`: a PEM file with one RSA
+    /// private key, PKCS#8 (`PRIVATE KEY`), PKCS#8 encrypted with PBES2
+    /// (`ENCRYPTED PRIVATE KEY`, decrypted with
+    /// [`Self::private_key_passphrase`]), or PKCS#1 (`RSA PRIVATE KEY`).
+    pub private_key_file: PathBuf,
+    /// `sasl.oauthbearer.assertion.private.key.passphrase`.
+    pub private_key_passphrase: Option<Password>,
+    /// `sasl.oauthbearer.assertion.template.file`: a JSON file of the shape
+    /// `{"header": {...}, "payload": {...}}`, either key optional. Its
+    /// entries seed the assertion's header and payload, and the generated
+    /// `alg`, `typ`, `iat`, `exp`, `nbf` and (if configured) `jti` then
+    /// overwrite same-named entries, as `LayeredAssertionJwtTemplate` layers
+    /// the static claims, the template file and the dynamic claims, each on
+    /// top of the last.
+    pub template_file: Option<PathBuf>,
+    /// The TLS settings of an `https` endpoint.
+    pub tls: TlsConnectorConfig,
+    /// `sasl.login.connect.timeout.ms`. `None` has no limit.
+    pub connect_timeout: Option<Duration>,
+    /// `sasl.login.read.timeout.ms`. `None` has no limit.
+    pub read_timeout: Option<Duration>,
+    /// `sasl.login.retry.backoff.ms`.
+    pub retry_backoff: Duration,
+    /// `sasl.login.retry.backoff.max.ms`.
+    pub retry_backoff_max: Duration,
+    /// `sasl.login.refresh.window.factor`.
+    pub refresh_window_factor: f64,
+    /// `sasl.login.refresh.window.jitter`.
+    pub refresh_window_jitter: f64,
+    /// `sasl.login.refresh.min.period.seconds`.
+    pub refresh_min_period: Duration,
+    /// `sasl.login.refresh.buffer.seconds`.
+    pub refresh_buffer: Duration,
+    /// [`OAuthBearerTokenProvider::background_refresh_enabled`].
+    pub background_refresh: bool,
+}
+
+impl JwtBearerConfig {
+    /// Settings with Kafka's defaults for `endpoint` and `private_key_file`:
+    /// `RS256`, a 300 s `exp` claim, a 60 s `nbf` claim, and no `jti`, `iss`,
+    /// `sub`, `aud`, scope or template file.
+    #[must_use]
+    pub fn new(endpoint: impl Into<String>, private_key_file: impl Into<PathBuf>) -> Self {
+        Self {
+            token_endpoint_url: endpoint.into(),
+            algorithm: "RS256".to_owned(),
+            exp_seconds: 300,
+            nbf_seconds: 60,
+            include_jti: false,
+            iss: None,
+            sub: None,
+            aud: None,
+            scope: None,
+            private_key_file: private_key_file.into(),
+            private_key_passphrase: None,
+            template_file: None,
+            tls: TlsConnectorConfig::default(),
+            connect_timeout: None,
+            read_timeout: None,
+            retry_backoff: DEFAULT_LOGIN_RETRY_BACKOFF,
+            retry_backoff_max: DEFAULT_LOGIN_RETRY_BACKOFF_MAX,
+            refresh_window_factor: DEFAULT_LOGIN_REFRESH_WINDOW_FACTOR,
+            refresh_window_jitter: DEFAULT_LOGIN_REFRESH_WINDOW_JITTER,
+            refresh_min_period: DEFAULT_LOGIN_REFRESH_MIN_PERIOD,
+            refresh_buffer: DEFAULT_LOGIN_REFRESH_BUFFER,
+            background_refresh: true,
+        }
+    }
+}
+
+/// A signed JSON claim map, kept in the order the file or config gave it so a
+/// deterministic assertion is easy to test.
+type ClaimMap = serde_json::Map<String, serde_json::Value>;
+
+/// An OAUTHBEARER token provider that uses the OAuth 2 jwt-bearer grant with a
+/// signed client assertion (RFC 7523), as Kafka's `JwtBearerJwtRetriever` with
+/// `JwtBearerRequestFormatter` does. It keeps the token until the refresh time
+/// of Kafka's `ExpiringCredentialRefreshingLogin`, then fetches a new one.
+pub struct JwtBearerTokenProvider {
+    config: JwtBearerConfig,
+    key_pair: ring::signature::RsaKeyPair,
+    template_header: ClaimMap,
+    template_payload: ClaimMap,
+    cached: tokio::sync::Mutex<Option<Cached>>,
+}
+
+impl fmt::Debug for JwtBearerTokenProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JwtBearerTokenProvider")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl JwtBearerTokenProvider {
+    /// A provider for `config`.
+    ///
+    /// # Errors
+    /// Returns a description when the algorithm is not `RS256`, the endpoint
+    /// is not an `http` or `https` URL, the private key file or template file
+    /// cannot be read or parsed, or a refresh window setting is out of range,
+    /// as Kafka's `ConfigException`.
+    pub fn new(config: JwtBearerConfig) -> Result<Arc<Self>, String> {
+        if config.algorithm != "RS256" {
+            return Err(format!(
+                "sasl.oauthbearer.assertion.algorithm {:?} is not supported; only RS256 is \
+                 implemented",
+                config.algorithm
+            ));
+        }
+        Endpoint::parse(&config.token_endpoint_url)?;
+        // Kafka's `ExpiringCredentialRefreshConfig` refuses a window factor or
+        // jitter outside its range. A bad one would reach `Duration::mul_f64`
+        // and panic at the first token.
+        for (name, value, range) in [
+            (
+                "sasl.login.refresh.window.factor",
+                config.refresh_window_factor,
+                (0.5, 1.0),
+            ),
+            (
+                "sasl.login.refresh.window.jitter",
+                config.refresh_window_jitter,
+                (0.0, 0.25),
+            ),
+        ] {
+            if !value.is_finite() || value < range.0 || value > range.1 {
+                return Err(format!(
+                    "{name} must be between {} and {}, and it is {value}",
+                    range.0, range.1
+                ));
+            }
+        }
+        let key_pair = load_rsa_private_key(
+            &config.private_key_file,
+            config.private_key_passphrase.as_ref(),
+        )
+        .map_err(|error| {
+            format!(
+                "sasl.oauthbearer.assertion.private.key.file {}: {error}",
+                config.private_key_file.display()
+            )
+        })?;
+        let (template_header, template_payload) = match &config.template_file {
+            Some(path) => load_assertion_template(path)?,
+            None => (ClaimMap::new(), ClaimMap::new()),
+        };
+        Ok(Arc::new(Self {
+            config,
+            key_pair,
+            template_header,
+            template_payload,
+            cached: tokio::sync::Mutex::new(None),
+        }))
+    }
+
+    /// Fetch a new token as of `now` and store it with its refresh time in
+    /// `cached`.
+    async fn fetch_into(
+        &self,
+        cached: &mut Option<Cached>,
+        now: SystemTime,
+    ) -> Result<String, String> {
+        let token = self.fetch().await?;
+        let claims = token_times(&token)?;
+        let refresh_at = self.refresh_at(
+            now,
+            claims.0.unwrap_or(now),
+            claims.1,
+            crate::backoff::random_unit(),
+        );
+        *cached = Some(Cached {
+            token: token.clone(),
+            refresh_at,
+        });
+        Ok(token)
+    }
+
+    async fn fetch(&self) -> Result<String, String> {
+        let request = self.request()?;
+        retry_token_request(
+            self.config.retry_backoff,
+            self.config.retry_backoff_max,
+            || Box::pin(self.post(&request)),
+        )
+        .await
+    }
+
+    /// The header and payload of `LayeredAssertionJwtTemplate`: the template
+    /// file's entries (if any) sit under the static `iss`/`sub`/`aud` claims,
+    /// and the dynamic `alg`, `typ`, `iat`, `exp`, `nbf` and `jti` claims are
+    /// generated fresh and win any conflict, as
+    /// `AssertionSupplierFactory.layeredAssertionJwtTemplate` orders its
+    /// layers.
+    fn claims(&self, now: SystemTime) -> (ClaimMap, ClaimMap) {
+        let mut header = self.template_header.clone();
+        header.insert("typ".to_owned(), "JWT".into());
+        header.insert("alg".to_owned(), self.config.algorithm.clone().into());
+
+        let mut payload = ClaimMap::new();
+        if let Some(iss) = &self.config.iss {
+            payload.insert("iss".to_owned(), iss.clone().into());
+        }
+        if let Some(sub) = &self.config.sub {
+            payload.insert("sub".to_owned(), sub.clone().into());
+        }
+        if let Some(aud) = &self.config.aud {
+            payload.insert("aud".to_owned(), aud.clone().into());
+        }
+        for (claim, value) in &self.template_payload {
+            payload.insert(claim.clone(), value.clone());
+        }
+        let now_secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        payload.insert("iat".to_owned(), now_secs.into());
+        payload.insert(
+            "exp".to_owned(),
+            (now_secs + self.config.exp_seconds).into(),
+        );
+        payload.insert(
+            "nbf".to_owned(),
+            now_secs.saturating_sub(self.config.nbf_seconds).into(),
+        );
+        if self.config.include_jti {
+            payload.insert("jti".to_owned(), uuid::Uuid::new_v4().to_string().into());
+        }
+        (header, payload)
+    }
+
+    /// The signed compact JWT assertion of `DefaultAssertionCreator`.
+    fn assertion(&self) -> Result<String, String> {
+        let (header, payload) = self.claims(SystemTime::now());
+        let signing_input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::Value::Object(header).to_string()),
+            URL_SAFE_NO_PAD.encode(serde_json::Value::Object(payload).to_string()),
+        );
+        let signature = sign_rs256(&self.key_pair, signing_input.as_bytes())?;
+        Ok(format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature)
+        ))
+    }
+
+    /// The headers and body of `JwtBearerRequestFormatter.formatBody`: the
+    /// jwt-bearer grant with the signed assertion, and the optional scope. No
+    /// `Authorization` header is sent.
+    fn request(&self) -> Result<TokenRequest, String> {
+        let assertion = self.assertion()?;
+        let mut body = format!(
+            "grant_type={}&assertion={}",
+            form_urlencode(JWT_BEARER_GRANT_TYPE),
+            form_urlencode(&assertion)
+        );
+        if let Some(scope) = self
+            .config
+            .scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+        {
+            body.push_str("&scope=");
+            body.push_str(&form_urlencode(scope));
+        }
+        Ok(TokenRequest {
+            endpoint: Endpoint::parse(&self.config.token_endpoint_url)?,
+            authorization: None,
+            body,
+        })
+    }
+
+    async fn post(&self, request: &TokenRequest) -> Result<String, Failure> {
+        post_to_endpoint(
+            &self.config.tls,
+            self.config.connect_timeout,
+            self.config.read_timeout,
+            request,
+        )
+        .await
+    }
+
+    /// The refresh time of Kafka's
+    /// `ExpiringCredentialRefreshingLogin.refreshMs` for a token issued at
+    /// `start` and expiring at `expire`, now being `now`.
+    fn refresh_at(
+        &self,
+        now: SystemTime,
+        start: SystemTime,
+        expire: SystemTime,
+        unit: f64,
+    ) -> SystemTime {
+        expiring_credential_refresh_at(
+            now,
+            start,
+            expire,
+            unit,
+            &RefreshWindow {
+                factor: self.config.refresh_window_factor,
+                jitter: self.config.refresh_window_jitter,
+                min_period: self.config.refresh_min_period,
+                buffer: self.config.refresh_buffer,
+            },
+        )
+    }
+}
+
+impl OAuthBearerTokenProvider for JwtBearerTokenProvider {
+    fn token(&self) -> TokenFuture<'_> {
+        Box::pin(async move {
+            let mut cached = self.cached.lock().await;
+            let now = SystemTime::now();
+            if let Some(current) = cached.as_ref()
+                && now < current.refresh_at
+            {
+                return Ok(current.token.clone());
+            }
+            self.fetch_into(&mut cached, now).await
+        })
+    }
+
+    fn refresh(&self) -> TokenFuture<'_> {
+        Box::pin(async move {
+            let mut cached = self.cached.lock().await;
+            self.fetch_into(&mut cached, SystemTime::now()).await
+        })
+    }
+
+    fn refresh_at(&self) -> RefreshFuture<'_> {
+        Box::pin(async move {
+            self.cached
+                .lock()
+                .await
+                .as_ref()
+                .map(|cached| cached.refresh_at)
+        })
+    }
+
+    fn background_refresh_enabled(&self) -> bool {
+        self.config.background_refresh
+    }
+}
+
+/// Sign `message` with `key_pair`, as `DefaultAssertionCreator` does with
+/// Kafka's `sasl.oauthbearer.assertion.algorithm` `RS256`.
+fn sign_rs256(key_pair: &ring::signature::RsaKeyPair, message: &[u8]) -> Result<Vec<u8>, String> {
+    let rng = ring::rand::SystemRandom::new();
+    let mut signature = vec![0_u8; key_pair.public().modulus_len()];
+    key_pair
+        .sign(
+            &ring::signature::RSA_PKCS1_SHA256,
+            &rng,
+            message,
+            &mut signature,
+        )
+        .map_err(|_| "RSA signing failed".to_owned())?;
+    Ok(signature)
+}
+
+/// The one PEM block of `text`, as `(label, DER)`.
+fn pem_block(text: &str) -> Result<(String, Vec<u8>), String> {
+    const BEGIN: &str = "-----BEGIN ";
+    let start = text
+        .find(BEGIN)
+        .ok_or_else(|| "no PEM block found".to_owned())?;
+    let block = &text[start..];
+    let label_end = block[BEGIN.len()..]
+        .find("-----")
+        .ok_or_else(|| "unterminated BEGIN line".to_owned())?;
+    let label = block[BEGIN.len()..BEGIN.len() + label_end].to_owned();
+    let end_line = format!("-----END {label}-----");
+    let end = block
+        .find(&end_line)
+        .ok_or_else(|| format!("no END line for {label}"))?
+        + end_line.len();
+    let (_, der) = pkcs8::der::pem::decode_vec(&block.as_bytes()[..end])
+        .map_err(|error| format!("{label}: {error}"))?;
+    Ok((label, der))
+}
+
+/// Decrypt a PKCS#8 `EncryptedPrivateKeyInfo` with PBES2, as Kafka's
+/// `PemStore.privateKey` does with `sasl.oauthbearer.assertion.private.key.passphrase`.
+fn decrypt_pkcs8(der: &[u8], passphrase: &Password) -> Result<Vec<u8>, String> {
+    let encrypted = pkcs8::EncryptedPrivateKeyInfoRef::try_from(der)
+        .map_err(|error| format!("invalid encrypted private key: {error}"))?;
+    let document = encrypted
+        .decrypt(passphrase.value())
+        .map_err(|error| format!("private key decryption failed: {error}"))?;
+    Ok(document.as_bytes().to_vec())
+}
+
+/// Load the one RSA private key of a PEM file, as `DefaultAssertionCreator`
+/// does for `sasl.oauthbearer.assertion.private.key.file`. Accepts a PKCS#8
+/// key (`PRIVATE KEY`), a PKCS#8 key encrypted with PBES2
+/// (`ENCRYPTED PRIVATE KEY`, decrypted with `passphrase`), or a PKCS#1 RSA
+/// key (`RSA PRIVATE KEY`).
+fn load_rsa_private_key(
+    path: &Path,
+    passphrase: Option<&Password>,
+) -> Result<ring::signature::RsaKeyPair, String> {
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let (label, der) = pem_block(&text)?;
+    let der = match (label.as_str(), passphrase) {
+        ("ENCRYPTED PRIVATE KEY", Some(passphrase)) => decrypt_pkcs8(&der, passphrase)?,
+        ("ENCRYPTED PRIVATE KEY", None) => {
+            return Err(
+                "the private key is encrypted, but sasl.oauthbearer.assertion.private.key.\
+                 passphrase is not set"
+                    .to_owned(),
+            );
+        }
+        (_, Some(_)) => {
+            return Err(
+                "sasl.oauthbearer.assertion.private.key.passphrase is set, but the private key \
+                 is not encrypted"
+                    .to_owned(),
+            );
+        }
+        ("PRIVATE KEY" | "RSA PRIVATE KEY", None) => der,
+        (other, None) => return Err(format!("unsupported private key format {other:?}")),
+    };
+    match label.as_str() {
+        "RSA PRIVATE KEY" => ring::signature::RsaKeyPair::from_der(&der),
+        _ => ring::signature::RsaKeyPair::from_pkcs8(&der),
+    }
+    .map_err(|error| format!("invalid RSA private key: {error}"))
+}
+
+/// Load an assertion template file's `header` and `payload` maps, as
+/// `FileAssertionJwtTemplate` does for
+/// `sasl.oauthbearer.assertion.template.file`. Either key may be absent,
+/// which is the same as an empty map.
+fn load_assertion_template(path: &Path) -> Result<(ClaimMap, ClaimMap), String> {
+    let shown = path.display();
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("sasl.oauthbearer.assertion.template.file {shown}: {error}"))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("sasl.oauthbearer.assertion.template.file {shown}: {error}"))?;
+    let map = |key: &str| match json.get(key) {
+        None => Ok(ClaimMap::new()),
+        Some(serde_json::Value::Object(map)) => Ok(map.clone()),
+        Some(_) => Err(format!(
+            "sasl.oauthbearer.assertion.template.file {shown}: {key:?} is not a JSON object"
+        )),
+    };
+    Ok((map("header")?, map("payload")?))
 }
 
 /// How a token endpoint request failed.
@@ -347,8 +925,88 @@ enum Failure {
 
 struct TokenRequest {
     endpoint: Endpoint,
-    authorization: String,
+    /// `None` for the jwt-bearer grant: `JwtBearerRequestFormatter` sends no
+    /// `Authorization` header, since the assertion itself authenticates the
+    /// client.
+    authorization: Option<String>,
     body: String,
+}
+
+/// Kafka's `Retry.execute`: post `request` with `attempt`, retrying a
+/// [`Failure::Retriable`] until `retry_backoff_max` has passed since the
+/// first attempt, doubling the wait each time, and returning the parsed
+/// access or id token of a success.
+async fn retry_token_request<'a>(
+    retry_backoff: Duration,
+    retry_backoff_max: Duration,
+    mut attempt: impl FnMut() -> Pin<Box<dyn Future<Output = Result<String, Failure>> + Send + 'a>>,
+) -> Result<String, String> {
+    let started = tokio::time::Instant::now();
+    let end = started + retry_backoff_max;
+    let mut attempt_number = 0_u32;
+    loop {
+        attempt_number += 1;
+        match attempt().await {
+            Ok(body) => return parse_token(&body),
+            Err(Failure::Final(error)) => return Err(error),
+            Err(Failure::Retriable(error)) => {
+                let wait = retry_backoff
+                    .saturating_mul(2_u32.saturating_pow(attempt_number - 1))
+                    .min(end.saturating_duration_since(tokio::time::Instant::now()));
+                if wait.is_zero() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    attempt = attempt_number,
+                    error = %error,
+                    "token endpoint request failed"
+                );
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
+/// Connect to `request`'s endpoint, over TLS with `tls` when it is `https`,
+/// and post it, as `HttpJwtRetriever.doPost` does.
+async fn post_to_endpoint(
+    tls: &TlsConnectorConfig,
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    request: &TokenRequest,
+) -> Result<String, Failure> {
+    let endpoint = &request.endpoint;
+    let connect = TcpStream::connect((endpoint.host.as_str(), endpoint.port));
+    let tcp = within(connect_timeout, connect)
+        .await
+        .map_err(|()| Failure::Retriable("token endpoint connect timed out".into()))?
+        .map_err(|error| Failure::Retriable(format!("token endpoint connect: {error}")))?;
+    let exchange = async {
+        if endpoint.https {
+            let connector = tls
+                .connector()
+                .map_err(|error| Failure::Final(error.to_string()))?;
+            // `tls.server_name` overrides the SNI name, as it does on a
+            // broker connection.
+            let server_name = if tls.server_name.is_empty() {
+                endpoint.host.clone()
+            } else {
+                tls.server_name.clone()
+            };
+            let name = rustls::pki_types::ServerName::try_from(server_name)
+                .map_err(|error| Failure::Final(format!("invalid endpoint host: {error}")))?;
+            let stream = connector
+                .connect(name, tcp)
+                .await
+                .map_err(|error| Failure::Retriable(format!("token endpoint TLS: {error}")))?;
+            http_post(stream, request).await
+        } else {
+            http_post(tcp, request).await
+        }
+    };
+    within(read_timeout, exchange)
+        .await
+        .map_err(|()| Failure::Retriable("token endpoint read timed out".into()))?
 }
 
 /// A parsed token endpoint URL.
@@ -427,13 +1085,16 @@ where
     } else {
         endpoint.host.clone()
     };
+    let authorization = request
+        .authorization
+        .as_deref()
+        .map_or_else(String::new, |value| format!("Authorization: {value}\r\n"));
     let head = format!(
-        "POST {} HTTP/1.1\r\nHost: {host}:{}\r\nAccept: application/json\r\nAuthorization: {}\r\n\
+        "POST {} HTTP/1.1\r\nHost: {host}:{}\r\nAccept: application/json\r\n{authorization}\
          Cache-Control: no-cache\r\nContent-Type: application/x-www-form-urlencoded\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         endpoint.target,
         endpoint.port,
-        request.authorization,
         request.body.len()
     );
     let io = |error: std::io::Error| Failure::Retriable(format!("token endpoint I/O: {error}"));

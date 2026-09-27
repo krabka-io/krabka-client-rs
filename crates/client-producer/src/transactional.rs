@@ -1135,8 +1135,9 @@ mod tests {
     }
 
     /// Boot a mock coordinator that answers `EndTxn` and `AddPartitionsToTxn`
-    /// from `coordinator`.
-    async fn scripted_producer(
+    /// from `coordinator`, and connect a transactional producer to it without
+    /// calling `init_transactions`. The producer is left `Uninitialized`.
+    async fn scripted_producer_raw(
         coordinator: Coordinator,
     ) -> (MockBroker, Producer, SharedCoordinator) {
         let port_cell = Arc::new(AtomicU16::new(0));
@@ -1322,6 +1323,15 @@ mod tests {
             .build()
             .await
             .expect("producer connects to the mock");
+        (mock, producer, shared)
+    }
+
+    /// [`scripted_producer_raw`], then `init_transactions` against the mock
+    /// coordinator, leaving the producer `Ready`.
+    async fn scripted_producer(
+        coordinator: Coordinator,
+    ) -> (MockBroker, Producer, SharedCoordinator) {
+        let (mock, producer, shared) = scripted_producer_raw(coordinator).await;
         producer
             .init_transactions()
             .await
@@ -2691,6 +2701,130 @@ mod tests {
                     },
                 "{call:?}"
             );
+        }
+    }
+
+    /// The transaction state each `send` / `send_offsets_to_transaction`
+    /// case starts from.
+    #[derive(Debug, Clone, Copy)]
+    enum StartState {
+        /// Before `init_transactions`.
+        Uninitialized,
+        /// After `init_transactions`, before `begin_transaction`.
+        Ready,
+        /// Between `begin_transaction` and `commit`/`abort`.
+        InTransaction,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Operation {
+        SendRecord,
+        SendOffsets,
+    }
+
+    /// Kafka's `TransactionManager.maybeAddPartition` and
+    /// `.sendOffsetsToTransaction` throw `IllegalStateException` synchronously,
+    /// and send nothing, when `currentState != IN_TRANSACTION`. `send` and
+    /// `send_offsets_to_transaction` must refuse the same way, sending nothing,
+    /// outside `InTransaction`, and must succeed, sending requests, inside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_and_send_offsets_require_an_open_transaction() {
+        use Operation::{SendOffsets, SendRecord};
+        use StartState::{InTransaction, Ready, Uninitialized};
+
+        let cases = [
+            ("send, uninitialized", Uninitialized, SendRecord, false),
+            ("send, ready", Ready, SendRecord, false),
+            ("send, in transaction", InTransaction, SendRecord, true),
+            (
+                "send_offsets_to_transaction, uninitialized",
+                Uninitialized,
+                SendOffsets,
+                false,
+            ),
+            (
+                "send_offsets_to_transaction, ready",
+                Ready,
+                SendOffsets,
+                false,
+            ),
+            (
+                "send_offsets_to_transaction, in transaction",
+                InTransaction,
+                SendOffsets,
+                true,
+            ),
+        ];
+
+        for (name, state, operation, should_succeed) in cases {
+            let (mock, producer, coordinator) = match state {
+                Uninitialized => scripted_producer_raw(Coordinator::default()).await,
+                Ready | InTransaction => scripted_producer(Coordinator::default()).await,
+            };
+            let transaction = match state {
+                InTransaction => Some(
+                    producer
+                        .begin_transaction()
+                        .await
+                        .expect("begin_transaction"),
+                ),
+                Uninitialized | Ready => None,
+            };
+            assert2::assert!(
+                matches!(
+                    (*producer.txn_state.lock().await, state),
+                    (TxnState::Uninitialized, Uninitialized)
+                        | (TxnState::Ready, Ready)
+                        | (TxnState::InTransaction, InTransaction)
+                ),
+                "{name}"
+            );
+
+            let group = krabka_client_consumer::ConsumerGroupMetadata {
+                group_id: "group-a".into(),
+                generation_id: 3,
+                member_id: "member-a".into(),
+                group_instance_id: None,
+            };
+            let result = match operation {
+                SendRecord => producer
+                    .send(ProducerRecord {
+                        topic: "topic".into(),
+                        value: Some(bytes::Bytes::from_static(b"v")),
+                        ..Default::default()
+                    })
+                    .await
+                    .await
+                    .expect("acknowledgement channel")
+                    .map(|_| ()),
+                SendOffsets => {
+                    producer
+                        .send_offsets_to_transaction([(("topic".to_owned(), 0), 5)], &group)
+                        .await
+                }
+            };
+
+            assert2::assert!(result.is_ok() == should_succeed, "{name}: {result:?}");
+            if !should_succeed {
+                assert2::assert!(
+                    matches!(result, Err(ProducerError::InvalidTransactionState(_))),
+                    "{name}: {result:?}"
+                );
+            }
+
+            let requests_sent = coordinator
+                .lock()
+                .expect("scripted coordinator")
+                .transaction_requests
+                .len();
+            if should_succeed {
+                assert2::assert!(requests_sent > 0, "{name}: expected requests to be sent");
+            } else {
+                assert2::assert!(requests_sent == 0, "{name}: sent {requests_sent} requests");
+            }
+
+            drop(transaction);
+            mock.stop();
         }
     }
 }

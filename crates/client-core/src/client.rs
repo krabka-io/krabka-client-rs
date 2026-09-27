@@ -17,6 +17,10 @@ use crate::{
     metadata_topics::{MetadataScope, MetadataTopics},
     pool::{BrokerInfo, BrokerPool},
     request::ProtocolRequest,
+    telemetry::{
+        ClientMetrics, ClientTelemetry, ClientTelemetryConfig, NetworkMetrics,
+        TelemetryConnections, TelemetryTiming,
+    },
 };
 
 /// A Kafka client backed by a [`BrokerPool`].
@@ -32,6 +36,11 @@ pub struct Client {
     options: ConnectionOptions,
     metadata_recovery: Arc<MetadataRecovery>,
     metadata_topics: Arc<MetadataTopics>,
+    /// The metric registry, for a client that pushes its metrics.
+    metrics: Option<ClientMetrics>,
+    /// The KIP-714 reporter. The last clone that drops it starts its close.
+    /// The reporter itself holds a clone without it.
+    telemetry: Option<Arc<ClientTelemetry>>,
 }
 
 /// Kafka client behavior when its last-known broker metadata can no longer be
@@ -170,6 +179,11 @@ impl Client {
         /// consumer name their topics. The default asks for all topics.
         #[builder(default)]
         metadata_scope: MetadataScope,
+        /// Push client metrics (KIP-714) as this kind of client: Kafka's
+        /// `enable.metrics.push`. `None`, the default of this transport
+        /// client, sends neither `GetTelemetrySubscriptions` nor
+        /// `PushTelemetry`. The producer, consumer and admin builders set it.
+        telemetry: Option<ClientTelemetryConfig>,
     ) -> Result<Self, ClientError> {
         let dns_timeout = ClientDnsTimeout::new(dns_timeout).map_err(ClientError::InvalidConfig)?;
         let dispatch_queue_capacity = ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
@@ -200,6 +214,8 @@ impl Client {
             dispatch_queue_capacity,
             frame_max,
             security: security.map(Box::new),
+            // `start_with_options` sets it for a client that pushes metrics.
+            network_metrics: None,
         };
         Self::start_with_options(
             bootstrap,
@@ -209,6 +225,7 @@ impl Client {
                 metadata_recovery_rebootstrap_trigger,
             ),
             metadata_scope,
+            telemetry,
         )
         .await
     }
@@ -223,12 +240,13 @@ impl Client {
     )]
     async fn start_with_options(
         bootstrap: String,
-        options: ConnectionOptions,
+        mut options: ConnectionOptions,
         (metadata_recovery_strategy, metadata_recovery_rebootstrap_trigger): (
             MetadataRecoveryStrategy,
             MetadataRecoveryRebootstrapTrigger,
         ),
         metadata_scope: MetadataScope,
+        telemetry: Option<ClientTelemetryConfig>,
     ) -> Result<Self, ClientError> {
         let addrs = bootstrap::resolve_with_server_names(
             &bootstrap,
@@ -236,8 +254,16 @@ impl Client {
             options.client_dns_lookup,
         )
         .await?;
+        let metrics = telemetry.as_ref().map(|_| ClientMetrics::new());
+        options.network_metrics =
+            telemetry
+                .as_ref()
+                .zip(metrics.as_ref())
+                .map(|(config, metrics)| {
+                    NetworkMetrics::register(metrics, config.client_type.metric_group())
+                });
         let pool = Arc::new(BrokerPool::new_with_server_names(addrs, options.clone()));
-        Ok(Client {
+        let client = Client {
             bootstrap,
             pool,
             options,
@@ -247,7 +273,60 @@ impl Client {
                 first_attempt: Mutex::new(None),
             }),
             metadata_topics: Arc::new(MetadataTopics::new(metadata_scope)),
+            metrics,
+            telemetry: None,
+        };
+        let telemetry = telemetry
+            .zip(client.metrics.clone())
+            .map(|(config, metrics)| {
+                let timing = TelemetryTiming {
+                    request_timeout: client.options.request_timeout.to_std(),
+                    reconnect_backoff: client.options.reconnect_backoff.to_std(),
+                };
+                Arc::new(ClientTelemetry::start(
+                    client.clone(),
+                    &config,
+                    metrics,
+                    timing,
+                ))
+            });
+        Ok(Client {
+            telemetry,
+            ..client
         })
+    }
+
+    /// The metric registry of a client that pushes its metrics (KIP-714).
+    /// A client crate registers its own metrics in it.
+    #[must_use]
+    pub fn metrics(&self) -> Option<&ClientMetrics> {
+        self.metrics.as_ref()
+    }
+
+    /// Send the terminating telemetry push (KIP-714), if the client pushes
+    /// metrics and has a subscription, and wait for it. Kafka's clients
+    /// send it from `close`. Without this call, the push goes out in the
+    /// background once the last clone of the client drops.
+    pub async fn close_telemetry(&self) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.close().await;
+        }
+    }
+
+    /// The client instance id that the broker assigned for metrics push
+    /// (KIP-714), waiting up to `timeout` for the first subscription, as
+    /// Kafka's `clientInstanceId` does. `Ok(None)` when no subscription has
+    /// loaded by then, as Kafka returns `null`.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::InvalidArgument`] for a negative `timeout`, and
+    /// [`ClientError::TelemetryDisabled`] for a client that does not push
+    /// metrics.
+    pub async fn client_instance_id(
+        &self,
+        timeout: Time,
+    ) -> Result<Option<uuid::Uuid>, ClientError> {
+        crate::telemetry::client_instance_id(self.telemetry.as_deref(), timeout).await
     }
 
     /// Send a request that has no fixed target broker.
@@ -724,6 +803,15 @@ impl Client {
         if let Some(pool) = Arc::into_inner(self.pool) {
             pool.close_all();
         }
+    }
+}
+
+impl TelemetryConnections for Client {
+    fn open_connection(
+        &self,
+        preferred: Option<i32>,
+    ) -> Option<(i32, Arc<crate::connection::Connection>)> {
+        self.pool.open_connection(preferred)
     }
 }
 

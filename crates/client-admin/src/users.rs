@@ -68,6 +68,10 @@ pub enum AclOperation {
     DescribeConfigs,
     AlterConfigs,
     IdempotentWrite,
+    /// KIP-373: permission to create delegation tokens for other users.
+    CreateTokens,
+    /// KIP-373: permission to describe the delegation tokens of other users.
+    DescribeTokens,
     /// KIP-939: 2PC participation permission on a `TransactionalId`.
     TwoPhaseCommit,
 }
@@ -534,13 +538,13 @@ const WIRE_ANY: i8 = 1;
 
 macro_rules! acl_wire_enum {
     ($to_wire:ident, $from_wire:ident, $ty:ty, $unknown:literal, {$($variant:path => $wire:literal),+ $(,)?}) => {
-        fn $to_wire(value: $ty) -> i8 {
+        pub(crate) fn $to_wire(value: $ty) -> i8 {
             match value {
                 $($variant => $wire,)+
             }
         }
 
-        fn $from_wire(value: i8) -> Result<$ty, AdminError> {
+        pub(crate) fn $from_wire(value: i8) -> Result<$ty, AdminError> {
             match value {
                 $($wire => Ok($variant),)+
                 _ => Err(AdminError::Protocol(format!(concat!($unknown, ": {}"), value))),
@@ -601,6 +605,8 @@ acl_wire_enum!(
         AclOperation::DescribeConfigs => 10,
         AclOperation::AlterConfigs => 11,
         AclOperation::IdempotentWrite => 12,
+        AclOperation::CreateTokens => 13,
+        AclOperation::DescribeTokens => 14,
         AclOperation::TwoPhaseCommit => 15,
     }
 );
@@ -743,6 +749,8 @@ mod tests {
             ("describe configs", AclOperation::DescribeConfigs),
             ("alter configs", AclOperation::AlterConfigs),
             ("idempotent write", AclOperation::IdempotentWrite),
+            ("create tokens", AclOperation::CreateTokens),
+            ("describe tokens", AclOperation::DescribeTokens),
             // KIP-939: TWO_PHASE_COMMIT (wire byte 15).
             ("two phase commit", AclOperation::TwoPhaseCommit),
         ] {

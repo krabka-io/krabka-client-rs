@@ -32,6 +32,11 @@ pub(crate) struct PartitionerConfig {
     /// Kafka's `partitioner.availability.timeout.ms`. Zero turns the check
     /// off.
     pub availability_timeout: Duration,
+    /// Kafka's `partitioner.rack.aware`. With `client.rack` set, the sticky
+    /// pick prefers a partition whose leader is in that rack, and falls back
+    /// to every partition with a leader when none is. See
+    /// [`BuiltInPartitioner::peek_rack_aware`].
+    pub rack_aware: bool,
 }
 
 impl Default for PartitionerConfig {
@@ -42,8 +47,62 @@ impl Default for PartitionerConfig {
             ignore_keys: crate::DEFAULT_PRODUCER_PARTITIONER_IGNORE_KEYS,
             adaptive_partitioning: crate::DEFAULT_PRODUCER_PARTITIONER_ADAPTIVE_PARTITIONING_ENABLE,
             availability_timeout: crate::DEFAULT_PRODUCER_PARTITIONER_AVAILABILITY_TIMEOUT,
+            rack_aware: crate::DEFAULT_PRODUCER_PARTITIONER_RACK_AWARE,
         }
     }
+}
+
+/// One partition of a topic, as Kafka's `PartitionInfo` describes it to a
+/// custom [`Partitioner`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionInfo {
+    /// The partition index.
+    pub partition: i32,
+    /// The id of the broker that leads the partition, or `None` when it is
+    /// not known.
+    pub leader_id: Option<i32>,
+    /// The rack of the leader, or `None` when it is not known or the leader
+    /// has none. Kafka's `Node.rack()`.
+    pub leader_rack: Option<String>,
+}
+
+/// A caller-supplied `partitioner.class` hook (Kafka's `Partitioner`
+/// interface).
+///
+/// `Producer::builder().partitioner(...)` installs one. `send` then calls it,
+/// instead of the built-in partitioner, for every record with no explicit
+/// partition — keyed or not. A negative result fails the send with
+/// [`crate::ProducerError::InvalidPartitionerResult`], the message Kafka's
+/// `KafkaProducer.partition` throws. Setting a partitioner also turns
+/// adaptive partitioning off, matching Kafka's
+/// `enableAdaptivePartitioning = partitionerPlugin.get() == null && ...`.
+pub trait Partitioner: Send + Sync {
+    /// Pick the partition of a record. `available_partitions` holds the
+    /// partitions of `topic` that have a leader; `all_partitions` holds every
+    /// partition. Kafka's `Partitioner.partition` takes the unserialized and
+    /// the serialized key and value; this trait takes only the serialized
+    /// forms, which is what the producer already holds at partitioning time.
+    fn partition(
+        &self,
+        topic: &str,
+        key: Option<&[u8]>,
+        value: Option<&[u8]>,
+        available_partitions: &[PartitionInfo],
+        all_partitions: &[PartitionInfo],
+    ) -> i32;
+}
+
+/// The rack of the leader of a partition, or `None` when it is not known or
+/// the leader has none. `producer.rs` builds one from the broker rack cache;
+/// tests script one directly.
+pub(crate) type LeaderRack<'a> = &'a (dyn Fn(i32) -> Option<String> + Sync);
+
+/// The rack preference of `partitioner.rack.aware`: the rack of each
+/// partition leader, and the `client.rack` of the producer.
+#[derive(Clone, Copy)]
+pub(crate) struct RackPreference<'a> {
+    pub leader_rack: LeaderRack<'a>,
+    pub client_rack: &'a str,
 }
 
 /// A source of random 32-bit values. Tests give a scripted source.
@@ -203,12 +262,35 @@ impl BuiltInPartitioner {
     /// Kafka's `BuiltInPartitioner.peekCurrentPartitionInfo`: the sticky
     /// partition of `topic`, picked now when the topic has none.
     pub(crate) fn peek(&self, topic: &str, partitions: &TopicPartitions<'_>) -> StickyPartition {
+        self.peek_inner(topic, partitions, None)
+    }
+
+    /// [`Self::peek`], with `partitioner.rack.aware`: the pick prefers a
+    /// partition whose leader is in `client_rack`, and falls back to
+    /// [`Self::peek`]'s pick when no partition with a leader is. The caller
+    /// checks `config().rack_aware` and its own `client_rack` first, so this
+    /// always applies the preference when called.
+    pub(crate) fn peek_rack_aware(
+        &self,
+        topic: &str,
+        partitions: &TopicPartitions<'_>,
+        rack: RackPreference<'_>,
+    ) -> StickyPartition {
+        self.peek_inner(topic, partitions, Some(rack))
+    }
+
+    fn peek_inner(
+        &self,
+        topic: &str,
+        partitions: &TopicPartitions<'_>,
+        rack: Option<RackPreference<'_>>,
+    ) -> StickyPartition {
         let mut topics = self.lock();
         let state = topics.entry(topic.to_owned()).or_default();
         if let Some((sticky, _)) = state.sticky {
             return sticky;
         }
-        let sticky = self.pick(state.load_stats.as_ref(), partitions);
+        let sticky = self.pick(state.load_stats.as_ref(), partitions, rack);
         state.sticky = Some((sticky, 0));
         sticky
     }
@@ -238,6 +320,39 @@ impl BuiltInPartitioner {
         partitions: &TopicPartitions<'_>,
         enable_switch: bool,
     ) {
+        self.update_inner(topic, sticky, appended, partitions, enable_switch, None);
+    }
+
+    /// [`Self::update`], with the rack preference of [`Self::peek_rack_aware`]
+    /// for the partition picked when the sticky partition switches.
+    pub(crate) fn update_rack_aware(
+        &self,
+        topic: &str,
+        sticky: StickyPartition,
+        appended: usize,
+        partitions: &TopicPartitions<'_>,
+        enable_switch: bool,
+        rack: RackPreference<'_>,
+    ) {
+        self.update_inner(
+            topic,
+            sticky,
+            appended,
+            partitions,
+            enable_switch,
+            Some(rack),
+        );
+    }
+
+    fn update_inner(
+        &self,
+        topic: &str,
+        sticky: StickyPartition,
+        appended: usize,
+        partitions: &TopicPartitions<'_>,
+        enable_switch: bool,
+        rack: Option<RackPreference<'_>>,
+    ) {
         let mut topics = self.lock();
         let Some(state) = topics.get_mut(topic) else {
             return;
@@ -251,7 +366,7 @@ impl BuiltInPartitioner {
         *produced = produced.saturating_add(appended);
         let size = self.config.sticky_batch_size.max(1);
         if (*produced >= size && enable_switch) || *produced >= size.saturating_mul(2) {
-            let next = self.pick(state.load_stats.as_ref(), partitions);
+            let next = self.pick(state.load_stats.as_ref(), partitions, rack);
             state.sticky = Some((next, 0));
         }
     }
@@ -276,15 +391,21 @@ impl BuiltInPartitioner {
         }
     }
 
-    /// Kafka's `BuiltInPartitioner.nextPartition`.
+    /// Kafka's `BuiltInPartitioner.nextPartition`, with the in-rack form of
+    /// `createPartitionLoadStatsForThisRackIfNeeded` when `rack` names a
+    /// client rack and `config.rack_aware` is set.
     fn pick(
         &self,
         load_stats: Option<&LoadStats>,
         partitions: &TopicPartitions<'_>,
+        rack: Option<RackPreference<'_>>,
     ) -> StickyPartition {
         // Kafka's `Utils.toPositive` of a random `int`.
         let random = (self.random)() & 0x7fff_ffff;
-        let partition = if let Some(stats) = load_stats {
+        let rack_candidates = self.rack_aware_candidates(partitions, rack);
+        let partition = if let Some(candidates) = &rack_candidates {
+            Self::pick_among(load_stats, candidates, random)
+        } else if let Some(stats) = load_stats {
             let total = stats
                 .cumulative_frequency
                 .last()
@@ -316,6 +437,64 @@ impl BuiltInPartitioner {
             partition,
             pick: self.picks.fetch_add(1, Ordering::AcqRel),
         }
+    }
+
+    /// The partitions with a leader in `client_rack`, or `None` when rack
+    /// awareness does not apply (`config.rack_aware` is off, or `rack` is
+    /// `None`) or no partition with a leader is in the rack. Kafka's
+    /// `BuiltInPartitioner.nextPartition` filters the same way before it
+    /// falls back to every partition with a leader.
+    fn rack_aware_candidates(
+        &self,
+        partitions: &TopicPartitions<'_>,
+        rack: Option<RackPreference<'_>>,
+    ) -> Option<Vec<i32>> {
+        if !self.config.rack_aware {
+            return None;
+        }
+        let RackPreference {
+            leader_rack,
+            client_rack,
+        } = rack?;
+        let in_rack: Vec<i32> = (0..partitions.count)
+            .filter(|&partition| (partitions.has_leader)(partition))
+            .filter(|&partition| leader_rack(partition).as_deref() == Some(client_rack))
+            .collect();
+        (!in_rack.is_empty()).then_some(in_rack)
+    }
+
+    /// Pick among `candidates`, weighted by `load_stats` when it covers at
+    /// least one of them, and uniformly otherwise. This is the in-rack
+    /// variant of the adaptive table: rather than store a second table, it
+    /// derives each candidate's weight from the primary table's cumulative
+    /// frequencies and renormalizes over the restricted set. Kafka's
+    /// `createPartitionLoadStatsForThisRackIfNeeded` instead caches a second
+    /// table, but the resulting distribution is the same.
+    fn pick_among(load_stats: Option<&LoadStats>, candidates: &[i32], random: u32) -> i32 {
+        if let Some(stats) = load_stats {
+            let mut previous_cumulative = 0_u32;
+            let mut running = 0_u32;
+            let mut cumulative_frequency = Vec::new();
+            let mut partition_ids = Vec::new();
+            for (index, &partition_id) in stats.partition_ids.iter().enumerate() {
+                let cumulative = stats.cumulative_frequency.get(index).copied().unwrap_or(0);
+                let weight = cumulative.saturating_sub(previous_cumulative);
+                previous_cumulative = cumulative;
+                if candidates.contains(&partition_id) {
+                    running = running.saturating_add(weight);
+                    cumulative_frequency.push(running);
+                    partition_ids.push(partition_id);
+                }
+            }
+            if !partition_ids.is_empty() {
+                let total = cumulative_frequency.last().copied().unwrap_or(1).max(1);
+                let weighted = random % total;
+                let index = cumulative_frequency.partition_point(|&sum| sum <= weighted);
+                return partition_ids.get(index).copied().unwrap_or(candidates[0]);
+            }
+        }
+        let index = usize::try_from(random).unwrap_or(0) % candidates.len();
+        candidates[index]
     }
 }
 
@@ -408,6 +587,7 @@ mod tests {
             ignore_keys: false,
             adaptive_partitioning: true,
             availability_timeout: Duration::ZERO,
+            rack_aware: false,
         }
     }
 
@@ -639,6 +819,119 @@ mod tests {
             })
             .collect();
         check!(picks == vec![4, 4, 4, 4, 5, 6, 6, 6, 4]);
+    }
+
+    /// Two racks of leaders: partitions 0 and 1 lead in rack "a", partitions
+    /// 2 and 3 in rack "b".
+    fn two_rack_leaders(partition: i32) -> Option<String> {
+        match partition {
+            0 | 1 => Some("a".to_owned()),
+            2 | 3 => Some("b".to_owned()),
+            _ => None,
+        }
+    }
+
+    /// The rack preference of a producer in `client_rack`, with the leaders
+    /// of [`two_rack_leaders`].
+    fn in_rack(client_rack: &str) -> RackPreference<'_> {
+        RackPreference {
+            leader_rack: &two_rack_leaders,
+            client_rack,
+        }
+    }
+
+    #[test]
+    fn rack_aware_pick_prefers_a_partition_whose_leader_is_in_the_client_rack() {
+        // Each row: the random value, and the pick. `partitioner.rack.aware`
+        // restricts the pick to partitions 0 and 1, which lead in rack "a".
+        let cases: [(&str, u32, i32); 4] = [
+            ("value 0 of the 2 in-rack", 0, 0),
+            ("value 1 of the 2 in-rack", 1, 1),
+            ("value 2 wraps to the first in-rack", 2, 0),
+            ("sign bit masked", 0x8000_0001, 1),
+        ];
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (name, random, want) in cases {
+            let partitioner = scripted(
+                PartitionerConfig {
+                    rack_aware: true,
+                    ..config(100)
+                },
+                &[random],
+            );
+            let partitions = TopicPartitions {
+                count: 4,
+                has_leader: &all_leaders,
+            };
+            let sticky = partitioner.peek_rack_aware(TOPIC, &partitions, in_rack("a"));
+            actual.push((name, sticky.partition()));
+            expected.push((name, want));
+        }
+        assert2::assert!(actual == expected);
+    }
+
+    #[test]
+    fn rack_aware_pick_falls_back_to_every_partition_with_a_leader_when_none_is_in_rack() {
+        // No leader is in rack "z", so the pick falls back to Kafka's
+        // ordinary uniform pick among the 4 partitions with a leader.
+        let partitioner = scripted(
+            PartitionerConfig {
+                rack_aware: true,
+                ..config(100)
+            },
+            &[1],
+        );
+        let partitions = TopicPartitions {
+            count: 4,
+            has_leader: &all_leaders,
+        };
+        let sticky = partitioner.peek_rack_aware(TOPIC, &partitions, in_rack("z"));
+        assert2::check!(sticky.partition() == 1);
+    }
+
+    #[test]
+    fn rack_awareness_applies_only_when_the_config_and_the_client_rack_agree() {
+        // `rack_aware: false`: the client rack is ignored, and the pick is
+        // Kafka's ordinary uniform pick among the 4 partitions with a leader.
+        let partitioner = scripted(config(100), &[3]);
+        let partitions = TopicPartitions {
+            count: 4,
+            has_leader: &all_leaders,
+        };
+        let sticky = partitioner.peek_rack_aware(TOPIC, &partitions, in_rack("a"));
+        assert2::check!(sticky.partition() == 3);
+    }
+
+    #[test]
+    fn rack_aware_adaptive_pick_weights_by_queue_size_within_the_rack() {
+        // Queue sizes 0, 3, 1, 2 on partitions 0..=3 give the full-table
+        // weights 4, 1, 3, 2 (`largest + 1 - size`). Restricted to the
+        // in-rack partitions 0 and 1, the weights renormalize to a table of
+        // 4, 5: values 0-3 pick partition 0, and 4 picks partition 1.
+        let partitioner = scripted(
+            PartitionerConfig {
+                rack_aware: true,
+                ..config(1)
+            },
+            &[0, 4],
+        );
+        let partitions = TopicPartitions {
+            count: 4,
+            has_leader: &all_leaders,
+        };
+        partitioner.update_load_stats(
+            TOPIC,
+            Some(QueueSizes {
+                sizes: vec![0, 3, 1, 2],
+                partition_ids: vec![0, 1, 2, 3],
+                all: 4,
+            }),
+        );
+        let first = partitioner.peek_rack_aware(TOPIC, &partitions, in_rack("a"));
+        partitioner.update_rack_aware(TOPIC, first, 1, &partitions, true, in_rack("a"));
+        let second = partitioner.peek_rack_aware(TOPIC, &partitions, in_rack("a"));
+        assert2::check!((first.partition(), second.partition()) == (0, 1));
     }
 
     #[test]

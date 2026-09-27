@@ -400,16 +400,12 @@ mod tests {
                 name,
                 message,
             } => {
-                // 65 is not in `kafka_error_name`'s match table yet, so
-                // it falls through to "UNKNOWN" — locking that behavior
-                // so a later edit to the table doesn't silently change
-                // the surfaced name.
                 check!(
                     (api, code, name, message.as_deref())
                         == (
                             "CreateDelegationToken",
                             65,
-                            "UNKNOWN",
+                            "DELEGATION_TOKEN_AUTHORIZATION_FAILED",
                             Some("not super-user")
                         )
                 );

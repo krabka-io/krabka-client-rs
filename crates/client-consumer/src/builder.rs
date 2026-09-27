@@ -8,13 +8,17 @@ use bytes::{Bytes, BytesMut};
 /// `auto.offset.reset`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoOffsetReset {
-    /// Start from offset 0.
+    /// Start from the log-start offset. `Consumer::poll` resolves it lazily
+    /// with `ListOffsets(timestamp=-2)`, so a partition never reports offset 0
+    /// before the broker's real log start is known.
     Earliest,
     /// Start from the log-end offset. `Consumer::poll` resolves it lazily with
     /// `ListOffsets(timestamp=-1)`.
     Latest,
-    /// Do not reset automatically. On a missing offset or a detected truncation,
-    /// `poll` returns `ConsumerError::LogTruncation` and surfaces the error.
+    /// Do not reset automatically. On a missing committed offset, `poll` and
+    /// `position` return `ConsumerError::NoOffsetForPartition` naming the
+    /// partitions, instead of synthesizing a reset. On a detected truncation,
+    /// `poll` returns `ConsumerError::LogTruncation`.
     None,
     /// Start from the first offset whose timestamp is at or after now minus
     /// this duration (KIP-1106, `by_duration:<ISO-8601 duration>`).

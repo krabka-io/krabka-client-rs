@@ -30,6 +30,9 @@ without a dependency on broker internals.
 - Create, renew, expire, and describe delegation tokens.
 - Alter and describe the log directories of each broker.
 - List consumer groups and inspect their offsets.
+- Push client metrics to the cluster (KIP-714) when a broker client metrics
+  subscription matches the client, as a Java admin client does.
+  `AdminClientConfig::enable_metrics_push` (default `true`) turns this off.
 
 ## Kafka Scope
 

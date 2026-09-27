@@ -223,6 +223,18 @@ struct StartConfig {
     leave_group_timeout: Time,
     client_rack: Option<String>,
     security: Option<krabka_client_core::security::ClientSecurity>,
+    /// Kafka's `client.dns.lookup`.
+    client_dns_lookup: krabka_client_core::ClientDnsLookup,
+    /// Kafka's `reconnect.backoff.ms`.
+    reconnect_backoff: Time,
+    /// Kafka's `reconnect.backoff.max.ms`.
+    reconnect_backoff_max: Time,
+    /// Kafka's `connections.max.idle.ms`.
+    connections_max_idle: Time,
+    /// Kafka's `socket.connection.setup.timeout.ms`.
+    socket_connection_setup_timeout: Time,
+    /// Kafka's `socket.connection.setup.timeout.max.ms`.
+    socket_connection_setup_timeout_max: Time,
     /// Whether the application set a rebalance listener.
     has_rebalance_listener: bool,
     retry_policy: ConsumerRetryPolicy,
@@ -231,6 +243,9 @@ struct StartConfig {
     auto_commit_interval: Option<Duration>,
     /// Kafka's `allow.auto.create.topics`.
     allow_auto_create_topics: bool,
+    /// The KIP-714 reporter of the consumer's client, or `None` when Kafka's
+    /// `enable.metrics.push` is off.
+    telemetry: Option<krabka_client_core::telemetry::ClientTelemetryConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -265,6 +280,9 @@ pub struct ConsumerRetryPolicy {
     coordinator_initial_backoff: RetryTime,
     coordinator_max_backoff: RetryTime,
 }
+
+/// Kafka's default `retry.backoff.max.ms`.
+pub const DEFAULT_CONSUMER_RETRY_BACKOFF_MAX: Time = millis(1000);
 
 impl ConsumerRetryPolicy {
     /// Construct a validated retry policy.
@@ -371,20 +389,46 @@ impl ConsumerRetryPolicy {
     pub fn coordinator_max_backoff(self) -> Time {
         self.coordinator_max_backoff.time()
     }
+
+    /// The default retry policy, with Kafka's `retry.backoff.max.ms`
+    /// (`retry_backoff_max`) capping both the startup and the coordinator
+    /// exponential retry backoff.
+    ///
+    /// The fixed startup and coordinator initial backoffs are clamped to
+    /// `retry_backoff_max` so that a low configured maximum caps every
+    /// startup retry instead of failing construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `retry_backoff_max` does not validate, for example
+    /// a negative or fractional-millisecond value.
+    pub(crate) fn with_retry_backoff_max(retry_backoff_max: Time) -> Result<Self, String> {
+        let startup_initial_backoff = if millis(500) < retry_backoff_max {
+            millis(500)
+        } else {
+            retry_backoff_max
+        };
+        let coordinator_initial_backoff = if millis(100) < retry_backoff_max {
+            millis(100)
+        } else {
+            retry_backoff_max
+        };
+        Self::new(
+            secs(90),
+            minutes(5),
+            startup_initial_backoff,
+            retry_backoff_max,
+            secs(30),
+            coordinator_initial_backoff,
+            retry_backoff_max,
+        )
+    }
 }
 
 impl Default for ConsumerRetryPolicy {
     fn default() -> Self {
-        Self::new(
-            secs(90),
-            minutes(5),
-            millis(500),
-            secs(5),
-            secs(30),
-            millis(100),
-            secs(1),
-        )
-        .expect("default consumer retry policy is valid")
+        Self::with_retry_backoff_max(DEFAULT_CONSUMER_RETRY_BACKOFF_MAX)
+            .expect("default consumer retry backoff max is valid")
     }
 }
 
@@ -699,6 +743,12 @@ async fn pattern_topics(config: &StartConfig) -> Result<Vec<String>, ConsumerErr
         .metadata_recovery_strategy(config.metadata_recovery_strategy)
         .metadata_recovery_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger)
         .maybe_security(config.security.clone())
+        .client_dns_lookup(config.client_dns_lookup)
+        .reconnect_backoff(config.reconnect_backoff)
+        .reconnect_backoff_max(config.reconnect_backoff_max)
+        .connections_max_idle(config.connections_max_idle)
+        .socket_connection_setup_timeout(config.socket_connection_setup_timeout)
+        .socket_connection_setup_timeout_max(config.socket_connection_setup_timeout_max)
         .build()
         .await?;
     let metadata = client
@@ -819,13 +869,27 @@ pub(crate) fn starting_offset(committed: i64, auto_offset_reset: AutoOffsetReset
     }
 }
 
+/// The placeholder that a partition with no committed offset starts at, by
+/// `auto_offset_reset` policy.
+///
+/// Kafka's `AutoOffsetResetStrategy.EARLIEST.timestamp()` is
+/// `ListOffsetsRequest.EARLIEST_TIMESTAMP` (-2): `earliest` always asks the
+/// broker for the true log start with a `ListOffsets` round trip, and never
+/// reports a position before it completes. A hardcoded 0 would be wrong once
+/// retention has moved the log start past it, and the first `Fetch` would
+/// answer `OFFSET_OUT_OF_RANGE`. `none` never auto-resets at all: Kafka's
+/// `SubscriptionState.resetInitializingPositions` raises
+/// `NoOffsetForPartitionException` from `poll()` and `position()` instead
+/// (`OffsetFetcherUtils.offsetResetStrategyWithValidTimestamp`).
 pub(crate) fn reset_starting_offset(auto_offset_reset: AutoOffsetReset) -> i64 {
     match auto_offset_reset {
-        AutoOffsetReset::Earliest => 0,
-        // Resolved by poll() on first call.
-        AutoOffsetReset::Latest | AutoOffsetReset::None | AutoOffsetReset::ByDuration(_) => {
-            i64::MAX
-        }
+        // Resolved by poll() via ListOffsets(-2), the same sentinel as
+        // `seek_to_beginning`.
+        AutoOffsetReset::Earliest => crate::poll::BEGINNING_SENTINEL,
+        // Resolved by poll() via ListOffsets(-1) on first call.
+        AutoOffsetReset::Latest | AutoOffsetReset::ByDuration(_) => crate::poll::LATEST_SENTINEL,
+        // Never resolved: poll() and position() raise NoOffsetForPartition.
+        AutoOffsetReset::None => crate::poll::NO_OFFSET_SENTINEL,
     }
 }
 
@@ -1038,7 +1102,9 @@ impl Consumer {
         #[builder(default = DEFAULT_CONSUMER_FETCH_MAX_WAIT)] fetch_max_wait: Time,
         #[builder(default = DEFAULT_CONSUMER_METADATA_MAX_AGE)] metadata_max_age: Time,
         /// Kafka's `default.api.timeout.ms`: the timeout of
-        /// [`position`](Self::position) and [`committed`](Self::committed).
+        /// [`position`](Self::position), [`committed`](Self::committed),
+        /// [`commit_sync`](Self::commit_sync) and
+        /// [`commit_offsets_sync`](Self::commit_offsets_sync).
         #[builder(default = DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT)]
         default_api_timeout: Time,
         #[builder(default = secs(30))] request_timeout: Time,
@@ -1052,8 +1118,32 @@ impl Consumer {
         #[builder(default = DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT)] leave_group_timeout: Time,
         #[builder(into)] client_rack: Option<String>,
         security: Option<krabka_client_core::security::ClientSecurity>,
+        /// Kafka's `client.dns.lookup`.
+        #[builder(default)]
+        client_dns_lookup: krabka_client_core::ClientDnsLookup,
+        /// Kafka's `reconnect.backoff.ms`.
+        #[builder(default = krabka_client_core::DEFAULT_RECONNECT_BACKOFF)]
+        reconnect_backoff: Time,
+        /// Kafka's `reconnect.backoff.max.ms`.
+        #[builder(default = krabka_client_core::DEFAULT_RECONNECT_BACKOFF_MAX)]
+        reconnect_backoff_max: Time,
+        /// Kafka's `connections.max.idle.ms`.
+        #[builder(default = krabka_client_core::DEFAULT_CONNECTIONS_MAX_IDLE)]
+        connections_max_idle: Time,
+        /// Kafka's `socket.connection.setup.timeout.ms`.
+        #[builder(default = krabka_client_core::DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT)]
+        socket_connection_setup_timeout: Time,
+        /// Kafka's `socket.connection.setup.timeout.max.ms`.
+        #[builder(default = krabka_client_core::DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX)]
+        socket_connection_setup_timeout_max: Time,
         rebalance_listener: Option<Box<dyn crate::ConsumerRebalanceListener>>,
-        #[builder(default = ConsumerRetryPolicy::default())] retry_policy: ConsumerRetryPolicy,
+        /// Kafka's `retry.backoff.max.ms`: caps the startup and coordinator
+        /// exponential retry backoff. Ignored when `retry_policy` is set.
+        #[builder(default = DEFAULT_CONSUMER_RETRY_BACKOFF_MAX)]
+        retry_backoff_max: Time,
+        /// Overrides every retry timing, including `retry_backoff_max`, with a
+        /// fully custom policy.
+        retry_policy: Option<ConsumerRetryPolicy>,
         /// Kafka's `enable.auto.commit`: on by default with a group id, off
         /// without one.
         enable_auto_commit: Option<bool>,
@@ -1063,6 +1153,11 @@ impl Consumer {
         /// `auto.create.topics.enable=true` create a missing one.
         #[builder(default = true)]
         allow_auto_create_topics: bool,
+        /// Kafka's `enable.metrics.push` (default `true`): push the client
+        /// metrics that a broker's client metrics subscription names
+        /// (KIP-714), and a terminating push on close.
+        #[builder(default = true)]
+        enable_metrics_push: bool,
     ) -> Result<Self, ConsumerError> {
         // Fail fast on misconfig — before any retry loop.
         // Kafka treats an empty `group.id` as no group id.
@@ -1176,10 +1271,24 @@ impl Consumer {
                 "consumer default api timeout must not be negative".to_owned(),
             ));
         }
+        // `retry_backoff_max` feeds the default retry policy only: an
+        // explicit `retry_policy` already validated its own backoff caps.
+        let retry_policy = match retry_policy {
+            Some(retry_policy) => retry_policy,
+            None => ConsumerRetryPolicy::with_retry_backoff_max(retry_backoff_max)
+                .map_err(ConsumerError::InvalidConfig)?,
+        };
         let rebalance_protocol = crate::assignor::rebalance_protocol_of(&assignors)
             .map_err(ConsumerError::InvalidConfig)?;
 
         let client_id = consumer_client_id(client_id, &group_id, group_instance_id.as_deref());
+        let telemetry = enable_metrics_push.then(|| {
+            krabka_client_core::telemetry::ClientTelemetryConfig::consumer(
+                Some(group_id.as_str()),
+                group_instance_id.as_deref(),
+                client_rack.as_deref(),
+            )
+        });
         let config = StartConfig {
             bootstrap,
             client_id,
@@ -1216,12 +1325,29 @@ impl Consumer {
             leave_group_timeout: Time::from_std(leave_group_timeout.duration()),
             client_rack,
             security,
+            client_dns_lookup,
+            reconnect_backoff,
+            reconnect_backoff_max,
+            connections_max_idle,
+            socket_connection_setup_timeout,
+            socket_connection_setup_timeout_max,
             has_rebalance_listener: rebalance_listener.is_some(),
             retry_policy,
             auto_commit_interval,
             allow_auto_create_topics,
+            telemetry,
         };
 
+        Self::retry_start_until_success(config, rebalance_listener).await
+    }
+
+    /// Retries [`Self::start_once`] with the timeout-and-backoff policy that
+    /// [`Self::start`] describes, until it succeeds or a non-retriable error
+    /// or the startup deadline ends the attempt loop.
+    async fn retry_start_until_success(
+        config: StartConfig,
+        rebalance_listener: Option<Box<dyn crate::ConsumerRebalanceListener>>,
+    ) -> Result<Self, ConsumerError> {
         let started = tokio::time::Instant::now();
         let mut backoff = config.retry_policy.startup_initial_backoff().to_std();
         loop {
@@ -1313,6 +1439,7 @@ impl Consumer {
             return start_without_subscription(config).await;
         }
         let finish_config = config.clone();
+        let telemetry = config.telemetry.clone();
         let StartConfig {
             bootstrap,
             client_id,
@@ -1329,6 +1456,12 @@ impl Consumer {
             metadata_recovery_rebootstrap_trigger,
             client_rack,
             security,
+            client_dns_lookup,
+            reconnect_backoff,
+            reconnect_backoff_max,
+            connections_max_idle,
+            socket_connection_setup_timeout,
+            socket_connection_setup_timeout_max,
             allow_auto_create_topics,
             ..
         } = config;
@@ -1341,7 +1474,14 @@ impl Consumer {
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger)
             .maybe_security(security.clone())
+            .client_dns_lookup(client_dns_lookup)
+            .reconnect_backoff(reconnect_backoff)
+            .reconnect_backoff_max(reconnect_backoff_max)
+            .connections_max_idle(connections_max_idle)
+            .socket_connection_setup_timeout(socket_connection_setup_timeout)
+            .socket_connection_setup_timeout_max(socket_connection_setup_timeout_max)
             .metadata_scope(subscription_metadata_scope(allow_auto_create_topics))
+            .maybe_telemetry(telemetry)
             .build()
             .await?;
         client.metadata_topics().set(subscribe.iter().cloned());
@@ -1674,7 +1814,14 @@ async fn start_without_subscription(config: StartConfig) -> Result<Consumer, Con
         .metadata_recovery_strategy(config.metadata_recovery_strategy)
         .metadata_recovery_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger)
         .maybe_security(config.security.clone())
+        .client_dns_lookup(config.client_dns_lookup)
+        .reconnect_backoff(config.reconnect_backoff)
+        .reconnect_backoff_max(config.reconnect_backoff_max)
+        .connections_max_idle(config.connections_max_idle)
+        .socket_connection_setup_timeout(config.socket_connection_setup_timeout)
+        .socket_connection_setup_timeout_max(config.socket_connection_setup_timeout_max)
         .metadata_scope(subscription_metadata_scope(config.allow_auto_create_topics))
+        .maybe_telemetry(config.telemetry.clone())
         .build()
         .await?;
     let coordinator_id = if config.group_id.is_empty() {
@@ -1736,6 +1883,12 @@ async fn coordinator_task_client(
         .metadata_recovery_strategy(config.metadata_recovery_strategy)
         .metadata_recovery_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger)
         .maybe_security(config.security.clone())
+        .client_dns_lookup(config.client_dns_lookup)
+        .reconnect_backoff(config.reconnect_backoff)
+        .reconnect_backoff_max(config.reconnect_backoff_max)
+        .connections_max_idle(config.connections_max_idle)
+        .socket_connection_setup_timeout(config.socket_connection_setup_timeout)
+        .socket_connection_setup_timeout_max(config.socket_connection_setup_timeout_max)
         .metadata_scope(subscription_metadata_scope(config.allow_auto_create_topics))
         .build()
         .await?;
@@ -2070,6 +2223,29 @@ impl Consumer {
         self.close_with(crate::CloseOptions::default()).await
     }
 
+    /// The client instance id that the broker assigned for metrics push
+    /// (KIP-714), as Kafka's `KafkaConsumer.clientInstanceId` returns it.
+    ///
+    /// The call waits up to `timeout` for the first
+    /// `GetTelemetrySubscriptions` response. It returns `Ok(None)` when none
+    /// has come by then, as Kafka returns `null`. A zero `timeout` does not
+    /// wait.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::TelemetryDisabled`] when `enable_metrics_push`
+    /// is `false`, and [`ClientError::InvalidArgument`] for a negative
+    /// `timeout`, as Kafka throws an `IllegalStateException` and an
+    /// `IllegalArgumentException`.
+    ///
+    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
+    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
+    pub async fn client_instance_id(
+        &self,
+        timeout: Time,
+    ) -> Result<Option<uuid::Uuid>, ConsumerError> {
+        Ok(self.client.client_instance_id(timeout).await?)
+    }
+
     /// Close the consumer, and leave the group or stay in it as
     /// `options.group_membership_operation` says. Kafka's
     /// `KafkaConsumer.close(CloseOptions)`.
@@ -2131,6 +2307,9 @@ impl Consumer {
             .saturating_sub(started.elapsed())
             .min(request_timeout);
         self.close_fetch_sessions(left).await;
+        // The terminating telemetry push (KIP-714), within the time left.
+        let left = timeout.saturating_sub(started.elapsed());
+        let _ = tokio::time::timeout(left, self.client.close_telemetry()).await;
         listener_result
     }
 
@@ -2211,7 +2390,7 @@ mod consumer_retry_policy_tests {
         check!(defaults.startup_attempt_timeout() == secs(90));
         check!(defaults.startup_deadline() == minutes(5));
         check!(defaults.startup_initial_backoff() == millis(500));
-        check!(defaults.startup_max_backoff() == secs(5));
+        check!(defaults.startup_max_backoff() == millis(1000));
         check!(defaults.coordinator_retry_timeout() == secs(30));
         check!(defaults.coordinator_initial_backoff() == millis(100));
         check!(defaults.coordinator_max_backoff() == secs(1));
@@ -2233,6 +2412,44 @@ mod consumer_retry_policy_tests {
         check!(configured.coordinator_retry_timeout() == secs(15));
         check!(configured.coordinator_initial_backoff() == millis(16));
         check!(configured.coordinator_max_backoff() == millis(17));
+    }
+
+    /// Kafka's `retry.backoff.max.ms` caps both the startup and the
+    /// coordinator exponential retry backoff. When it is below the fixed
+    /// 500 ms/100 ms initial backoffs, construction still succeeds and the
+    /// initial backoffs are clamped down to it instead of being rejected.
+    #[test]
+    fn with_retry_backoff_max_caps_startup_and_coordinator_backoff() {
+        for (name, retry_backoff_max) in [
+            ("Kafka's default", millis(1000)),
+            ("custom, above both fixed initial backoffs", secs(3)),
+            ("below both fixed initial backoffs", millis(100)),
+            ("between the two fixed initial backoffs", millis(250)),
+        ] {
+            let policy = ConsumerRetryPolicy::with_retry_backoff_max(retry_backoff_max)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            check!(policy.startup_max_backoff() == retry_backoff_max);
+            check!(policy.coordinator_max_backoff() == retry_backoff_max);
+            check!(
+                policy.startup_initial_backoff() <= retry_backoff_max,
+                "{name}: startup initial backoff must not exceed retry_backoff_max"
+            );
+            check!(
+                policy.coordinator_initial_backoff() <= retry_backoff_max,
+                "{name}: coordinator initial backoff must not exceed retry_backoff_max"
+            );
+        }
+    }
+
+    #[test]
+    fn with_retry_backoff_max_rejects_invalid_values() {
+        for retry_backoff_max in [
+            Time::ZERO,
+            Time::from_secs_f64(0.0005),
+            Time::from_secs_f64(f64::INFINITY),
+        ] {
+            assert!(ConsumerRetryPolicy::with_retry_backoff_max(retry_backoff_max).is_err());
+        }
     }
 
     #[test]
@@ -2475,6 +2692,52 @@ mod security_arg_tests {
                     ),
                 ]
         );
+    }
+
+    /// A `retry_backoff_max` below the fixed 500 ms/100 ms startup and
+    /// coordinator initial backoffs must still build: the initial backoffs
+    /// are clamped down to it rather than making construction fail.
+    #[tokio::test]
+    async fn low_retry_backoff_max_clamps_initial_backoffs_instead_of_failing() {
+        let mock = MockBroker::start(|_api_key, _version, _corr_id, _body| None).await;
+
+        let build = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id("low-retry-backoff-max-consumer")
+            .group_id("low-retry-backoff-max-group")
+            .subscribe(vec!["orders".to_string()])
+            .request_timeout(krabka_units::millis(50))
+            .retry_backoff_max(millis(100))
+            .build();
+        let res = tokio::time::timeout(Duration::from_millis(500), build).await;
+
+        mock.stop();
+
+        let Err(err) = res.expect("a valid low retry_backoff_max must not hang the build") else {
+            panic!("silent broker must time out during build")
+        };
+        assert2::assert!(
+            matches!(err, ConsumerError::Client(ClientError::Timeout(_))),
+            "build must fail on the connection timeout, not on config validation: {err}"
+        );
+    }
+
+    /// `retry_backoff_max` (Kafka's `retry.backoff.max.ms`) validates through
+    /// the same eager, pre-connection check as the other retry timings.
+    #[tokio::test]
+    async fn invalid_retry_backoff_max_fails_before_broker_lookup() {
+        let build = Consumer::builder()
+            .bootstrap("invalid.invalid:9092")
+            .group_id("retry-backoff-max")
+            .subscribe(["topic".to_owned()])
+            .retry_backoff_max(Time::ZERO)
+            .build();
+        let error = tokio::time::timeout(Duration::from_secs(5), build)
+            .await
+            .expect("build must fail before any broker lookup")
+            .err()
+            .expect("a zero retry backoff max must be rejected");
+        assert2::assert!(error.to_string().contains("backoff"));
     }
 
     /// A build needs exactly one of `subscribe` and `subscribe_pattern`, and
@@ -2896,9 +3159,24 @@ mod security_arg_tests {
 
         for (_name, committed, reset, expected) in [
             ("committed offset", 12, AutoOffsetReset::Earliest, 12),
-            ("missing earliest", -1, AutoOffsetReset::Earliest, 0),
-            ("missing latest", -1, AutoOffsetReset::Latest, i64::MAX),
-            ("missing none", -1, AutoOffsetReset::None, i64::MAX),
+            (
+                "missing earliest",
+                -1,
+                AutoOffsetReset::Earliest,
+                crate::poll::BEGINNING_SENTINEL,
+            ),
+            (
+                "missing latest",
+                -1,
+                AutoOffsetReset::Latest,
+                crate::poll::LATEST_SENTINEL,
+            ),
+            (
+                "missing none",
+                -1,
+                AutoOffsetReset::None,
+                crate::poll::NO_OFFSET_SENTINEL,
+            ),
         ] {
             assert2::assert!(starting_offset(committed, reset) == expected);
         }
@@ -3302,6 +3580,10 @@ mod auto_commit_tests {
             join_group_request::{self, JoinGroupRequest},
             leave_group_request::{self, LeaveGroupRequest},
             leave_group_response::LeaveGroupResponse,
+            list_offsets_request,
+            list_offsets_response::{
+                ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
+            },
             metadata_request,
             metadata_response::MetadataResponse,
             offset_commit_request::{
@@ -3361,7 +3643,7 @@ mod auto_commit_tests {
     /// The API versions that the mock advertises: `(api_key, min, max)`. Each
     /// maximum is below the flexible version of its API, so no response needs a
     /// tagged response header.
-    const API_VERSIONS: [(i16, i16, i16); 10] = [
+    const API_VERSIONS: [(i16, i16, i16); 11] = [
         (api_versions_request::API_KEY, 0, 3),
         (metadata_request::API_KEY, 0, 8),
         (find_coordinator_request::API_KEY, 0, 2),
@@ -3372,6 +3654,7 @@ mod auto_commit_tests {
         (offset_commit_request::API_KEY, 2, 7),
         (offset_fetch_request::API_KEY, 1, 5),
         (fetch_request::API_KEY, 4, 11),
+        (list_offsets_request::API_KEY, 1, 5),
     ];
 
     /// A group coordinator that records every group request. It answers each
@@ -3538,6 +3821,47 @@ mod auto_commit_tests {
                 }
                 // No partition has records.
                 fetch_request::API_KEY => Some(encode(&FetchResponse::default(), version)),
+                // Every partition resolves to offset 0, whichever timestamp the
+                // request asked for.
+                list_offsets_request::API_KEY => {
+                    let client_id_len = body.get_i16();
+                    body.advance(usize::try_from(client_id_len.max(0)).expect("client id length"));
+                    let flexible = version >= list_offsets_request::FLEXIBLE_MIN;
+                    if flexible {
+                        // The empty tagged fields of the request header.
+                        body.advance(1);
+                    }
+                    let request =
+                        krabka_protocol::owned::list_offsets_request::ListOffsetsRequest::decode(
+                            &mut body, version,
+                        )
+                        .expect("decode list offsets");
+                    let mut response = if flexible { vec![0] } else { Vec::new() };
+                    response.extend(encode(
+                        &ListOffsetsResponse {
+                            topics: request
+                                .topics
+                                .iter()
+                                .map(|topic| ListOffsetsTopicResponse {
+                                    name: topic.name.clone(),
+                                    partitions: topic
+                                        .partitions
+                                        .iter()
+                                        .map(|p| ListOffsetsPartitionResponse {
+                                            partition_index: p.partition_index,
+                                            offset: 0,
+                                            ..Default::default()
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        version,
+                    ));
+                    Some(response)
+                }
                 // No partition has a committed offset.
                 offset_fetch_request::API_KEY => {
                     Some(encode(&OffsetFetchResponse::default(), version))
@@ -3569,57 +3893,59 @@ mod auto_commit_tests {
                     },
                     version,
                 )),
-                offset_commit_request::API_KEY => {
-                    let client_id_len = body.get_i16();
-                    body.advance(usize::try_from(client_id_len.max(0)).expect("client id length"));
-                    let mut request =
-                        OffsetCommitRequest::decode(&mut body, version).expect("decode commit");
-                    request.topics.sort_by(|a, b| a.name.cmp(&b.name));
-                    for topic in &mut request.topics {
-                        topic.partitions.sort_by_key(|p| p.partition_index);
-                    }
-                    if self.rebalance_on_commit.swap(false, Ordering::SeqCst) {
-                        self.heartbeat_error
-                            .store(REBALANCE_IN_PROGRESS, Ordering::SeqCst);
-                    }
-                    let error_code = match self
-                        .commit_replies
-                        .lock()
-                        .expect("commit replies lock")
-                        .pop_front()
-                    {
-                        None => 0,
-                        Some(CommitReply::Error(code)) => code,
-                        Some(CommitReply::Drop) => {
-                            self.record(GroupRequest::OffsetCommit(request));
-                            return None;
-                        }
-                    };
-                    let response = OffsetCommitResponse {
-                        topics: request
-                            .topics
+                offset_commit_request::API_KEY => self.respond_offset_commit(version, body),
+                _ => None,
+            }
+        }
+
+        fn respond_offset_commit(&self, version: i16, mut body: &[u8]) -> Option<Vec<u8>> {
+            let client_id_len = body.get_i16();
+            body.advance(usize::try_from(client_id_len.max(0)).expect("client id length"));
+            let mut request =
+                OffsetCommitRequest::decode(&mut body, version).expect("decode commit");
+            request.topics.sort_by(|a, b| a.name.cmp(&b.name));
+            for topic in &mut request.topics {
+                topic.partitions.sort_by_key(|p| p.partition_index);
+            }
+            if self.rebalance_on_commit.swap(false, Ordering::SeqCst) {
+                self.heartbeat_error
+                    .store(REBALANCE_IN_PROGRESS, Ordering::SeqCst);
+            }
+            let error_code = match self
+                .commit_replies
+                .lock()
+                .expect("commit replies lock")
+                .pop_front()
+            {
+                None => 0,
+                Some(CommitReply::Error(code)) => code,
+                Some(CommitReply::Drop) => {
+                    self.record(GroupRequest::OffsetCommit(request));
+                    return None;
+                }
+            };
+            let response = OffsetCommitResponse {
+                topics: request
+                    .topics
+                    .iter()
+                    .map(|topic| OffsetCommitResponseTopic {
+                        name: topic.name.clone(),
+                        partitions: topic
+                            .partitions
                             .iter()
-                            .map(|topic| OffsetCommitResponseTopic {
-                                name: topic.name.clone(),
-                                partitions: topic
-                                    .partitions
-                                    .iter()
-                                    .map(|p| OffsetCommitResponsePartition {
-                                        partition_index: p.partition_index,
-                                        error_code,
-                                        ..Default::default()
-                                    })
-                                    .collect(),
+                            .map(|p| OffsetCommitResponsePartition {
+                                partition_index: p.partition_index,
+                                error_code,
                                 ..Default::default()
                             })
                             .collect(),
                         ..Default::default()
-                    };
-                    self.record(GroupRequest::OffsetCommit(request));
-                    Some(encode(&response, version))
-                }
-                _ => None,
-            }
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            self.record(GroupRequest::OffsetCommit(request));
+            Some(encode(&response, version))
         }
     }
 
@@ -3880,10 +4206,19 @@ mod auto_commit_tests {
             leave_group_timeout: secs(5),
             client_rack: None,
             security: None,
+            client_dns_lookup: krabka_client_core::ClientDnsLookup::default(),
+            reconnect_backoff: krabka_client_core::DEFAULT_RECONNECT_BACKOFF,
+            reconnect_backoff_max: krabka_client_core::DEFAULT_RECONNECT_BACKOFF_MAX,
+            connections_max_idle: krabka_client_core::DEFAULT_CONNECTIONS_MAX_IDLE,
+            socket_connection_setup_timeout:
+                krabka_client_core::DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT,
+            socket_connection_setup_timeout_max:
+                krabka_client_core::DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
             has_rebalance_listener: false,
             retry_policy: ConsumerRetryPolicy::default(),
             auto_commit_interval: auto_commit.then_some(AUTO_COMMIT_INTERVAL),
             allow_auto_create_topics: true,
+            telemetry: None,
         }
     }
 
@@ -4280,6 +4615,11 @@ mod auto_commit_tests {
                     },
                 ],
                 vec![
+                    // `default_api_timeout` (60s), not `coordinator_retry_timeout`
+                    // (30s), now bounds `commit_sync`'s retries, so it has time
+                    // left to retry the dropped request once more before the
+                    // rebalance it triggered is detected.
+                    commit(1, &received),
                     commit(1, &received),
                     CommitSyncReturned,
                     commit(1, &received),
@@ -4288,8 +4628,9 @@ mod auto_commit_tests {
                 ],
             ),
             (
-                "a rebalance while commit_sync waits for the rebalance: the rebalance does not \
-                 wait for commit_sync",
+                "a rebalance while commit_sync waits for its response, with a \
+                 REBALANCE_IN_PROGRESS reply: commit_sync fails immediately instead of \
+                 waiting for the rejoin, so the commit before JoinGroup comes after it",
                 minutes(1),
                 vec![
                     Poll,
@@ -4302,10 +4643,10 @@ mod auto_commit_tests {
                 ],
                 vec![
                     commit(1, &received),
+                    CommitSyncReturned,
                     commit(1, &received),
                     JoinGroup,
                     SyncGroup,
-                    CommitSyncReturned,
                 ],
             ),
             (

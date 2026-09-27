@@ -332,6 +332,13 @@ impl ShareConsumer {
         /// `ShareConsumerMetadata` reads.
         #[builder(default = true)]
         allow_auto_create_topics: bool,
+        /// Kafka's `enable.metrics.push` (default `true`): push the client
+        /// metrics that a broker's client metrics subscription names
+        /// (KIP-714), with a terminating push on close. When it is `false`,
+        /// the consumer sends neither `GetTelemetrySubscriptions` nor
+        /// `PushTelemetry`.
+        #[builder(default = true)]
+        enable_metrics_push: bool,
     ) -> Result<Self, ConsumerError> {
         if subscribe.is_empty() {
             return Err(ConsumerError::NotSubscribed);
@@ -390,6 +397,16 @@ impl ShareConsumer {
             .metadata_scope(krabka_client_core::MetadataScope::Topics {
                 allow_auto_topic_creation: allow_auto_create_topics,
             })
+            .maybe_telemetry(enable_metrics_push.then(|| {
+                // `ClientTelemetryProvider` labels a consumer's metrics with
+                // its `group.id`. A share consumer has no
+                // `group.instance.id` and no `client.rack`.
+                krabka_client_core::telemetry::ClientTelemetryConfig::consumer(
+                    Some(&group_id),
+                    None,
+                    None,
+                )
+            }))
             .build()
             .await?;
         client.metadata_topics().set(subscribe.iter().cloned());
@@ -538,7 +555,9 @@ impl ShareConsumer {
     /// The task sends a best-effort leave heartbeat with `member_epoch = -1` on
     /// its way out, so the broker evicts this member promptly and does not wait
     /// out the session timeout. A flush failure is best-effort and logged, so
-    /// close still leaves the group.
+    /// close still leaves the group. Last, it sends the terminating
+    /// telemetry push (KIP-714) when the consumer pushes metrics and has a
+    /// subscription.
     #[tracing::instrument(
         name = "share_consumer.close",
         level = "info",
@@ -562,7 +581,33 @@ impl ShareConsumer {
         if let Some(h) = self.hb_handle.take() {
             let _ = h.await;
         }
+        // The terminating telemetry push (KIP-714).
+        self.client.close_telemetry().await;
         Ok(())
+    }
+
+    /// The client instance id that the broker assigned for metrics push
+    /// (KIP-714), as Kafka's `KafkaShareConsumer.clientInstanceId` returns
+    /// it.
+    ///
+    /// The call waits up to `timeout` for the first
+    /// `GetTelemetrySubscriptions` response. It returns `Ok(None)` when none
+    /// has come by then, as Kafka returns `null`. A zero `timeout` does not
+    /// wait.
+    ///
+    /// # Errors
+    /// Returns [`ClientError::TelemetryDisabled`] when `enable_metrics_push`
+    /// is `false`, and [`ClientError::InvalidArgument`] for a negative
+    /// `timeout`, as Kafka throws an `IllegalStateException` and an
+    /// `IllegalArgumentException`.
+    ///
+    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
+    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
+    pub async fn client_instance_id(
+        &self,
+        timeout: Time,
+    ) -> Result<Option<uuid::Uuid>, ConsumerError> {
+        Ok(self.client.client_instance_id(timeout).await?)
     }
 }
 

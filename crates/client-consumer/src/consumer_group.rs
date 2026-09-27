@@ -1459,11 +1459,9 @@ mod group_protocol_tests {
     /// The listener calls of one run.
     type ListenerCalls = Arc<Mutex<Vec<ListenerCall>>>;
 
-    /// A rebalance listener that records its calls, and that can hold the
-    /// assign callback for a while.
+    /// A rebalance listener that records its calls.
     struct RecordingListener {
         calls: ListenerCalls,
-        assign_delay: std::time::Duration,
     }
 
     #[async_trait::async_trait]
@@ -1489,7 +1487,6 @@ mod group_protocol_tests {
                 crate::rebalance_listener::ListenerCallKind::Assigned,
                 partitions,
             );
-            tokio::time::sleep(self.assign_delay).await;
             Ok(())
         }
 
@@ -1790,7 +1787,6 @@ mod group_protocol_tests {
             .request_timeout(secs(5))
             .rebalance_listener(Box::new(RecordingListener {
                 calls: Arc::clone(&calls),
-                assign_delay: std::time::Duration::ZERO,
             }))
             .build()
             .await
@@ -1855,7 +1851,6 @@ mod group_protocol_tests {
             .request_timeout(secs(5))
             .rebalance_listener(Box::new(RecordingListener {
                 calls: Arc::clone(&calls),
-                assign_delay: std::time::Duration::ZERO,
             }))
             .build()
             .await
@@ -1880,13 +1875,58 @@ mod group_protocol_tests {
         );
     }
 
+    /// The heartbeats that reach the coordinator while the assign callback of
+    /// [`HeartbeatWaitingListener`] runs.
+    const HEARTBEATS_IN_CALLBACK: usize = 3;
+
+    /// A rebalance listener whose assign callback returns only after
+    /// [`HEARTBEATS_IN_CALLBACK`] more heartbeats reached the coordinator, or
+    /// after a bound. It records how many arrived.
+    struct HeartbeatWaitingListener {
+        recorder: Recorder,
+        /// The heartbeats that arrived during the assign callback, once it
+        /// returned.
+        in_callback: Arc<Mutex<Option<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ConsumerRebalanceListener for HeartbeatWaitingListener {
+        async fn on_partitions_revoked(
+            &mut self,
+            _consumer: &Consumer,
+            _partitions: &[(String, i32)],
+        ) -> Result<(), crate::RebalanceListenerError> {
+            Ok(())
+        }
+
+        async fn on_partitions_assigned(
+            &mut self,
+            _consumer: &Consumer,
+            _partitions: &[(String, i32)],
+        ) -> Result<(), crate::RebalanceListenerError> {
+            let before = self.recorder.heartbeats().len();
+            let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut arrived = 0;
+            while arrived < HEARTBEATS_IN_CALLBACK && tokio::time::Instant::now() < bound {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                arrived = self.recorder.heartbeats().len() - before;
+            }
+            *self.in_callback.lock().expect("in callback lock") = Some(arrived);
+            Ok(())
+        }
+    }
+
     /// The member keeps its membership with `ConsumerGroupHeartbeat` while a
     /// rebalance listener callback runs, and never sends the classic
     /// `Heartbeat`.
+    ///
+    /// The coordinator task publishes the assignment before it queues the
+    /// assign callback, so a non-empty `assignment()` does not mean that the
+    /// callback ran. The test waits for the callback itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeats_go_on_during_a_rebalance_callback() {
         let recorder = Recorder::default();
-        let calls: ListenerCalls = Arc::default();
+        let in_callback: Arc<Mutex<Option<usize>>> = Arc::default();
         let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
         let mut consumer = Consumer::builder()
             .bootstrap(mock.addr.to_string())
@@ -1895,27 +1935,32 @@ mod group_protocol_tests {
             .group_protocol(GroupProtocol::Consumer)
             .heartbeat_interval(millis(20))
             .request_timeout(secs(5))
-            .rebalance_listener(Box::new(RecordingListener {
-                calls: Arc::clone(&calls),
-                assign_delay: std::time::Duration::from_millis(200),
+            .rebalance_listener(Box::new(HeartbeatWaitingListener {
+                recorder: recorder.clone(),
+                in_callback: Arc::clone(&in_callback),
             }))
             .build()
             .await
             .expect("build");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while in_callback.lock().expect("in callback lock").is_none()
+            && tokio::time::Instant::now() < deadline
+        {
             let _ = consumer.poll(millis(200)).await;
         }
-        let during_callback = recorder.heartbeats().len();
+        let during_callback = *in_callback.lock().expect("in callback lock");
         consumer.close().await.expect("close");
         mock.stop();
         let classic = *recorder
             .classic_heartbeats
             .lock()
             .expect("classic heartbeats lock");
-        // The join, the acknowledgement and the heartbeats of the 200 ms
-        // callback at a 20 ms interval.
-        assert2::assert!((during_callback >= 4, classic) == (true, 0));
+        assert2::assert!(
+            (
+                during_callback.map(|arrived| arrived >= HEARTBEATS_IN_CALLBACK),
+                classic
+            ) == (Some(true), 0)
+        );
     }
 
     /// The member id of the coordinator reaches the consumer, and a new
