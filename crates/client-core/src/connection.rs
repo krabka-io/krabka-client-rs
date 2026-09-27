@@ -23,13 +23,18 @@ use krabka_units::{
 use refined_type::rule::{GreaterI64, GreaterUsize};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::{TcpSocket, TcpStream},
+    net::TcpStream,
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{error::ClientError, request::ProtocolRequest, version::ApiVersionTable};
+use crate::{
+    error::ClientError,
+    request::ProtocolRequest,
+    transport::{SocketOptions, dial_address},
+    version::ApiVersionTable,
+};
 
 /// Trait alias for the duplex stream types `Connection::from_stream` accepts,
 /// such as `TcpStream` and `tokio_rustls::client::TlsStream`.
@@ -366,33 +371,20 @@ impl Activity {
     }
 }
 
-/// Open a TCP connection with the socket buffers of `options`.
+/// Open a TCP connection to `addr` through [`crate::transport::dial`], with
+/// the `send.buffer.bytes` and `receive.buffer.bytes` of `options`.
 async fn tcp_connect(
     addr: SocketAddr,
     options: &ConnectionOptions,
 ) -> Result<TcpStream, ClientError> {
-    let stream = async { configured_socket(addr, options)?.connect(addr).await }
-        .await
-        .map_err(|source| ClientError::Connect { addr, source })?;
-    stream.set_nodelay(true).ok();
-    Ok(stream)
-}
-
-/// A TCP socket for `addr` with the `send.buffer.bytes` and
-/// `receive.buffer.bytes` of `options`.
-fn configured_socket(addr: SocketAddr, options: &ConnectionOptions) -> std::io::Result<TcpSocket> {
-    let socket = if addr.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
+    let socket = SocketOptions {
+        send_buffer: options.send_buffer,
+        receive_buffer: options.receive_buffer,
+        nodelay: true,
     };
-    if let Some(size) = options.send_buffer {
-        socket.set_send_buffer_size(buffer_size(size))?;
-    }
-    if let Some(size) = options.receive_buffer {
-        socket.set_recv_buffer_size(buffer_size(size))?;
-    }
-    Ok(socket)
+    dial_address(addr, socket)
+        .await
+        .map_err(|source| ClientError::Connect { addr, source })
 }
 
 /// Run `setup` within `options.socket_connection_setup_timeout`.
@@ -407,10 +399,6 @@ async fn within_setup_timeout<T>(
     tokio::time::timeout(options.socket_connection_setup_timeout.to_std(), setup)
         .await
         .map_err(|_| ClientError::Timeout(options.socket_connection_setup_timeout))?
-}
-
-fn buffer_size(size: ByteSize) -> u32 {
-    u32::try_from(size.bytes_u64()).unwrap_or(u32::MAX)
 }
 
 impl Connection {
@@ -1062,9 +1050,8 @@ fn spawn_io_tasks(
     } = context;
 
     let (read_half, write_half) = tokio::io::split(stream);
-    let mut framed_read = FramedRead::new(read_half, crate::transport::codec_with_max(frame_max));
-    let mut framed_write =
-        FramedWrite::new(write_half, crate::transport::codec_with_max(frame_max));
+    let mut framed_read = FramedRead::new(read_half, crate::framing::codec_with_max(frame_max));
+    let mut framed_write = FramedWrite::new(write_half, crate::framing::codec_with_max(frame_max));
 
     // WRITER: drains the dispatch channel, flushing each frame in receive
     // order. Owns only the write half, so a not-yet-writable socket can never
@@ -2147,34 +2134,5 @@ mod connection_policy_tests {
         task.abort();
         let _ = task.await;
         check!(connection.in_flight() == 0);
-    }
-
-    #[test]
-    fn sockets_get_the_configured_buffer_sizes() {
-        let addr: SocketAddr = "127.0.0.1:9092".parse().unwrap();
-        let requested = kibibytes(96);
-        let configured = configured_socket(
-            addr,
-            &ConnectionOptions {
-                send_buffer: Some(requested),
-                receive_buffer: Some(requested),
-                ..ConnectionOptions::default()
-            },
-        )
-        .unwrap();
-        let untouched = configured_socket(
-            addr,
-            &ConnectionOptions {
-                send_buffer: None,
-                receive_buffer: None,
-                ..ConnectionOptions::default()
-            },
-        )
-        .unwrap();
-        // Linux doubles the value that the socket option sets.
-        let bytes = buffer_size(requested);
-        check!(configured.send_buffer_size().unwrap() >= bytes);
-        check!(configured.recv_buffer_size().unwrap() >= bytes);
-        check!(untouched.send_buffer_size().unwrap() != configured.send_buffer_size().unwrap());
     }
 }

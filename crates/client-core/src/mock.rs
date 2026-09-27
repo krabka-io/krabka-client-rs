@@ -239,7 +239,7 @@ async fn handle_connection(
 ) {
     use futures_util::{SinkExt, StreamExt};
 
-    let mut framed = crate::transport::frame(stream);
+    let mut framed = crate::framing::frame(stream);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,

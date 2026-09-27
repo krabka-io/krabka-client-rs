@@ -6,11 +6,7 @@
 
 mod stores;
 
-use std::{
-    fmt,
-    path::PathBuf,
-    sync::{Arc, OnceLock},
-};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use krabka_security::ListenerProtocol;
 use rustls::{
@@ -84,7 +80,8 @@ pub enum TrustStore {
     /// The platform trust store. Kafka uses the JVM default trust store when
     /// `ssl.truststore.location` and `ssl.truststore.certificates` are not
     /// set (`DefaultSslEngineFactory.getTrustManagers` with a null
-    /// `KeyStore`).
+    /// `KeyStore`). WebAssembly has no platform trust store, so there this
+    /// store fails to build with [`TlsConfigError::PlatformTrustStore`].
     #[default]
     Platform,
     /// A PEM file of CA certificates (`ssl.truststore.type=PEM` with
@@ -301,8 +298,10 @@ impl Default for TlsConnectorConfig {
 
 /// The platform trust store, loaded once for the process as the JVM loads its
 /// default trust store once.
+#[cfg(not(target_family = "wasm"))]
 fn platform_roots() -> Result<Arc<rustls::RootCertStore>, TlsConfigError> {
-    static ROOTS: OnceLock<Result<Arc<rustls::RootCertStore>, String>> = OnceLock::new();
+    static ROOTS: std::sync::OnceLock<Result<Arc<rustls::RootCertStore>, String>> =
+        std::sync::OnceLock::new();
     ROOTS
         .get_or_init(|| {
             let loaded = rustls_native_certs::load_native_certs();
@@ -324,13 +323,22 @@ fn platform_roots() -> Result<Arc<rustls::RootCertStore>, TlsConfigError> {
         .map_err(TlsConfigError::PlatformTrustStore)
 }
 
+/// WebAssembly has no platform trust store, so a TLS connection there needs a
+/// configured trust store.
+#[cfg(target_family = "wasm")]
+fn platform_roots() -> Result<Arc<rustls::RootCertStore>, TlsConfigError> {
+    Err(TlsConfigError::PlatformTrustStore(
+        "WebAssembly has no platform trust store, so set ssl.truststore.location".to_owned(),
+    ))
+}
+
 impl TlsConnectorConfig {
     /// Build a `rustls::ClientConfig`.
     ///
     /// # Errors
     /// Returns [`TlsConfigError`] when a store does not load, when a protocol
     /// or cipher suite setting leaves nothing to offer, or when the platform
-    /// trust store is empty.
+    /// trust store is empty or, on WebAssembly, absent.
     pub fn build(&self) -> Result<Arc<rustls::ClientConfig>, TlsConfigError> {
         self.build_with_platform_roots(platform_roots)
     }

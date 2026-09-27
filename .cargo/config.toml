@@ -20,3 +20,12 @@
 # does not. Local builds also read it, so developers get the runners' fetch path.
 [net]
 git-fetch-with-cli = true
+
+# tokio does not build its `fs`, `net` and `rt-multi-thread` features for
+# WebAssembly without `--cfg tokio_unstable`: its `lib.rs` has a
+# `compile_error!` for that case. The client crates need `net` on
+# `wasm32-wasip1`. Cargo applies this table to that target only, so native
+# builds do not get the flag, and Bazel does not read this file. A `RUSTFLAGS`
+# variable replaces the table, so do not set one for a `wasm32-wasip1` build.
+[target.wasm32-wasip1]
+rustflags = ["--cfg", "tokio_unstable"]

@@ -20,6 +20,7 @@ use crate::{
     bootstrap::{bounded_lookup, filter_preferred_addresses},
     connection::{Connection, ConnectionOptions},
     error::ClientError,
+    transport::resolve_host,
     version::FinalizedFeatures,
 };
 
@@ -94,7 +95,7 @@ impl BrokerConnector for TcpConnector {
 
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, ClientError> {
         let timeout = self.options.dns_timeout;
-        let addresses = bounded_lookup(timeout, tokio::net::lookup_host((host, port)))
+        let addresses = bounded_lookup(timeout, resolve_host(host, port))
             .await
             .map_err(|_| ClientError::Timeout(timeout.time()))??;
         Ok(filter_preferred_addresses(addresses))

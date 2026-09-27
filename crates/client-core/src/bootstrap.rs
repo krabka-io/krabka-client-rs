@@ -1,7 +1,10 @@
 //! Parse a Kafka-style bootstrap string ("host:port,host:port") into
 //! a list of resolved [`SocketAddr`](std::net::SocketAddr)s.
 
-use std::{future::Future, net::SocketAddr};
+use std::{
+    future::Future,
+    net::{IpAddr, SocketAddr},
+};
 
 use krabka_units::convert::TimeExt as _;
 
@@ -9,6 +12,7 @@ use crate::{
     connection::{ClientDnsLookup, ClientDnsTimeout},
     error::ClientError,
     security::connection_target_host,
+    transport,
 };
 
 pub(crate) async fn bounded_lookup<F>(
@@ -22,7 +26,7 @@ where
 }
 
 /// Parse a comma-separated `host:port` list and resolve each entry with
-/// [`tokio::net::lookup_host`].
+/// [`crate::transport::resolve`].
 ///
 /// This function silently skips entries that fail to resolve. It returns
 /// [`ClientError::Disconnected`] if *none* resolve.
@@ -48,12 +52,15 @@ pub(crate) async fn resolve_with_server_names(
         if part.is_empty() {
             continue;
         }
-        match bounded_lookup(dns_timeout, tokio::net::lookup_host(part)).await {
-            Ok(Ok(iter)) => match lookup {
-                ClientDnsLookup::UseAllDnsIps => out
-                    .extend(iter.map(|address| (address, connection_target_host(part).to_owned()))),
+        match bounded_lookup(dns_timeout, transport::resolve(part)).await {
+            Ok(Ok(addresses)) => match lookup {
+                ClientDnsLookup::UseAllDnsIps => out.extend(
+                    addresses
+                        .into_iter()
+                        .map(|address| (address, connection_target_host(part).to_owned())),
+                ),
                 ClientDnsLookup::ResolveCanonicalBootstrapServersOnly => {
-                    out.extend(canonical_addresses(part, iter, dns_timeout).await);
+                    out.extend(canonical_addresses(part, addresses, dns_timeout).await);
                 }
             },
             Ok(Err(error)) => {
@@ -76,22 +83,20 @@ pub(crate) async fn resolve_with_server_names(
 /// An address whose canonical name does not resolve is skipped.
 async fn canonical_addresses(
     part: &str,
-    addresses: impl Iterator<Item = SocketAddr>,
+    addresses: Vec<SocketAddr>,
     dns_timeout: ClientDnsTimeout,
 ) -> Vec<(SocketAddr, String)> {
     let mut out = Vec::new();
     for address in addresses {
         let ip = address.ip();
-        let reverse = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip));
         // Java's `getCanonicalHostName` gives the address text when the
         // reverse lookup fails.
-        let canonical = match bounded_lookup(dns_timeout, reverse).await {
-            Ok(Ok(Ok(name))) => name,
-            _ => ip.to_string(),
-        };
+        let canonical = reverse_lookup(ip, dns_timeout)
+            .await
+            .unwrap_or_else(|| ip.to_string());
         let resolved = bounded_lookup(
             dns_timeout,
-            tokio::net::lookup_host((canonical.clone(), address.port())),
+            transport::resolve_host(&canonical, address.port()),
         )
         .await
         .ok()
@@ -108,6 +113,23 @@ async fn canonical_addresses(
         add_canonical_addresses(&mut out, &canonical, resolved);
     }
     out
+}
+
+/// The host name of `ip` from a reverse lookup, or `None` when the lookup
+/// fails or does not end within `dns_timeout`.
+#[cfg(not(target_family = "wasm"))]
+async fn reverse_lookup(ip: IpAddr, dns_timeout: ClientDnsTimeout) -> Option<String> {
+    let reverse = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip));
+    bounded_lookup(dns_timeout, reverse).await.ok()?.ok()?.ok()
+}
+
+/// WebAssembly has no reverse lookup, so no address has a host name.
+#[cfg(target_family = "wasm")]
+fn reverse_lookup(
+    _ip: IpAddr,
+    _dns_timeout: ClientDnsTimeout,
+) -> std::future::Ready<Option<String>> {
+    std::future::ready(None)
 }
 
 /// Add the addresses of one canonical host name, once each. Kafka resolves the
