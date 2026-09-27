@@ -78,7 +78,7 @@ use krabka_client_admin::{
 use krabka_client_core::{
     BrokerInfo, BrokerPool, ClientDnsTimeout, ClientError, ClientSecurity, Connection,
     ConnectionOptions, DEFAULT_FETCH_RESPONSE_MAX, FetchMinBytes, FetchedRecord, IsolatedFetch,
-    connection_target_host, fetch_partition_with_isolation_progress,
+    connection_target_host, fetch_partition_with_isolation_progress, transport::resolve,
 };
 use krabka_client_producer::{
     Acks, Producer, ProducerError, ProducerRecord, RecordMetadata, partition_for_key,
@@ -718,18 +718,21 @@ async fn resolve_addresses(
 ) -> Result<Vec<(SocketAddr, String)>, CoordinationError> {
     let mut resolved = Vec::new();
     for address in addresses {
-        let lookup = tokio::time::timeout(
-            dns_timeout.time().to_std(),
-            tokio::net::lookup_host(address),
-        )
-        .await
-        .map_err(|_elapsed| {
-            CoordinationError::InvalidConfig(format!("the DNS lookup of {address} timed out"))
-        })?
-        .map_err(|error| {
-            CoordinationError::InvalidConfig(format!("the DNS lookup of {address} failed: {error}"))
-        })?;
-        resolved.extend(lookup.map(|socket| (socket, connection_target_host(address).to_owned())));
+        let lookup = tokio::time::timeout(dns_timeout.time().to_std(), resolve(address))
+            .await
+            .map_err(|_elapsed| {
+                CoordinationError::InvalidConfig(format!("the DNS lookup of {address} timed out"))
+            })?
+            .map_err(|error| {
+                CoordinationError::InvalidConfig(format!(
+                    "the DNS lookup of {address} failed: {error}"
+                ))
+            })?;
+        resolved.extend(
+            lookup
+                .into_iter()
+                .map(|socket| (socket, connection_target_host(address).to_owned())),
+        );
     }
     if resolved.is_empty() {
         return Err(CoordinationError::InvalidConfig(format!(

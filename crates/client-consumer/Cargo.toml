@@ -24,7 +24,7 @@ assert2 = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 krabka-protocol = { version = "0.4.0", default-features = false }
-krabka-client-core = { version = "0.4.0", path = "../client-core", features = ["mock"] }
+krabka-client-core = { version = "0.4.0", path = "../client-core" }
 krabka-ids = { version = "0.4.0" }
 krabka-units = { workspace = true }
 bytes = { workspace = true }
@@ -37,6 +37,9 @@ refined_type = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# `mock` exposes MockBroker to the tests. It binds a TCP listener, so it stays
+# out of the library, which also builds for `wasm32-wasip1`.
+krabka-client-core = { path = "../client-core", features = ["mock"] }
 krabka-client-producer = { path = "../client-producer" }
 krabka-security = { version = "0.4.0" }
 mutants = { workspace = true }

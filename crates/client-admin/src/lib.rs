@@ -26,6 +26,7 @@ use krabka_client_core::{
         ClientMetrics, ClientTelemetry, ClientTelemetryConfig, NetworkMetrics, TelemetryClientType,
         TelemetryTiming,
     },
+    transport,
 };
 use krabka_units::{Time, convert::TimeExt as _};
 use thiserror::Error;
@@ -623,9 +624,9 @@ async fn lookup_first<F, I>(
 ) -> Result<std::net::SocketAddr, AdminError>
 where
     F: std::future::Future<Output = std::io::Result<I>>,
-    I: Iterator<Item = std::net::SocketAddr>,
+    I: IntoIterator<Item = std::net::SocketAddr>,
 {
-    let mut addrs = tokio::time::timeout(dns_timeout.time().to_std(), lookup)
+    let addrs = tokio::time::timeout(dns_timeout.time().to_std(), lookup)
         .await
         .map_err(|_| {
             AdminError::Protocol(format!(
@@ -635,6 +636,7 @@ where
         })?
         .map_err(|error| AdminError::Protocol(format!("DNS lookup {host_port}: {error}")))?;
     addrs
+        .into_iter()
         .next()
         .ok_or_else(|| AdminError::Protocol(format!("no addresses for {host_port}")))
 }
@@ -1349,7 +1351,8 @@ impl AdminClient {
 
     /// Tries each bootstrap address in order.
     ///
-    /// Each entry is `host:port`. `tokio::net::lookup_host` resolves the DNS.
+    /// Each entry is `host:port`, which
+    /// [`krabka_client_core::transport::resolve`] resolves.
     /// The first successful connect wins. Returns
     /// [`AdminError::Connect`] with the last cause if none responded. The connection is
     /// plaintext. See [`AdminClient::connect_secured`].
@@ -1367,12 +1370,7 @@ impl AdminClient {
         if let Some(security) = opts.security.as_mut() {
             **security = security.for_target_host(connection_target_host(host_port));
         }
-        let addr = lookup_first(
-            host_port,
-            opts.dns_timeout,
-            tokio::net::lookup_host(host_port),
-        )
-        .await?;
+        let addr = lookup_first(host_port, opts.dns_timeout, transport::resolve(host_port)).await?;
         Connection::connect_with_options(addr, opts)
             .await
             .map_err(AdminError::from)
