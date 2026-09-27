@@ -97,7 +97,7 @@ pub use fetch::{
     FetchedHeader, FetchedRecord, IsolatedFetch, fetch_partition, fetch_partition_with_isolation,
     fetch_partition_with_isolation_progress,
 };
-pub use metadata_topics::{MetadataScope, MetadataTopics, topics_request};
+pub use metadata_topics::{MetadataScope, MetadataTopics, all_topics_request, topics_request};
 #[cfg(any(test, feature = "mock"))]
 pub use mock::{MockBroker, MockReply, MockSaslAnswer};
 pub use offset_for_leader_epoch::{EpochEndOffset, offset_for_leader_epoch};

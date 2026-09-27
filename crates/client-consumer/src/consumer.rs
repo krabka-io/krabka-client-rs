@@ -752,7 +752,7 @@ async fn pattern_topics(config: &StartConfig) -> Result<Vec<String>, ConsumerErr
         .build()
         .await?;
     let metadata = client
-        .refresh_metadata_with(krabka_protocol::owned::metadata_request::MetadataRequest::default())
+        .refresh_metadata_with(krabka_client_core::all_topics_request())
         .await;
     client.close();
     let subscription = crate::subscription::Subscription {

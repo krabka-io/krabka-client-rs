@@ -124,11 +124,25 @@ impl MetadataTopics {
     #[must_use]
     pub fn request(&self) -> MetadataRequest {
         match self.scope {
-            MetadataScope::AllTopics => MetadataRequest::default(),
+            MetadataScope::AllTopics => all_topics_request(),
             MetadataScope::Topics {
                 allow_auto_topic_creation,
             } => topics_request(self.names(), allow_auto_topic_creation),
         }
+    }
+}
+
+/// The `Metadata` request for every topic of the cluster
+/// (`MetadataRequest.Builder.allTopics`): a null topic list.
+///
+/// `MetadataRequest::default()` is not this request. Its `topics` is the
+/// schema default, an empty list, which asks for no topic.
+#[must_use]
+pub fn all_topics_request() -> MetadataRequest {
+    MetadataRequest {
+        topics: None,
+        allow_auto_topic_creation: true,
+        ..Default::default()
     }
 }
 
@@ -175,7 +189,11 @@ mod tests {
                 "all topics",
                 MetadataScope::AllTopics,
                 vec!["t1"],
-                MetadataRequest::default(),
+                MetadataRequest {
+                    topics: None,
+                    allow_auto_topic_creation: true,
+                    ..Default::default()
+                },
             ),
             ("no topic yet", producer, vec![], named(&[], true)),
             (

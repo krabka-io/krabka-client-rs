@@ -1553,7 +1553,7 @@ pub(crate) async fn refresh_pattern_topics(state: &mut CoordinatorState) -> bool
     };
     let Ok(metadata) = state
         .client
-        .refresh_metadata_with(krabka_protocol::owned::metadata_request::MetadataRequest::default())
+        .refresh_metadata_with(krabka_client_core::all_topics_request())
         .await
     else {
         return false;
