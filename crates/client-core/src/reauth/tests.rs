@@ -359,3 +359,29 @@ fn the_due_time_is_85_to_95_percent_of_the_lifetime() {
         );
     }
 }
+
+/// A re-authentication runs over the connection's own dispatch, which frames
+/// every request with a Kafka header, so it refuses a headerless token rather
+/// than writing one to the broker.
+#[tokio::test]
+async fn the_connection_channel_refuses_a_headerless_token() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let script = tokio::spawn(broker(server, 0, None, Arc::clone(&seen)));
+    let options = ConnectionOptions::default();
+    let frame_max = options.frame_max;
+    let connection = Connection::from_stream(Box::new(client), options)
+        .await
+        .unwrap();
+    let result = ConnectionChannel {
+        connection: &connection,
+    }
+    .token(PLAIN_TOKEN, frame_max)
+    .await
+    .map(drop)
+    .map_err(|error| error.to_string());
+    connection.close();
+    script.abort();
+    check!(result == Err("codec: re-authentication needs SaslAuthenticate".to_owned()));
+    check!(seen.lock().unwrap().tokens.is_empty());
+}
