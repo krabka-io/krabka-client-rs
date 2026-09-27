@@ -533,10 +533,9 @@ fn murmur2(data: &[u8]) -> i32 {
         u32::try_from(length & usize_u32_max).expect("masked Murmur2 input length must fit in u32");
     let mut h: u32 = SEED ^ length_low;
 
-    let chunks = data.chunks_exact(4);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = data.as_chunks::<4>();
     for chunk in chunks {
-        let mut k = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mut k = u32::from_le_bytes(*chunk);
         k = k.wrapping_mul(M);
         k ^= k >> R;
         k = k.wrapping_mul(M);

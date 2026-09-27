@@ -10,7 +10,7 @@ module(
     version = "0.4.0",
 )
 
-bazel_dep(name = "rules_rs", version = "0.0.110")
+bazel_dep(name = "rules_rs", version = "0.0.112")
 bazel_dep(name = "rules_rs_mutants", version = "0.0.1")
 
 # rules_rs_mutants is not published to the Bazel Central Registry, so the
@@ -31,31 +31,30 @@ git_override(
 # the toolchain links with lld instead, makes a local build and a CI build the
 # same build, and is what rules_rs_mutants needs on macOS, where Xcode's
 # cc_wrapper leaves a mutant link without `DEVELOPER_DIR`.
-bazel_dep(name = "llvm", version = "0.8.18")
+bazel_dep(name = "llvm", version = "0.8.24")
+
+# rules_rs merges coverage with this module's llvm-profdata, which reads only
+# the raw profile version of its own LLVM. rustc writes the version of the LLVM
+# it was built on, so the two majors must match: 22.x for Rust 1.98 (`rustc
+# -vV` prints it). The module's own default, 23.x, fails every test in `bazel
+# coverage` with "raw profile version mismatch". Move this with the toolchain.
+llvm = use_extension("@llvm//extensions:llvm.bzl", "llvm")
+llvm.version(llvm_version = "22.1.8")
+use_repo(llvm, "llvm-project")
 
 register_toolchains("@llvm//toolchain:all")
 
 # ---------------------------------------------------------------------------
 # Format and lint. See //tools/format and //tools/lint.
 # ---------------------------------------------------------------------------
-bazel_dep(name = "aspect_rules_lint", version = "2.7.2")
+bazel_dep(name = "aspect_rules_lint", version = "2.9.0")
 
 # Supplies a clippy aspect shaped the way `aspect lint` expects -- it writes the
 # `rules_lint_machine` output group, which the aspect from @rules_rust does not.
-# It also registers a Rust toolchain of its own, pinned to 1.92.0 / edition 2021
-# for its own tests; see the toolchain block below for how the two coexist.
-bazel_dep(name = "aspect_rules_lint_rust", version = "0.0.2")
-
-# See the patch header: that module registers `@default_rust_toolchains//:all`,
-# a package rules_rs does not create.
-single_version_override(
-    module_name = "aspect_rules_lint_rust",
-    patch_strip = 1,
-    patches = ["//bazel/patches:aspect-rules-lint-rust-toolchain-pattern.patch"],
-    version = "0.0.2",
-)
-
-bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.3")
+# It registers `@default_rust_toolchains`, which the toolchain block below
+# configures.
+bazel_dep(name = "aspect_rules_lint_rust", version = "0.0.3")
+bazel_dep(name = "buildifier_prebuilt", version = "10.1.0")
 
 # `sh_test`. //bazel/defs.bzl is shared verbatim across the three repositories,
 # and its container-suite path builds one; no crate here uses that path today.
@@ -64,7 +63,7 @@ bazel_dep(name = "rules_shell", version = "0.8.0")
 # A hermetic JDK. Like rules_shell above, this is here because //bazel/defs.bzl
 # is shared verbatim and its container-suite path declares one; no crate here
 # uses that path today.
-bazel_dep(name = "rules_java", version = "9.8.0")
+bazel_dep(name = "rules_java", version = "9.9.0")
 
 # rules_rs vends its own patched @rules_rust. `rust_doc_test` has no rules_rs
 # wrapper, so it is loaded from there directly rather than from a second copy.
@@ -76,13 +75,11 @@ use_repo(rules_rust, "rules_rust")
 # ---------------------------------------------------------------------------
 toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
 
-# Named rather than left as `default_rust_toolchains`, which
-# aspect_rules_lint_rust also claims: rules_rs refuses two configurations under
-# one repo name, and that module wants 1.92.0 / edition 2021 while this
-# repository is 1.97.1 / edition 2024. Both toolchains get registered; ours is
-# registered from the root module, which is what makes it the one that resolves.
+# Configured under the default repo name. aspect_rules_lint_rust imports
+# `default_rust_toolchains` without configuring it, and rules_rs creates that
+# repo only from a configuration, so this one is the toolchain both modules
+# register.
 toolchains.toolchain(
-    name = "krabka_rust_toolchains",
     edition = "2024",
     # rustfmt.toml sets `format_code_in_doc_comments`, `group_imports` and
     # `imports_granularity`, all still nightly-gated. Stable rustfmt does not
@@ -94,11 +91,11 @@ toolchains.toolchain(
     # Matches rust-toolchain.toml. These had drifted apart -- Bazel built with
     # 1.97.0 while Cargo used 1.97.1 -- which is precisely the split the "one
     # dependency source of truth" arrangement exists to avoid.
-    version = "1.97.1",
+    version = "1.98.1",
 )
-use_repo(toolchains, "krabka_rust_toolchains")
+use_repo(toolchains, "default_rust_toolchains")
 
-register_toolchains("@krabka_rust_toolchains//...")
+register_toolchains("@default_rust_toolchains//...")
 
 # ---------------------------------------------------------------------------
 # Native `-sys` crates, built by Bazel rather than by their build scripts.
@@ -109,7 +106,7 @@ register_toolchains("@krabka_rust_toolchains//...")
 # headers, none of which the hermetic toolchain governs. Pointing them at the
 # BCR's own builds puts that C under the same toolchain as everything else.
 # ---------------------------------------------------------------------------
-bazel_dep(name = "zstd", version = "1.5.7.bcr.1")
+bazel_dep(name = "zstd", version = "1.5.7.bcr.2")
 
 # ---------------------------------------------------------------------------
 # Third-party crates, resolved from the Cargo workspace.

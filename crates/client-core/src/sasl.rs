@@ -1278,32 +1278,19 @@ mod tests {
     }
 
     /// A SASL channel that answers every request with success and records the
-    /// `auth_bytes` of each `SaslAuthenticate`.
+    /// `auth_bytes` of each `SaslAuthenticate` or headerless token.
     struct RecordingChannel {
         tokens: Vec<Vec<u8>>,
         server: Option<krabka_security::ScramServerExchange>,
     }
 
-    impl SaslChannel for RecordingChannel {
-        async fn request(
-            &mut self,
-            (api_key, version, _corr_id): (ApiKey, ApiVersion, i32),
-            _flexible: bool,
-            body: &[u8],
-            _policy: SaslPolicy<'_>,
-        ) -> Result<Vec<u8>, OutboundSaslError> {
-            let mut out = BytesMut::new();
-            if api_key == ApiKey(API_KEY_SASL_HANDSHAKE) {
-                SaslHandshakeResponse::default()
-                    .encode(&mut out, version.0)
-                    .unwrap();
-                return Ok(out.to_vec());
-            }
-            let mut cursor = body;
-            let request = SaslAuthenticateRequest::decode(&mut cursor, version.0).unwrap();
-            self.tokens.push(request.auth_bytes.to_vec());
-            let auth_bytes = match self.server.take() {
-                Some(server) => match server.step(&request.auth_bytes) {
+    impl RecordingChannel {
+        /// Record `token` and return the SCRAM server's answer, or nothing
+        /// when the exchange has no server.
+        fn answer(&mut self, token: &[u8]) -> Vec<u8> {
+            self.tokens.push(token.to_vec());
+            match self.server.take() {
+                Some(server) => match server.step(token) {
                     StepResult::Continue(bytes, next) => {
                         self.server = Some(next);
                         bytes
@@ -1312,22 +1299,46 @@ mod tests {
                     StepResult::Failed(error) => panic!("SCRAM server failed: {error:?}"),
                 },
                 None => Vec::new(),
-            };
+            }
+        }
+    }
+
+    impl SaslChannel for RecordingChannel {
+        fn request(
+            &mut self,
+            (api_key, version, _corr_id): (ApiKey, ApiVersion, i32),
+            _flexible: bool,
+            body: &[u8],
+            _policy: SaslPolicy<'_>,
+        ) -> impl Future<Output = Result<Vec<u8>, OutboundSaslError>> + Send {
+            let mut out = BytesMut::new();
+            if api_key == ApiKey(API_KEY_SASL_HANDSHAKE) {
+                SaslHandshakeResponse::default()
+                    .encode(&mut out, version.0)
+                    .unwrap();
+                return std::future::ready(Ok(out.to_vec()));
+            }
+            let mut cursor = body;
+            let request = SaslAuthenticateRequest::decode(&mut cursor, version.0).unwrap();
             SaslAuthenticateResponse {
-                auth_bytes: auth_bytes.into(),
+                auth_bytes: self.answer(&request.auth_bytes).into(),
                 ..Default::default()
             }
             .encode(&mut out, version.0)
             .unwrap();
-            Ok(out.to_vec())
+            std::future::ready(Ok(out.to_vec()))
         }
 
-        async fn token(
+        fn token(
             &mut self,
-            _token: &[u8],
+            token: &[u8],
             _frame_max: ClientFrameMax,
-        ) -> Result<SaslAuthenticateResponse, OutboundSaslError> {
-            unreachable!("the test lists SaslAuthenticate")
+        ) -> impl Future<Output = Result<SaslAuthenticateResponse, OutboundSaslError>> + Send
+        {
+            std::future::ready(Ok(SaslAuthenticateResponse {
+                auth_bytes: self.answer(token).into(),
+                ..Default::default()
+            }))
         }
     }
 
@@ -1340,66 +1351,83 @@ mod tests {
         }
     }
 
-    /// The first token of each credential kind, as the broker receives it.
+    /// The first token of each credential kind, as the broker receives it,
+    /// both in a `SaslAuthenticate` and as a headerless token.
     #[tokio::test]
     async fn credentials_send_provider_tokens_extensions_and_delegation_token_login() {
-        let session = SaslSession {
-            handshake_version: 1,
-            authenticate_version: Some(1),
-            session_lifetime_ms: None,
-        };
+        let sessions = [
+            (
+                "SaslAuthenticate v1",
+                SaslSession {
+                    handshake_version: 1,
+                    authenticate_version: Some(1),
+                    session_lifetime_ms: None,
+                },
+            ),
+            (
+                "headerless",
+                SaslSession {
+                    handshake_version: 0,
+                    authenticate_version: None,
+                    session_lifetime_ms: None,
+                },
+            ),
+        ];
         let scram_server = || {
             Some(ScramServerExchange::new(
                 "token-id".into(),
                 hash_scram_password(b"hmac", SaslMechanism::ScramSha256, 4096),
             ))
         };
-        for (name, credentials, server, check_first) in [
-            (
-                "OAUTHBEARER provider with an extension",
-                SaslCredentials::OAuthBearer {
-                    token: OAuthBearerTokenSource::Provider(Arc::new(FixedToken)),
-                    extensions: BTreeMap::from([("logicalCluster".into(), "lkc-1".into())]),
-                },
-                None,
-                Box::new(|first: &[u8]| {
-                    first == b"n,,\x01auth=Bearer provided.token\x01logicalCluster=lkc-1\x01\x01"
-                }) as Box<dyn Fn(&[u8]) -> bool>,
-            ),
-            (
-                "SCRAM delegation token",
-                SaslCredentials::Scram {
-                    mechanism: SaslMechanism::ScramSha256,
-                    username: "token-id".into(),
-                    password: "hmac".into(),
-                    delegation_token: true,
-                },
-                scram_server(),
-                Box::new(|first: &[u8]| {
-                    let first = String::from_utf8_lossy(first);
-                    first.starts_with("n,,n=token-id,r=") && first.ends_with(",tokenauth=true")
-                }),
-            ),
-        ] {
-            let mut channel = RecordingChannel {
-                tokens: Vec::new(),
-                server,
-            };
-            let mut corr_id = 0;
-            let result = authenticate(
-                &mut channel,
-                &credentials,
-                "localhost",
-                session,
-                (&mut corr_id, TEST_CLIENT_ID, ClientFrameMax::default()),
-            )
-            .await;
-            check!(result.is_ok(), "{name}: {result:?}");
-            check!(
-                check_first(&channel.tokens[0]),
-                "{name}: {:?}",
-                String::from_utf8_lossy(&channel.tokens[0])
-            );
+        for (session_name, session) in sessions {
+            for (name, credentials, server, check_first) in [
+                (
+                    "OAUTHBEARER provider with an extension",
+                    SaslCredentials::OAuthBearer {
+                        token: OAuthBearerTokenSource::Provider(Arc::new(FixedToken)),
+                        extensions: BTreeMap::from([("logicalCluster".into(), "lkc-1".into())]),
+                    },
+                    None,
+                    Box::new(|first: &[u8]| {
+                        first
+                            == b"n,,\x01auth=Bearer provided.token\x01logicalCluster=lkc-1\x01\x01"
+                    }) as Box<dyn Fn(&[u8]) -> bool>,
+                ),
+                (
+                    "SCRAM delegation token",
+                    SaslCredentials::Scram {
+                        mechanism: SaslMechanism::ScramSha256,
+                        username: "token-id".into(),
+                        password: "hmac".into(),
+                        delegation_token: true,
+                    },
+                    scram_server(),
+                    Box::new(|first: &[u8]| {
+                        let first = String::from_utf8_lossy(first);
+                        first.starts_with("n,,n=token-id,r=") && first.ends_with(",tokenauth=true")
+                    }),
+                ),
+            ] {
+                let mut channel = RecordingChannel {
+                    tokens: Vec::new(),
+                    server,
+                };
+                let mut corr_id = 0;
+                let result = authenticate(
+                    &mut channel,
+                    &credentials,
+                    "localhost",
+                    session,
+                    (&mut corr_id, TEST_CLIENT_ID, ClientFrameMax::default()),
+                )
+                .await;
+                check!(result.is_ok(), "{session_name}, {name}: {result:?}");
+                check!(
+                    check_first(&channel.tokens[0]),
+                    "{session_name}, {name}: {:?}",
+                    String::from_utf8_lossy(&channel.tokens[0])
+                );
+            }
         }
     }
 

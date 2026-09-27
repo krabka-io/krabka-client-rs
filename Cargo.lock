@@ -1946,7 +1946,7 @@ version = "0.4.0"
 dependencies = [
  "assert2",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bon",
  "bytes",
  "crc32c",
@@ -2022,7 +2022,7 @@ dependencies = [
 [[package]]
 name = "krabka-compression"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=81b2b0b528025180e00c0c0c3946cb4441c1a439#81b2b0b528025180e00c0c0c3946cb4441c1a439"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
 dependencies = [
  "assert2",
  "bytes",
@@ -2039,7 +2039,7 @@ dependencies = [
 [[package]]
 name = "krabka-ids"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=81b2b0b528025180e00c0c0c3946cb4441c1a439#81b2b0b528025180e00c0c0c3946cb4441c1a439"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
 dependencies = [
  "assert2",
  "derive_more",
@@ -2049,7 +2049,7 @@ dependencies = [
 [[package]]
 name = "krabka-metadata"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=81b2b0b528025180e00c0c0c3946cb4441c1a439#81b2b0b528025180e00c0c0c3946cb4441c1a439"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
 dependencies = [
  "assert2",
  "bytes",
@@ -2069,7 +2069,7 @@ dependencies = [
 [[package]]
 name = "krabka-protocol"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=81b2b0b528025180e00c0c0c3946cb4441c1a439#81b2b0b528025180e00c0c0c3946cb4441c1a439"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
 dependencies = [
  "assert2",
  "bytes",
@@ -2085,7 +2085,7 @@ dependencies = [
 [[package]]
 name = "krabka-security"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=81b2b0b528025180e00c0c0c3946cb4441c1a439#81b2b0b528025180e00c0c0c3946cb4441c1a439"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
 dependencies = [
  "arc-swap",
  "assert2",
@@ -2119,7 +2119,7 @@ dependencies = [
 [[package]]
 name = "krabka-units"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=81b2b0b528025180e00c0c0c3946cb4441c1a439#81b2b0b528025180e00c0c0c3946cb4441c1a439"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
 dependencies = [
  "num-traits",
  "serde",
@@ -2130,7 +2130,7 @@ dependencies = [
 [[package]]
 name = "krabka-voters"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=81b2b0b528025180e00c0c0c3946cb4441c1a439#81b2b0b528025180e00c0c0c3946cb4441c1a439"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
 dependencies = [
  "assert2",
  "krabka-ids",
@@ -2185,9 +2185,9 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lz4rip"
-version = "0.11.9"
+version = "0.11.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3759769fd483a5f6aa41e16350340d18af8400e6f77304c2740bfe710d5712de"
+checksum = "37d8ecd80125a8e67ebcaacd9fad5757efa2b6f5b875e1b4ce567814d758a419"
 dependencies = [
  "lz4rip-core",
  "lz4rip-decode",
@@ -5131,18 +5131,18 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.3.0"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+checksum = "ae42c0555055784c70058d19ba8e275528e8a99a706684868ace5da4e716a4ab"
 dependencies = [
  "zstd-sys",
 ]
