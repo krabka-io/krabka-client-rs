@@ -1285,19 +1285,19 @@ mod tests {
     }
 
     impl SaslChannel for RecordingChannel {
-        async fn request(
+        fn request(
             &mut self,
             (api_key, version, _corr_id): (ApiKey, ApiVersion, i32),
             _flexible: bool,
             body: &[u8],
             _policy: SaslPolicy<'_>,
-        ) -> Result<Vec<u8>, OutboundSaslError> {
+        ) -> impl Future<Output = Result<Vec<u8>, OutboundSaslError>> + Send {
             let mut out = BytesMut::new();
             if api_key == ApiKey(API_KEY_SASL_HANDSHAKE) {
                 SaslHandshakeResponse::default()
                     .encode(&mut out, version.0)
                     .unwrap();
-                return Ok(out.to_vec());
+                return std::future::ready(Ok(out.to_vec()));
             }
             let mut cursor = body;
             let request = SaslAuthenticateRequest::decode(&mut cursor, version.0).unwrap();
@@ -1319,15 +1319,19 @@ mod tests {
             }
             .encode(&mut out, version.0)
             .unwrap();
-            Ok(out.to_vec())
+            std::future::ready(Ok(out.to_vec()))
         }
 
-        async fn token(
+        fn token(
             &mut self,
             _token: &[u8],
             _frame_max: ClientFrameMax,
-        ) -> Result<SaslAuthenticateResponse, OutboundSaslError> {
-            unreachable!("the test lists SaslAuthenticate")
+        ) -> impl Future<Output = Result<SaslAuthenticateResponse, OutboundSaslError>> + Send
+        {
+            unreachable!("the test lists SaslAuthenticate");
+            // Names the future type the signature needs; never reached.
+            #[expect(unreachable_code)]
+            std::future::pending()
         }
     }
 

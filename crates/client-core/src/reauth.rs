@@ -128,19 +128,21 @@ impl SaslChannel for ConnectionChannel<'_> {
         Ok(body.to_vec())
     }
 
-    async fn token(
+    fn token(
         &mut self,
         _token: &[u8],
         _frame_max: ClientFrameMax,
-    ) -> Result<
-        krabka_protocol::owned::sasl_authenticate_response::SaslAuthenticateResponse,
-        OutboundSaslError,
-    > {
+    ) -> impl Future<
+        Output = Result<
+            krabka_protocol::owned::sasl_authenticate_response::SaslAuthenticateResponse,
+            OutboundSaslError,
+        >,
+    > + Send {
         // A session lifetime needs `SaslAuthenticate` v1 or later, so a
         // re-authentication never sends a token without a Kafka header.
-        Err(OutboundSaslError::Codec(
+        std::future::ready(Err(OutboundSaslError::Codec(
             "re-authentication needs SaslAuthenticate".to_owned(),
-        ))
+        )))
     }
 }
 

@@ -424,7 +424,7 @@ mod tests {
         },
         records::{Attributes, Record, RecordBatch, RecordsPayload},
     };
-    use krabka_units::{ByteSize, bytes, convert::ByteSizeExt as _, kibibytes, millis};
+    use krabka_units::{ByteSize, bytes, kibibytes, millis};
 
     use super::*;
 

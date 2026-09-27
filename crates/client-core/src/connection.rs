@@ -1340,9 +1340,7 @@ async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, Client
 #[cfg(test)]
 mod tests {
     use assert2::assert;
-    use krabka_units::{
-        ByteSize, bytes, convert::ByteSizeExt as _, kibibytes, mebibytes, micros, millis,
-    };
+    use krabka_units::{ByteSize, bytes, kibibytes, mebibytes, micros, millis};
 
     use super::*;
 
