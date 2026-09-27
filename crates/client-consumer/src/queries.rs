@@ -562,7 +562,8 @@ impl Consumer {
     /// [`ConsumerError::Timeout`] when a retriable error lasts past
     /// `default_api_timeout`, or a request error.
     pub async fn list_topics(&self) -> Result<HashMap<String, Vec<PartitionInfo>>, ConsumerError> {
-        self.topic_metadata(MetadataRequest::default()).await
+        self.topic_metadata(krabka_client_core::all_topics_request())
+            .await
     }
 
     /// Whether the consumer lets a `Metadata` request create a topic.
@@ -1073,6 +1074,69 @@ mod tests {
     /// Kafka's `currentLag` is the end offset of the last fetch minus the
     /// position, empty when one of them is not known, and it throws for an
     /// unassigned partition (`SubscriptionState.partitionLag`).
+    /// Kafka's `listTopics` asks for every topic with a null topic list
+    /// (`MetadataRequest.Builder.allTopics`). `MetadataRequest::default()`
+    /// carries the schema default, an empty list, which asks for none.
+    #[tokio::test]
+    async fn list_topics_asks_for_every_topic() {
+        use bytes::Buf as _;
+        let seen: Arc<std::sync::Mutex<Vec<MetadataRequest>>> = Arc::default();
+        let seen_in_mock = Arc::clone(&seen);
+        let port = Arc::new(AtomicU16::new(0));
+        let port_in_mock = Arc::clone(&port);
+        let broker = MockBroker::start(move |api_key, version, _corr_id, mut body| {
+            if api_key == api_versions_request::API_KEY {
+                let versions = ApiVersionsResponse {
+                    api_keys: [
+                        (api_versions_request::API_KEY, 3),
+                        (metadata_request::API_KEY, 8),
+                    ]
+                    .into_iter()
+                    .map(|(api_key, max_version)| ApiVersion {
+                        api_key,
+                        min_version: 0,
+                        max_version,
+                        ..Default::default()
+                    })
+                    .collect(),
+                    ..Default::default()
+                };
+                return Some(encode(&versions, 0));
+            }
+            if api_key == metadata_request::API_KEY {
+                let client_id_len = usize::try_from(body.get_i16()).expect("client id");
+                body.advance(client_id_len);
+                let request = MetadataRequest::decode(&mut body, version).expect("decode");
+                seen_in_mock.lock().expect("seen lock").push(request);
+                let port = i32::from(port_in_mock.load(Ordering::SeqCst));
+                return Some(encode(&metadata(port, 0), version));
+            }
+            None
+        })
+        .await;
+        port.store(broker.addr.port(), Ordering::SeqCst);
+        let client = Client::builder()
+            .bootstrap(broker.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let consumer = consumer_with_client(client);
+
+        let topics = consumer.list_topics().await.expect("list topics");
+
+        assert2::check!(topics.keys().collect::<Vec<_>>() == vec!["orders"]);
+        let seen = seen.lock().expect("seen lock");
+        assert2::check!(seen.last() == Some(&krabka_client_core::all_topics_request()));
+        assert2::check!(
+            krabka_client_core::all_topics_request()
+                == MetadataRequest {
+                    topics: None,
+                    allow_auto_topic_creation: true,
+                    ..Default::default()
+                }
+        );
+    }
+
     #[tokio::test]
     async fn current_lag_follows_kafkas_partition_lag() {
         let broker = query_broker(Some(|_, _| (0, 0, 0, 0)), 0, 5, SentRequests::default()).await;

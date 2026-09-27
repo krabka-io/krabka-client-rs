@@ -1149,7 +1149,7 @@ mod bootstrap_failover_tests {
             ..Default::default()
         };
         for (name, request) in [
-            ("all topics", MetadataRequest::default()),
+            ("all topics", crate::all_topics_request()),
             ("the topic orders", orders),
         ] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
