@@ -15,7 +15,7 @@ use std::{
 };
 
 use krabka_client_core::{
-    Connection, CoordinatorEndpoint, CoordinatorKeyType, build_find_coordinator,
+    ClientError, Connection, CoordinatorEndpoint, CoordinatorKeyType, build_find_coordinator,
 };
 use krabka_protocol::owned::{
     find_coordinator_request::{self, FindCoordinatorRequest},
@@ -185,9 +185,13 @@ impl AdminClient {
     /// Finds the coordinator of each group of `keys`.
     ///
     /// A broker that supports `FindCoordinator` v4 gets one request for all
-    /// keys, as Kafka's `CoordinatorStrategy.buildRequest` batches them. An
-    /// older broker gets one request for each key, as the strategy does after
-    /// `disableBatch`.
+    /// keys, as Kafka's `CoordinatorStrategy.buildRequest` batches them. The
+    /// batched request is sent with a v4 floor, so a reconnect to an older
+    /// broker cannot send it at v0-v3, which carry only the empty legacy
+    /// `key`. When the broker has no v4, before sending or after such a
+    /// reconnect, every key gets its own request, as the strategy does after
+    /// `disableBatch`. Those requests run concurrently, so a large batch costs
+    /// one round trip rather than one for each group.
     async fn find_group_coordinators(&self, keys: &[String]) -> Vec<(String, CoordinatorLookup)> {
         let batched = self
             .conn
@@ -200,24 +204,29 @@ impl AdminClient {
                 coordinator_keys: keys.to_vec(),
                 ..Default::default()
             };
-            return match self.conn.send(request).await {
-                Ok(response) => coordinator_lookups(keys, response),
-                Err(error) => failed_lookups(keys, &error),
-            };
+            match self
+                .conn
+                .send_at_least(request, MIN_BATCHED_FIND_COORDINATOR_VERSION)
+                .await
+            {
+                Ok(response) => return coordinator_lookups(keys, response),
+                Err(AdminError::Transport(ClientError::IncompatibleVersion { .. })) => {}
+                Err(error) => return failed_lookups(keys, &error),
+            }
         }
-        let mut lookups = Vec::with_capacity(keys.len());
-        for key in keys {
+        let lookups = futures_util::future::join_all(keys.iter().map(|key| async move {
             let single = std::slice::from_ref(key);
             match self
                 .conn
                 .send(build_find_coordinator(key, CoordinatorKeyType::Group))
                 .await
             {
-                Ok(response) => lookups.extend(coordinator_lookups(single, response)),
-                Err(error) => lookups.extend(failed_lookups(single, &error)),
+                Ok(response) => coordinator_lookups(single, response),
+                Err(error) => failed_lookups(single, &error),
             }
-        }
-        lookups
+        }))
+        .await;
+        lookups.into_iter().flatten().collect()
     }
 
     /// Opens a new connection to `coordinator`.

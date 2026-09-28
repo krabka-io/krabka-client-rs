@@ -237,6 +237,87 @@ mod tests {
         }
     }
 
+    /// A broker at `FindCoordinator` v4 or later gets one lookup for every
+    /// group, and a broker below v4 gets one lookup for each group, sent all at
+    /// once. Each row compares the version and keys of every lookup, sorted
+    /// because concurrent lookups arrive in any order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_lookups_batch_from_find_coordinator_v4_and_fan_out_below() {
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for (name, find_coordinator_max, expected) in [
+            ("v6 broker batches", 6, vec![(4, names(&["a", "b", "c"]))]),
+            ("v4 broker batches", 4, vec![(4, names(&["a", "b", "c"]))]),
+            (
+                "v3 broker looks up each group",
+                3,
+                vec![(3, names(&["a"])), (3, names(&["b"])), (3, names(&["c"]))],
+            ),
+        ] {
+            let cluster = group_cluster(
+                1,
+                vec![
+                    (delete_groups_request::API_KEY, 0, 2),
+                    (
+                        krabka_protocol::owned::find_coordinator_request::API_KEY,
+                        0,
+                        find_coordinator_max,
+                    ),
+                ],
+                |_, _| Lookup::At(0),
+                |_, api_key, version, body, _| {
+                    if api_key != delete_groups_request::API_KEY {
+                        return MockReply::Silent;
+                    }
+                    let request: DeleteGroupsRequest = decode_request(body, version, version >= 2);
+                    MockReply::Respond(encode_response(
+                        &DeleteGroupsResponse {
+                            results: request
+                                .groups_names
+                                .into_iter()
+                                .map(|group_id| DeletableGroupResult {
+                                    group_id,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                        version,
+                        version >= 2,
+                    ))
+                },
+            )
+            .await;
+            let admin = cluster.admin(krabka_units::secs(5)).await;
+
+            let result = admin.delete_consumer_groups(&["a", "b", "c"]).await;
+
+            let mut lookups = cluster
+                .stop()
+                .find_coordinator
+                .into_iter()
+                .map(|(version, keys)| (version.min(4), keys))
+                .collect::<Vec<_>>();
+            lookups.sort();
+            assert!(
+                (result, lookups)
+                    == (
+                        BTreeMap::from([
+                            ("a".to_owned(), Ok(())),
+                            ("b".to_owned(), Ok(())),
+                            ("c".to_owned(), Ok(())),
+                        ]),
+                        expected,
+                    ),
+                "case {name}"
+            );
+        }
+    }
+
     /// A broker below `FindCoordinator` v4 cannot look up many keys at once,
     /// so each group gets its own lookup, as Kafka's `CoordinatorStrategy`
     /// does after `disableBatch`. The groups of one coordinator still share
