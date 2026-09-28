@@ -164,6 +164,8 @@ pub const DEFAULT_PRODUCER_DELIVERY_TIMEOUT: Duration = Duration::from_mins(2);
 ///
 /// The same timeout limits the retries of a transaction coordinator request:
 /// `AddPartitionsToTxn`, and an `EndTxn` whose outcome a transport failure hid.
+/// It also limits the `FindCoordinator` retries of each of them, and bounds the
+/// lookup and `InitProducerId` of `init_transactions` together.
 pub const DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default upper bound of the exponential retry backoff. Kafka's
 /// `retry.backoff.max.ms` default is 1000.

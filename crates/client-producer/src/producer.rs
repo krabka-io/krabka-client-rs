@@ -14,7 +14,8 @@ use bytes::BufMut;
 use dashmap::DashMap;
 use krabka_client_consumer::ConsumerGroupMetadata;
 use krabka_client_core::{
-    Client, ClientError, ClientFrameMax, ConnectionDispatchQueueCapacity, security::ClientSecurity,
+    Client, ClientError, ClientFrameMax, ConnectionDispatchQueueCapacity, CoordinatorKeyType,
+    build_find_coordinator, security::ClientSecurity,
 };
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
@@ -24,7 +25,7 @@ use krabka_protocol::{
         add_partitions_to_txn_response::AddPartitionsToTxnResponse,
         common::add_partitions_to_txn_request::add_partitions_to_txn_topic::AddPartitionsToTxnTopic,
         end_txn_request::EndTxnRequest,
-        find_coordinator_request::FindCoordinatorRequest,
+        find_coordinator_response::FindCoordinatorResponse,
         init_producer_id_request::InitProducerIdRequest,
         init_producer_id_response::InitProducerIdResponse,
         metadata_response::MetadataResponse,
@@ -63,7 +64,8 @@ use crate::{
         TxnErrorSlot, TxnState,
     },
     txn_retry::{
-        self, AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision, TxnRequestDecision,
+        self, AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision, FindCoordinatorDecision,
+        LookupRefusal, TxnRequestDecision,
     },
 };
 
@@ -265,6 +267,58 @@ impl CoordinatorRetry {
         self.backoff = self.backoff.saturating_mul(2).min(self.max_backoff);
         tokio::time::Instant::now() < self.deadline
     }
+}
+
+/// Why a `FindCoordinator` lookup gave no coordinator.
+#[derive(Debug, thiserror::Error)]
+enum LookupError {
+    /// The broker refused the lookup.
+    #[error("the broker refused the coordinator lookup: {0:?}")]
+    Refused(LookupRefusal),
+    /// The retry deadline ended, or the request cannot be sent. It carries
+    /// the last error: the retriable code, or the transport failure.
+    #[error("the coordinator lookup did not resolve: {0}")]
+    Unresolved(ProducerError),
+}
+
+impl From<ProducerError> for LookupError {
+    fn from(error: ProducerError) -> Self {
+        Self::Unresolved(error)
+    }
+}
+
+/// The error code and the `host:port` address of a `FindCoordinator` answer.
+///
+/// Kafka's `FindCoordinatorHandler` reads the first row of `coordinators`,
+/// which versions 4 and later return. `FindCoordinatorResponse.coordinators`
+/// builds the same row from the top-level fields of versions 0 to 3.
+fn coordinator_answer(response: &FindCoordinatorResponse) -> (i16, String) {
+    response.coordinators.first().map_or_else(
+        || {
+            (
+                response.error_code,
+                format!("{}:{}", response.host, response.port),
+            )
+        },
+        |row| (row.error_code, format!("{}:{}", row.host, row.port)),
+    )
+}
+
+/// Whether a `FindCoordinator` lookup that failed in transport can succeed
+/// later. Kafka's `NetworkClient` reports a failed connection and a closed
+/// connection as a disconnect, and `TxnRequestHandler.onComplete` sends the
+/// lookup again. An authentication failure, a version mismatch and a codec
+/// error repeat on every attempt.
+fn lookup_may_succeed_later(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Disconnected
+            | ClientError::Timeout(_)
+            | ClientError::Io(_)
+            | ClientError::Connect { .. }
+            | ClientError::Tls { .. }
+            | ClientError::Sasl { .. }
+    )
 }
 
 /// Whether a request can have reached the broker, so the producer can send it
@@ -611,9 +665,17 @@ impl Producer {
                 return Err(last_error);
             }
             if rediscover {
-                coordinator = self
-                    .rediscovered_txn_coordinator(transactional_id, coordinator)
-                    .await;
+                coordinator = match self
+                    .rediscovered_txn_coordinator(transactional_id, coordinator, retry.deadline)
+                    .await
+                {
+                    Ok(coordinator) => coordinator,
+                    // The caller holds `txn_state` and moves it.
+                    Err(LookupRefusal::Abortable(code)) => return Err(self.abortable_error(code)),
+                    Err(LookupRefusal::Fatal(code)) => {
+                        return Err(self.fatal_error(FatalError::Server(code)));
+                    }
+                };
             }
         }
     }
@@ -1109,11 +1171,21 @@ impl Producer {
             backoff = backoff.saturating_mul(2).min(max_backoff);
             if rediscover {
                 match self
-                    .reconnect_txn_coordinator(&request.transactional_id)
+                    .reconnect_txn_coordinator(&request.transactional_id, deadline)
                     .await
                 {
                     Ok(fresh) => coordinator = fresh,
-                    Err(error) => {
+                    Err(LookupError::Refused(refusal)) => {
+                        let decision = txn_retry::decide_end_txn_after_refused_lookup(
+                            refusal,
+                            earlier_attempt_lost,
+                            committed,
+                        );
+                        if !matches!(decision, EndTxnDecision::Retry { .. }) {
+                            return Ok((decision, None));
+                        }
+                    }
+                    Err(LookupError::Unresolved(error)) => {
                         tracing::warn!(%error, "transaction coordinator lookup failed; retrying");
                         // The next send on the old client fails fast and
                         // leads here again.
@@ -1124,17 +1196,14 @@ impl Producer {
         }
     }
 
-    /// Find the transaction coordinator again and cache a new connection to it.
-    async fn reconnect_txn_coordinator(&self, tid: &str) -> Result<Client, ProducerError> {
-        let address = match self.find_txn_coordinator(tid).await {
-            Ok(address) => address,
-            Err(error @ ProducerError::Client(_)) => {
-                // The bootstrap connection can also be closed by the restart.
-                self.client.reconnect_bootstrap().await;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
+    /// Find the transaction coordinator again, until `deadline`, and cache a
+    /// new connection to it.
+    async fn reconnect_txn_coordinator(
+        &self,
+        tid: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Client, LookupError> {
+        let address = self.find_txn_coordinator(tid, deadline).await?;
         let coordinator = self.connect_txn_coordinator(address).await?;
         *self.txn_coord_client.lock().await = Some(coordinator.clone());
         Ok(coordinator)
@@ -1160,6 +1229,13 @@ impl Producer {
     /// dedicated connection to it, and calls `InitProducerId` to get a fenced
     /// `(producer_id, producer_epoch)` pair.
     ///
+    /// Like Kafka's `initTransactions`, it blocks while the coordinator is not
+    /// ready. A lookup that answers a retriable code, such as
+    /// `COORDINATOR_NOT_AVAILABLE` from a broker that is still creating
+    /// `__transaction_state`, or that fails in transport, goes out again. The
+    /// producer-ID initialization retry timeout bounds the lookup and
+    /// `InitProducerId` together.
+    ///
     /// # Errors
     ///
     /// - [`ProducerError::NotTransactional`] — `transactional_id` was not set.
@@ -1169,14 +1245,19 @@ impl Producer {
     ///   `INVALID_PRODUCER_EPOCH (47)` or `PRODUCER_FENCED (90)`, now or in an
     ///   earlier transactional operation.
     /// - [`ProducerError::FatalTransactionError`] — the coordinator answered
-    ///   with a fatal code, now or in an earlier transactional operation.
-    ///   Kafka's `initTransactions` does not clear a fatal error either: close
-    ///   the producer.
+    ///   with a fatal code, now or in an earlier transactional operation. A
+    ///   `FindCoordinator` answer of `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`,
+    ///   or of a code that Kafka's `FindCoordinatorHandler` does not expect, is
+    ///   fatal. Kafka's `initTransactions` does not clear a fatal error either:
+    ///   close the producer.
     /// - [`ProducerError::Server`] — an abortable code
-    ///   (`TRANSACTIONAL_ID_AUTHORIZATION_FAILED`,
-    ///   `CLUSTER_AUTHORIZATION_FAILED`, `TRANSACTION_ABORTABLE`), or a
-    ///   retriable code at the retry deadline. The call can be made again.
-    /// - [`ProducerError::Client`] — transport-level failure.
+    ///   (`TRANSACTIONAL_ID_AUTHORIZATION_FAILED` or
+    ///   `CLUSTER_AUTHORIZATION_FAILED` from `InitProducerId`, or
+    ///   `TRANSACTION_ABORTABLE`), or a retriable code at the retry deadline.
+    ///   The call can be made again.
+    /// - [`ProducerError::Client`] — transport-level failure, at once when it
+    ///   repeats on every attempt, such as a failed authentication, or at the
+    ///   retry deadline.
     #[tracing::instrument(
         level = "info",
         skip_all,
@@ -1249,8 +1330,14 @@ impl Producer {
             previous_state
         };
 
+        // Kafka's `initTransactions` waits for the lookup and `InitProducerId`
+        // together, within one `max.block.ms`.
+        let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
         let initialized = async {
-            let coord_addr = self.find_txn_coordinator(tid).await?;
+            let coord_addr = match self.find_txn_coordinator(tid, deadline).await {
+                Ok(address) => address,
+                Err(error) => return Err(self.init_lookup_error(error).await),
+            };
             tracing::Span::current().record("coordinator", coord_addr.as_str());
 
             let coord = self.connect_txn_coordinator(coord_addr).await?;
@@ -1265,6 +1352,7 @@ impl Producer {
                     ..Default::default()
                 },
                 coord,
+                deadline,
             )
             .await
         }
@@ -1272,7 +1360,10 @@ impl Producer {
         let (coord, resp) = match initialized {
             Ok(initialized) => initialized,
             Err(error) => {
-                *self.txn_state.lock().await = previous_state;
+                // A fatal lookup answer has moved the state already.
+                if self.fatal_error_state().is_none() {
+                    *self.txn_state.lock().await = previous_state;
+                }
                 return Err(error);
             }
         };
@@ -1339,15 +1430,17 @@ impl Producer {
     /// The retries follow Kafka's `InitProducerIdHandler`. A transport loss,
     /// `COORDINATOR_NOT_AVAILABLE` and `NOT_COORDINATOR` find the coordinator
     /// again. Every other retriable code sends the request again on the same
-    /// connection. The caller reads the error code of the answer.
+    /// connection. The caller reads the error code of the answer. `deadline`
+    /// bounds the retries and the lookups.
     async fn init_producer_id_on_coordinator(
         &self,
         transactional_id: &str,
         request: &InitProducerIdRequest,
         coordinator: Client,
+        deadline: tokio::time::Instant,
     ) -> Result<(Client, InitProducerIdResponse), ProducerError> {
         let mut coordinator = coordinator;
-        let mut retry = self.coordinator_retry();
+        let mut retry = self.coordinator_retry_until(deadline);
         loop {
             let (attempt, last_outcome) = match send_init_producer_id(&coordinator, request).await {
                 Ok(response) => (
@@ -1370,48 +1463,116 @@ impl Producer {
                     .map_err(ProducerError::Client);
             }
             if rediscover {
-                coordinator = self
-                    .rediscovered_txn_coordinator(transactional_id, coordinator)
-                    .await;
+                coordinator = match self
+                    .rediscovered_txn_coordinator(transactional_id, coordinator, deadline)
+                    .await
+                {
+                    Ok(coordinator) => coordinator,
+                    Err(refusal) => {
+                        return Err(self.init_lookup_error(LookupError::Refused(refusal)).await);
+                    }
+                };
             }
         }
     }
 
-    /// Discover the transaction coordinator for `tid` with `FindCoordinator`.
-    ///
-    /// It handles both the legacy top-level response, versions 0–3, and the
-    /// `coordinators` array that version 4 introduced.
+    /// Discover the transaction coordinator for `tid` with `FindCoordinator`,
+    /// and retry until `deadline`. See [`Self::find_coordinator`].
     #[tracing::instrument(level = "debug", skip_all, fields(transactional_id = %tid), err)]
-    async fn find_txn_coordinator(&self, tid: &str) -> Result<String, ProducerError> {
-        self.find_coordinator(tid, 1).await
+    async fn find_txn_coordinator(
+        &self,
+        tid: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, LookupError> {
+        self.find_coordinator(tid, CoordinatorKeyType::Transaction, deadline)
+            .await
     }
 
-    async fn find_coordinator(&self, key: &str, key_type: i8) -> Result<String, ProducerError> {
-        let resp = self
-            .client
-            .send(FindCoordinatorRequest {
-                // v0-3: the `key` field carries the lookup key
-                key: key.to_owned(),
-                key_type,
-                // v4+: repeated coordinator_keys list
-                coordinator_keys: vec![key.to_owned()],
-                ..Default::default()
-            })
-            .await?;
-
-        // v4+ returns a `coordinators` array; prefer it when present.
-        if let Some(coord) = resp.coordinators.first() {
-            if coord.error_code != 0 {
-                return Err(ProducerError::Server(coord.error_code));
+    /// Send `FindCoordinator` for `key` until the broker names the
+    /// coordinator, or until `deadline`, and give the `host:port` address.
+    ///
+    /// The retries follow Kafka's `FindCoordinatorHandler`: a disconnect and
+    /// every retriable code, such as `COORDINATOR_LOAD_IN_PROGRESS` and
+    /// `COORDINATOR_NOT_AVAILABLE` from a broker that is still creating
+    /// `__transaction_state`, send the lookup again after a backoff. The
+    /// request handles both the legacy top-level response, versions 0 to 3,
+    /// and the `coordinators` array that version 4 introduced.
+    async fn find_coordinator(
+        &self,
+        key: &str,
+        key_type: CoordinatorKeyType,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, LookupError> {
+        let mut retry = self.coordinator_retry_until(deadline);
+        loop {
+            let (attempt, address, last_error) = match self
+                .client
+                .send(build_find_coordinator(key, key_type))
+                .await
+            {
+                Ok(response) => {
+                    let (code, address) = coordinator_answer(&response);
+                    (
+                        CoordinatorAttempt::Answered(code),
+                        address,
+                        ProducerError::Server(code),
+                    )
+                }
+                Err(error) if lookup_may_succeed_later(&error) => (
+                    CoordinatorAttempt::Lost,
+                    String::new(),
+                    ProducerError::Client(error),
+                ),
+                Err(error) => {
+                    return Err(LookupError::Unresolved(ProducerError::Client(error)));
+                }
+            };
+            match txn_retry::decide_find_coordinator(attempt) {
+                FindCoordinatorDecision::Found => return Ok(address),
+                FindCoordinatorDecision::Retry => {}
+                FindCoordinatorDecision::Refused(refusal) => {
+                    tracing::warn!(
+                        ?key_type,
+                        key,
+                        ?refusal,
+                        "could not find a coordinator; the broker refused the lookup"
+                    );
+                    return Err(LookupError::Refused(refusal));
+                }
             }
-            return Ok(format!("{}:{}", coord.host, coord.port));
+            if attempt == CoordinatorAttempt::Lost {
+                // The same failure can have closed the bootstrap connection.
+                self.client.reconnect_bootstrap().await;
+            }
+            if !retry.wait().await {
+                return Err(LookupError::Unresolved(last_error));
+            }
         }
+    }
 
-        // Fallback: legacy top-level host/port (versions 0–3).
-        if resp.error_code != 0 {
-            return Err(ProducerError::Server(resp.error_code));
+    /// Give the error of a refused lookup inside a transaction, and move the
+    /// transaction as Kafka's `FindCoordinatorHandler` does: `abortableError`
+    /// or `fatalError`.
+    ///
+    /// The caller must not hold `txn_state`.
+    async fn refused_lookup(&self, refusal: LookupRefusal) -> ProducerError {
+        match refusal {
+            LookupRefusal::Abortable(code) => self.abortable_error(code),
+            LookupRefusal::Fatal(code) => self.fatal_transaction(code).await,
         }
-        Ok(format!("{}:{}", resp.host, resp.port))
+    }
+
+    /// Give the error of a lookup that ended `init_transactions`.
+    ///
+    /// A fatal code moves the producer to the fatal error state. An abortable
+    /// code leaves the producer as it was, as an abortable `InitProducerId`
+    /// answer does, so the call can be made again.
+    async fn init_lookup_error(&self, error: LookupError) -> ProducerError {
+        match error {
+            LookupError::Refused(LookupRefusal::Fatal(code)) => self.fatal_transaction(code).await,
+            LookupError::Refused(LookupRefusal::Abortable(code)) => ProducerError::Server(code),
+            LookupError::Unresolved(error) => error,
+        }
     }
 
     /// Enroll a consumer group's offsets in the current transaction, and fence
@@ -1592,9 +1753,13 @@ impl Producer {
                 return Err(last_error);
             }
             if rediscover {
-                coordinator = self
-                    .rediscovered_txn_coordinator(transactional_id, coordinator)
-                    .await;
+                coordinator = match self
+                    .rediscovered_txn_coordinator(transactional_id, coordinator, retry.deadline)
+                    .await
+                {
+                    Ok(coordinator) => coordinator,
+                    Err(refusal) => return Err(self.refused_lookup(refusal).await),
+                };
             }
         }
     }
@@ -1634,8 +1799,15 @@ impl Producer {
             topics,
             ..Default::default()
         };
-        let mut group_client = self.connect_group_coordinator(&group_meta.group_id).await?;
         let mut retry = self.coordinator_retry();
+        let mut group_client = match self
+            .connect_group_coordinator(&group_meta.group_id, retry.deadline)
+            .await
+        {
+            Ok(client) => client,
+            Err(LookupError::Refused(refusal)) => return Err(self.refused_lookup(refusal).await),
+            Err(LookupError::Unresolved(error)) => return Err(error),
+        };
         loop {
             let (attempt, last_error) = match cap.send(&group_client, request.clone()).await {
                 Ok(response) => {
@@ -1661,9 +1833,15 @@ impl Producer {
                 return Err(last_error);
             }
             if rediscover {
-                match self.connect_group_coordinator(&group_meta.group_id).await {
+                match self
+                    .connect_group_coordinator(&group_meta.group_id, retry.deadline)
+                    .await
+                {
                     Ok(fresh) => group_client = fresh,
-                    Err(error) => {
+                    Err(LookupError::Refused(refusal)) => {
+                        return Err(self.refused_lookup(refusal).await);
+                    }
+                    Err(LookupError::Unresolved(error)) => {
                         tracing::warn!(%error, "group coordinator lookup failed; retrying");
                         // `FindCoordinator` goes out on the bootstrap
                         // connection, which the same restart can have closed.
@@ -1674,30 +1852,40 @@ impl Producer {
         }
     }
 
-    /// Connect to the group coordinator of `group_id`.
-    async fn connect_group_coordinator(&self, group_id: &str) -> Result<Client, ProducerError> {
-        let group_addr = self.find_group_coordinator(group_id).await?;
-        Ok(Client::builder()
+    /// Find the group coordinator of `group_id`, until `deadline`, and
+    /// connect to it.
+    async fn connect_group_coordinator(
+        &self,
+        group_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Client, LookupError> {
+        let group_addr = self.find_group_coordinator(group_id, deadline).await?;
+        Client::builder()
             .bootstrap(group_addr)
             .client_id(self.client_id.clone())
             .maybe_security(self.security.clone())
             .dispatch_queue_capacity(self.dispatch_queue_capacity.get())
             .frame_max(self.frame_max.size())
             .build()
-            .await?)
+            .await
+            .map_err(|error| LookupError::Unresolved(error.into()))
     }
 
     /// Discover the group coordinator for `group_id` with `FindCoordinator`
-    /// and `key_type = 0`, which is GROUP.
+    /// and `key_type = 0`, which is GROUP, and retry until `deadline`.
     ///
-    /// This mirrors [`find_txn_coordinator`], but it uses `key_type = 0` and
-    /// looks up the group coordinator rather than the transaction
-    /// coordinator.
+    /// This mirrors [`find_txn_coordinator`], but it looks up the group
+    /// coordinator rather than the transaction coordinator.
     ///
     /// [`find_txn_coordinator`]: Self::find_txn_coordinator
     #[tracing::instrument(level = "debug", skip_all, fields(group_id = %group_id), err)]
-    async fn find_group_coordinator(&self, group_id: &str) -> Result<String, ProducerError> {
-        self.find_coordinator(group_id, 0).await
+    async fn find_group_coordinator(
+        &self,
+        group_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, LookupError> {
+        self.find_coordinator(group_id, CoordinatorKeyType::Group, deadline)
+            .await
     }
 
     // ── Internal lifecycle ───────────────────────────────────────────────────
@@ -1705,27 +1893,39 @@ impl Producer {
     /// The retry limits of a coordinator request. The producer-ID
     /// initialization retry timeout limits every such loop.
     fn coordinator_retry(&self) -> CoordinatorRetry {
+        self.coordinator_retry_until(tokio::time::Instant::now() + self.init_retry_timeout.to_std())
+    }
+
+    /// The retry limits of a coordinator request that ends at `deadline`,
+    /// which the operation that sends it set.
+    fn coordinator_retry_until(&self, deadline: tokio::time::Instant) -> CoordinatorRetry {
         CoordinatorRetry {
-            deadline: tokio::time::Instant::now() + self.init_retry_timeout.to_std(),
+            deadline,
             backoff: self.init_retry_backoff.to_std(),
             max_backoff: self.retry_backoff_max.to_std(),
         }
     }
 
-    /// Find the transaction coordinator again and connect to it. It gives
-    /// `current` back when the lookup fails, after it reconnects the bootstrap
-    /// connection.
+    /// Find the transaction coordinator again, until `deadline`, and connect
+    /// to it. It gives `current` back when the lookup does not resolve, after
+    /// it reconnects the bootstrap connection, and it gives the refusal when
+    /// the broker refuses the lookup.
     async fn rediscovered_txn_coordinator(
         &self,
         transactional_id: &str,
         current: Client,
-    ) -> Client {
-        match self.reconnect_txn_coordinator(transactional_id).await {
-            Ok(fresh) => fresh,
-            Err(error) => {
+        deadline: tokio::time::Instant,
+    ) -> Result<Client, LookupRefusal> {
+        match self
+            .reconnect_txn_coordinator(transactional_id, deadline)
+            .await
+        {
+            Ok(fresh) => Ok(fresh),
+            Err(LookupError::Refused(refusal)) => Err(refusal),
+            Err(LookupError::Unresolved(error)) => {
                 tracing::warn!(%error, "transaction coordinator lookup failed; retrying");
                 current.reconnect_bootstrap().await;
-                current
+                Ok(current)
             }
         }
     }
@@ -2852,9 +3052,10 @@ mod tests {
     }
 
     async fn find_coordinator(producer: &Producer, kind: LookupKind, key: &str) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         match kind {
-            LookupKind::Group => producer.find_group_coordinator(key).await,
-            LookupKind::Transaction => producer.find_txn_coordinator(key).await,
+            LookupKind::Group => producer.find_group_coordinator(key, deadline).await,
+            LookupKind::Transaction => producer.find_txn_coordinator(key, deadline).await,
         }
         .expect("coordinator is returned")
     }
