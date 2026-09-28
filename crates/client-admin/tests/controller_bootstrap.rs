@@ -23,7 +23,8 @@ use std::{
 use assert2::assert;
 use bytes::BytesMut;
 use krabka_client_admin::{
-    AdminClient, AdminError, CreateTopicSpec, TopicConfigOverrides, TopicMutationOptions,
+    AdminClient, AdminError, Config, ConfigEntry, ConfigResource, ConfigSource, ConfigType,
+    CreateTopicSpec, DescribeConfigsOptions, DescribeConfigsResults, TopicMutationOptions,
 };
 use krabka_client_core::MockBroker;
 use krabka_protocol::{
@@ -186,11 +187,33 @@ impl ControllerListener {
     }
 }
 
-fn expected_configs() -> Vec<TopicConfigOverrides> {
-    vec![TopicConfigOverrides {
-        topic: TOPIC.into(),
-        overrides: BTreeMap::from([("retention.ms".into(), "60000".into())]),
-    }]
+fn expected_configs() -> DescribeConfigsResults {
+    let retention = ConfigEntry {
+        name: "retention.ms".into(),
+        value: Some("60000".into()),
+        source: ConfigSource::DynamicTopicConfig,
+        is_sensitive: false,
+        is_read_only: false,
+        synonyms: Vec::new(),
+        config_type: ConfigType::Unknown,
+        documentation: Some(String::new()),
+    };
+    BTreeMap::from([(
+        ConfigResource::topic(TOPIC),
+        Ok(Config {
+            entries: BTreeMap::from([(retention.name.clone(), retention)]),
+        }),
+    )])
+}
+
+async fn describe_topic(admin: &AdminClient) -> DescribeConfigsResults {
+    admin
+        .describe_configs(
+            &[ConfigResource::topic(TOPIC)],
+            DescribeConfigsOptions::default(),
+        )
+        .await
+        .unwrap()
 }
 
 /// Asserts a local 115 rejection and returns its message.
@@ -291,7 +314,7 @@ async fn controller_connection_stays_usable_after_rejection() {
     let mut admin = AdminClient::connect_controller(&[controller.mock.addr.to_string()])
         .await
         .unwrap();
-    assert!(admin.describe_configs(&[TOPIC]).await.unwrap() == expected_configs());
+    assert!(describe_topic(&admin).await == expected_configs());
 
     unsupported_endpoint_message(
         admin
@@ -313,7 +336,7 @@ async fn controller_connection_stays_usable_after_rejection() {
     );
     let before = controller.received();
 
-    assert!(admin.describe_configs(&[TOPIC]).await.unwrap() == expected_configs());
+    assert!(describe_topic(&admin).await == expected_configs());
     // The same connection answers: no new ApiVersions or DescribeCluster.
     assert!(controller.received()[before.len()..] == [describe_configs_request::API_KEY]);
     controller.mock.stop();

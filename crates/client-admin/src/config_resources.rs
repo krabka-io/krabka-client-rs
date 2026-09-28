@@ -62,7 +62,7 @@ impl ConfigResourceType {
 
 /// One config resource, as Kafka's `ConfigResource`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ConfigResourceListing {
+pub struct ConfigResource {
     /// The type of the resource.
     pub resource_type: ConfigResourceType,
     /// The name of the resource.
@@ -85,9 +85,7 @@ fn list_request(types: &BTreeSet<ConfigResourceType>) -> ListConfigResourcesRequ
 
 /// The resources of an answer, as Kafka's `ListConfigResourcesResponse`
 /// reads it. A top-level error fails the call.
-fn listings(
-    response: ListConfigResourcesResponse,
-) -> Result<Vec<ConfigResourceListing>, AdminError> {
+fn listings(response: ListConfigResourcesResponse) -> Result<Vec<ConfigResource>, AdminError> {
     if response.error_code != 0 {
         return Err(AdminError::Broker {
             api: "ListConfigResources",
@@ -99,7 +97,7 @@ fn listings(
     Ok(response
         .config_resources
         .into_iter()
-        .map(|resource| ConfigResourceListing {
+        .map(|resource| ConfigResource {
             resource_type: ConfigResourceType::from_id(resource.resource_type),
             name: resource.resource_name,
         })
@@ -125,7 +123,7 @@ impl AdminClient {
     pub async fn list_config_resources(
         &self,
         types: &BTreeSet<ConfigResourceType>,
-    ) -> Result<Vec<ConfigResourceListing>, AdminError> {
+    ) -> Result<Vec<ConfigResource>, AdminError> {
         let request = list_request(types);
         let retry = ControllerRetry::new("ListConfigResources", self.retry);
         let response = if fits_v0(types) {
@@ -161,7 +159,8 @@ mod tests {
 
     use krabka_client_core::{ClientError, MockReply};
     use krabka_protocol::owned::{
-        list_config_resources_request, list_config_resources_response::ConfigResource,
+        list_config_resources_request,
+        list_config_resources_response::ConfigResource as ListedResource,
     };
 
     use super::*;
@@ -186,8 +185,8 @@ mod tests {
         }
     }
 
-    fn resource(resource_type: i8, name: &str) -> ConfigResource {
-        ConfigResource {
+    fn resource(resource_type: i8, name: &str) -> ListedResource {
+        ListedResource {
             resource_name: name.to_owned(),
             resource_type,
             ..Default::default()
@@ -204,7 +203,7 @@ mod tests {
     async fn run<T, F>(
         max_version: i16,
         answers: Vec<Option<i16>>,
-        resources: Vec<ConfigResource>,
+        resources: Vec<ListedResource>,
         call: F,
     ) -> Outcome<T>
     where
@@ -264,15 +263,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_config_resources_maps_types_and_gates_v0() {
         let listed = vec![
-            ConfigResourceListing {
+            ConfigResource {
                 resource_type: ConfigResourceType::Topic,
                 name: "orders".to_owned(),
             },
-            ConfigResourceListing {
+            ConfigResource {
                 resource_type: ConfigResourceType::Group,
                 name: "billing".to_owned(),
             },
-            ConfigResourceListing {
+            ConfigResource {
                 resource_type: ConfigResourceType::Unknown,
                 name: "future".to_owned(),
             },

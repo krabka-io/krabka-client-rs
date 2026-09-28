@@ -70,8 +70,12 @@ pub use config::{
     DEFAULT_RETRY_BACKOFF_MAX, DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT,
     DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
 };
-pub use config_resources::{ConfigResourceListing, ConfigResourceType};
-pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
+pub use config_resources::{ConfigResource, ConfigResourceType};
+pub use configs::{
+    AlterConfigOp, AlterConfigOpType, AlterConfigsResults, Config, ConfigEntry, ConfigSource,
+    ConfigSynonym, ConfigType, DescribeConfigsOptions, DescribeConfigsResults,
+    IncrementalAlterConfigsOptions,
+};
 pub use consumer_group_listings::{
     ConsumerGroupListing, ListConsumerGroupsOptions, ListConsumerGroupsResult,
 };
@@ -225,12 +229,14 @@ pub trait AdminClientLike: Send {
     ) -> Result<Vec<DeleteRecordsOutcome>, AdminError>;
     async fn describe_configs(
         &mut self,
-        topics: &[&str],
-    ) -> Result<Vec<TopicConfigOverrides>, AdminError>;
+        resources: &[ConfigResource],
+        options: DescribeConfigsOptions,
+    ) -> Result<DescribeConfigsResults, AdminError>;
     async fn incremental_alter_configs(
         &mut self,
-        ops: &[IncrementalAlterOp],
-    ) -> Result<Vec<AlterConfigsOutcome>, AdminError>;
+        configs: &BTreeMap<ConfigResource, Vec<AlterConfigOp>>,
+        options: IncrementalAlterConfigsOptions,
+    ) -> Result<AlterConfigsResults, AdminError>;
     async fn alter_user_scram_credentials_sha512(
         &mut self,
         upsertions: &[ScramUpsertion],
@@ -378,15 +384,17 @@ impl AdminClientLike for AdminClient {
     }
     async fn describe_configs(
         &mut self,
-        topics: &[&str],
-    ) -> Result<Vec<TopicConfigOverrides>, AdminError> {
-        AdminClient::describe_configs(self, topics).await
+        resources: &[ConfigResource],
+        options: DescribeConfigsOptions,
+    ) -> Result<DescribeConfigsResults, AdminError> {
+        AdminClient::describe_configs(self, resources, options).await
     }
     async fn incremental_alter_configs(
         &mut self,
-        ops: &[IncrementalAlterOp],
-    ) -> Result<Vec<AlterConfigsOutcome>, AdminError> {
-        AdminClient::incremental_alter_configs(self, ops).await
+        configs: &BTreeMap<ConfigResource, Vec<AlterConfigOp>>,
+        options: IncrementalAlterConfigsOptions,
+    ) -> Result<AlterConfigsResults, AdminError> {
+        AdminClient::incremental_alter_configs(self, configs, options).await
     }
     async fn alter_user_scram_credentials_sha512(
         &mut self,
