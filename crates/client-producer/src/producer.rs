@@ -2,7 +2,7 @@
 //! sender task lives in `sender.rs`.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize, Ordering},
@@ -1526,12 +1526,12 @@ impl Producer {
         &self,
         offsets: &[((String, i32), i64)],
     ) -> Result<HashMap<String, Uuid>, ProducerError> {
-        let mut topics: Vec<String> = Vec::new();
-        for ((topic, _), _) in offsets {
-            if !topics.contains(topic) {
-                topics.push(topic.clone());
-            }
-        }
+        let mut seen = HashSet::new();
+        let topics: Vec<String> = offsets
+            .iter()
+            .filter(|((topic, _), _)| seen.insert(topic.as_str()))
+            .map(|((topic, _), _)| topic.clone())
+            .collect();
         // Kafka's `awaitTopicMetadata` calls `ProducerMetadata.add` for the
         // topics, so the periodic and error refreshes name them.
         for topic in &topics {
@@ -2544,20 +2544,25 @@ fn build_topics_payload(
     topic_ids: &HashMap<String, Uuid>,
 ) -> Vec<TxnOffsetCommitRequestTopic> {
     let mut topics: Vec<TxnOffsetCommitRequestTopic> = Vec::new();
+    // Topic name to its index in `topics`, so grouping keeps first-seen order
+    // without a linear search per offset.
+    let mut index: HashMap<&str, usize> = HashMap::new();
     for ((topic, partition), offset) in offsets {
         let partition = TxnOffsetCommitRequestPartition {
             partition_index: *partition,
             committed_offset: *offset,
             ..Default::default()
         };
-        match topics.iter_mut().find(|entry| entry.name == *topic) {
-            Some(entry) => entry.partitions.push(partition),
-            None => topics.push(TxnOffsetCommitRequestTopic {
+        if let Some(&at) = index.get(topic.as_str()) {
+            topics[at].partitions.push(partition);
+        } else {
+            index.insert(topic.as_str(), topics.len());
+            topics.push(TxnOffsetCommitRequestTopic {
                 name: topic.clone(),
                 topic_id: topic_ids.get(topic).copied().unwrap_or(Uuid::ZERO),
                 partitions: vec![partition],
                 ..Default::default()
-            }),
+            });
         }
     }
     topics

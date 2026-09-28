@@ -415,6 +415,9 @@ impl MetadataWait<'_> {
             let mut seen = first_seen;
             let mut backoff = self.retry_backoff;
             loop {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(timeout());
+                }
                 let Some(attempt) = before(
                     deadline,
                     self.refresh.newer_than(&mut seen, topic, &mut refresh),
@@ -425,8 +428,10 @@ impl MetadataWait<'_> {
                 };
                 match attempt {
                     Ok(response) => {
-                        if let TopicLookup::Known(meta) = lookup(&response, topic) {
-                            self.store(topic, meta, &response).await;
+                        match lookup(&response, topic) {
+                            TopicLookup::Known(meta) => self.store(topic, meta, &response).await,
+                            TopicLookup::Fatal(code) => return Err(ProducerError::Server(code)),
+                            TopicLookup::Unknown => {}
                         }
                         break;
                     }
@@ -1084,6 +1089,57 @@ mod tests {
         Silent,
         /// The refresh fails at once with the error that the function makes.
         Fails(fn() -> ClientError),
+        /// The response lists each requested topic with this error code.
+        TopicError(i16),
+    }
+
+    /// The scripted metadata answer to a refresh that names `topics`.
+    async fn answer_topic_ids(
+        answer: IdAnswer,
+        topics: Vec<String>,
+    ) -> Result<MetadataResponse, ClientError> {
+        match answer {
+            IdAnswer::Exists(existing) => Ok(MetadataResponse {
+                topics: topics
+                    .iter()
+                    .map(|topic| {
+                        let exists = existing.contains(&topic.as_str());
+                        MetadataResponseTopic {
+                            error_code: if exists {
+                                0
+                            } else {
+                                UNKNOWN_TOPIC_OR_PARTITION
+                            },
+                            name: Some(topic.clone()),
+                            topic_id: if exists { id_of(topic) } else { Uuid::ZERO },
+                            partitions: if exists {
+                                vec![MetadataResponsePartition::default()]
+                            } else {
+                                Vec::new()
+                            },
+                            ..Default::default()
+                        }
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            IdAnswer::Silent => {
+                tokio::time::sleep(REQUEST_TIMEOUT).await;
+                Err(ClientError::Timeout(secs(1)))
+            }
+            IdAnswer::Fails(error) => Err(error()),
+            IdAnswer::TopicError(code) => Ok(MetadataResponse {
+                topics: topics
+                    .iter()
+                    .map(|topic| MetadataResponseTopic {
+                        error_code: code,
+                        name: Some(topic.clone()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+        }
     }
 
     /// The id of a topic in the scripted metadata.
@@ -1191,6 +1247,42 @@ mod tests {
                 },
             ),
             (
+                "a topic authorization failure stops the wait",
+                vec![],
+                vec![IdAnswer::TopicError(TOPIC_AUTHORIZATION_FAILED)],
+                vec!["orders"],
+                minute,
+                TopicIdsOutcome {
+                    result: Err("broker error_code 29".into()),
+                    waited: Duration::ZERO,
+                    requests: vec![named(&["orders"])],
+                },
+            ),
+            (
+                "an invalid topic stops the wait",
+                vec![],
+                vec![IdAnswer::TopicError(INVALID_TOPIC_EXCEPTION)],
+                vec!["orders"],
+                minute,
+                TopicIdsOutcome {
+                    result: Err("broker error_code 17".into()),
+                    waited: Duration::ZERO,
+                    requests: vec![named(&["orders"])],
+                },
+            ),
+            (
+                "a zero max_block times out without a refresh",
+                vec![],
+                vec![IdAnswer::Exists(&["orders"])],
+                vec!["orders"],
+                Duration::ZERO,
+                TopicIdsOutcome {
+                    result: Err("Topic orders not present in metadata after 0 ms.".into()),
+                    waited: Duration::ZERO,
+                    requests: vec![],
+                },
+            ),
+            (
                 "an unsupported version stops the wait",
                 vec![],
                 vec![IdAnswer::Fails(|| ClientError::IncompatibleVersion {
@@ -1234,39 +1326,7 @@ mod tests {
                         *answers.front().expect("answer")
                     }
                 };
-                async move {
-                    match answer {
-                        IdAnswer::Exists(existing) => Ok(MetadataResponse {
-                            topics: topics
-                                .iter()
-                                .map(|topic| {
-                                    let exists = existing.contains(&topic.as_str());
-                                    MetadataResponseTopic {
-                                        error_code: if exists {
-                                            0
-                                        } else {
-                                            UNKNOWN_TOPIC_OR_PARTITION
-                                        },
-                                        name: Some(topic.clone()),
-                                        topic_id: if exists { id_of(topic) } else { Uuid::ZERO },
-                                        partitions: if exists {
-                                            vec![MetadataResponsePartition::default()]
-                                        } else {
-                                            Vec::new()
-                                        },
-                                        ..Default::default()
-                                    }
-                                })
-                                .collect(),
-                            ..Default::default()
-                        }),
-                        IdAnswer::Silent => {
-                            tokio::time::sleep(REQUEST_TIMEOUT).await;
-                            Err(ClientError::Timeout(secs(1)))
-                        }
-                        IdAnswer::Fails(error) => Err(error()),
-                    }
-                }
+                answer_topic_ids(answer, topics)
             };
             let started = Instant::now();
             let topics = named(&topics);
