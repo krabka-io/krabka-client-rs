@@ -1873,7 +1873,6 @@ dependencies = [
  "krabka-client-core",
  "krabka-client-producer",
  "krabka-ids",
- "krabka-metadata",
  "krabka-protocol",
  "krabka-security",
  "krabka-units",
@@ -2047,26 +2046,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krabka-metadata"
-version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
-dependencies = [
- "assert2",
- "bytes",
- "krabka-ids",
- "krabka-protocol",
- "krabka-security",
- "krabka-units",
- "krabka-voters",
- "serde",
- "serde-wincode",
- "thiserror",
- "tracing",
- "uuid",
- "wincode",
-]
-
-[[package]]
 name = "krabka-protocol"
 version = "0.4.0"
 source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
@@ -2125,17 +2104,6 @@ dependencies = [
  "serde",
  "thiserror",
  "uom",
-]
-
-[[package]]
-name = "krabka-voters"
-version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=2d34902e2074c6e0ce996428b3650678bf78ec50#2d34902e2074c6e0ce996428b3650678bf78ec50"
-dependencies = [
- "assert2",
- "krabka-ids",
- "serde",
- "uuid",
 ]
 
 [[package]]
@@ -2597,12 +2565,6 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
-name = "pastey"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pbkdf2"
@@ -3632,17 +3594,6 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-wincode"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9aa9d3a86c66cf10ce79df36f555a5a4c8d72a82515d9ea8ca420e02c925c30f"
-dependencies = [
- "serde",
- "thiserror",
- "wincode",
 ]
 
 [[package]]
@@ -4700,18 +4651,6 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
-
-[[package]]
-name = "wincode"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfc6339f1ba427bf7ad7c42403b28e524832ba2ddb5eef1bb2cc3b85db6b7b75"
-dependencies = [
- "pastey",
- "proc-macro2",
- "quote",
- "thiserror",
-]
 
 [[package]]
 name = "windows"

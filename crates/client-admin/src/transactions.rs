@@ -1,6 +1,6 @@
 //! Transaction administration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::BufMut;
 use krabka_client_core::{
@@ -98,7 +98,8 @@ fn fence_retry_action(error_code: i16) -> RetryAction<()> {
     }
 }
 
-/// The transaction coordinator's view of one transactional ID.
+/// The transaction coordinator's view of one transactional ID, as Kafka's
+/// `TransactionDescription`.
 ///
 /// A third party reads [`producer_id`](Self::producer_id) and
 /// [`producer_epoch`](Self::producer_epoch) to verify the authority of a
@@ -109,18 +110,34 @@ fn fence_retry_action(error_code: i16) -> RetryAction<()> {
 pub struct TransactionDescription {
     /// The transactional ID that the caller asked about.
     pub transactional_id: String,
+    /// The broker ID of the transaction coordinator that answered.
+    pub coordinator_id: i32,
     /// The coordinator's state name, such as `Ongoing` or `CompleteCommit`.
     pub state: String,
-    /// The transaction timeout that the producer registered.
-    pub timeout: Time,
-    /// The start of the current transaction, in Kafka epoch milliseconds. An
-    /// instant is a coordinate, so it stays a raw integer.
-    pub start_time_ms: i64,
     /// The producer ID that the coordinator holds for this transactional ID.
     pub producer_id: i64,
     /// The producer epoch that the coordinator holds for this transactional
     /// ID.
     pub producer_epoch: i16,
+    /// The transaction timeout that the producer registered.
+    pub timeout: Time,
+    /// The start of the current transaction, in Kafka epoch milliseconds, or
+    /// `None` when no transaction is open. The coordinator reports `-1` for
+    /// none, and Kafka maps any negative value to an empty `OptionalLong`. An
+    /// instant is a coordinate, so it stays a raw integer.
+    pub start_time_ms: Option<i64>,
+    /// The partitions of the current transaction. While the transaction
+    /// prepares to commit or abort, only the partitions that have no marker
+    /// yet.
+    pub topic_partitions: BTreeSet<(String, i32)>,
+}
+
+/// An open connection to the transaction coordinator of one transactional
+/// ID.
+struct TransactionCoordinator {
+    /// The broker ID that `FindCoordinator` named.
+    node_id: i32,
+    connection: Connection,
 }
 
 /// One transaction that `list_transactions` found on a broker, as Kafka's
@@ -172,10 +189,12 @@ pub struct ProducerStateInfo {
     pub current_txn_start_offset: Option<i64>,
 }
 
+/// The broker ID and the address of the coordinator that a
+/// `FindCoordinator` answer names for `transactional_id`.
 fn coordinator_address(
     transactional_id: &str,
     response: FindCoordinatorResponse,
-) -> Result<String, AdminError> {
+) -> Result<(i32, String), AdminError> {
     if let Some(coordinator) = response
         .coordinators
         .into_iter()
@@ -189,7 +208,10 @@ fn coordinator_address(
                 message: coordinator.error_message,
             });
         }
-        return Ok(format!("{}:{}", coordinator.host, coordinator.port));
+        return Ok((
+            coordinator.node_id,
+            format!("{}:{}", coordinator.host, coordinator.port),
+        ));
     }
 
     if response.error_code != 0 {
@@ -205,7 +227,10 @@ fn coordinator_address(
             "FindCoordinator returned no entry for transactional id {transactional_id:?}"
         )));
     }
-    Ok(format!("{}:{}", response.host, response.port))
+    Ok((
+        response.node_id,
+        format!("{}:{}", response.host, response.port),
+    ))
 }
 
 /// An `InitProducerId` request limited to the released versions, v0 to v5.
@@ -264,9 +289,13 @@ fn describe_transactions_request(transactional_id: &str) -> DescribeTransactions
     }
 }
 
-/// Converts one coordinator row into the domain struct, or surfaces the error
-/// code that the coordinator attached to that row.
-fn described_transaction(state: TransactionState) -> Result<TransactionDescription, AdminError> {
+/// Converts one row of coordinator `coordinator_id` into the domain struct,
+/// as Kafka's `DescribeTransactionsHandler.handleResponse` does, or surfaces
+/// the error code that the coordinator attached to that row.
+fn described_transaction(
+    coordinator_id: i32,
+    state: TransactionState,
+) -> Result<TransactionDescription, AdminError> {
     if state.error_code != 0 {
         return Err(AdminError::Broker {
             api: "DescribeTransactions",
@@ -277,18 +306,31 @@ fn described_transaction(state: TransactionState) -> Result<TransactionDescripti
     }
     Ok(TransactionDescription {
         transactional_id: state.transactional_id,
+        coordinator_id,
         state: state.transaction_state,
-        timeout: Time::from_millis(i64::from(state.transaction_timeout_ms)),
-        start_time_ms: state.transaction_start_time_ms,
         producer_id: state.producer_id,
         producer_epoch: state.producer_epoch,
+        timeout: Time::from_millis(i64::from(state.transaction_timeout_ms)),
+        start_time_ms: (state.transaction_start_time_ms >= 0)
+            .then_some(state.transaction_start_time_ms),
+        topic_partitions: state
+            .topics
+            .into_iter()
+            .flat_map(|topic| {
+                topic
+                    .partitions
+                    .into_iter()
+                    .map(move |partition| (topic.topic.clone(), partition))
+            })
+            .collect(),
     })
 }
 
-/// Picks the row for `transactional_id` out of a `DescribeTransactions`
-/// response and maps it to the domain struct.
+/// Picks the row for `transactional_id` out of the `DescribeTransactions`
+/// response of coordinator `coordinator_id` and maps it to the domain struct.
 fn transaction_description(
     transactional_id: &str,
+    coordinator_id: i32,
     response: DescribeTransactionsResponse,
 ) -> Result<TransactionDescription, AdminError> {
     response
@@ -300,7 +342,7 @@ fn transaction_description(
                 "DescribeTransactions returned no state for transactional id {transactional_id:?}"
             ))
         })
-        .and_then(described_transaction)
+        .and_then(|state| described_transaction(coordinator_id, state))
 }
 
 /// A `Metadata` request for `topics`, as Kafka's leader-routed handlers send
@@ -916,19 +958,19 @@ impl AdminClient {
     async fn force_terminate_attempt(
         &self,
         transactional_id: &str,
-        coordinator: &mut Option<Connection>,
+        coordinator: &mut Option<TransactionCoordinator>,
         find_coordinator: bool,
     ) -> RetryAction<()> {
-        let connection = match self
+        let coordinator = match self
             .transaction_coordinator(transactional_id, coordinator, find_coordinator)
             .await
         {
-            Ok(connection) => connection,
+            Ok(coordinator) => coordinator,
             Err(action) => return action,
         };
         let request =
             force_terminate_request(transactional_id, self.options.request_timeout.millis_i32());
-        match connection.send(request).await {
+        match coordinator.connection.send(request).await {
             Ok(response) => fence_retry_action(response.error_code),
             Err(error) => connection_failure_action(error.into()),
         }
@@ -1018,31 +1060,34 @@ impl AdminClient {
     async fn describe_transaction_attempt(
         &self,
         transactional_id: &str,
-        coordinator: &mut Option<Connection>,
+        coordinator: &mut Option<TransactionCoordinator>,
         find_coordinator: bool,
     ) -> RetryAction<TransactionDescription> {
-        let connection = match self
+        let coordinator = match self
             .transaction_coordinator(transactional_id, coordinator, find_coordinator)
             .await
         {
-            Ok(connection) => connection,
+            Ok(coordinator) => coordinator,
             Err(action) => return action,
         };
-        match connection
+        match coordinator
+            .connection
             .send(describe_transactions_request(transactional_id))
             .await
         {
-            Ok(response) => {
-                describe_retry_action(transaction_description(transactional_id, response))
-            }
+            Ok(response) => describe_retry_action(transaction_description(
+                transactional_id,
+                coordinator.node_id,
+                response,
+            )),
             Err(error) => connection_failure_action(error.into()),
         }
     }
 
-    /// Returns the connection to the transaction coordinator of
-    /// `transactional_id`. When `find_coordinator` is set, or when no
-    /// connection is open, the attempt first sends `FindCoordinator` and
-    /// connects to the coordinator that it names.
+    /// Returns the transaction coordinator of `transactional_id`. When
+    /// `find_coordinator` is set, or when no connection is open, the attempt
+    /// first sends `FindCoordinator` and connects to the coordinator that it
+    /// names.
     ///
     /// A `FindCoordinator` answer of `COORDINATOR_LOAD_IN_PROGRESS` (14) or
     /// `COORDINATOR_NOT_AVAILABLE` (15) and a failed connection to the
@@ -1051,14 +1096,14 @@ impl AdminClient {
     async fn transaction_coordinator<'c, T>(
         &self,
         transactional_id: &str,
-        coordinator: &'c mut Option<Connection>,
+        coordinator: &'c mut Option<TransactionCoordinator>,
         find_coordinator: bool,
-    ) -> Result<&'c Connection, RetryAction<T>> {
+    ) -> Result<&'c TransactionCoordinator, RetryAction<T>> {
         if find_coordinator {
             *coordinator = None;
         }
-        if let Some(connection) = coordinator {
-            return Ok(connection);
+        if let Some(coordinator) = coordinator {
+            return Ok(coordinator);
         }
         let response = self
             .conn
@@ -1068,8 +1113,8 @@ impl AdminClient {
             ))
             .await
             .map_err(connection_failure_action)?;
-        let address = match coordinator_address(transactional_id, response) {
-            Ok(address) => address,
+        let (node_id, address) = match coordinator_address(transactional_id, response) {
+            Ok(found) => found,
             Err(
                 error @ AdminError::Broker {
                     code: COORDINATOR_LOAD_IN_PROGRESS | COORDINATOR_NOT_AVAILABLE,
@@ -1079,7 +1124,10 @@ impl AdminClient {
             Err(error) => return Err(RetryAction::Done(Err(error))),
         };
         match Self::connect_one(&address, self.options.clone()).await {
-            Ok(connection) => Ok(coordinator.insert(connection)),
+            Ok(connection) => Ok(coordinator.insert(TransactionCoordinator {
+                node_id,
+                connection,
+            })),
             Err(error) => Err(connection_failure_action(error)),
         }
     }
@@ -1143,7 +1191,9 @@ mod tests {
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             describe_producers_request,
             describe_producers_response::{PartitionResponse, TopicResponse},
-            describe_transactions_request, find_coordinator_request,
+            describe_transactions_request,
+            describe_transactions_response::TopicData,
+            find_coordinator_request,
             find_coordinator_response::Coordinator,
             list_transactions_request, metadata_request,
             metadata_response::{
@@ -1339,28 +1389,46 @@ mod tests {
         }
     }
 
+    /// Kafka's `CoordinatorStrategy` reads the batched entry of the key from
+    /// v4 on, and the top-level fields of an older answer.
     #[test]
-    fn coordinator_lookup_selects_the_matching_batched_entry() {
-        let response = FindCoordinatorResponse {
-            coordinators: vec![
-                Coordinator {
-                    key: "other".to_owned(),
-                    host: "wrong".to_owned(),
-                    port: 1,
+    fn coordinator_lookup_names_the_node_and_address_of_the_key() {
+        for (name, response) in [
+            (
+                "batched entry",
+                FindCoordinatorResponse {
+                    coordinators: vec![
+                        Coordinator {
+                            key: "other".to_owned(),
+                            node_id: 1,
+                            host: "wrong".to_owned(),
+                            port: 1,
+                            ..Default::default()
+                        },
+                        Coordinator {
+                            key: "payments".to_owned(),
+                            node_id: 3,
+                            host: "coordinator".to_owned(),
+                            port: 9092,
+                            ..Default::default()
+                        },
+                    ],
                     ..Default::default()
                 },
-                Coordinator {
-                    key: "payments".to_owned(),
+            ),
+            (
+                "top-level fields",
+                FindCoordinatorResponse {
+                    node_id: 3,
                     host: "coordinator".to_owned(),
                     port: 9092,
                     ..Default::default()
                 },
-            ],
-            ..Default::default()
-        };
-
-        let address = coordinator_address("payments", response).expect("matching coordinator");
-        assert2::assert!(address == "coordinator:9092");
+            ),
+        ] {
+            let found = coordinator_address("payments", response).expect("matching coordinator");
+            assert2::assert!(found == (3, "coordinator:9092".to_owned()), "case {name}");
+        }
     }
 
     #[test]
@@ -1376,42 +1444,87 @@ mod tests {
         );
     }
 
+    /// Kafka's `DescribeTransactionsHandler.handleResponse` names the
+    /// coordinator that answered, maps a negative start time to an empty
+    /// `OptionalLong`, and collects the partitions of every topic.
     #[test]
     fn description_maps_the_matching_row_to_the_domain_struct() {
-        let response = DescribeTransactionsResponse {
-            transaction_states: vec![
-                TransactionState {
-                    transactional_id: "other".to_owned(),
-                    producer_id: 11,
-                    producer_epoch: 1,
-                    ..Default::default()
-                },
-                TransactionState {
-                    transactional_id: "payments".to_owned(),
-                    transaction_state: "Ongoing".to_owned(),
-                    transaction_timeout_ms: 60_000,
-                    transaction_start_time_ms: 1_700_000_000_123,
-                    producer_id: 4242,
-                    producer_epoch: 7,
-                    ..Default::default()
-                },
-            ],
+        let topic = |topic: &str, partitions: Vec<i32>| TopicData {
+            topic: topic.to_owned(),
+            partitions,
             ..Default::default()
         };
+        let partitions = |entries: &[(&str, i32)]| {
+            entries
+                .iter()
+                .map(|(topic, partition)| ((*topic).to_owned(), *partition))
+                .collect::<BTreeSet<_>>()
+        };
+        for (name, state, start, topics, expected_start, expected_partitions) in [
+            (
+                "ongoing with partitions of two topics",
+                "Ongoing",
+                1_700_000_000_123,
+                vec![topic("orders", vec![1, 0]), topic("audit", vec![2])],
+                Some(1_700_000_000_123),
+                partitions(&[("audit", 2), ("orders", 0), ("orders", 1)]),
+            ),
+            (
+                "empty with no start time",
+                "Empty",
+                -1,
+                Vec::new(),
+                None,
+                BTreeSet::new(),
+            ),
+            (
+                "start time at the epoch",
+                "Ongoing",
+                0,
+                Vec::new(),
+                Some(0),
+                BTreeSet::new(),
+            ),
+        ] {
+            let response = DescribeTransactionsResponse {
+                transaction_states: vec![
+                    TransactionState {
+                        transactional_id: "other".to_owned(),
+                        producer_id: 11,
+                        producer_epoch: 1,
+                        ..Default::default()
+                    },
+                    TransactionState {
+                        transactional_id: "payments".to_owned(),
+                        transaction_state: state.to_owned(),
+                        transaction_timeout_ms: 60_000,
+                        transaction_start_time_ms: start,
+                        producer_id: 4242,
+                        producer_epoch: 7,
+                        topics,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
 
-        let described = transaction_description("payments", response).expect("matching row");
+            let described = transaction_description("payments", 3, response).expect("matching row");
 
-        assert2::assert!(
-            described
-                == TransactionDescription {
-                    transactional_id: "payments".to_owned(),
-                    state: "Ongoing".to_owned(),
-                    timeout: Time::from_millis(60_000),
-                    start_time_ms: 1_700_000_000_123,
-                    producer_id: 4242,
-                    producer_epoch: 7,
-                }
-        );
+            assert2::assert!(
+                described
+                    == TransactionDescription {
+                        transactional_id: "payments".to_owned(),
+                        coordinator_id: 3,
+                        state: state.to_owned(),
+                        producer_id: 4242,
+                        producer_epoch: 7,
+                        timeout: Time::from_millis(60_000),
+                        start_time_ms: expected_start,
+                        topic_partitions: expected_partitions,
+                    },
+                "case {name}"
+            );
+        }
     }
 
     #[test]
@@ -1431,7 +1544,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let error = transaction_description("payments", response).expect_err("broker error");
+            let error = transaction_description("payments", 3, response).expect_err("broker error");
             match error {
                 AdminError::Broker {
                     api,
@@ -1456,7 +1569,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = transaction_description("payments", response).expect_err("missing row");
+        let error = transaction_description("payments", 3, response).expect_err("missing row");
         assert2::assert!(matches!(error, AdminError::Protocol(_)));
     }
 
@@ -1936,6 +2049,45 @@ mod tests {
         ] {
             run_transaction_case(case).await;
         }
+    }
+
+    /// Kafka's `DescribeTransactionsHandler` names the broker that answered
+    /// as the coordinator, which is the node that `FindCoordinator` gave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn describe_transaction_names_the_coordinator_that_find_coordinator_gave() {
+        let script = Arc::new(Mutex::new(CoordinatorScript {
+            find_coordinator: vec![0],
+            coordinator: vec![0],
+            ..CoordinatorScript::default()
+        }));
+        let coordinator_addr = Arc::new(Mutex::new(None));
+        let coordinator =
+            scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr)).await;
+        *coordinator_addr.lock().expect("coordinator lock") = Some(coordinator.addr);
+        let bootstrap =
+            scripted_transaction_broker(Arc::clone(&script), Arc::clone(&coordinator_addr)).await;
+        let admin = AdminClient::connect(&[bootstrap.addr.to_string()])
+            .await
+            .expect("admin connects");
+
+        let described = admin.describe_transaction("payments").await;
+
+        bootstrap.stop();
+        coordinator.stop();
+        assert2::assert!(let Ok(described) = described);
+        assert2::assert!(
+            described
+                == TransactionDescription {
+                    transactional_id: "payments".to_owned(),
+                    coordinator_id: 2,
+                    state: "Ongoing".to_owned(),
+                    producer_id: 4242,
+                    producer_epoch: 7,
+                    timeout: Time::from_millis(0),
+                    start_time_ms: Some(0),
+                    topic_partitions: BTreeSet::new(),
+                }
+        );
     }
 
     /// Kafka's `describeTransactions` runs every ID under one call deadline
