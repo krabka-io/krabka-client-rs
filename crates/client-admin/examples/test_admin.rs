@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 partitions: 1,
                 replicas: 1,
                 configs: BTreeMap::new(),
+                ..Default::default()
             }],
             TopicMutationOptions::with_timeout(krabka_units::secs(30)),
         )

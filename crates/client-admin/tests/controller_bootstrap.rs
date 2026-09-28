@@ -272,6 +272,7 @@ async fn controller_bootstrap_rejects_unadvertised_api_locally() {
                 partitions: 1,
                 replicas: 1,
                 configs: BTreeMap::new(),
+                ..Default::default()
             }],
             TopicMutationOptions::with_timeout(krabka_units::secs(5)),
         )
@@ -329,6 +330,7 @@ async fn controller_connection_stays_usable_after_rejection() {
                     partitions: 1,
                     replicas: 1,
                     configs: BTreeMap::new(),
+                    ..Default::default()
                 }],
                 TopicMutationOptions::with_timeout(krabka_units::secs(5)),
             )

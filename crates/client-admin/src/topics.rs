@@ -11,8 +11,12 @@ use krabka_protocol::{
             AlterPartitionReassignmentsRequest, ReassignablePartition, ReassignableTopic,
         },
         alter_partition_reassignments_response::AlterPartitionReassignmentsResponse,
-        create_partitions_request::{CreatePartitionsRequest, CreatePartitionsTopic},
-        create_topics_request::{CreatableTopic, CreatableTopicConfig, CreateTopicsRequest},
+        create_partitions_request::{
+            CreatePartitionsAssignment, CreatePartitionsRequest, CreatePartitionsTopic,
+        },
+        create_topics_request::{
+            CreatableReplicaAssignment, CreatableTopic, CreatableTopicConfig, CreateTopicsRequest,
+        },
         delete_records_request::{
             DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsTopic,
         },
@@ -36,12 +40,20 @@ use crate::{
     retry::{ControllerRetry, RetryPolicy, call_timeout_error, is_connection_failure},
 };
 
-#[derive(Debug, Clone)]
+/// One topic to create, as Kafka's `NewTopic`.
+#[derive(Debug, Clone, Default)]
 pub struct CreateTopicSpec {
     pub name: String,
+    /// `-1` asks for the broker's `num.partitions`.
     pub partitions: i32,
+    /// `-1` asks for the broker's `default.replication.factor`.
     pub replicas: i32,
     pub configs: BTreeMap<String, String>,
+    /// The broker ids of each partition, by partition index, as
+    /// `NewTopic(name, replicasAssignments)` takes them. Kafka requires
+    /// `partitions` and `replicas` to be `-1` when this is set; an empty map
+    /// leaves placement to the broker.
+    pub replica_assignments: BTreeMap<i32, Vec<i32>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,10 +136,15 @@ pub struct DeleteRecordsOutcome {
     pub low_watermark: i64,
 }
 
-#[derive(Debug, Clone)]
+/// One topic to grow, as Kafka's `NewPartitions`.
+#[derive(Debug, Clone, Default)]
 pub struct CreatePartitionsOp {
     pub name: String,
     pub new_total_count: i32,
+    /// The broker ids of each new partition, in order, as
+    /// `NewPartitions.increaseTo(totalCount, newAssignments)` takes them.
+    /// `None` leaves placement to the broker.
+    pub assignments: Option<Vec<Vec<i32>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1179,7 +1196,15 @@ fn build_create_topics(specs: &[CreateTopicSpec], timeout_ms: i32) -> CreateTopi
                 name: s.name.clone(),
                 num_partitions: s.partitions,
                 replication_factor: i16::try_from(s.replicas).unwrap_or(i16::MAX),
-                assignments: Vec::new(),
+                assignments: s
+                    .replica_assignments
+                    .iter()
+                    .map(|(partition_index, broker_ids)| CreatableReplicaAssignment {
+                        partition_index: *partition_index,
+                        broker_ids: broker_ids.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
                 configs: s
                     .configs
                     .iter()
@@ -1224,7 +1249,15 @@ fn build_create_partitions(ops: &[CreatePartitionsOp], timeout_ms: i32) -> Creat
             .map(|op| CreatePartitionsTopic {
                 name: op.name.clone(),
                 count: op.new_total_count,
-                assignments: None,
+                assignments: op.assignments.as_ref().map(|assignments| {
+                    assignments
+                        .iter()
+                        .map(|broker_ids| CreatePartitionsAssignment {
+                            broker_ids: broker_ids.clone(),
+                            ..Default::default()
+                        })
+                        .collect()
+                }),
                 ..Default::default()
             })
             .collect(),
@@ -1640,6 +1673,7 @@ mod tests {
                 partitions: 3,
                 replicas: 1,
                 configs: BTreeMap::from([("retention.ms".to_string(), "60000".to_string())]),
+                ..Default::default()
             }],
             5_000,
         );
@@ -1662,6 +1696,81 @@ mod tests {
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
             }
         );
+    }
+
+    /// Kafka's `NewTopic.convertToCreatableTopic` sends one assignment row
+    /// per partition index, and `createPartitions` sends the new partitions'
+    /// broker lists in order, or a null list when none is given.
+    #[test]
+    fn replica_assignments_reach_the_wire_as_kafka_sends_them() {
+        let topics = build_create_topics(
+            &[CreateTopicSpec {
+                name: "placed".into(),
+                partitions: -1,
+                replicas: -1,
+                replica_assignments: BTreeMap::from([(1, vec![3, 1]), (0, vec![1, 2])]),
+                ..Default::default()
+            }],
+            5_000,
+        );
+        assert2::assert!(
+            topics.topics
+                == vec![CreatableTopic {
+                    name: "placed".into(),
+                    num_partitions: -1,
+                    replication_factor: -1,
+                    assignments: vec![
+                        CreatableReplicaAssignment {
+                            partition_index: 0,
+                            broker_ids: vec![1, 2],
+                            ..Default::default()
+                        },
+                        CreatableReplicaAssignment {
+                            partition_index: 1,
+                            broker_ids: vec![3, 1],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }]
+        );
+
+        for (name, assignments, expected) in [
+            ("broker placement", None, None),
+            (
+                "explicit placement",
+                Some(vec![vec![2, 3], vec![3, 1]]),
+                Some(vec![
+                    CreatePartitionsAssignment {
+                        broker_ids: vec![2, 3],
+                        ..Default::default()
+                    },
+                    CreatePartitionsAssignment {
+                        broker_ids: vec![3, 1],
+                        ..Default::default()
+                    },
+                ]),
+            ),
+        ] {
+            let request = build_create_partitions(
+                &[CreatePartitionsOp {
+                    name: "orders".into(),
+                    new_total_count: 4,
+                    assignments,
+                }],
+                5_000,
+            );
+            assert2::assert!(
+                request.topics
+                    == vec![CreatePartitionsTopic {
+                        name: "orders".into(),
+                        count: 4,
+                        assignments: expected,
+                        ..Default::default()
+                    }],
+                "case {name}"
+            );
+        }
     }
 
     #[test]
@@ -2437,6 +2546,7 @@ mod tests {
                         partitions: 1,
                         replicas: 1,
                         configs: BTreeMap::new(),
+                        ..Default::default()
                     })
                     .collect::<Vec<_>>();
                 observe(
@@ -2458,6 +2568,7 @@ mod tests {
                     .map(|name| CreatePartitionsOp {
                         name: (*name).to_owned(),
                         new_total_count: 2,
+                        ..Default::default()
                     })
                     .collect::<Vec<_>>();
                 observe(

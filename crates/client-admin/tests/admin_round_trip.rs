@@ -99,6 +99,7 @@ async fn create_topic_with_override(admin: &mut AdminClient, topic: &str) {
                 partitions: 3,
                 replicas: 1,
                 configs,
+                ..Default::default()
             }],
             TopicMutationOptions::with_timeout(krabka_units::secs(RPC_TIMEOUT_SECS)),
         )
@@ -137,6 +138,7 @@ async fn expand_partitions(admin: &mut AdminClient, topic: &str) {
             &[CreatePartitionsOp {
                 name: topic.to_owned(),
                 new_total_count: 5,
+                ..Default::default()
             }],
             TopicMutationOptions::with_timeout(krabka_units::secs(RPC_TIMEOUT_SECS)),
         )
