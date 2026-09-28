@@ -27,11 +27,13 @@ use krabka_protocol::{
         find_coordinator_request::FindCoordinatorRequest,
         init_producer_id_request::InitProducerIdRequest,
         init_producer_id_response::InitProducerIdResponse,
+        metadata_response::MetadataResponse,
         txn_offset_commit_request::{
             TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
         },
         txn_offset_commit_response::TxnOffsetCommitResponse,
     },
+    primitives::uuid::Uuid,
 };
 use krabka_units::{Time, convert::TimeExt};
 use tokio::{
@@ -108,6 +110,11 @@ const END_TXN_TRANSACTION_V1_MAX_VERSION: i16 = 4;
 /// `TxnOffsetCommitRequest.LAST_STABLE_VERSION_BEFORE_TRANSACTION_V2`.
 const TXN_OFFSET_COMMIT_TRANSACTION_V1_MAX_VERSION: i16 = 4;
 
+/// The last `TxnOffsetCommit` version that names each topic. v6 (KIP-1319)
+/// names each topic by id only. Kafka's `TxnOffsetCommitRequest.Builder`
+/// `.forTopicNames` stops here with transaction version 2.
+const TXN_OFFSET_COMMIT_TOPIC_NAME_MAX_VERSION: i16 = 5;
+
 /// The finalized feature that names the transaction protocol of the cluster.
 const TRANSACTION_VERSION_FEATURE: &str = "transaction.version";
 
@@ -155,6 +162,75 @@ where
         client.send(request).await
     } else {
         client.send(VersionCapped::<R, V1_MAX>(request)).await
+    }
+}
+
+/// The `TxnOffsetCommit` version cap of one request.
+///
+/// Kafka's `TransactionManager.txnOffsetCommitHandler` picks
+/// `TxnOffsetCommitRequest.Builder.forTopicIdsOrNames` when the metadata
+/// cache holds an id for every topic, and `forTopicNames` otherwise.
+/// `forTopicIdsOrNames` allows the latest version, and `forTopicNames` stops
+/// at v5. With transaction version 1 both stop at
+/// `LAST_STABLE_VERSION_BEFORE_TRANSACTION_V2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxnOffsetCommitCap {
+    /// The producer follows transaction version 1, so the request stops at
+    /// v4.
+    TransactionV1,
+    /// A topic of the request has no topic id, so the request stops at v5,
+    /// which names each topic.
+    TopicNames,
+    /// Every topic has an id, so the request can use v6, which names each
+    /// topic by id.
+    Latest,
+}
+
+impl TxnOffsetCommitCap {
+    /// The cap of a request whose topics are `topics`.
+    fn of(topics: &[TxnOffsetCommitRequestTopic], transaction_v2: bool) -> Self {
+        if !transaction_v2 {
+            Self::TransactionV1
+        } else if topics.iter().any(|topic| topic.topic_id == Uuid::ZERO) {
+            Self::TopicNames
+        } else {
+            Self::Latest
+        }
+    }
+
+    /// The highest version that the cap offers.
+    #[cfg(test)]
+    const fn max_version(self) -> i16 {
+        match self {
+            Self::TransactionV1 => TXN_OFFSET_COMMIT_TRANSACTION_V1_MAX_VERSION,
+            Self::TopicNames => TXN_OFFSET_COMMIT_TOPIC_NAME_MAX_VERSION,
+            Self::Latest => <TxnOffsetCommitRequest as ProtocolRequest>::LATEST_STABLE_VERSION,
+        }
+    }
+
+    /// Send `request` on `client`, and negotiate at most the version of the
+    /// cap.
+    async fn send(
+        self,
+        client: &Client,
+        request: TxnOffsetCommitRequest,
+    ) -> Result<TxnOffsetCommitResponse, ClientError> {
+        match self {
+            Self::TransactionV1 => {
+                client
+                    .send(VersionCapped::<
+                        _,
+                        TXN_OFFSET_COMMIT_TRANSACTION_V1_MAX_VERSION,
+                    >(request))
+                    .await
+            }
+            Self::TopicNames => {
+                client
+                    .send(VersionCapped::<_, TXN_OFFSET_COMMIT_TOPIC_NAME_MAX_VERSION>(request))
+                    .await
+            }
+            Self::Latest => client.send(request).await,
+        }
     }
 }
 
@@ -1342,7 +1418,9 @@ impl Producer {
     /// zombie producers with the supplied [`ConsumerGroupMetadata`], as
     /// KIP-447 defines.
     ///
-    /// This does two broker round-trips:
+    /// It first waits for metadata that names the topics of `offsets`, as
+    /// Kafka's producer does, so that `TxnOffsetCommit` can name each topic
+    /// by its id. Then it does two broker round-trips:
     ///
     /// 1. `AddOffsetsToTxn` to the transaction coordinator. This registers the
     ///    group offset commit as part of the ongoing transaction.
@@ -1367,6 +1445,9 @@ impl Producer {
     /// - [`ProducerError::Server`] — any other broker error code. A code that
     ///   Kafka calls abortable also makes every later commit fail, so the
     ///   application must abort the transaction.
+    /// - [`ProducerError::MetadataTimeout`] — no metadata response named a
+    ///   topic of `offsets` within `max_block`. Kafka's
+    ///   `sendOffsetsToTransaction` throws `TimeoutException`.
     /// - [`ProducerError::Client`] — transport-level failure.
     ///
     /// [`init_transactions`]: Self::init_transactions
@@ -1413,6 +1494,10 @@ impl Producer {
             return Err(error);
         }
 
+        // Kafka's `KafkaProducer.sendOffsetsToTransaction` waits for the
+        // metadata of the topics first (`awaitTopicMetadata`), so the request
+        // can name each topic by its id.
+        let topic_ids = self.offset_topic_ids(&offsets_vec).await?;
         let (pid, epoch) = *self.txn_pid_epoch.lock().await;
 
         // 1. AddOffsetsToTxn → transaction coordinator. Kafka's
@@ -1429,7 +1514,31 @@ impl Producer {
         //    (generation id / member id / instance id) so the coordinator can
         //    fence zombie producers through the group's own state rather than
         //    requiring one producer per input partition (KIP-447).
-        self.txn_offset_commit(&tid, pid, epoch, group_meta, &offsets_vec)
+        let topics = build_topics_payload(&offsets_vec, &topic_ids);
+        self.txn_offset_commit(&tid, pid, epoch, group_meta, topics)
+            .await
+    }
+
+    /// Wait for the metadata of the topics of `offsets`, and return the id of
+    /// each topic, or [`Uuid::ZERO`] for a topic that the metadata does not
+    /// hold. See [`MetadataWait::topic_ids`].
+    async fn offset_topic_ids(
+        &self,
+        offsets: &[((String, i32), i64)],
+    ) -> Result<HashMap<String, Uuid>, ProducerError> {
+        let mut topics: Vec<String> = Vec::new();
+        for ((topic, _), _) in offsets {
+            if !topics.contains(topic) {
+                topics.push(topic.clone());
+            }
+        }
+        // Kafka's `awaitTopicMetadata` calls `ProducerMetadata.add` for the
+        // topics, so the periodic and error refreshes name them.
+        for topic in &topics {
+            self.client.metadata_topics().add(topic);
+        }
+        self.metadata_wait()
+            .topic_ids(&topics, |topics| self.refresh_producer_metadata(topics))
             .await
     }
 
@@ -1499,14 +1608,21 @@ impl Producer {
     /// request again on the same connection. Kafka sends only the partitions
     /// that failed with a retriable code; this producer sends the whole
     /// request again, and the coordinator writes the same offsets.
+    ///
+    /// The request goes out at v6 (KIP-1319), which names each topic by id,
+    /// when every topic of `topics` has an id and the producer follows
+    /// transaction version 2. Otherwise it names each topic at v5 or lower.
+    /// `UNKNOWN_TOPIC_ID` is retriable, so the same request goes out again, as
+    /// Kafka's handler re-enqueues it with the ids that it resolved at first.
     async fn txn_offset_commit(
         &self,
         transactional_id: &str,
         producer_id: i64,
         producer_epoch: i16,
         group_meta: &ConsumerGroupMetadata,
-        offsets: &[((String, i32), i64)],
+        topics: Vec<TxnOffsetCommitRequestTopic>,
     ) -> Result<(), ProducerError> {
+        let cap = TxnOffsetCommitCap::of(&topics, self.transaction_v2());
         let request = TxnOffsetCommitRequest {
             transactional_id: transactional_id.to_owned(),
             producer_id,
@@ -1515,20 +1631,13 @@ impl Producer {
             generation_id_or_member_epoch: group_meta.generation_id,
             member_id: group_meta.member_id.clone(),
             group_instance_id: group_meta.group_instance_id.clone(),
-            topics: build_topics_payload(offsets),
+            topics,
             ..Default::default()
         };
         let mut group_client = self.connect_group_coordinator(&group_meta.group_id).await?;
         let mut retry = self.coordinator_retry();
         loop {
-            let sent =
-                send_in_transaction_version::<_, TXN_OFFSET_COMMIT_TRANSACTION_V1_MAX_VERSION>(
-                    &group_client,
-                    request.clone(),
-                    self.transaction_v2(),
-                )
-                .await;
-            let (attempt, last_error) = match sent {
+            let (attempt, last_error) = match cap.send(&group_client, request.clone()).await {
                 Ok(response) => {
                     let code = txn_offset_commit_error_code(&response);
                     (
@@ -2240,7 +2349,19 @@ impl Producer {
         // Kafka's `KafkaProducer.waitOnMetadata` calls `ProducerMetadata.add`
         // for each send, so the periodic and error refreshes name the topic.
         self.client.metadata_topics().add(topic);
-        let count = MetadataWait {
+        let count = self
+            .metadata_wait()
+            .partition_count(topic, partition, |topics| {
+                self.refresh_producer_metadata(topics)
+            })
+            .await?;
+        tracing::Span::current().record("num_partitions", count);
+        Ok(count)
+    }
+
+    /// The metadata wait of this producer, limited by `max_block`.
+    fn metadata_wait(&self) -> MetadataWait<'_> {
+        MetadataWait {
             cache: &self.metadata_cache,
             partition_leaders: &self.partition_leaders,
             refresh: &self.metadata_refresh,
@@ -2248,23 +2369,25 @@ impl Producer {
             retry_backoff: self.init_retry_backoff.to_std(),
             max_backoff: self.retry_backoff_max.to_std(),
         }
-        .partition_count(topic, partition, |topics| async move {
-            let response = self
-                .client
-                .refresh_metadata_with(metadata_request(topics))
-                .await?;
-            // Kafka's `Cluster` keeps each broker's rack alongside its
-            // partition leaders. `partitioner.rack.aware` reads it through
-            // `leader_rack`.
-            for broker in &response.brokers {
-                self.broker_racks
-                    .insert(broker.node_id, broker.rack.clone());
-            }
-            Ok(response)
-        })
-        .await?;
-        tracing::Span::current().record("num_partitions", count);
-        Ok(count)
+    }
+
+    /// Send the `Metadata` request of the producer for `topics`, and record
+    /// the rack of each broker of the response.
+    async fn refresh_producer_metadata(
+        &self,
+        topics: Vec<String>,
+    ) -> Result<MetadataResponse, ClientError> {
+        let response = self
+            .client
+            .refresh_metadata_with(metadata_request(topics))
+            .await?;
+        // Kafka's `Cluster` keeps each broker's rack alongside its partition
+        // leaders. `partitioner.rack.aware` reads it through `leader_rack`.
+        for broker in &response.brokers {
+            self.broker_racks
+                .insert(broker.node_id, broker.rack.clone());
+        }
+        Ok(response)
     }
 
     #[tracing::instrument(
@@ -2408,29 +2531,36 @@ fn current_millis() -> i64 {
     .unwrap_or(0)
 }
 
-/// Group `((topic, partition), offset)` pairs by topic name into the nested
-/// structure required by [`TxnOffsetCommitRequest`].
-fn build_topics_payload(offsets: &[((String, i32), i64)]) -> Vec<TxnOffsetCommitRequestTopic> {
-    let mut by_topic: std::collections::HashMap<&str, Vec<TxnOffsetCommitRequestPartition>> =
-        std::collections::HashMap::new();
+/// Group `((topic, partition), offset)` pairs by topic into the nested
+/// structure required by [`TxnOffsetCommitRequest`], in the order in which
+/// each topic first appears.
+///
+/// Each topic carries its name and the id that `topic_ids` gives, or
+/// [`Uuid::ZERO`] for a topic without one, as Kafka's
+/// `TransactionManager.txnOffsetCommitHandler` sets both. The negotiated
+/// version decides which of the two goes on the wire.
+fn build_topics_payload(
+    offsets: &[((String, i32), i64)],
+    topic_ids: &HashMap<String, Uuid>,
+) -> Vec<TxnOffsetCommitRequestTopic> {
+    let mut topics: Vec<TxnOffsetCommitRequestTopic> = Vec::new();
     for ((topic, partition), offset) in offsets {
-        by_topic
-            .entry(topic.as_str())
-            .or_default()
-            .push(TxnOffsetCommitRequestPartition {
-                partition_index: *partition,
-                committed_offset: *offset,
-                ..Default::default()
-            });
-    }
-    by_topic
-        .into_iter()
-        .map(|(name, partitions)| TxnOffsetCommitRequestTopic {
-            name: name.to_owned(),
-            partitions,
+        let partition = TxnOffsetCommitRequestPartition {
+            partition_index: *partition,
+            committed_offset: *offset,
             ..Default::default()
-        })
-        .collect()
+        };
+        match topics.iter_mut().find(|entry| entry.name == *topic) {
+            Some(entry) => entry.partitions.push(partition),
+            None => topics.push(TxnOffsetCommitRequestTopic {
+                name: topic.clone(),
+                topic_id: topic_ids.get(topic).copied().unwrap_or(Uuid::ZERO),
+                partitions: vec![partition],
+                ..Default::default()
+            }),
+        }
+    }
+    topics
 }
 
 #[cfg(test)]
@@ -2461,12 +2591,14 @@ mod tests {
             produce_request::{self, ProduceRequest},
             produce_response::{PartitionProduceResponse, ProduceResponse, TopicProduceResponse},
         },
+        primitives::uuid::Uuid,
     };
 
     use super::{
-        DrainIntent, Producer, TxnOffsetCommitResponse, minted_identity,
-        request_may_have_reached_the_broker, txn_offset_commit_error_code,
-        wake_sender_after_append,
+        DrainIntent, HashMap, Producer, TxnOffsetCommitCap, TxnOffsetCommitRequest,
+        TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic, TxnOffsetCommitResponse,
+        build_topics_payload, minted_identity, request_may_have_reached_the_broker,
+        txn_offset_commit_error_code, wake_sender_after_append,
     };
     use crate::{
         ProducerRecord,
@@ -2855,6 +2987,116 @@ mod tests {
             .expect("flush must not wait for another notification")
             .expect("empty producer flushes");
         mock.stop();
+    }
+
+    /// The version cap and the wire form of one `TxnOffsetCommit` request.
+    #[derive(Debug, PartialEq, Eq)]
+    struct TxnOffsetCommitShape {
+        cap: TxnOffsetCommitCap,
+        max_version: i16,
+        /// The topics as the broker decodes them at `max_version`.
+        wire_topics: Vec<TxnOffsetCommitRequestTopic>,
+    }
+
+    /// Kafka's `TransactionManager.txnOffsetCommitHandler` sends v6, which
+    /// names each topic by id (KIP-1319), only when the metadata holds an id
+    /// for every topic and the producer follows transaction version 2. One
+    /// topic without an id caps the request at v5, which names each topic,
+    /// and transaction version 1 caps it at v4. The request groups the
+    /// partitions of a topic in the order in which the topic first appears.
+    #[test]
+    fn txn_offset_commit_names_topics_by_id_only_at_v6() {
+        let orders = Uuid([7; 16]);
+        let payments = Uuid([8; 16]);
+        let offsets = [
+            (("orders".to_owned(), 0), 10),
+            (("payments".to_owned(), 1), 20),
+            (("orders".to_owned(), 2), 30),
+        ];
+        let partition = |partition_index, committed_offset| TxnOffsetCommitRequestPartition {
+            partition_index,
+            committed_offset,
+            ..Default::default()
+        };
+        let topic = |name: &str, topic_id, partitions| TxnOffsetCommitRequestTopic {
+            name: name.to_owned(),
+            topic_id,
+            partitions,
+            ..Default::default()
+        };
+        let both_ids = HashMap::from([
+            ("orders".to_owned(), orders),
+            ("payments".to_owned(), payments),
+        ]);
+        let one_id = HashMap::from([("orders".to_owned(), orders)]);
+        for (name, topic_ids, transaction_v2, expected) in [
+            (
+                "every topic has an id",
+                &both_ids,
+                true,
+                TxnOffsetCommitShape {
+                    cap: TxnOffsetCommitCap::Latest,
+                    max_version: 6,
+                    wire_topics: vec![
+                        topic("", orders, vec![partition(0, 10), partition(2, 30)]),
+                        topic("", payments, vec![partition(1, 20)]),
+                    ],
+                },
+            ),
+            (
+                "one topic has no id",
+                &one_id,
+                true,
+                TxnOffsetCommitShape {
+                    cap: TxnOffsetCommitCap::TopicNames,
+                    max_version: 5,
+                    wire_topics: vec![
+                        topic(
+                            "orders",
+                            Uuid::ZERO,
+                            vec![partition(0, 10), partition(2, 30)],
+                        ),
+                        topic("payments", Uuid::ZERO, vec![partition(1, 20)]),
+                    ],
+                },
+            ),
+            (
+                "transaction version 1",
+                &both_ids,
+                false,
+                TxnOffsetCommitShape {
+                    cap: TxnOffsetCommitCap::TransactionV1,
+                    max_version: 4,
+                    wire_topics: vec![
+                        topic(
+                            "orders",
+                            Uuid::ZERO,
+                            vec![partition(0, 10), partition(2, 30)],
+                        ),
+                        topic("payments", Uuid::ZERO, vec![partition(1, 20)]),
+                    ],
+                },
+            ),
+        ] {
+            let request = TxnOffsetCommitRequest {
+                transactional_id: "txn".into(),
+                group_id: "group".into(),
+                topics: build_topics_payload(&offsets, topic_ids),
+                ..Default::default()
+            };
+            let cap = TxnOffsetCommitCap::of(&request.topics, transaction_v2);
+            let max_version = cap.max_version();
+            let mut buf = BytesMut::new();
+            request.encode(&mut buf, max_version).expect("encode");
+            let decoded =
+                TxnOffsetCommitRequest::decode(&mut buf.freeze(), max_version).expect("decode");
+            let actual = TxnOffsetCommitShape {
+                cap,
+                max_version,
+                wire_topics: decoded.topics,
+            };
+            assert2::assert!(actual == expected, "{name}");
+        }
     }
 
     /// A `TxnOffsetCommit` answer of several rows gives one code. A code that

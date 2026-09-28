@@ -522,12 +522,16 @@ mod tests {
             produce_response::{
                 self, PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
             },
-            txn_offset_commit_request,
+            txn_offset_commit_request::{
+                self, TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition,
+                TxnOffsetCommitRequestTopic,
+            },
             txn_offset_commit_response::{
                 self, TxnOffsetCommitResponse, TxnOffsetCommitResponsePartition,
                 TxnOffsetCommitResponseTopic,
             },
         },
+        primitives::uuid::Uuid,
     };
 
     use super::{AbortableError, PreparedTransactionState, TxnState};
@@ -562,14 +566,24 @@ mod tests {
     /// request header client id, and a flexible version adds a tagged-field
     /// byte after it.
     fn is_transactional_init(body: &[u8], version: i16) -> bool {
+        decode_request::<InitProducerIdRequest>(
+            body,
+            version,
+            init_producer_id_request::FLEXIBLE_MIN,
+        )
+        .transactional_id
+        .is_some()
+    }
+
+    /// Decode the request of a request body at `version`. The body starts
+    /// with the request header client id, and a flexible version adds a
+    /// tagged-field byte after it.
+    fn decode_request<R: for<'a> Decode<'a>>(body: &[u8], version: i16, flexible_min: i16) -> R {
         let client_id_len = usize::try_from(i16::from_be_bytes([body[0], body[1]]).max(0))
             .expect("non-negative client id length");
-        let flexible = usize::from(version >= init_producer_id_request::FLEXIBLE_MIN);
+        let flexible = usize::from(version >= flexible_min);
         let mut request = &body[2 + client_id_len + flexible..];
-        InitProducerIdRequest::decode(&mut request, version)
-            .expect("decode InitProducerId")
-            .transactional_id
-            .is_some()
+        R::decode(&mut request, version).expect("decode request")
     }
 
     fn encode_v0(resp: &impl Encode) -> Vec<u8> {
@@ -982,12 +996,21 @@ mod tests {
         /// The linger of the producer. Zero when `None`.
         linger: Option<Duration>,
         /// The finalized `transaction.version` that the mock reports. With a
-        /// value, the mock also advertises `AddOffsetsToTxn` v0 to v4, and
-        /// `EndTxn` and `TxnOffsetCommit` v0 to v5, as a Kafka 4 broker does.
+        /// value, the mock also advertises `AddOffsetsToTxn` v0 to v4, `EndTxn`
+        /// v0 to v5 and `TxnOffsetCommit` up to `txn_offset_commit_max`, as a
+        /// Kafka 4 broker does.
         transaction_version: Option<i16>,
         /// The API key and version of each request other than `ApiVersions`,
         /// `Metadata`, `FindCoordinator` and `InitProducerId`.
         transaction_requests: Vec<(i16, i16)>,
+        /// The highest `TxnOffsetCommit` version that the mock advertises
+        /// with a transaction version. v5 when `None`, as Kafka 4.3 does.
+        txn_offset_commit_max: Option<i16>,
+        /// The topic id that the mock metadata gives the topic `topic`.
+        topic_id: Uuid,
+        /// The negotiated version and the decoded topics of each
+        /// `TxnOffsetCommit` request.
+        txn_offset_commit_topics: Vec<(i16, Vec<TxnOffsetCommitRequestTopic>)>,
     }
 
     type SharedCoordinator = Arc<std::sync::Mutex<Coordinator>>;
@@ -1048,6 +1071,7 @@ mod tests {
         add_partitions_range: (i16, i16),
         two_phase_commit: bool,
         transaction_version: Option<i16>,
+        txn_offset_commit_max: i16,
         version: i16,
     ) -> Vec<u8> {
         use krabka_protocol::owned::api_versions_response::FinalizedFeatureKey;
@@ -1081,7 +1105,7 @@ mod tests {
             api_keys.extend([
                 range(add_offsets_to_txn_request::API_KEY, 4),
                 range(end_txn_request::API_KEY, 5),
-                range(txn_offset_commit_request::API_KEY, 5),
+                range(txn_offset_commit_request::API_KEY, txn_offset_commit_max),
             ]);
             finalized_features.push(FinalizedFeatureKey {
                 name: "transaction.version".into(),
@@ -1107,7 +1131,7 @@ mod tests {
     ///
     /// The producer waits for metadata that holds the topic, so the answer
     /// must decode at the negotiated version.
-    fn scripted_metadata(port: u16, version: i16) -> Vec<u8> {
+    fn scripted_metadata(port: u16, topic_id: Uuid, version: i16) -> Vec<u8> {
         let response = MetadataResponse {
             brokers: vec![MetadataResponseBroker {
                 node_id: 1,
@@ -1117,6 +1141,7 @@ mod tests {
             }],
             topics: vec![MetadataResponseTopic {
                 name: Some("topic".into()),
+                topic_id,
                 partitions: vec![MetadataResponsePartition {
                     partition_index: 0,
                     leader_id: 1,
@@ -1134,6 +1159,53 @@ mod tests {
         buf.to_vec()
     }
 
+    /// Record one `TxnOffsetCommit` request, and answer it from the script.
+    /// The answer names each topic as the request did, and gives each
+    /// partition the scripted code.
+    fn scripted_txn_offset_commit(
+        coordinator: &mut Coordinator,
+        body: &[u8],
+        version: i16,
+    ) -> Option<Vec<u8>> {
+        let request = decode_request::<TxnOffsetCommitRequest>(
+            body,
+            version,
+            txn_offset_commit_request::FLEXIBLE_MIN,
+        );
+        coordinator
+            .txn_offset_commit_topics
+            .push((version, request.topics.clone()));
+        let Reply::Code(error_code) = coordinator.txn_offset_commit.next() else {
+            return None;
+        };
+        let topics = request
+            .topics
+            .iter()
+            .map(|topic| TxnOffsetCommitResponseTopic {
+                name: topic.name.clone(),
+                topic_id: topic.topic_id,
+                partitions: topic
+                    .partitions
+                    .iter()
+                    .map(|partition| TxnOffsetCommitResponsePartition {
+                        partition_index: partition.partition_index,
+                        error_code,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        Some(encode_at(
+            &TxnOffsetCommitResponse {
+                topics,
+                ..Default::default()
+            },
+            version,
+            txn_offset_commit_response::FLEXIBLE_MIN,
+        ))
+    }
+
     /// Boot a mock coordinator that answers `EndTxn` and `AddPartitionsToTxn`
     /// from `coordinator`, and connect a transactional producer to it without
     /// calling `init_transactions`. The producer is left `Uninitialized`.
@@ -1144,13 +1216,22 @@ mod tests {
         let handler_port = Arc::clone(&port_cell);
         let shared = Arc::new(std::sync::Mutex::new(coordinator));
         let handler_shared = Arc::clone(&shared);
-        let (add_partitions_range, two_phase_commit, transaction_version, linger) = {
+        let (
+            add_partitions_range,
+            two_phase_commit,
+            transaction_version,
+            linger,
+            txn_offset_commit_max,
+            topic_id,
+        ) = {
             let coordinator = shared.lock().expect("scripted coordinator");
             (
                 coordinator.add_partitions_range.unwrap_or((0, 5)),
                 coordinator.two_phase_commit,
                 coordinator.transaction_version,
                 coordinator.linger.unwrap_or(Duration::ZERO),
+                coordinator.txn_offset_commit_max.unwrap_or(5),
+                coordinator.topic_id,
             )
         };
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
@@ -1159,6 +1240,7 @@ mod tests {
                     add_partitions_range,
                     two_phase_commit,
                     transaction_version,
+                    txn_offset_commit_max,
                     version,
                 ));
             }
@@ -1176,6 +1258,7 @@ mod tests {
                 coordinator.metadata_requests += 1;
                 return Some(scripted_metadata(
                     handler_port.load(Ordering::SeqCst),
+                    topic_id,
                     version,
                 ));
             }
@@ -1218,25 +1301,7 @@ mod tests {
                 };
             }
             if api_key == txn_offset_commit_request::API_KEY {
-                return match coordinator.txn_offset_commit.next() {
-                    Reply::Silent => None,
-                    Reply::Code(error_code) => Some(encode_at(
-                        &TxnOffsetCommitResponse {
-                            topics: vec![TxnOffsetCommitResponseTopic {
-                                name: "topic".into(),
-                                partitions: vec![TxnOffsetCommitResponsePartition {
-                                    partition_index: 0,
-                                    error_code,
-                                    ..Default::default()
-                                }],
-                                ..Default::default()
-                            }],
-                            ..Default::default()
-                        },
-                        version,
-                        txn_offset_commit_response::FLEXIBLE_MIN,
-                    )),
-                };
+                return scripted_txn_offset_commit(&mut coordinator, body, version);
             }
             if api_key == find_coordinator_request::API_KEY {
                 coordinator.find_coordinator_requests += 1;
@@ -1997,6 +2062,154 @@ mod tests {
         }
     }
 
+    /// What one scripted `send_offsets_to_transaction` sent and gave.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SentOffsetCommits {
+        result: TxnResult,
+        /// The negotiated version and the decoded topics of each
+        /// `TxnOffsetCommit` request.
+        requests: Vec<(i16, Vec<TxnOffsetCommitRequestTopic>)>,
+    }
+
+    /// Kafka's `TransactionManager.txnOffsetCommitHandler` reads the topic
+    /// ids from the metadata that `KafkaProducer.sendOffsetsToTransaction`
+    /// waited for. With an id for every topic it negotiates up to v6
+    /// (KIP-1319), which names each topic by id. Without an id, or with
+    /// transaction version 1, it names each topic at v5 or v4. The handler
+    /// treats `UNKNOWN_TOPIC_ID` as retriable and sends the same request
+    /// again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_offsets_to_transaction_names_topics_by_id_at_v6() {
+        use Reply::Code;
+        let group = krabka_client_consumer::ConsumerGroupMetadata {
+            group_id: "group-a".into(),
+            generation_id: 3,
+            member_id: "member-a".into(),
+            group_instance_id: None,
+        };
+        let id = Uuid([5; 16]);
+        let by_id = TxnOffsetCommitRequestTopic {
+            topic_id: id,
+            partitions: vec![TxnOffsetCommitRequestPartition {
+                partition_index: 0,
+                committed_offset: 42,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let by_name = TxnOffsetCommitRequestTopic {
+            name: "topic".into(),
+            topic_id: Uuid::ZERO,
+            ..by_id.clone()
+        };
+        // (name, transaction version, advertised max, metadata topic id,
+        // offset commit script, expected)
+        let cases = [
+            (
+                "every topic has an id",
+                2,
+                6,
+                id,
+                vec![Code(0)],
+                SentOffsetCommits {
+                    result: TxnResult::Ok,
+                    requests: vec![(6, vec![by_id.clone()])],
+                },
+            ),
+            (
+                "the metadata gives no id",
+                2,
+                6,
+                Uuid::ZERO,
+                vec![Code(0)],
+                SentOffsetCommits {
+                    result: TxnResult::Ok,
+                    requests: vec![(5, vec![by_name.clone()])],
+                },
+            ),
+            (
+                "the broker stops at v5",
+                2,
+                5,
+                id,
+                vec![Code(0)],
+                SentOffsetCommits {
+                    result: TxnResult::Ok,
+                    requests: vec![(5, vec![by_name.clone()])],
+                },
+            ),
+            (
+                "transaction version 1",
+                1,
+                6,
+                id,
+                vec![Code(0)],
+                SentOffsetCommits {
+                    result: TxnResult::Ok,
+                    requests: vec![(4, vec![by_name.clone()])],
+                },
+            ),
+            (
+                "unknown topic id, then committed",
+                2,
+                6,
+                id,
+                vec![Code(100), Code(0)],
+                SentOffsetCommits {
+                    result: TxnResult::Ok,
+                    requests: vec![(6, vec![by_id.clone()]), (6, vec![by_id.clone()])],
+                },
+            ),
+            (
+                "unknown topic id until the retry deadline",
+                2,
+                6,
+                id,
+                vec![Code(100)],
+                SentOffsetCommits {
+                    result: TxnResult::Server(100),
+                    requests: Vec::new(),
+                },
+            ),
+        ];
+        for (name, transaction_version, txn_offset_commit_max, topic_id, script, expected) in cases
+        {
+            let exhausted = *script.last().expect("script");
+            let (mock, producer, coordinator) = scripted_producer(Coordinator {
+                transaction_version: Some(transaction_version),
+                txn_offset_commit_max: Some(txn_offset_commit_max),
+                topic_id,
+                txn_offset_commit: Script::new(&script, exhausted),
+                ..Coordinator::default()
+            })
+            .await;
+            let transaction = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction");
+            let result = producer
+                .send_offsets_to_transaction([(("topic".to_owned(), 0), 42)], &group)
+                .await
+                .into();
+            drop(transaction);
+            let mut requests = coordinator
+                .lock()
+                .expect("scripted coordinator")
+                .txn_offset_commit_topics
+                .clone();
+            mock.stop();
+            // The request goes out until the retry deadline ends, so the row
+            // checks the shape of each request and not their number.
+            if expected.requests.is_empty() {
+                requests.dedup();
+                assert2::assert!(requests == vec![(6, vec![by_id.clone()])], "{name}");
+                requests.clear();
+            }
+            let actual = SentOffsetCommits { result, requests };
+            assert2::assert!(actual == expected, "{name}");
+        }
+    }
+
     /// The observable result of a commit after a failed transactional batch.
     #[derive(Debug, PartialEq, Eq)]
     struct CommitAfterFailedBatch {
@@ -2238,7 +2451,7 @@ mod tests {
                 if api_key == api_versions_request::API_KEY {
                     // Only transaction version 2 sends `EndTxn` v5, whose
                     // answer carries the new identity.
-                    return Some(scripted_api_versions((0, 5), false, Some(2), version));
+                    return Some(scripted_api_versions((0, 5), false, Some(2), 5, version));
                 }
                 if api_key == find_coordinator_request::API_KEY {
                     return Some(encode_v0(&FindCoordinatorResponse {
