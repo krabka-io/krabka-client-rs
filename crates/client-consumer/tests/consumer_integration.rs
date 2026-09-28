@@ -976,6 +976,12 @@ async fn committed_leader_epoch_survives_restart() {
 /// So against this broker the case no longer isolates the client-only refresh
 /// path. What it still proves is the outcome: the cold-started member ends up
 /// with both partitions and delivers every record from them.
+///
+/// The consumer turns off `allow_auto_create_topics`. With Kafka's default of
+/// `true`, the metadata requests of the join name the subscribed topic and let
+/// the broker, whose `auto.create.topics.enable` is also `true`, create it with
+/// the default partition count before the first poll returns. The topic would
+/// then exist before the join, and the case would test no cold start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
 async fn cold_start_rejoins_when_subscribed_topic_appears() {
@@ -997,6 +1003,7 @@ async fn cold_start_rejoins_when_subscribed_topic_appears() {
         .heartbeat_interval(millis(500))
         .subscription_metadata_refresh_interval(millis(750))
         .auto_offset_reset(AutoOffsetReset::Earliest)
+        .allow_auto_create_topics(false)
         .subscribe([topic.clone()])
         .build()
         .await
