@@ -132,6 +132,7 @@ fn topic() -> CreateTopicSpec {
         partitions: 1,
         replicas: 1,
         configs: std::collections::BTreeMap::new(),
+        ..Default::default()
     }
 }
 
