@@ -13,10 +13,10 @@
 //!   retry gets `NONE`.
 //! - `CompleteCommit`: the retry gets `NONE`.
 //!
-//! [`decide_end_txn`] and [`decide_add_partitions`] are the pure parts of the
-//! retry loops. The producer sends the request, and these functions tell it
-//! what the answer means. The rules come from `TransactionManager` at Kafka
-//! trunk `f87be33`:
+//! [`decide_end_txn`], [`decide_add_partitions`] and the other `decide_*`
+//! functions are the pure parts of the retry loops. The producer sends the
+//! request, and these functions tell it what the answer means. The rules come
+//! from `TransactionManager` at Kafka trunk `f87be33`:
 //!
 //! - `TxnRequestHandler.onComplete`: a disconnect finds the coordinator again
 //!   and sends the request again.
@@ -330,14 +330,85 @@ pub(crate) const fn decide_init_producer_id(attempt: CoordinatorAttempt) -> TxnR
     }
 }
 
+/// A `FindCoordinator` answer that ends the lookup with no coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LookupRefusal {
+    /// Kafka's `FindCoordinatorHandler` calls `abortableError` for this code:
+    /// the application must abort the transaction.
+    Abortable(i16),
+    /// Kafka's `FindCoordinatorHandler` calls `fatalError` for this code.
+    Fatal(i16),
+}
+
+/// What the producer does after one `FindCoordinator` attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FindCoordinatorDecision {
+    /// The broker named the coordinator.
+    Found,
+    /// Send the same lookup again after a backoff.
+    Retry,
+    /// The broker refused the lookup.
+    Refused(LookupRefusal),
+}
+
+/// Decide what one `FindCoordinator` attempt means.
+///
+/// Kafka's `FindCoordinatorHandler.handleResponse` (4.3.1): every
+/// `RetriableException` sends the lookup again, and so does a disconnect
+/// (`TxnRequestHandler.onComplete`). `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`
+/// is fatal, `GROUP_AUTHORIZATION_FAILED` and `TRANSACTION_ABORTABLE` give an
+/// abortable error, and every other code is fatal ("Could not find a
+/// coordinator with type X with key Y due to unexpected error").
+pub(crate) const fn decide_find_coordinator(
+    attempt: CoordinatorAttempt,
+) -> FindCoordinatorDecision {
+    match attempt {
+        CoordinatorAttempt::Answered(NONE) => FindCoordinatorDecision::Found,
+        CoordinatorAttempt::Lost => FindCoordinatorDecision::Retry,
+        CoordinatorAttempt::Answered(code) if error_class::class(code).is_retriable() => {
+            FindCoordinatorDecision::Retry
+        }
+        CoordinatorAttempt::Answered(
+            code @ (GROUP_AUTHORIZATION_FAILED | TRANSACTION_ABORTABLE),
+        ) => FindCoordinatorDecision::Refused(LookupRefusal::Abortable(code)),
+        CoordinatorAttempt::Answered(code) => {
+            FindCoordinatorDecision::Refused(LookupRefusal::Fatal(code))
+        }
+    }
+}
+
+/// Decide what an `EndTxn` retry means when the lookup of the transaction
+/// coordinator before it was refused.
+///
+/// A fatal refusal is fatal, as Kafka's `fatalError` makes every pending
+/// request fail. An abortable refusal during a commit makes the commit fail
+/// with the refusal, as `transitionToAbortableError` moves
+/// `COMMITTING_TRANSACTION` to `ABORTABLE_ERROR`, unless an earlier attempt
+/// was lost, which leaves the outcome unknown. During an abort, Kafka's
+/// `transitionToAbortableError` skips the transition, and the `EndTxn`
+/// request waits for the next lookup, so the retry goes on.
+pub(crate) const fn decide_end_txn_after_refused_lookup(
+    refusal: LookupRefusal,
+    earlier_attempt_lost: bool,
+    committed: bool,
+) -> EndTxnDecision {
+    match refusal {
+        LookupRefusal::Fatal(code) => EndTxnDecision::Fatal(code),
+        LookupRefusal::Abortable(_) if !committed => EndTxnDecision::Retry { rediscover: true },
+        LookupRefusal::Abortable(_) if earlier_attempt_lost => EndTxnDecision::OutcomeUnknown,
+        LookupRefusal::Abortable(code) => EndTxnDecision::Abortable(code),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use assert2::assert;
 
     use super::{
-        AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision, TxnRequestDecision,
-        decide_add_offsets_to_txn, decide_add_partitions, decide_end_txn,
-        decide_end_txn_at_deadline, decide_init_producer_id, decide_txn_offset_commit,
+        AddPartitionsDecision, CoordinatorAttempt, EndTxnDecision, FindCoordinatorDecision,
+        LookupRefusal, TxnRequestDecision, decide_add_offsets_to_txn, decide_add_partitions,
+        decide_end_txn, decide_end_txn_after_refused_lookup, decide_end_txn_at_deadline,
+        decide_find_coordinator, decide_init_producer_id, decide_txn_offset_commit,
     };
 
     #[test]
@@ -577,6 +648,79 @@ mod tests {
         ];
         for (name, attempt, expected) in cases {
             assert!(decide_init_producer_id(attempt) == expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn each_find_coordinator_answer_maps_to_one_decision() {
+        use CoordinatorAttempt::{Answered, Lost};
+        use FindCoordinatorDecision::{Found, Refused, Retry};
+        let abortable = |code| Refused(LookupRefusal::Abortable(code));
+        let fatal = |code| Refused(LookupRefusal::Fatal(code));
+        let cases = [
+            ("none", Answered(0), Found),
+            ("transport loss", Lost, Retry),
+            ("request timed out", Answered(7), Retry),
+            ("network exception", Answered(13), Retry),
+            ("loading", Answered(14), Retry),
+            ("unavailable", Answered(15), Retry),
+            ("moved", Answered(16), Retry),
+            ("concurrent", Answered(51), Retry),
+            ("transactional id authorization", Answered(53), fatal(53)),
+            ("group authorization", Answered(30), abortable(30)),
+            ("transaction abortable", Answered(120), abortable(120)),
+            ("cluster authorization", Answered(31), fatal(31)),
+            ("invalid request", Answered(42), fatal(42)),
+            ("unknown server error", Answered(-1), fatal(-1)),
+        ];
+        for (name, attempt, expected) in cases {
+            assert!(decide_find_coordinator(attempt) == expected, "{name}");
+        }
+    }
+
+    /// Kafka's `fatalError` fails the `EndTxn` request, and
+    /// `transitionToAbortableError` moves a commit to `ABORTABLE_ERROR` but
+    /// leaves an abort as it was.
+    #[test]
+    fn a_refused_lookup_before_an_end_txn_retry_maps_to_one_decision() {
+        use EndTxnDecision::{Abortable, Fatal, OutcomeUnknown, Retry};
+        use LookupRefusal as Refusal;
+        let cases = [
+            ("commit, fatal", Refusal::Fatal(53), false, true, Fatal(53)),
+            ("abort, fatal", Refusal::Fatal(53), false, false, Fatal(53)),
+            (
+                "commit after a loss, fatal",
+                Refusal::Fatal(42),
+                true,
+                true,
+                Fatal(42),
+            ),
+            (
+                "commit, abortable",
+                Refusal::Abortable(120),
+                false,
+                true,
+                Abortable(120),
+            ),
+            (
+                "commit after a loss, abortable",
+                Refusal::Abortable(120),
+                true,
+                true,
+                OutcomeUnknown,
+            ),
+            (
+                "abort, abortable",
+                Refusal::Abortable(120),
+                false,
+                false,
+                Retry { rediscover: true },
+            ),
+        ];
+        for (name, refusal, earlier_attempt_lost, committed, expected) in cases {
+            let actual =
+                decide_end_txn_after_refused_lookup(refusal, earlier_attempt_lost, committed);
+            assert!(actual == expected, "{name}");
         }
     }
 }

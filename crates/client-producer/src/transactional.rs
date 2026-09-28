@@ -509,7 +509,7 @@ mod tests {
             },
             end_txn_request,
             end_txn_response::{self, EndTxnResponse},
-            find_coordinator_request,
+            find_coordinator_request::{self, FindCoordinatorRequest},
             find_coordinator_response::FindCoordinatorResponse,
             init_producer_id_request::{self, InitProducerIdRequest},
             init_producer_id_response::{self, InitProducerIdResponse},
@@ -980,6 +980,10 @@ mod tests {
         add_offsets: Script,
         txn_offset_commit: Script,
         produce: Script,
+        /// The answers to `FindCoordinator` for the transactional id.
+        txn_lookup: Script,
+        /// The answers to `FindCoordinator` for a group.
+        group_lookup: Script,
         find_coordinator_requests: usize,
         /// The number of transactional `InitProducerId` requests.
         init_producer_id_requests: usize,
@@ -1305,8 +1309,18 @@ mod tests {
             }
             if api_key == find_coordinator_request::API_KEY {
                 coordinator.find_coordinator_requests += 1;
+                let request: FindCoordinatorRequest =
+                    decode_request(body, version, find_coordinator_request::FLEXIBLE_MIN);
+                let script = if request.key == "test-txn" {
+                    &mut coordinator.txn_lookup
+                } else {
+                    &mut coordinator.group_lookup
+                };
+                let Reply::Code(error_code) = script.next() else {
+                    return None;
+                };
                 return Some(encode_v0(&FindCoordinatorResponse {
-                    error_code: 0,
+                    error_code,
                     node_id: 1,
                     host: "127.0.0.1".into(),
                     port: i32::from(handler_port.load(Ordering::SeqCst)),
@@ -1972,6 +1986,347 @@ mod tests {
                 coordinator_lookups,
                 abortable_error,
                 state: expected_state,
+            };
+            assert2::assert!(actual == expected, "{name}");
+            mock.stop();
+        }
+    }
+
+    /// The number of `FindCoordinator` requests, where `MANY_LOOKUPS` stands
+    /// for that number or more.
+    fn lookups(coordinator: &Coordinator) -> usize {
+        coordinator.find_coordinator_requests.min(MANY_LOOKUPS)
+    }
+
+    /// More lookups than a script names: the producer retried until the
+    /// deadline.
+    const MANY_LOOKUPS: usize = 5;
+
+    /// The observable result of one scripted `init_transactions`.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ScriptedInit {
+        result: TxnResult,
+        coordinator_lookups: usize,
+        init_producer_id_requests: usize,
+        state: TxnState,
+    }
+
+    /// Kafka's `FindCoordinatorHandler` sends the lookup again after a
+    /// disconnect and after every retriable code, so `initTransactions`
+    /// blocks while a new broker creates `__transaction_state`. The handler
+    /// makes `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` and an unexpected code
+    /// fatal, and `TRANSACTION_ABORTABLE` abortable. A lookup that answers a
+    /// retriable code until the deadline reports that code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn init_transactions_retries_the_lookups_that_kafka_retries() {
+        use Reply::{Code, Silent};
+        use TxnResult::{Fatal, Server};
+        let cases = [
+            ("found", vec![Code(0)], TxnResult::Ok, 1, 1, TxnState::Ready),
+            (
+                "unavailable twice, then found",
+                vec![Code(15), Code(15), Code(0)],
+                TxnResult::Ok,
+                3,
+                1,
+                TxnState::Ready,
+            ),
+            (
+                "loading, moved, then found",
+                vec![Code(14), Code(16), Code(0)],
+                TxnResult::Ok,
+                3,
+                1,
+                TxnState::Ready,
+            ),
+            (
+                "lost, then found",
+                vec![Silent, Code(0)],
+                TxnResult::Ok,
+                2,
+                1,
+                TxnState::Ready,
+            ),
+            (
+                "unavailable until the deadline",
+                vec![Code(15); MANY_LOOKUPS],
+                Server(15),
+                MANY_LOOKUPS,
+                0,
+                TxnState::Uninitialized,
+            ),
+            (
+                "transactional id authorization is fatal",
+                vec![Code(53)],
+                Fatal(53),
+                1,
+                0,
+                TxnState::FatalError,
+            ),
+            (
+                "an unexpected code is fatal",
+                vec![Code(42)],
+                Fatal(42),
+                1,
+                0,
+                TxnState::FatalError,
+            ),
+            (
+                "transaction abortable leaves the producer as it was",
+                vec![Code(120)],
+                Server(120),
+                1,
+                0,
+                TxnState::Uninitialized,
+            ),
+        ];
+        for (name, txn_lookup, result, coordinator_lookups, init_producer_id_requests, state) in
+            cases
+        {
+            let exhausted = txn_lookup.last().copied().unwrap_or(Code(0));
+            let (mock, producer, coordinator) = scripted_producer_raw(Coordinator {
+                txn_lookup: Script::new(&txn_lookup, exhausted),
+                ..Coordinator::default()
+            })
+            .await;
+            let outcome = producer.init_transactions().await;
+            let state_after = *producer.txn_state.lock().await;
+            let actual = {
+                let coordinator = coordinator.lock().expect("scripted coordinator");
+                ScriptedInit {
+                    result: outcome.into(),
+                    coordinator_lookups: lookups(&coordinator),
+                    init_producer_id_requests: coordinator.init_producer_id_requests,
+                    state: state_after,
+                }
+            };
+            let expected = ScriptedInit {
+                result,
+                coordinator_lookups,
+                init_producer_id_requests,
+                state,
+            };
+            assert2::assert!(actual == expected, "{name}");
+            mock.stop();
+        }
+    }
+
+    /// The lookups of `send_offsets_to_transaction` follow Kafka's
+    /// `FindCoordinatorHandler` too: the group lookup of `TxnOffsetCommit`, and
+    /// the lookup of the transaction coordinator after `AddOffsetsToTxn`
+    /// answers `NOT_COORDINATOR`. `GROUP_AUTHORIZATION_FAILED` stops the
+    /// transaction from committing, and
+    /// `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` is fatal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_offsets_to_transaction_retries_the_lookups_that_kafka_retries() {
+        use Reply::Code;
+        use TxnResult::{Fatal, Server};
+        let group = krabka_client_consumer::ConsumerGroupMetadata {
+            group_id: "group-a".into(),
+            generation_id: 3,
+            member_id: "member-a".into(),
+            group_instance_id: None,
+        };
+        // (name, transactional id lookups after the one of init_transactions,
+        // group lookups, add offsets script, result, offset commit requests,
+        // coordinator lookups, abortable, transaction state)
+        let cases = [
+            (
+                "group loading, then found",
+                vec![],
+                vec![Code(14), Code(0)],
+                vec![Code(0)],
+                TxnResult::Ok,
+                1,
+                2,
+                None,
+                TxnState::InTransaction,
+            ),
+            (
+                "group unavailable twice, then found",
+                vec![],
+                vec![Code(15), Code(15), Code(0)],
+                vec![Code(0)],
+                TxnResult::Ok,
+                1,
+                3,
+                None,
+                TxnState::InTransaction,
+            ),
+            (
+                "group authorization is abortable",
+                vec![],
+                vec![Code(30)],
+                vec![Code(0)],
+                Server(30),
+                0,
+                1,
+                Some(30),
+                TxnState::InTransaction,
+            ),
+            (
+                "group lookup unexpected code is fatal",
+                vec![],
+                vec![Code(42)],
+                vec![Code(0)],
+                Fatal(42),
+                0,
+                1,
+                None,
+                TxnState::FatalError,
+            ),
+            (
+                "transaction coordinator moved, loading, then found",
+                vec![Code(14), Code(0)],
+                vec![Code(0)],
+                vec![Code(16), Code(0)],
+                TxnResult::Ok,
+                1,
+                3,
+                None,
+                TxnState::InTransaction,
+            ),
+            (
+                "transaction coordinator moved, then transactional id authorization",
+                vec![Code(53)],
+                vec![Code(0)],
+                vec![Code(16)],
+                Fatal(53),
+                0,
+                1,
+                None,
+                TxnState::FatalError,
+            ),
+            (
+                "transaction coordinator moved, then transaction abortable",
+                vec![Code(120)],
+                vec![Code(0)],
+                vec![Code(16)],
+                Server(120),
+                0,
+                1,
+                Some(120),
+                TxnState::InTransaction,
+            ),
+        ];
+        for (
+            name,
+            txn_lookup,
+            group_lookup,
+            add_offsets,
+            result,
+            txn_offset_commit_requests,
+            coordinator_lookups,
+            abortable_error,
+            state,
+        ) in cases
+        {
+            let mut txn_lookups = vec![Code(0)];
+            txn_lookups.extend(txn_lookup);
+            let (mock, producer, coordinator) = scripted_producer(Coordinator {
+                txn_lookup: Script::new(&txn_lookups, Code(0)),
+                group_lookup: Script::new(&group_lookup, Code(0)),
+                add_offsets: Script::new(&add_offsets, Code(0)),
+                ..Coordinator::default()
+            })
+            .await;
+            let transaction = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction");
+            let outcome = producer
+                .send_offsets_to_transaction([(("topic".to_owned(), 0), 42)], &group)
+                .await;
+            let state_after = *producer.txn_state.lock().await;
+            drop(transaction);
+            let actual = {
+                let coordinator = coordinator.lock().expect("scripted coordinator");
+                ScriptedSendOffsets {
+                    result: outcome.into(),
+                    add_offsets_requests: coordinator.add_offsets.requests,
+                    txn_offset_commit_requests: coordinator.txn_offset_commit.requests,
+                    coordinator_lookups: lookups(&coordinator),
+                    abortable_error: producer.txn_error.abortable().map(|error| match error {
+                        AbortableError::Server(code) => code,
+                        AbortableError::Timeout => i16::MIN,
+                    }),
+                    state: state_after,
+                }
+            };
+            let expected = ScriptedSendOffsets {
+                result,
+                add_offsets_requests: add_offsets.len(),
+                txn_offset_commit_requests,
+                coordinator_lookups,
+                abortable_error,
+                state,
+            };
+            assert2::assert!(actual == expected, "{name}");
+            mock.stop();
+        }
+    }
+
+    /// A commit whose `EndTxn` answers `NOT_COORDINATOR` finds the
+    /// coordinator again, with the retries of Kafka's
+    /// `FindCoordinatorHandler`. A fatal lookup answer makes the producer
+    /// fatal, and an abortable one fails the commit with that code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_retries_the_lookups_that_kafka_retries() {
+        use Reply::Code;
+        use TxnResult::{Fatal, Server};
+        let cases = [
+            (
+                "moved, unavailable, then committed",
+                vec![Code(15), Code(0)],
+                vec![Code(16), Code(0)],
+                TxnResult::Ok,
+                TxnState::Ready,
+            ),
+            (
+                "moved, then transactional id authorization",
+                vec![Code(53)],
+                vec![Code(16)],
+                Fatal(53),
+                TxnState::FatalError,
+            ),
+            (
+                "moved, then transaction abortable",
+                vec![Code(120)],
+                vec![Code(16)],
+                Server(120),
+                TxnState::InTransaction,
+            ),
+        ];
+        for (name, txn_lookup, end_txn, result, state) in cases {
+            let mut txn_lookups = vec![Code(0)];
+            txn_lookups.extend(txn_lookup);
+            let (mock, producer, coordinator) = scripted_producer(Coordinator {
+                txn_lookup: Script::new(&txn_lookups, Code(0)),
+                end_txn: Script::new(&end_txn, Code(0)),
+                ..Coordinator::default()
+            })
+            .await;
+            let outcome = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction")
+                .commit()
+                .await
+                .map_err(|error| error.source);
+            let state_after = *producer.txn_state.lock().await;
+            let actual = ScriptedCommit {
+                result: outcome.into(),
+                end_txn_requests: coordinator
+                    .lock()
+                    .expect("scripted coordinator")
+                    .end_txn
+                    .requests,
+                state: state_after,
+            };
+            let expected = ScriptedCommit {
+                result,
+                end_txn_requests: end_txn.len(),
+                state,
             };
             assert2::assert!(actual == expected, "{name}");
             mock.stop();
