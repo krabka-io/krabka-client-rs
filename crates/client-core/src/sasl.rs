@@ -1087,6 +1087,15 @@ mod tests {
                 r#"Scram { mechanism: ScramSha512, username: "token-id", password: [hidden], delegation_token: true }"#,
             ),
             (
+                SaslCredentials::Gssapi {
+                    keytab_path: PathBuf::from("/etc/krb5.keytab"),
+                    client_principal: "kafka/client@EXAMPLE.COM".into(),
+                    service_name: "kafka".into(),
+                    kdc_url: "kdc.example.com:88".into(),
+                },
+                r#"Gssapi { keytab_path: "/etc/krb5.keytab", client_principal: "kafka/client@EXAMPLE.COM", service_name: "kafka", kdc_url: "kdc.example.com:88" }"#,
+            ),
+            (
                 SaslCredentials::OAuthBearer {
                     token: OAuthBearerTokenSource::File(PathBuf::from("/run/token")),
                     extensions: BTreeMap::from([("logicalCluster".into(), "lkc-1".into())]),
