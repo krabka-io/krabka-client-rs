@@ -36,9 +36,13 @@ pub mod cluster;
 mod config;
 pub mod config_resources;
 pub mod configs;
+pub mod consumer_group_listings;
 pub mod delegation_tokens;
 pub mod elections;
 pub mod features;
+mod group_coordinators;
+pub mod group_deletions;
+pub mod group_descriptions;
 pub mod groups;
 pub mod log_dirs;
 pub mod offsets;
@@ -46,6 +50,7 @@ mod partition_leaders;
 pub mod quorum;
 pub mod quotas;
 mod retry;
+pub mod share_group_offsets;
 mod telemetry;
 pub mod topic_descriptions;
 pub mod topics;
@@ -67,11 +72,18 @@ pub use config::{
 };
 pub use config_resources::{ConfigResourceListing, ConfigResourceType};
 pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
+pub use consumer_group_listings::{
+    ConsumerGroupListing, ListConsumerGroupsOptions, ListConsumerGroupsResult,
+};
 pub use elections::{ElectionResults, ElectionType};
 pub use features::{FeatureMetadata, FeatureRange, FeatureUpdate, FeatureUpdateOutcome};
+pub use group_deletions::GroupDeletions;
+pub use group_descriptions::{
+    ClassicGroupDescription, ConsumerGroupDescription, DescribeGroupsOptions, GroupDescriptions,
+    MemberDescription, ShareGroupDescription, StreamsGroupDescription,
+};
 pub use groups::{
-    ClassicGroupDescription, ConsumerGroupDescription, ConsumerGroupOffsetOutcome,
-    ShareGroupDescription, ShareGroupOffsetPartition, StreamsGroupDescription,
+    ConsumerGroupOffsetOutcome, MemberToRemove, RemoveMembersOptions, RemovedMember, RemovedMembers,
 };
 pub use log_dirs::{
     BrokerResult, LogDirInfo, LogDirPartitionInfo, LogDirTopicInfo, ReplicaLogDir,
@@ -83,6 +95,9 @@ pub use quotas::{
     ClientQuotaAlteration, ClientQuotaEntity, ClientQuotaFilter, ClientQuotaFilterComponent,
     ClientQuotaMatch, ClientQuotas, ENTITY_CLIENT_ID, ENTITY_IP, ENTITY_USER, QuotaOp,
     UserQuotaConfig, diff_user_quotas,
+};
+pub use share_group_offsets::{
+    ListShareGroupOffsetsSpec, ShareGroupOffsets, SharePartitionOffsetInfo,
 };
 pub use topic_descriptions::{
     DescribeTopicsOptions, ListTopicsOptions, TopicDescription, TopicDescriptions, TopicListing,
