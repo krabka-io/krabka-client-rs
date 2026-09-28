@@ -18,6 +18,7 @@ use krabka_protocol::{
             AlterReplicaLogDir, AlterReplicaLogDirTopic, AlterReplicaLogDirsRequest,
         },
         alter_replica_log_dirs_response::AlterReplicaLogDirsResponse,
+        describe_cluster_request::DescribeClusterRequest,
         describe_log_dirs_request::{DescribableLogDirTopic, DescribeLogDirsRequest},
         describe_log_dirs_response::DescribeLogDirsResponse,
         metadata_request::MetadataRequest,
@@ -30,6 +31,7 @@ use crate::{
     groups::list_groups_kafka_error,
     kafka_error_if, kafka_error_name,
     retry::{CoordinatorRetry, RetryAction, RetryPolicy, is_connection_failure},
+    send_connection_at_least,
 };
 
 /// `UNKNOWN_SERVER_ERROR`.
@@ -41,6 +43,8 @@ const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
 /// `KAFKA_STORAGE_ERROR`: the log dir is offline, or the broker does not
 /// host the replica.
 const KAFKA_STORAGE_ERROR: i16 = 56;
+/// `DescribeCluster` `EndpointType.CONTROLLER` (KIP-919).
+const ENDPOINT_TYPE_CONTROLLERS: i8 = 2;
 
 /// One replica of a partition on one broker, as Kafka's
 /// `TopicPartitionReplica`.
@@ -476,6 +480,46 @@ async fn call_broker<R>(
     broker_id: i32,
     options: &ConnectionOptions,
     request: R,
+    retry: CoordinatorRetry,
+) -> BrokerResult<R::Response>
+where
+    R: ProtocolRequest + Clone,
+{
+    call_node(conn, NodeTarget::broker(broker_id), options, request, retry).await
+}
+
+/// The node of a [`call_node`] call, as Kafka's `ConstantNodeIdProvider`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NodeTarget {
+    /// The id of the node.
+    pub(crate) node_id: i32,
+    /// Whether the call finds the node among the controllers when the client
+    /// bootstraps from controllers (KIP-919), as a provider with
+    /// `supportsUseControllers` does. A call without it looks the node up in
+    /// `Metadata`.
+    pub(crate) supports_controllers: bool,
+    /// The lowest version of the request that the call may send.
+    pub(crate) min_version: Option<i16>,
+}
+
+impl NodeTarget {
+    /// A broker, found in `Metadata`, at any version.
+    const fn broker(node_id: i32) -> Self {
+        Self {
+            node_id,
+            supports_controllers: false,
+            min_version: None,
+        }
+    }
+}
+
+/// Send `request` to the node of `target`, as [`call_broker`] does for a
+/// broker.
+pub(crate) async fn call_node<R>(
+    conn: &RecoveringConnection,
+    target: NodeTarget,
+    options: &ConnectionOptions,
+    request: R,
     mut retry: CoordinatorRetry,
 ) -> BrokerResult<R::Response>
 where
@@ -487,13 +531,13 @@ where
             .run(broker_attempt(
                 &mut connection,
                 conn,
-                broker_id,
+                target,
                 options,
                 request.clone(),
             ))
             .await;
         if let Some(result) = retry.next(action).await {
-            return result.map_err(|error| broker_error(broker_id, &error));
+            return result.map_err(|error| broker_error(target.node_id, &error));
         }
     }
 }
@@ -518,15 +562,16 @@ fn broker_error(broker_id: i32, error: &AdminError) -> KafkaError {
 async fn broker_attempt<R>(
     connection: &mut Option<Connection>,
     conn: &RecoveringConnection,
-    broker_id: i32,
+    target: NodeTarget,
     options: &ConnectionOptions,
     request: R,
 ) -> RetryAction<R::Response>
 where
     R: ProtocolRequest,
 {
+    let broker_id = target.node_id;
     if connection.is_none() {
-        let endpoint = match broker_endpoint(conn, broker_id).await {
+        let endpoint = match node_endpoint(conn, target).await {
             Ok(Some(endpoint)) => endpoint,
             Ok(None) => {
                 tracing::debug!(broker_id, "the broker is not in the metadata; retrying");
@@ -555,7 +600,11 @@ where
             krabka_client_core::ClientError::Disconnected,
         )));
     };
-    match current.send(request).await {
+    let sent = match target.min_version {
+        Some(min_version) => send_connection_at_least(current, request, min_version).await,
+        None => current.send(request).await,
+    };
+    match sent {
         Ok(response) => RetryAction::Done(Ok(response)),
         Err(error) => {
             let error = AdminError::from(error);
@@ -567,6 +616,41 @@ where
             }
         }
     }
+}
+
+/// The `host:port` of the node of `target`, or `None` when no node has its
+/// id. With a controller bootstrap and `supports_controllers`, the node is
+/// one of the controllers that `DescribeCluster` names, as Kafka's admin
+/// metadata holds the controllers then; otherwise a broker of fresh metadata.
+async fn node_endpoint(
+    conn: &RecoveringConnection,
+    target: NodeTarget,
+) -> Result<Option<String>, AdminError> {
+    if !(target.supports_controllers && conn.uses_controller_bootstrap()) {
+        return broker_endpoint(conn, target.node_id).await;
+    }
+    let response = conn
+        .send_at_least(
+            DescribeClusterRequest {
+                endpoint_type: ENDPOINT_TYPE_CONTROLLERS,
+                ..Default::default()
+            },
+            1,
+        )
+        .await?;
+    if response.error_code != 0 {
+        return Err(AdminError::Broker {
+            api: "DescribeCluster",
+            code: response.error_code,
+            name: kafka_error_name(response.error_code),
+            message: response.error_message,
+        });
+    }
+    Ok(response
+        .brokers
+        .into_iter()
+        .find(|controller| controller.broker_id == target.node_id)
+        .map(|controller| format_host_port(&controller.host, controller.port)))
 }
 
 /// The `host:port` of `broker_id` in fresh metadata, or `None` when the

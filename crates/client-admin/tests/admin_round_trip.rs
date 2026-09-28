@@ -39,11 +39,15 @@ mod support;
 
 use std::{collections::BTreeMap, time::Duration};
 
+/// The dynamic config overrides of one topic.
+type Overrides = BTreeMap<String, String>;
+
 use assert2::assert;
 use krabka_client_admin::{
-    AdminClient, AlterConfigsOutcome, CreatePartitionsOp, CreatePartitionsOutcome,
-    CreateTopicOutcome, CreateTopicSpec, DeleteTopicOutcome, IncrementalAlterOp,
-    TopicConfigOverrides, TopicMetadataEntry, TopicMutationOptions,
+    AdminClient, AlterConfigOp, AlterConfigsResults, ConfigResource, CreatePartitionsOp,
+    CreatePartitionsOutcome, CreateTopicOutcome, CreateTopicSpec, DeleteTopicOutcome,
+    DescribeConfigsOptions, IncrementalAlterConfigsOptions, TopicMetadataEntry,
+    TopicMutationOptions,
 };
 
 /// Bound on every read-back loop. The broker applies a change and then makes
@@ -170,20 +174,22 @@ async fn read_create_override(admin: &mut AdminClient, topic: &str) {
         override_is(o, "retention.ms", "60000")
     })
     .await;
-    assert!(overrides == vec![expected_overrides(topic, &[("retention.ms", "60000")])]);
+    assert!(overrides == expected_overrides(&[("retention.ms", "60000")]));
 }
 
 /// Step 5. `IncrementalAlterConfigs` sets a second key.
 async fn set_override(admin: &mut AdminClient, topic: &str) {
     let outcomes = admin
-        .incremental_alter_configs(&[IncrementalAlterOp::Set {
-            topic: topic.to_owned(),
-            key: "cleanup.policy".to_owned(),
-            value: "compact".to_owned(),
-        }])
+        .incremental_alter_configs(
+            &BTreeMap::from([(
+                ConfigResource::topic(topic),
+                vec![AlterConfigOp::set("cleanup.policy", "compact")],
+            )]),
+            IncrementalAlterConfigsOptions::default(),
+        )
         .await
         .expect("incremental_alter_configs set");
-    assert!(outcomes == vec![alter_ok(topic)]);
+    assert!(outcomes == alter_ok(topic));
 
     let overrides = await_overrides(admin, topic, "cleanup.policy is compact", |o| {
         override_is(o, "cleanup.policy", "compact")
@@ -191,10 +197,7 @@ async fn set_override(admin: &mut AdminClient, topic: &str) {
     .await;
     assert!(
         overrides
-            == vec![expected_overrides(
-                topic,
-                &[("cleanup.policy", "compact"), ("retention.ms", "60000")],
-            )]
+            == expected_overrides(&[("cleanup.policy", "compact"), ("retention.ms", "60000")])
     );
 }
 
@@ -202,20 +205,22 @@ async fn set_override(admin: &mut AdminClient, topic: &str) {
 /// second key stays.
 async fn delete_override(admin: &mut AdminClient, topic: &str) {
     let outcomes = admin
-        .incremental_alter_configs(&[IncrementalAlterOp::Delete {
-            topic: topic.to_owned(),
-            key: "retention.ms".to_owned(),
-        }])
+        .incremental_alter_configs(
+            &BTreeMap::from([(
+                ConfigResource::topic(topic),
+                vec![AlterConfigOp::delete("retention.ms")],
+            )]),
+            IncrementalAlterConfigsOptions::default(),
+        )
         .await
         .expect("incremental_alter_configs delete");
-    assert!(outcomes == vec![alter_ok(topic)]);
+    assert!(outcomes == alter_ok(topic));
 
     let overrides = await_overrides(admin, topic, "retention.ms is gone", |o| {
-        !o.iter().any(|t| t.overrides.contains_key("retention.ms"))
-            && override_is(o, "cleanup.policy", "compact")
+        !o.contains_key("retention.ms") && override_is(o, "cleanup.policy", "compact")
     })
     .await;
-    assert!(overrides == vec![expected_overrides(topic, &[("cleanup.policy", "compact")])]);
+    assert!(overrides == expected_overrides(&[("cleanup.policy", "compact")]));
 }
 
 /// Step 7. Delete the topic. The metadata then reports the topic as absent or
@@ -279,14 +284,23 @@ async fn await_overrides(
     admin: &mut AdminClient,
     topic: &str,
     what: &str,
-    ready: impl Fn(&[TopicConfigOverrides]) -> bool,
-) -> Vec<TopicConfigOverrides> {
+    ready: impl Fn(&Overrides) -> bool,
+) -> Overrides {
+    let resource = ConfigResource::topic(topic);
     tokio::time::timeout(SETTLE_TIMEOUT, async {
         loop {
-            let overrides = admin
-                .describe_configs(&[topic])
+            let mut described = admin
+                .describe_configs(
+                    std::slice::from_ref(&resource),
+                    DescribeConfigsOptions::default(),
+                )
                 .await
                 .expect("describe_configs");
+            let config = described
+                .remove(&resource)
+                .expect("a result for the topic")
+                .expect("the topic's config");
+            let overrides = config.dynamic_overrides(&resource);
             if ready(&overrides) {
                 break overrides;
             }
@@ -297,25 +311,17 @@ async fn await_overrides(
     .unwrap_or_else(|_| panic!("the broker did not report that {what} within {SETTLE_TIMEOUT:?}"))
 }
 
-fn override_is(overrides: &[TopicConfigOverrides], key: &str, value: &str) -> bool {
-    overrides
+fn override_is(overrides: &Overrides, key: &str, value: &str) -> bool {
+    overrides.get(key).map(String::as_str) == Some(value)
+}
+
+fn expected_overrides(entries: &[(&str, &str)]) -> Overrides {
+    entries
         .iter()
-        .any(|t| t.overrides.get(key).map(String::as_str) == Some(value))
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
 }
 
-fn expected_overrides(topic: &str, entries: &[(&str, &str)]) -> TopicConfigOverrides {
-    TopicConfigOverrides {
-        topic: topic.to_owned(),
-        overrides: entries
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect(),
-    }
-}
-
-fn alter_ok(topic: &str) -> AlterConfigsOutcome {
-    AlterConfigsOutcome {
-        topic: topic.to_owned(),
-        error: None,
-    }
+fn alter_ok(topic: &str) -> AlterConfigsResults {
+    BTreeMap::from([(ConfigResource::topic(topic), Ok(()))])
 }
