@@ -46,20 +46,10 @@ use krabka_protocol::{
             AlterShareGroupOffsetsRequestTopic,
         },
         alter_share_group_offsets_response::AlterShareGroupOffsetsResponse,
-        consumer_group_describe_request::ConsumerGroupDescribeRequest,
-        consumer_group_describe_response::DescribedGroup as ConsumerGroupDescribedGroup,
-        delete_groups_request::DeleteGroupsRequest,
-        delete_groups_response::DeleteGroupsResponse,
         delete_share_group_offsets_request::{
             DeleteShareGroupOffsetsRequest, DeleteShareGroupOffsetsRequestTopic,
         },
         delete_share_group_offsets_response::DeleteShareGroupOffsetsResponse,
-        describe_groups_request::DescribeGroupsRequest,
-        describe_groups_response::DescribedGroup as ClassicDescribedGroup,
-        describe_share_group_offsets_request::{
-            DescribeShareGroupOffsetsRequest, DescribeShareGroupOffsetsRequestGroup,
-        },
-        describe_share_group_offsets_response::DescribeShareGroupOffsetsResponse,
         leave_group_request::{self, LeaveGroupRequest, MemberIdentity},
         leave_group_response::LeaveGroupResponse,
         list_groups_request::{self, ListGroupsRequest},
@@ -76,15 +66,13 @@ use krabka_protocol::{
         offset_delete_response::OffsetDeleteResponse,
         offset_fetch_request::{self, OffsetFetchRequest, OffsetFetchRequestGroup},
         offset_fetch_response::OffsetFetchResponse,
-        share_group_describe_request::ShareGroupDescribeRequest,
-        share_group_describe_response::DescribedGroup as ShareGroupDescribedGroup,
-        streams_group_describe_request::StreamsGroupDescribeRequest,
-        streams_group_describe_response::DescribedGroup as StreamsGroupDescribedGroup,
     },
 };
 
 use crate::{
-    AdminClient, AdminError, KafkaError, format_host_port, kafka_error_if, kafka_error_name,
+    AdminClient, AdminError, KafkaError, format_host_port,
+    group_descriptions::DescribeGroupsOptions,
+    kafka_error_if, kafka_error_name,
     retry::{CoordinatorRetry, RetryAction, RetryPolicy, connection_failure_action},
     send_connection_at_least,
 };
@@ -93,36 +81,6 @@ use crate::{
 pub struct ConsumerGroupOffsetOutcome {
     pub topic: String,
     pub partition: i32,
-    pub error: Option<KafkaError>,
-}
-
-/// A classic group's description from `DescribeGroups`, as Apache Kafka's
-/// `ClassicGroupDescription` holds it. This is the broker's wire response
-/// entry for the group, reused directly rather than duplicated into a
-/// bespoke type.
-pub type ClassicGroupDescription = ClassicDescribedGroup;
-
-/// A consumer group's description from `ConsumerGroupDescribe` (KIP-848), as
-/// Apache Kafka's `ConsumerGroupDescription` holds it.
-pub type ConsumerGroupDescription = ConsumerGroupDescribedGroup;
-
-/// A share group's description from `ShareGroupDescribe`, as Apache Kafka's
-/// `ShareGroupDescription` holds it.
-pub type ShareGroupDescription = ShareGroupDescribedGroup;
-
-/// A streams group's description from `StreamsGroupDescribe`, as Apache
-/// Kafka's `StreamsGroupDescription` holds it.
-pub type StreamsGroupDescription = StreamsGroupDescribedGroup;
-
-/// One partition's share-group offset, as Apache Kafka's
-/// `SharePartitionOffsetInfo` holds it (`DescribeShareGroupOffsets`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShareGroupOffsetPartition {
-    pub topic: String,
-    pub partition: i32,
-    pub start_offset: i64,
-    pub leader_epoch: i32,
-    pub lag: i64,
     pub error: Option<KafkaError>,
 }
 
@@ -693,311 +651,6 @@ impl AdminClient {
             .await
     }
 
-    /// Describes one classic (`ConsumerProtocol`) group with `DescribeGroups`,
-    /// as Apache Kafka's `describeClassicGroups` does for that group. Routes
-    /// to the group's coordinator, with the same coordinator retry policy as
-    /// [`AdminClient::list_consumer_group_offsets`].
-    ///
-    /// Kafka's `describeClassicGroups` takes a collection of group ids; this
-    /// call takes one, so a caller describing several groups calls it once
-    /// per group id.
-    ///
-    /// # Errors
-    /// Returns an error when encoding, transport, or response handling fails,
-    /// or when the coordinator's answer for the group carries an error code
-    /// that Kafka does not retry (see
-    /// [`AdminClient::list_consumer_group_offsets`] for the retried codes).
-    pub async fn describe_classic_groups(
-        &mut self,
-        group: &str,
-    ) -> Result<ClassicGroupDescription, AdminError> {
-        self.describe_classic_groups_with_retry(group, self.retry)
-            .await
-    }
-
-    async fn describe_classic_groups_with_retry(
-        &mut self,
-        group: &str,
-        retry: RetryPolicy,
-    ) -> Result<ClassicGroupDescription, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.describe_classic_groups_attempt(group, retry.find_coordinator()))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
-    }
-
-    async fn describe_classic_groups_attempt(
-        &mut self,
-        group: &str,
-        find_coordinator: bool,
-    ) -> RetryAction<ClassicGroupDescription> {
-        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
-            return action;
-        }
-        let request = DescribeGroupsRequest {
-            groups: vec![group.to_owned()],
-            include_authorized_operations: true,
-            ..Default::default()
-        };
-        match self.conn.send(request).await {
-            Ok(response) => {
-                describe_group_result("DescribeGroups", group, response.groups, |g| g.error_code)
-            }
-            Err(error) => connection_failure_action(error),
-        }
-    }
-
-    /// Describes one consumer-protocol group (KIP-848) with
-    /// `ConsumerGroupDescribe`, as Apache Kafka's `describeConsumerGroups`
-    /// does for that group. Routes to the group's coordinator with the same
-    /// retry policy as [`AdminClient::describe_classic_groups`].
-    ///
-    /// Kafka's `KafkaAdminClient.describeConsumerGroups` falls back to
-    /// `DescribeGroups` for a classic group; this call always sends
-    /// `ConsumerGroupDescribe`, so a classic group is described with
-    /// [`AdminClient::describe_classic_groups`] instead.
-    ///
-    /// # Errors
-    /// Returns an error when encoding, transport, or response handling fails,
-    /// or when the coordinator's answer for the group carries an error code
-    /// that Kafka does not retry.
-    pub async fn describe_consumer_groups(
-        &mut self,
-        group: &str,
-    ) -> Result<ConsumerGroupDescription, AdminError> {
-        self.describe_consumer_groups_with_retry(group, self.retry)
-            .await
-    }
-
-    async fn describe_consumer_groups_with_retry(
-        &mut self,
-        group: &str,
-        retry: RetryPolicy,
-    ) -> Result<ConsumerGroupDescription, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.describe_consumer_groups_attempt(group, retry.find_coordinator()))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
-    }
-
-    async fn describe_consumer_groups_attempt(
-        &mut self,
-        group: &str,
-        find_coordinator: bool,
-    ) -> RetryAction<ConsumerGroupDescription> {
-        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
-            return action;
-        }
-        let request = ConsumerGroupDescribeRequest {
-            group_ids: vec![group.to_owned()],
-            include_authorized_operations: true,
-            ..Default::default()
-        };
-        match self.conn.send(request).await {
-            Ok(response) => {
-                describe_group_result("ConsumerGroupDescribe", group, response.groups, |g| {
-                    g.error_code
-                })
-            }
-            Err(error) => connection_failure_action(error),
-        }
-    }
-
-    /// Describes one share group with `ShareGroupDescribe`, as Apache Kafka's
-    /// `describeShareGroups` does for that group. Routes to the group's
-    /// coordinator with the same retry policy as
-    /// [`AdminClient::describe_classic_groups`].
-    ///
-    /// # Errors
-    /// Returns an error when encoding, transport, or response handling fails,
-    /// or when the coordinator's answer for the group carries an error code
-    /// that Kafka does not retry.
-    pub async fn describe_share_groups(
-        &mut self,
-        group: &str,
-    ) -> Result<ShareGroupDescription, AdminError> {
-        self.describe_share_groups_with_retry(group, self.retry)
-            .await
-    }
-
-    async fn describe_share_groups_with_retry(
-        &mut self,
-        group: &str,
-        retry: RetryPolicy,
-    ) -> Result<ShareGroupDescription, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.describe_share_groups_attempt(group, retry.find_coordinator()))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
-    }
-
-    async fn describe_share_groups_attempt(
-        &mut self,
-        group: &str,
-        find_coordinator: bool,
-    ) -> RetryAction<ShareGroupDescription> {
-        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
-            return action;
-        }
-        let request = ShareGroupDescribeRequest {
-            group_ids: vec![group.to_owned()],
-            include_authorized_operations: true,
-            ..Default::default()
-        };
-        match self.conn.send(request).await {
-            Ok(response) => {
-                describe_group_result("ShareGroupDescribe", group, response.groups, |g| {
-                    g.error_code
-                })
-            }
-            Err(error) => connection_failure_action(error),
-        }
-    }
-
-    /// Describes one streams group with `StreamsGroupDescribe`, as Apache
-    /// Kafka's `describeStreamsGroups` does for that group. Routes to the
-    /// group's coordinator with the same retry policy as
-    /// [`AdminClient::describe_classic_groups`].
-    ///
-    /// # Errors
-    /// Returns an error when encoding, transport, or response handling fails,
-    /// or when the coordinator's answer for the group carries an error code
-    /// that Kafka does not retry.
-    pub async fn describe_streams_groups(
-        &mut self,
-        group: &str,
-    ) -> Result<StreamsGroupDescription, AdminError> {
-        self.describe_streams_groups_with_retry(group, self.retry)
-            .await
-    }
-
-    async fn describe_streams_groups_with_retry(
-        &mut self,
-        group: &str,
-        retry: RetryPolicy,
-    ) -> Result<StreamsGroupDescription, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.describe_streams_groups_attempt(group, retry.find_coordinator()))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
-    }
-
-    async fn describe_streams_groups_attempt(
-        &mut self,
-        group: &str,
-        find_coordinator: bool,
-    ) -> RetryAction<StreamsGroupDescription> {
-        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
-            return action;
-        }
-        let request = StreamsGroupDescribeRequest {
-            group_ids: vec![group.to_owned()],
-            include_authorized_operations: true,
-            ..Default::default()
-        };
-        match self.conn.send(request).await {
-            Ok(response) => {
-                describe_group_result("StreamsGroupDescribe", group, response.groups, |g| {
-                    g.error_code
-                })
-            }
-            Err(error) => connection_failure_action(error),
-        }
-    }
-
-    /// Deletes one empty consumer group with `DeleteGroups`, as Apache
-    /// Kafka's `deleteConsumerGroups` does for that group. Routes to the
-    /// group's coordinator with the same retry policy as
-    /// [`AdminClient::describe_classic_groups`].
-    ///
-    /// Kafka's `deleteConsumerGroups` takes a collection of group ids; this
-    /// call takes one, so a caller deleting several groups calls it once per
-    /// group id.
-    ///
-    /// # Errors
-    /// Returns an error when encoding, transport, or response handling fails,
-    /// or when the coordinator's answer for the group carries an error code
-    /// that Kafka does not retry, such as `NON_EMPTY_GROUP` or
-    /// `GROUP_ID_NOT_FOUND`.
-    pub async fn delete_consumer_groups(&mut self, group: &str) -> Result<(), AdminError> {
-        self.delete_consumer_groups_with_retry(group, self.retry)
-            .await
-    }
-
-    /// Deletes one empty share group. Apache Kafka's `deleteShareGroups`
-    /// builds the same `DeleteGroups` request as `deleteConsumerGroups`, so
-    /// this delegates to [`AdminClient::delete_consumer_groups`].
-    ///
-    /// # Errors
-    /// See [`AdminClient::delete_consumer_groups`].
-    pub async fn delete_share_groups(&mut self, group: &str) -> Result<(), AdminError> {
-        self.delete_consumer_groups(group).await
-    }
-
-    /// Deletes one empty streams group. Apache Kafka's
-    /// `KafkaAdminClient.deleteStreamsGroups` delegates to
-    /// `deleteConsumerGroups` verbatim, so this does too.
-    ///
-    /// # Errors
-    /// See [`AdminClient::delete_consumer_groups`].
-    pub async fn delete_streams_groups(&mut self, group: &str) -> Result<(), AdminError> {
-        self.delete_consumer_groups(group).await
-    }
-
-    async fn delete_consumer_groups_with_retry(
-        &mut self,
-        group: &str,
-        retry: RetryPolicy,
-    ) -> Result<(), AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.delete_consumer_groups_attempt(group, retry.find_coordinator()))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
-    }
-
-    async fn delete_consumer_groups_attempt(
-        &mut self,
-        group: &str,
-        find_coordinator: bool,
-    ) -> RetryAction<()> {
-        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
-            return action;
-        }
-        let request = DeleteGroupsRequest {
-            groups_names: vec![group.to_owned()],
-            ..Default::default()
-        };
-        match self.conn.send(request).await {
-            Ok(response) => delete_groups_retry_action(group, response),
-            Err(error) => connection_failure_action(error),
-        }
-    }
-
     /// Deletes committed offsets of an inactive consumer group for the named
     /// partitions with `OffsetDelete`, as Apache Kafka's
     /// `deleteConsumerGroupOffsets` does. Routes to the group's coordinator
@@ -1074,14 +727,27 @@ impl AdminClient {
     /// coordinator with the same retry policy as
     /// [`AdminClient::alter_consumer_group_offsets`].
     ///
-    /// `LeaveGroup`'s member-list field needs v3, so the client negotiates
-    /// v3 or higher, as Apache Kafka's `RemoveMembersFromConsumerGroupHandler`
-    /// does with `LeaveGroupRequest.Builder`.
+    /// Each member is named by its `group.instance.id`, as Kafka's
+    /// `MemberToRemove` names it, and is sent with the member id
+    /// `UNKNOWN_MEMBER_ID` (empty). An empty `members` removes every member of
+    /// the group, as Kafka's `removeAll` mode does: the call first describes
+    /// the group with [`AdminClient::describe_consumer_groups`] and names each
+    /// member by its instance id, or by its member id when it has none.
+    ///
+    /// Each member carries `options.reason`, cut to 255 characters, or
+    /// Kafka's default `"member was removed by an admin"` when the reason is
+    /// `None` or empty. `LeaveGroup`'s member list needs v3, so the client
+    /// negotiates v3 or higher, as Kafka's `LeaveGroupRequest.Builder` does.
+    ///
+    /// The result maps each member of the `LeaveGroup` answer, by member id
+    /// and instance id, to its error, as Kafka's
+    /// `RemoveMembersFromConsumerGroupHandler.handleResponse` does.
     ///
     /// # Errors
     /// Returns an error when encoding, transport, or response handling fails.
     /// Returns [`AdminError::Broker`] when the coordinator's top-level answer
-    /// carries a group error code that Kafka does not retry. Returns
+    /// carries a group error code that Kafka does not retry, or when the
+    /// `removeAll` describe fails for the group. Returns
     /// [`ClientError::IncompatibleVersion`] when the coordinator does not
     /// support `LeaveGroup` v3 or higher.
     ///
@@ -1089,10 +755,73 @@ impl AdminClient {
     pub async fn remove_members_from_consumer_group(
         &mut self,
         group: &str,
-        members: &[MemberIdentity],
-    ) -> Result<Vec<(MemberIdentity, Option<KafkaError>)>, AdminError> {
-        self.remove_members_from_consumer_group_with_retry(group, members, self.retry)
+        members: &[MemberToRemove],
+        options: &RemoveMembersOptions,
+    ) -> Result<RemovedMembers, AdminError> {
+        let reason = leave_group_reason(options.reason.as_deref());
+        let identities = if members.is_empty() {
+            self.all_members_of(group, &reason).await?
+        } else {
+            members
+                .iter()
+                .map(|member| MemberIdentity {
+                    member_id: String::new(),
+                    group_instance_id: Some(member.group_instance_id.clone()),
+                    reason: Some(reason.clone()),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        self.remove_members_from_consumer_group_with_retry(group, &identities, self.retry)
             .await
+    }
+
+    /// The members of `group` for Kafka's `removeAll` mode, as
+    /// `KafkaAdminClient.getMembersFromGroup` names them.
+    async fn all_members_of(
+        &self,
+        group: &str,
+        reason: &str,
+    ) -> Result<Vec<MemberIdentity>, AdminError> {
+        let description = self
+            .describe_consumer_groups(&[group], DescribeGroupsOptions::default())
+            .await
+            .remove(group)
+            .unwrap_or_else(|| {
+                Err(KafkaError {
+                    code: UNKNOWN_SERVER_ERROR,
+                    name: kafka_error_name(UNKNOWN_SERVER_ERROR),
+                    message: Some(format!("no description for group {group}")),
+                })
+            })
+            .map_err(|error| AdminError::Broker {
+                api: "describeConsumerGroups",
+                code: error.code,
+                name: error.name,
+                message: Some(format!(
+                    "Encounter exception when trying to get members from group: {group}{}",
+                    error
+                        .message
+                        .map(|message| format!(": {message}"))
+                        .unwrap_or_default()
+                )),
+            })?;
+        Ok(description
+            .members
+            .into_iter()
+            .map(|member| {
+                let (member_id, group_instance_id) = match member.group_instance_id {
+                    Some(instance_id) => (String::new(), Some(instance_id)),
+                    None => (member.member_id, None),
+                };
+                MemberIdentity {
+                    member_id,
+                    group_instance_id,
+                    reason: Some(reason.to_owned()),
+                    ..Default::default()
+                }
+            })
+            .collect())
     }
 
     async fn remove_members_from_consumer_group_with_retry(
@@ -1100,7 +829,7 @@ impl AdminClient {
         group: &str,
         members: &[MemberIdentity],
         retry: RetryPolicy,
-    ) -> Result<Vec<(MemberIdentity, Option<KafkaError>)>, AdminError> {
+    ) -> Result<RemovedMembers, AdminError> {
         let mut retry = CoordinatorRetry::new(retry);
         loop {
             let action = retry
@@ -1117,7 +846,7 @@ impl AdminClient {
         group: &str,
         members: &[MemberIdentity],
         find_coordinator: bool,
-    ) -> RetryAction<Vec<(MemberIdentity, Option<KafkaError>)>> {
+    ) -> RetryAction<RemovedMembers> {
         if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
             return action;
         }
@@ -1127,7 +856,7 @@ impl AdminClient {
             ..Default::default()
         });
         match self.conn.send(request).await {
-            Ok(response) => leave_group_retry_action(members, response),
+            Ok(response) => leave_group_retry_action(response),
             Err(error) => connection_failure_action(error),
         }
     }
@@ -1137,10 +866,17 @@ impl AdminClient {
     /// does. Routes to the group's coordinator with the same retry policy as
     /// [`AdminClient::alter_consumer_group_offsets`].
     ///
+    /// A top-level `COORDINATOR_LOAD_IN_PROGRESS` (14) or
+    /// `REBALANCE_IN_PROGRESS` (27) sends the request again to the same
+    /// coordinator, and `COORDINATOR_NOT_AVAILABLE` (15) or `NOT_COORDINATOR`
+    /// (16) finds the coordinator again. Every other top-level code, such as
+    /// `NON_EMPTY_GROUP` (68), is the error of each requested partition, as
+    /// Kafka's `AlterShareGroupOffsetsHandler.handleError` puts it in the
+    /// partition results.
+    ///
     /// # Errors
-    /// Returns an error when encoding, transport, or response handling fails.
-    /// Returns [`AdminError::Broker`] when the coordinator's top-level answer
-    /// carries a group error code that Kafka does not retry.
+    /// Returns an error when the coordinator lookup, the connection, or the
+    /// request fails, or at the deadline.
     pub async fn alter_share_group_offsets(
         &mut self,
         group: &str,
@@ -1212,63 +948,7 @@ impl AdminClient {
             .send(alter_share_group_offsets_request(group, offsets))
             .await
         {
-            Ok(response) => alter_share_group_offsets_retry_action(group, response),
-            Err(error) => connection_failure_action(error),
-        }
-    }
-
-    /// Reads committed start offsets, end-of-partition lag and leader epoch
-    /// for a share group's partitions with `DescribeShareGroupOffsets`, as
-    /// Apache Kafka's `listShareGroupOffsets` does. Routes to the group's
-    /// coordinator with the same retry policy as
-    /// [`AdminClient::list_consumer_group_offsets`].
-    ///
-    /// # Errors
-    /// Returns an error when encoding, transport, or response handling fails.
-    /// Returns [`AdminError::Broker`] when the coordinator's top-level answer
-    /// for the group carries an error code that Kafka does not retry.
-    pub async fn list_share_group_offsets(
-        &mut self,
-        group: &str,
-    ) -> Result<Vec<ShareGroupOffsetPartition>, AdminError> {
-        self.list_share_group_offsets_with_retry(group, self.retry)
-            .await
-    }
-
-    async fn list_share_group_offsets_with_retry(
-        &mut self,
-        group: &str,
-        retry: RetryPolicy,
-    ) -> Result<Vec<ShareGroupOffsetPartition>, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.describe_share_group_offsets_attempt(group, retry.find_coordinator()))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
-    }
-
-    async fn describe_share_group_offsets_attempt(
-        &mut self,
-        group: &str,
-        find_coordinator: bool,
-    ) -> RetryAction<Vec<ShareGroupOffsetPartition>> {
-        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
-            return action;
-        }
-        let request = DescribeShareGroupOffsetsRequest {
-            groups: vec![DescribeShareGroupOffsetsRequestGroup {
-                group_id: group.into(),
-                topics: None,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        match self.conn.send(request).await {
-            Ok(response) => describe_share_group_offsets_retry_action(group, response),
+            Ok(response) => alter_share_group_offsets_retry_action(offsets, response),
             Err(error) => connection_failure_action(error),
         }
     }
@@ -1276,7 +956,11 @@ impl AdminClient {
     /// Deletes a share group's committed offsets for the named topics with
     /// `DeleteShareGroupOffsets`, as Apache Kafka's
     /// `deleteShareGroupOffsets` does. Routes to the group's coordinator with
-    /// the same retry policy as [`AdminClient::alter_consumer_group_offsets`].
+    /// the same retry policy as [`AdminClient::alter_consumer_group_offsets`]:
+    /// a top-level `COORDINATOR_LOAD_IN_PROGRESS` (14) or
+    /// `REBALANCE_IN_PROGRESS` (27) retries on the same coordinator, and
+    /// `COORDINATOR_NOT_AVAILABLE` (15) or `NOT_COORDINATOR` (16) finds the
+    /// coordinator again.
     ///
     /// # Errors
     /// Returns an error when encoding, transport, or response handling fails.
@@ -1416,71 +1100,6 @@ fn offset_commit_retry_action(
     }
 }
 
-/// Maps one group-scoped describe answer (`DescribeGroups`,
-/// `ConsumerGroupDescribe`, `ShareGroupDescribe` or `StreamsGroupDescribe`) to
-/// a retry action, using `error_code` to read the per-group error code out of
-/// the single requested group's entry. `14` retries on the same coordinator,
-/// `15` and `16` unmap the group so the next attempt finds the coordinator
-/// again, and every other code is a final result, as Kafka's
-/// `AbstractCoordinatorGroupHandler` request handlers do for a
-/// `CoordinatorKey`.
-fn describe_group_result<T>(
-    api: &'static str,
-    group: &str,
-    mut groups: Vec<T>,
-    error_code: impl Fn(&T) -> i16,
-) -> RetryAction<T> {
-    let Some(entry) = groups.pop() else {
-        return RetryAction::Done(Err(AdminError::Protocol(format!(
-            "{api} returned no entry for group {group}"
-        ))));
-    };
-    let code = error_code(&entry);
-    if code == 0 {
-        return RetryAction::Done(Ok(entry));
-    }
-    let result = Err(AdminError::Broker {
-        api,
-        code,
-        name: kafka_error_name(code),
-        message: None,
-    });
-    match code {
-        COORDINATOR_LOAD_IN_PROGRESS => RetryAction::SameCoordinator(result),
-        COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => RetryAction::FindCoordinator(result),
-        _ => RetryAction::Done(result),
-    }
-}
-
-/// Maps one `DeleteGroups` answer for the named group to a retry action, as
-/// Kafka's `DeleteConsumerGroupsHandler.handleResponse` does for that group's
-/// `DeletableGroupResult`.
-fn delete_groups_retry_action(group: &str, response: DeleteGroupsResponse) -> RetryAction<()> {
-    let Some(entry) = response
-        .results
-        .into_iter()
-        .find(|result| result.group_id == group)
-    else {
-        return RetryAction::Done(Err(AdminError::Protocol(format!(
-            "DeleteGroups returned no result for group {group}"
-        ))));
-    };
-    if entry.error_code == 0 {
-        return RetryAction::Done(Ok(()));
-    }
-    let result = Err(AdminError::Broker {
-        api: "DeleteGroups",
-        code: entry.error_code,
-        name: kafka_error_name(entry.error_code),
-        message: None,
-    });
-    match entry.error_code {
-        COORDINATOR_LOAD_IN_PROGRESS => RetryAction::SameCoordinator(result),
-        COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => RetryAction::FindCoordinator(result),
-        _ => RetryAction::Done(result),
-    }
-}
-
 /// Builds an `OffsetDelete` request for the named partitions of `group`.
 fn offset_delete_request(group: &str, partitions: &[(String, i32)]) -> OffsetDeleteRequest {
     let mut topics = BTreeMap::<String, Vec<OffsetDeleteRequestPartition>>::new();
@@ -1575,16 +1194,12 @@ impl ProtocolRequest for MembersOnlyLeaveGroup {
     type Response = LeaveGroupResponse;
 }
 
-/// Maps one `LeaveGroup` answer to a retry action, pairing each requested
-/// [`MemberIdentity`] with its per-member error, as Kafka's
+/// Maps one `LeaveGroup` answer to a retry action, as Kafka's
 /// `RemoveMembersFromConsumerGroupHandler.handleResponse` does. The top-level
 /// `error_code` is a group-level failure: `14` retries on the same
-/// coordinator, `15` and `16` unmap the group. Members come back in the order
-/// requested, as Kafka's coordinator preserves request order.
-fn leave_group_retry_action(
-    requested: &[MemberIdentity],
-    response: LeaveGroupResponse,
-) -> RetryAction<Vec<(MemberIdentity, Option<KafkaError>)>> {
+/// coordinator, `15` and `16` unmap the group. A final answer maps each
+/// answered member, by member id and instance id, to its error.
+fn leave_group_retry_action(response: LeaveGroupResponse) -> RetryAction<RemovedMembers> {
     if response.error_code != 0 {
         let result = Err(AdminError::Broker {
             api: "LeaveGroup",
@@ -1598,13 +1213,98 @@ fn leave_group_retry_action(
             _ => RetryAction::Done(result),
         };
     }
-    let outcomes = requested
-        .iter()
-        .cloned()
-        .zip(response.members)
-        .map(|(requested, answered)| (requested, kafka_error_if(answered.error_code, None)))
+    let members = response
+        .members
+        .into_iter()
+        .map(|member| {
+            (
+                RemovedMember {
+                    member_id: member.member_id,
+                    group_instance_id: member.group_instance_id,
+                },
+                kafka_error_if(member.error_code, None),
+            )
+        })
         .collect();
-    RetryAction::Done(Ok(outcomes))
+    RetryAction::Done(Ok(RemovedMembers { members }))
+}
+
+/// `UNKNOWN_SERVER_ERROR`: the code that Kafka's `ApiError.fromThrowable`
+/// gives an exception with no Kafka error code.
+const UNKNOWN_SERVER_ERROR: i16 = -1;
+/// Kafka's `KafkaAdminClient.DEFAULT_LEAVE_GROUP_REASON`.
+const DEFAULT_LEAVE_GROUP_REASON: &str = "member was removed by an admin";
+/// The longest reason that Kafka's `JoinGroupRequest.maybeTruncateReason`
+/// keeps.
+const MAX_REASON_CHARS: usize = 255;
+
+/// The reason of each removed member: `reason` cut to 255 characters, or
+/// Kafka's default when it is `None` or empty.
+fn leave_group_reason(reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) if !reason.is_empty() => reason.chars().take(MAX_REASON_CHARS).collect(),
+        _ => DEFAULT_LEAVE_GROUP_REASON.to_owned(),
+    }
+}
+
+/// One member to remove, as Apache Kafka's `MemberToRemove` names it: by its
+/// `group.instance.id`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MemberToRemove {
+    pub group_instance_id: String,
+}
+
+/// The options of [`AdminClient::remove_members_from_consumer_group`], as
+/// Apache Kafka's `RemoveMembersFromConsumerGroupOptions` holds them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoveMembersOptions {
+    /// The reason that the coordinator logs for each member. `None` or empty
+    /// sends Kafka's default reason.
+    pub reason: Option<String>,
+}
+
+/// One member of a `LeaveGroup` answer, as the `MemberIdentity` keys of
+/// Kafka's `RemoveMembersFromConsumerGroupHandler` result name it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RemovedMember {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+}
+
+/// The result of [`AdminClient::remove_members_from_consumer_group`], as
+/// Apache Kafka's `RemoveMembersFromConsumerGroupResult` holds it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemovedMembers {
+    /// Each member of the `LeaveGroup` answer and its error.
+    pub members: BTreeMap<RemovedMember, Option<KafkaError>>,
+}
+
+impl RemovedMembers {
+    /// The result of one requested member, as Kafka's
+    /// `RemoveMembersFromConsumerGroupResult.memberResult` gives it.
+    ///
+    /// # Errors
+    /// Returns the member's error, or `UNKNOWN_SERVER_ERROR` when the answer
+    /// does not name the member, as Kafka's `getSubLevelError` gives an
+    /// `IllegalArgumentException`.
+    pub fn member_result(&self, member: &MemberToRemove) -> Result<(), KafkaError> {
+        let key = RemovedMember {
+            member_id: String::new(),
+            group_instance_id: Some(member.group_instance_id.clone()),
+        };
+        match self.members.get(&key) {
+            Some(None) => Ok(()),
+            Some(Some(error)) => Err(error.clone()),
+            None => Err(KafkaError {
+                code: UNKNOWN_SERVER_ERROR,
+                name: kafka_error_name(UNKNOWN_SERVER_ERROR),
+                message: Some(format!(
+                    "Member \"{}\" was not included in the removal response",
+                    member.group_instance_id
+                )),
+            }),
+        }
+    }
 }
 
 /// Builds an `AlterShareGroupOffsets` request for `group`'s partitions.
@@ -1639,12 +1339,15 @@ fn alter_share_group_offsets_request(
     }
 }
 
-/// Maps one `AlterShareGroupOffsets` answer to a retry action: the top-level
-/// `error_code` is a group-level failure retried the same way as
-/// [`offset_delete_retry_action`], and a final answer becomes one
-/// [`ConsumerGroupOffsetOutcome`] per requested partition.
+/// Maps one `AlterShareGroupOffsets` answer to a retry action, as Kafka's
+/// `AlterShareGroupOffsetsHandler.handleResponse` does. A top-level
+/// `COORDINATOR_LOAD_IN_PROGRESS` or `REBALANCE_IN_PROGRESS` retries on the
+/// same coordinator, and `COORDINATOR_NOT_AVAILABLE` or `NOT_COORDINATOR`
+/// finds the coordinator again. Every other top-level code becomes the error
+/// of each requested partition. Otherwise the answer gives one
+/// [`ConsumerGroupOffsetOutcome`] for each answered partition.
 fn alter_share_group_offsets_retry_action(
-    group: &str,
+    offsets: &BTreeMap<(String, i32), i64>,
     response: AlterShareGroupOffsetsResponse,
 ) -> RetryAction<Vec<ConsumerGroupOffsetOutcome>> {
     if response.error_code != 0 {
@@ -1652,12 +1355,21 @@ fn alter_share_group_offsets_retry_action(
             api: "AlterShareGroupOffsets",
             code: response.error_code,
             name: kafka_error_name(response.error_code),
-            message: Some(format!("group={group}")),
+            message: response.error_message.clone(),
         });
         return match response.error_code {
-            COORDINATOR_LOAD_IN_PROGRESS => RetryAction::SameCoordinator(result),
+            COORDINATOR_LOAD_IN_PROGRESS | REBALANCE_IN_PROGRESS => {
+                RetryAction::SameCoordinator(result)
+            }
             COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => RetryAction::FindCoordinator(result),
-            _ => RetryAction::Done(result),
+            code => RetryAction::Done(Ok(offsets
+                .keys()
+                .map(|(topic, partition)| ConsumerGroupOffsetOutcome {
+                    topic: topic.clone(),
+                    partition: *partition,
+                    error: kafka_error_if(code, response.error_message.clone()),
+                })
+                .collect())),
         };
     }
     let outcomes = response
@@ -1678,61 +1390,12 @@ fn alter_share_group_offsets_retry_action(
     RetryAction::Done(Ok(outcomes))
 }
 
-/// Maps one `DescribeShareGroupOffsets` answer for the named group to a retry
-/// action: the group entry's `error_code` is a group-level failure retried
-/// the same way as [`offset_delete_retry_action`], and a final answer becomes
-/// one [`ShareGroupOffsetPartition`] per partition in the response.
-fn describe_share_group_offsets_retry_action(
-    group: &str,
-    response: DescribeShareGroupOffsetsResponse,
-) -> RetryAction<Vec<ShareGroupOffsetPartition>> {
-    let Some(entry) = response
-        .groups
-        .into_iter()
-        .find(|entry| entry.group_id == group)
-    else {
-        return RetryAction::Done(Err(AdminError::Protocol(format!(
-            "DescribeShareGroupOffsets returned no entry for group {group}"
-        ))));
-    };
-    if entry.error_code != 0 {
-        let result = Err(AdminError::Broker {
-            api: "DescribeShareGroupOffsets",
-            code: entry.error_code,
-            name: kafka_error_name(entry.error_code),
-            message: entry.error_message,
-        });
-        return match entry.error_code {
-            COORDINATOR_LOAD_IN_PROGRESS => RetryAction::SameCoordinator(result),
-            COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => RetryAction::FindCoordinator(result),
-            _ => RetryAction::Done(result),
-        };
-    }
-    let partitions = entry
-        .topics
-        .into_iter()
-        .flat_map(|topic| {
-            let name = topic.topic_name;
-            topic
-                .partitions
-                .into_iter()
-                .map(move |partition| ShareGroupOffsetPartition {
-                    topic: name.clone(),
-                    partition: partition.partition_index,
-                    start_offset: partition.start_offset,
-                    leader_epoch: partition.leader_epoch,
-                    lag: partition.lag,
-                    error: kafka_error_if(partition.error_code, partition.error_message),
-                })
-        })
-        .collect();
-    RetryAction::Done(Ok(partitions))
-}
-
-/// Maps one `DeleteShareGroupOffsets` answer to a retry action: the
-/// top-level `error_code` is a group-level failure retried the same way as
-/// [`offset_delete_retry_action`], and a final answer becomes one
-/// `(topic, error)` pair per requested topic.
+/// Maps one `DeleteShareGroupOffsets` answer to a retry action, as Kafka's
+/// `DeleteShareGroupOffsetsHandler.handleResponse` does. A top-level
+/// `COORDINATOR_LOAD_IN_PROGRESS` or `REBALANCE_IN_PROGRESS` retries on the
+/// same coordinator, `COORDINATOR_NOT_AVAILABLE` or `NOT_COORDINATOR` finds
+/// the coordinator again, and every other top-level code fails the call. A
+/// final answer gives one `(topic, error)` pair for each answered topic.
 fn delete_share_group_offsets_retry_action(
     response: DeleteShareGroupOffsetsResponse,
 ) -> RetryAction<Vec<(String, Option<KafkaError>)>> {
@@ -1744,7 +1407,9 @@ fn delete_share_group_offsets_retry_action(
             message: response.error_message,
         });
         return match response.error_code {
-            COORDINATOR_LOAD_IN_PROGRESS => RetryAction::SameCoordinator(result),
+            COORDINATOR_LOAD_IN_PROGRESS | REBALANCE_IN_PROGRESS => {
+                RetryAction::SameCoordinator(result)
+            }
             COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => RetryAction::FindCoordinator(result),
             _ => RetryAction::Done(result),
         };
@@ -2189,14 +1854,7 @@ mod tests {
             },
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
-            consumer_group_describe_response::ConsumerGroupDescribeResponse,
-            delete_groups_response::DeletableGroupResult,
             delete_share_group_offsets_response::DeleteShareGroupOffsetsResponseTopic,
-            describe_groups_response::DescribeGroupsResponse,
-            describe_share_group_offsets_response::{
-                DescribeShareGroupOffsetsResponseGroup, DescribeShareGroupOffsetsResponsePartition,
-                DescribeShareGroupOffsetsResponseTopic,
-            },
             find_coordinator_request,
             find_coordinator_response::FindCoordinatorResponse,
             leave_group_response::MemberResponse,
@@ -2210,8 +1868,6 @@ mod tests {
                 OffsetFetchResponsePartitions, OffsetFetchResponseTopic, OffsetFetchResponseTopics,
             },
             sasl_handshake_request,
-            share_group_describe_response::ShareGroupDescribeResponse,
-            streams_group_describe_response::StreamsGroupDescribeResponse,
         },
     };
 
@@ -4153,18 +3809,9 @@ mod tests {
                     api(metadata_request::API_KEY, 13),
                     api(offset_commit_request::API_KEY, 9),
                     api(offset_fetch_request::API_KEY, 9),
-                    api(DescribeGroupsRequest::API_KEY, 6),
-                    api(ConsumerGroupDescribeRequest::API_KEY, 1),
-                    ApiVersion {
-                        min_version: 1,
-                        ..api(ShareGroupDescribeRequest::API_KEY, 1)
-                    },
-                    api(StreamsGroupDescribeRequest::API_KEY, 0),
-                    api(DeleteGroupsRequest::API_KEY, 2),
                     api(OffsetDeleteRequest::API_KEY, 0),
                     api(LeaveGroupRequest::API_KEY, 5),
                     api(AlterShareGroupOffsetsRequest::API_KEY, 1),
-                    api(DescribeShareGroupOffsetsRequest::API_KEY, 1),
                     api(DeleteShareGroupOffsetsRequest::API_KEY, 0),
                 ],
                 ..Default::default()
@@ -4232,327 +3879,6 @@ mod tests {
             .await
             .expect("admin connects");
         (admin, broker, calls)
-    }
-
-    /// `DescribeGroups`, `ConsumerGroupDescribe`, `ShareGroupDescribe` and
-    /// `StreamsGroupDescribe` all retry the same way: `14` on the same
-    /// coordinator, `15`/`16` by finding the coordinator again, and every
-    /// other code is final, as [`describe_group_result`] implements.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn describe_classic_groups_retries_coordinator_errors_as_kafka_does() {
-        let group_entry = |code| ClassicDescribedGroup {
-            error_code: code,
-            group_id: "workers".into(),
-            group_state: "Stable".into(),
-            protocol_type: "consumer".into(),
-            protocol_data: "range".into(),
-            authorized_operations: -2_147_483_648,
-            ..Default::default()
-        };
-        let respond = move |code: i16, version: i16| {
-            encode(
-                &DescribeGroupsResponse {
-                    groups: vec![group_entry(code)],
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
-        };
-        for (name, codes, expected_calls, expected) in [
-            ("no error", vec![0], 1, Ok(group_entry(0))),
-            (
-                "coordinator load in progress retries on the same coordinator",
-                vec![14, 0],
-                2,
-                Ok(group_entry(0)),
-            ),
-            (
-                "not coordinator finds the coordinator again",
-                vec![16, 0],
-                2,
-                Ok(group_entry(0)),
-            ),
-            ("group authorization failed is final", vec![30], 1, Err(30)),
-        ] {
-            let (mut admin, broker, calls) =
-                connect_self_coordinating(DescribeGroupsRequest::API_KEY, codes, respond).await;
-            let result =
-                admin
-                    .describe_classic_groups("workers")
-                    .await
-                    .map_err(|error| match error {
-                        AdminError::Broker { code, .. } => code,
-                        other => panic!("case {name}: unexpected error {other:?}"),
-                    });
-            broker.stop();
-            assert!(
-                (result, calls.load(Ordering::SeqCst)) == (expected, expected_calls),
-                "case {name}"
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn describe_consumer_groups_retries_coordinator_errors_as_kafka_does() {
-        let group_entry = |code| ConsumerGroupDescribedGroup {
-            error_code: code,
-            group_id: "workers".into(),
-            group_state: "Stable".into(),
-            group_epoch: 3,
-            assignment_epoch: 3,
-            assignor_name: "uniform".into(),
-            authorized_operations: -2_147_483_648,
-            ..Default::default()
-        };
-        let respond = move |code: i16, version: i16| {
-            encode(
-                &ConsumerGroupDescribeResponse {
-                    groups: vec![group_entry(code)],
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
-        };
-        for (name, codes, expected_calls, expected) in [
-            ("no error", vec![0], 1, Ok(group_entry(0))),
-            (
-                "coordinator load in progress retries on the same coordinator",
-                vec![14, 0],
-                2,
-                Ok(group_entry(0)),
-            ),
-            (
-                "not coordinator finds the coordinator again",
-                vec![16, 0],
-                2,
-                Ok(group_entry(0)),
-            ),
-            ("group authorization failed is final", vec![30], 1, Err(30)),
-        ] {
-            let (mut admin, broker, calls) =
-                connect_self_coordinating(ConsumerGroupDescribeRequest::API_KEY, codes, respond)
-                    .await;
-            let result =
-                admin
-                    .describe_consumer_groups("workers")
-                    .await
-                    .map_err(|error| match error {
-                        AdminError::Broker { code, .. } => code,
-                        other => panic!("case {name}: unexpected error {other:?}"),
-                    });
-            broker.stop();
-            assert!(
-                (result, calls.load(Ordering::SeqCst)) == (expected, expected_calls),
-                "case {name}"
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn describe_share_groups_retries_coordinator_errors_as_kafka_does() {
-        let group_entry = |code| ShareGroupDescribedGroup {
-            error_code: code,
-            group_id: "workers".into(),
-            group_state: "Stable".into(),
-            group_epoch: 3,
-            assignment_epoch: 3,
-            assignor_name: "uniform".into(),
-            authorized_operations: -2_147_483_648,
-            ..Default::default()
-        };
-        let respond = move |code: i16, version: i16| {
-            encode(
-                &ShareGroupDescribeResponse {
-                    groups: vec![group_entry(code)],
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
-        };
-        for (name, codes, expected_calls, expected) in [
-            ("no error", vec![0], 1, Ok(group_entry(0))),
-            (
-                "coordinator load in progress retries on the same coordinator",
-                vec![14, 0],
-                2,
-                Ok(group_entry(0)),
-            ),
-            (
-                "not coordinator finds the coordinator again",
-                vec![16, 0],
-                2,
-                Ok(group_entry(0)),
-            ),
-            ("group authorization failed is final", vec![30], 1, Err(30)),
-        ] {
-            let (mut admin, broker, calls) =
-                connect_self_coordinating(ShareGroupDescribeRequest::API_KEY, codes, respond).await;
-            let result =
-                admin
-                    .describe_share_groups("workers")
-                    .await
-                    .map_err(|error| match error {
-                        AdminError::Broker { code, .. } => code,
-                        other => panic!("case {name}: unexpected error {other:?}"),
-                    });
-            broker.stop();
-            assert!(
-                (result, calls.load(Ordering::SeqCst)) == (expected, expected_calls),
-                "case {name}"
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn describe_streams_groups_retries_coordinator_errors_as_kafka_does() {
-        let group_entry = |code| StreamsGroupDescribedGroup {
-            error_code: code,
-            group_id: "workers".into(),
-            group_state: "Stable".into(),
-            group_epoch: 3,
-            assignment_epoch: 3,
-            authorized_operations: -2_147_483_648,
-            ..Default::default()
-        };
-        let respond = move |code: i16, version: i16| {
-            encode(
-                &StreamsGroupDescribeResponse {
-                    groups: vec![group_entry(code)],
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
-        };
-        for (name, codes, expected_calls, expected) in [
-            ("no error", vec![0], 1, Ok(group_entry(0))),
-            (
-                "coordinator load in progress retries on the same coordinator",
-                vec![14, 0],
-                2,
-                Ok(group_entry(0)),
-            ),
-            (
-                "not coordinator finds the coordinator again",
-                vec![16, 0],
-                2,
-                Ok(group_entry(0)),
-            ),
-            ("group authorization failed is final", vec![30], 1, Err(30)),
-        ] {
-            let (mut admin, broker, calls) =
-                connect_self_coordinating(StreamsGroupDescribeRequest::API_KEY, codes, respond)
-                    .await;
-            let result =
-                admin
-                    .describe_streams_groups("workers")
-                    .await
-                    .map_err(|error| match error {
-                        AdminError::Broker { code, .. } => code,
-                        other => panic!("case {name}: unexpected error {other:?}"),
-                    });
-            broker.stop();
-            assert!(
-                (result, calls.load(Ordering::SeqCst)) == (expected, expected_calls),
-                "case {name}"
-            );
-        }
-    }
-
-    /// Apache Kafka's `DeleteConsumerGroupsHandler.handleResponse` retries
-    /// `14` on the same coordinator, unmaps the group on `15`/`16`, and keeps
-    /// every other code as a final error.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delete_consumer_groups_retries_coordinator_errors_as_kafka_does() {
-        let respond = |code: i16, version: i16| {
-            encode(
-                &DeleteGroupsResponse {
-                    results: vec![DeletableGroupResult {
-                        group_id: "workers".into(),
-                        error_code: code,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
-        };
-        for (name, codes, expected_calls, expected) in [
-            ("no error", vec![0], 1, Ok(())),
-            (
-                "coordinator load in progress retries on the same coordinator",
-                vec![14, 0],
-                2,
-                Ok(()),
-            ),
-            (
-                "not coordinator finds the coordinator again",
-                vec![16, 0],
-                2,
-                Ok(()),
-            ),
-            ("non-empty group is final", vec![68], 1, Err(68)),
-        ] {
-            let (mut admin, broker, calls) =
-                connect_self_coordinating(DeleteGroupsRequest::API_KEY, codes, respond).await;
-            let result =
-                admin
-                    .delete_consumer_groups("workers")
-                    .await
-                    .map_err(|error| match error {
-                        AdminError::Broker { code, .. } => code,
-                        other => panic!("case {name}: unexpected error {other:?}"),
-                    });
-            broker.stop();
-            assert!(
-                (result, calls.load(Ordering::SeqCst)) == (expected, expected_calls),
-                "case {name}"
-            );
-        }
-    }
-
-    /// Apache Kafka's `KafkaAdminClient.deleteShareGroups` and
-    /// `deleteStreamsGroups` build the same `DeleteGroups` request as
-    /// `deleteConsumerGroups` (`deleteStreamsGroups` literally delegates to
-    /// it), so a happy path proves the delegation.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delete_share_and_streams_groups_delegate_to_delete_groups() {
-        let respond = |code: i16, version: i16| {
-            encode(
-                &DeleteGroupsResponse {
-                    results: vec![DeletableGroupResult {
-                        group_id: "workers".into(),
-                        error_code: code,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
-        };
-
-        let (mut admin, broker, calls) =
-            connect_self_coordinating(DeleteGroupsRequest::API_KEY, vec![0], respond).await;
-        let result = admin
-            .delete_share_groups("workers")
-            .await
-            .map_err(|error| error.to_string());
-        broker.stop();
-        assert!((result, calls.load(Ordering::SeqCst)) == (Ok(()), 1));
-
-        let (mut admin, broker, calls) =
-            connect_self_coordinating(DeleteGroupsRequest::API_KEY, vec![0], respond).await;
-        let result = admin
-            .delete_streams_groups("workers")
-            .await
-            .map_err(|error| error.to_string());
-        broker.stop();
-        assert!((result, calls.load(Ordering::SeqCst)) == (Ok(()), 1));
     }
 
     /// Apache Kafka's `DeleteConsumerGroupOffsetsHandler.handleResponse`
@@ -4668,41 +3994,51 @@ mod tests {
 
     /// Apache Kafka's `RemoveMembersFromConsumerGroupHandler.handleResponse`
     /// reads the top-level `error_code` as a group-level failure, retried the
-    /// same way as `DeleteGroups`, and otherwise pairs each requested member
-    /// with its own answer, in request order.
+    /// same way as `DeleteGroups`, and otherwise maps each answered member to
+    /// its error. `removeMembersFromConsumerGroup` names each member by its
+    /// instance id with `UNKNOWN_MEMBER_ID` and sends the default reason.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_members_from_consumer_group_retries_coordinator_errors_as_kafka_does() {
-        let member = MemberIdentity {
-            member_id: "m1".into(),
-            group_instance_id: None,
-            reason: None,
+        let answered = |instance_id: &str, error_code| MemberResponse {
+            member_id: String::new(),
+            group_instance_id: Some(instance_id.into()),
+            error_code,
             ..Default::default()
         };
-        let respond = {
-            let member = member.clone();
-            move |code: i16, version: i16| {
-                let members = if code == 0 {
-                    vec![MemberResponse {
-                        member_id: member.member_id.clone(),
-                        group_instance_id: None,
-                        error_code: 0,
-                        ..Default::default()
-                    }]
-                } else {
-                    Vec::new()
-                };
-                encode(
-                    &LeaveGroupResponse {
-                        error_code: code,
-                        members,
-                        ..Default::default()
-                    },
-                    version,
-                    true,
-                )
-            }
+        let respond = move |code: i16, version: i16| {
+            let members = if code == 0 {
+                // The coordinator answers in its own order.
+                vec![answered("b", 25), answered("a", 0)]
+            } else {
+                Vec::new()
+            };
+            encode(
+                &LeaveGroupResponse {
+                    error_code: code,
+                    members,
+                    ..Default::default()
+                },
+                version,
+                true,
+            )
         };
-        let outcome = Ok(vec![(member.clone(), None)]);
+        let removed = |instance_id: &str| RemovedMember {
+            member_id: String::new(),
+            group_instance_id: Some(instance_id.into()),
+        };
+        let outcome = Ok(RemovedMembers {
+            members: BTreeMap::from([
+                (removed("a"), None),
+                (
+                    removed("b"),
+                    Some(KafkaError {
+                        code: 25,
+                        name: "UNKNOWN_MEMBER_ID",
+                        message: None,
+                    }),
+                ),
+            ]),
+        });
         for (name, codes, expected_calls, expected) in [
             ("no error", vec![0], 1, outcome.clone()),
             (
@@ -4720,9 +4056,20 @@ mod tests {
             ("group authorization failed is final", vec![30], 1, Err(30)),
         ] {
             let (mut admin, broker, calls) =
-                connect_self_coordinating(LeaveGroupRequest::API_KEY, codes, respond.clone()).await;
+                connect_self_coordinating(LeaveGroupRequest::API_KEY, codes, respond).await;
             let result = admin
-                .remove_members_from_consumer_group("workers", std::slice::from_ref(&member))
+                .remove_members_from_consumer_group(
+                    "workers",
+                    &[
+                        MemberToRemove {
+                            group_instance_id: "a".into(),
+                        },
+                        MemberToRemove {
+                            group_instance_id: "b".into(),
+                        },
+                    ],
+                    &RemoveMembersOptions::default(),
+                )
                 .await
                 .map_err(|error| match error {
                     AdminError::Broker { code, .. } => code,
@@ -4736,10 +4083,77 @@ mod tests {
         }
     }
 
-    /// Apache Kafka's `AlterShareGroupOffsetsHandler.handleResponse` reads
-    /// the top-level `error_code` as a group-level failure, retried the same
-    /// way as `DeleteGroups`, and otherwise returns one outcome per requested
-    /// partition.
+    /// Kafka's `removeMembersFromConsumerGroup` sends each member with
+    /// `UNKNOWN_MEMBER_ID`, its instance id and the reason, which is the
+    /// default for `None` or empty and is cut to 255 characters.
+    #[test]
+    fn leave_group_reason_matches_kafka() {
+        let long = "r".repeat(300);
+        for (name, reason, expected) in [
+            ("none", None, DEFAULT_LEAVE_GROUP_REASON.to_owned()),
+            ("empty", Some(""), DEFAULT_LEAVE_GROUP_REASON.to_owned()),
+            (
+                "short",
+                Some("rolling restart"),
+                "rolling restart".to_owned(),
+            ),
+            ("long", Some(long.as_str()), "r".repeat(255)),
+        ] {
+            assert!(leave_group_reason(reason) == expected, "case {name}");
+        }
+    }
+
+    /// `RemoveMembersFromConsumerGroupResult.memberResult` looks a member up
+    /// by `UNKNOWN_MEMBER_ID` and its instance id, and gives an error for a
+    /// member that the answer does not name.
+    #[test]
+    fn removed_members_member_result_matches_kafka() {
+        let member = |instance_id: &str| MemberToRemove {
+            group_instance_id: instance_id.into(),
+        };
+        let fenced = KafkaError {
+            code: 82,
+            name: kafka_error_name(82),
+            message: None,
+        };
+        let result = RemovedMembers {
+            members: BTreeMap::from([
+                (
+                    RemovedMember {
+                        member_id: String::new(),
+                        group_instance_id: Some("a".into()),
+                    },
+                    None,
+                ),
+                (
+                    RemovedMember {
+                        member_id: String::new(),
+                        group_instance_id: Some("b".into()),
+                    },
+                    Some(fenced.clone()),
+                ),
+            ]),
+        };
+        assert!(
+            [member("a"), member("b"), member("c")].map(|member| result.member_result(&member))
+                == [
+                    Ok(()),
+                    Err(fenced),
+                    Err(KafkaError {
+                        code: -1,
+                        name: "UNKNOWN_SERVER_ERROR",
+                        message: Some(
+                            "Member \"c\" was not included in the removal response".into()
+                        ),
+                    }),
+                ]
+        );
+    }
+
+    /// Apache Kafka's `AlterShareGroupOffsetsHandler.handleResponse` retries
+    /// a top-level 14 or 27 on the same coordinator, finds the coordinator
+    /// again on 15 or 16, and puts every other top-level code on each
+    /// requested partition.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn alter_share_group_offsets_retries_coordinator_errors_as_kafka_does() {
         let respond = |code: i16, version: i16| {
@@ -4785,7 +4199,26 @@ mod tests {
                 2,
                 outcome.clone(),
             ),
-            ("group authorization failed is final", vec![30], 1, Err(30)),
+            (
+                "rebalance in progress retries on the same coordinator",
+                vec![27, 0],
+                2,
+                outcome.clone(),
+            ),
+            (
+                "a final group error is the error of each partition",
+                vec![68],
+                1,
+                Ok(vec![ConsumerGroupOffsetOutcome {
+                    topic: "orders".into(),
+                    partition: 2,
+                    error: Some(KafkaError {
+                        code: 68,
+                        name: "NON_EMPTY_GROUP",
+                        message: None,
+                    }),
+                }]),
+            ),
         ] {
             let (mut admin, broker, calls) =
                 connect_self_coordinating(AlterShareGroupOffsetsRequest::API_KEY, codes, respond)
@@ -4866,89 +4299,6 @@ mod tests {
         );
     }
 
-    /// Apache Kafka's `DescribeShareGroupOffsetsHandler.handleResponse` reads
-    /// the named group entry's `error_code` as a group-level failure,
-    /// retried the same way as `DeleteGroups`, and otherwise returns one
-    /// [`ShareGroupOffsetPartition`] per partition in the response.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_share_group_offsets_retries_coordinator_errors_as_kafka_does() {
-        let respond = |code: i16, version: i16| {
-            let topics = if code == 0 {
-                vec![DescribeShareGroupOffsetsResponseTopic {
-                    topic_name: "orders".into(),
-                    partitions: vec![DescribeShareGroupOffsetsResponsePartition {
-                        partition_index: 2,
-                        start_offset: 41,
-                        leader_epoch: 3,
-                        lag: 5,
-                        error_code: 0,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }]
-            } else {
-                Vec::new()
-            };
-            encode(
-                &DescribeShareGroupOffsetsResponse {
-                    groups: vec![DescribeShareGroupOffsetsResponseGroup {
-                        group_id: "workers".into(),
-                        topics,
-                        error_code: code,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
-        };
-        let outcome = Ok(vec![ShareGroupOffsetPartition {
-            topic: "orders".into(),
-            partition: 2,
-            start_offset: 41,
-            leader_epoch: 3,
-            lag: 5,
-            error: None,
-        }]);
-        for (name, codes, expected_calls, expected) in [
-            ("no error", vec![0], 1, outcome.clone()),
-            (
-                "coordinator load in progress retries on the same coordinator",
-                vec![14, 0],
-                2,
-                outcome.clone(),
-            ),
-            (
-                "not coordinator finds the coordinator again",
-                vec![16, 0],
-                2,
-                outcome.clone(),
-            ),
-            ("group authorization failed is final", vec![30], 1, Err(30)),
-        ] {
-            let (mut admin, broker, calls) = connect_self_coordinating(
-                DescribeShareGroupOffsetsRequest::API_KEY,
-                codes,
-                respond,
-            )
-            .await;
-            let result =
-                admin
-                    .list_share_group_offsets("workers")
-                    .await
-                    .map_err(|error| match error {
-                        AdminError::Broker { code, .. } => code,
-                        other => panic!("case {name}: unexpected error {other:?}"),
-                    });
-            broker.stop();
-            assert!(
-                (result, calls.load(Ordering::SeqCst)) == (expected, expected_calls),
-                "case {name}"
-            );
-        }
-    }
-
     /// Apache Kafka's `DeleteShareGroupOffsetsHandler.handleResponse` reads
     /// the top-level `error_code` as a group-level failure, retried the same
     /// way as `DeleteGroups`, and otherwise returns one `(topic, error)` pair
@@ -4987,6 +4337,12 @@ mod tests {
             (
                 "not coordinator finds the coordinator again",
                 vec![16, 0],
+                2,
+                outcome.clone(),
+            ),
+            (
+                "rebalance in progress retries on the same coordinator",
+                vec![27, 0],
                 2,
                 outcome.clone(),
             ),
