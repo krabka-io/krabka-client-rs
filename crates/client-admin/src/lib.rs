@@ -108,10 +108,10 @@ pub use topic_descriptions::{
     TopicPartitionInfo,
 };
 pub use topics::{
-    CreatePartitionsOp, CreatePartitionsOutcome, CreateTopicOutcome, CreateTopicSpec,
-    DeleteRecordsOp, DeleteRecordsOutcome, DeleteTopicOutcome, PartitionAssignment,
-    PartitionAssignmentOutcome, TopicMetadata, TopicMetadataEntry, TopicMutationOptions,
-    TopicReplicationStatus,
+    AlterPartitionReassignmentsOptions, CreatePartitionsOp, CreatePartitionsOutcome,
+    CreateTopicOutcome, CreateTopicSpec, DeleteRecordsOp, DeleteRecordsOutcome, DeleteTopicOutcome,
+    PartitionAssignment, PartitionAssignmentOutcome, TopicMetadata, TopicMetadataEntry,
+    TopicMutationOptions, TopicReplicationStatus,
 };
 pub use transactions::{
     AbortTransactionSpec, ListTransactionsFilter, ProducerStateInfo, TransactionDescription,
