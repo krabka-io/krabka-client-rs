@@ -41,10 +41,18 @@ pub enum ResourceType {
     Group,
     Cluster,
     TransactionalId,
+    /// A delegation token, named by its token id (KIP-48).
+    DelegationToken,
+    /// A user principal, for `CreateTokens` and `DescribeTokens` (KIP-373).
+    User,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PatternType {
+    /// Filter only: matches every stored pattern that applies to the filter's
+    /// resource name, the literal name, `*`, and every matching prefix, as
+    /// Kafka's `PatternType.MATCH` does. A stored ACL is never `Match`.
+    Match,
     Literal,
     Prefixed,
 }
@@ -232,11 +240,16 @@ impl AdminClient {
     /// Creates the supplied ACLs.
     ///
     /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
+    /// Returns [`AdminError::InvalidArgument`], before anything is sent, for
+    /// an entry whose pattern type is [`PatternType::Match`]: Kafka's
+    /// `ResourcePattern` refuses `patternType must not be MATCH`. Otherwise
+    /// returns an error when protocol encoding fails, the broker rejects the
+    /// request, or transport I/O fails.
     pub async fn create_acls(
         &mut self,
         creations: &[AclEntry],
     ) -> Result<Vec<CreateAclOutcome>, AdminError> {
+        check_concrete_patterns(creations)?;
         let req = CreateAclsRequest {
             creations: creations.iter().map(acl_to_creation).collect(),
             ..Default::default()
@@ -291,7 +304,7 @@ impl AdminClient {
                 matched.push(AclEntry {
                     resource_type: wire_to_resource_type(m.resource_type)?,
                     resource_name: m.resource_name,
-                    pattern_type: wire_to_pattern_type(m.pattern_type)?,
+                    pattern_type: wire_to_stored_pattern_type(m.pattern_type)?,
                     principal: m.principal,
                     host: m.host,
                     operation: wire_to_operation(m.operation)?,
@@ -457,7 +470,7 @@ fn parse_describe_acls(
     let mut out = Vec::new();
     for resource in resp.resources {
         let rt = wire_to_resource_type(resource.resource_type)?;
-        let pt = wire_to_pattern_type(resource.pattern_type)?;
+        let pt = wire_to_stored_pattern_type(resource.pattern_type)?;
         for desc in resource.acls {
             out.push(AclEntry {
                 resource_type: rt,
@@ -471,6 +484,20 @@ fn parse_describe_acls(
         }
     }
     Ok(out)
+}
+
+/// Refuses a stored ACL with the filter-only [`PatternType::Match`], with the
+/// message of Kafka's `ResourcePattern` constructor.
+fn check_concrete_patterns(entries: &[AclEntry]) -> Result<(), AdminError> {
+    if entries
+        .iter()
+        .any(|entry| entry.pattern_type == PatternType::Match)
+    {
+        return Err(AdminError::InvalidArgument(
+            "patternType must not be MATCH".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Pure function. It serializes an `AclEntry` to the wire representation that
@@ -563,6 +590,8 @@ acl_wire_enum!(
         ResourceType::Group => 3,
         ResourceType::Cluster => 4,
         ResourceType::TransactionalId => 5,
+        ResourceType::DelegationToken => 6,
+        ResourceType::User => 7,
     }
 );
 
@@ -572,10 +601,23 @@ acl_wire_enum!(
     PatternType,
     "unknown ACL pattern_type discriminant",
     {
+        PatternType::Match => 2,
         PatternType::Literal => 3,
         PatternType::Prefixed => 4,
     }
 );
+
+/// Decodes the pattern type of a stored ACL in a `DescribeAcls` or
+/// `DeleteAcls` response. `MATCH` (2) is a filter value that no stored ACL
+/// carries, so it is refused like ANY.
+fn wire_to_stored_pattern_type(value: i8) -> Result<PatternType, AdminError> {
+    match wire_to_pattern_type(value)? {
+        PatternType::Match => Err(AdminError::Protocol(format!(
+            "unknown ACL pattern_type discriminant: {value}"
+        ))),
+        stored => Ok(stored),
+    }
+}
 
 acl_wire_enum!(
     permission_to_wire,
@@ -708,6 +750,8 @@ mod tests {
             ("group", ResourceType::Group),
             ("cluster", ResourceType::Cluster),
             ("transactional id", ResourceType::TransactionalId),
+            ("delegation token", ResourceType::DelegationToken),
+            ("user", ResourceType::User),
         ] {
             assert2::assert!(wire_to_resource_type(resource_type_to_wire(rt)).unwrap() == rt);
         }
@@ -716,6 +760,7 @@ mod tests {
     #[test]
     fn pattern_type_round_trips() {
         for (_name, pt) in [
+            ("match", PatternType::Match),
             ("literal", PatternType::Literal),
             ("prefixed", PatternType::Prefixed),
         ] {
@@ -759,6 +804,17 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_acl_never_decodes_as_match() {
+        for (wire, expected) in [
+            (2, None),
+            (3, Some(PatternType::Literal)),
+            (4, Some(PatternType::Prefixed)),
+        ] {
+            check!(wire_to_stored_pattern_type(wire).ok() == expected);
+        }
+    }
+
+    #[test]
     fn wire_to_unknown_resource_type_errors() {
         assert2::assert!(matches!(
             wire_to_resource_type(99),
@@ -772,6 +828,30 @@ mod tests {
             wire_to_resource_type(1),
             Err(AdminError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn a_match_pattern_cannot_be_stored() {
+        let cases = [
+            (PatternType::Literal, Ok(())),
+            (PatternType::Prefixed, Ok(())),
+            (
+                PatternType::Match,
+                Err("patternType must not be MATCH".to_owned()),
+            ),
+        ];
+        for (pattern_type, expected) in cases {
+            let entry = AclEntry {
+                pattern_type,
+                ..sample_entry()
+            };
+            let actual =
+                check_concrete_patterns(&[sample_entry(), entry]).map_err(|error| match error {
+                    AdminError::InvalidArgument(message) => message,
+                    other => format!("{other:?}"),
+                });
+            check!(actual == expected);
+        }
     }
 
     #[test]
