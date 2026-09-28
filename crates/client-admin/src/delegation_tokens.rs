@@ -274,14 +274,16 @@ fn created_token(
     renewers: &[KafkaPrincipal],
 ) -> Result<DelegationToken, AdminError> {
     check("CreateDelegationToken", response.error_code)?;
+    let owner = principal(response.principal_type, response.principal_name);
     Ok(DelegationToken {
         token_id: response.token_id,
         hmac: response.hmac.to_vec(),
-        owner: principal(response.principal_type, response.principal_name),
-        token_requester: principal(
+        token_requester: requester(
+            &owner,
             response.token_requester_principal_type,
             response.token_requester_principal_name,
         ),
+        owner,
         renewers: renewers.to_vec(),
         issue_timestamp_ms: response.issue_timestamp_ms,
         expiry_timestamp_ms: response.expiry_timestamp_ms,
@@ -297,14 +299,16 @@ fn described_tokens(
 }
 
 fn described_token(token: DescribedDelegationToken) -> DelegationToken {
+    let owner = principal(token.principal_type, token.principal_name);
     DelegationToken {
         token_id: token.token_id,
         hmac: token.hmac.to_vec(),
-        owner: principal(token.principal_type, token.principal_name),
-        token_requester: principal(
+        token_requester: requester(
+            &owner,
             token.token_requester_principal_type,
             token.token_requester_principal_name,
         ),
+        owner,
         renewers: token
             .renewers
             .into_iter()
@@ -313,6 +317,17 @@ fn described_token(token: DescribedDelegationToken) -> DelegationToken {
         issue_timestamp_ms: token.issue_timestamp,
         expiry_timestamp_ms: token.expiry_timestamp,
         max_timestamp_ms: token.max_timestamp,
+    }
+}
+
+/// The requester of a token. The requester fields start at v3; below it they
+/// decode empty, and a token could then only be made by its own owner, so the
+/// owner is the requester.
+fn requester(owner: &KafkaPrincipal, principal_type: String, name: String) -> KafkaPrincipal {
+    if principal_type.is_empty() && name.is_empty() {
+        owner.clone()
+    } else {
+        principal(principal_type, name)
     }
 }
 
@@ -554,6 +569,124 @@ mod tests {
             let requests = requests.lock().expect("requests lock").clone();
             assert2::assert!(
                 (result, requests) == (expected, vec![request]),
+                "case {name}"
+            );
+        }
+    }
+
+    /// The `AdminClientLike` methods forward to the inherent calls: each one
+    /// reaches the broker and returns the inherent call's result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_client_like_forwards_each_token_call() {
+        use crate::AdminClientLike;
+
+        let (create, _) = token_broker::<CreateDelegationTokenRequest, _>(
+            TOKEN_APIS.to_vec(),
+            create_delegation_token_request::API_KEY,
+            created_response(0),
+        )
+        .await;
+        let mut admin = fast_admin(create.addr, krabka_units::secs(5)).await;
+        let created = AdminClientLike::create_delegation_token(
+            &mut admin,
+            &CreateDelegationTokenOptions::default(),
+        )
+        .await
+        .map(|token| token.token_id);
+        create.stop();
+
+        let (renew, _) = token_broker::<RenewDelegationTokenRequest, _>(
+            TOKEN_APIS.to_vec(),
+            renew_delegation_token_request::API_KEY,
+            RenewDelegationTokenResponse {
+                expiry_timestamp_ms: 7_000,
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut admin = fast_admin(renew.addr, krabka_units::secs(5)).await;
+        let renewed = AdminClientLike::renew_delegation_token(
+            &mut admin,
+            b"hmac",
+            RenewDelegationTokenOptions::default(),
+        )
+        .await;
+        renew.stop();
+
+        let (expire, _) = token_broker::<ExpireDelegationTokenRequest, _>(
+            TOKEN_APIS.to_vec(),
+            expire_delegation_token_request::API_KEY,
+            ExpireDelegationTokenResponse {
+                expiry_timestamp_ms: 8_000,
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut admin = fast_admin(expire.addr, krabka_units::secs(5)).await;
+        let expired = AdminClientLike::expire_delegation_token(
+            &mut admin,
+            b"hmac",
+            ExpireDelegationTokenOptions::default(),
+        )
+        .await;
+        expire.stop();
+
+        let (describe, _) = token_broker::<DescribeDelegationTokenRequest, _>(
+            TOKEN_APIS.to_vec(),
+            describe_delegation_token_request::API_KEY,
+            DescribeDelegationTokenResponse::default(),
+        )
+        .await;
+        let mut admin = fast_admin(describe.addr, krabka_units::secs(5)).await;
+        let described = AdminClientLike::describe_delegation_token(
+            &mut admin,
+            &DescribeDelegationTokenOptions::default(),
+        )
+        .await
+        .map(|tokens| tokens.len());
+        describe.stop();
+
+        assert2::assert!(
+            (
+                outcome(created),
+                outcome(renewed),
+                outcome(expired),
+                outcome(described),
+            ) == (Ok("tok-1".to_owned()), Ok(7_000), Ok(8_000), Ok(0))
+        );
+    }
+
+    /// Below v3 the requester fields are absent and decode empty, and a
+    /// token could then only be made by its owner, so the requester of a
+    /// created or described token falls back to the owner. From v3 the answer
+    /// names the requester.
+    #[test]
+    fn a_token_without_requester_fields_names_its_owner_as_requester() {
+        for (name, requester_type, requester_name, expected) in [
+            ("v1 or v2 answer", "", "", user("alice")),
+            ("v3 answer", "User", "admin", user("admin")),
+        ] {
+            let created = created_token(
+                CreateDelegationTokenResponse {
+                    principal_type: "User".to_owned(),
+                    principal_name: "alice".to_owned(),
+                    token_requester_principal_type: requester_type.to_owned(),
+                    token_requester_principal_name: requester_name.to_owned(),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .expect("no error code");
+            let described = described_token(DescribedDelegationToken {
+                principal_type: "User".to_owned(),
+                principal_name: "alice".to_owned(),
+                token_requester_principal_type: requester_type.to_owned(),
+                token_requester_principal_name: requester_name.to_owned(),
+                ..Default::default()
+            });
+            assert2::assert!(
+                (created.token_requester, described.token_requester)
+                    == (expected.clone(), expected),
                 "case {name}"
             );
         }
