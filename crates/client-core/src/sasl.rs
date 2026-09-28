@@ -19,6 +19,7 @@ mod scram;
 
 use std::{
     collections::BTreeMap,
+    fmt,
     future::Future,
     path::{Path, PathBuf},
     sync::{
@@ -181,7 +182,11 @@ const GSSAPI_MAX_RECV: krabka_units::ByteSize = krabka_units::kibibytes(64);
 ///
 /// This enum mirrors the broker's `InterBrokerCredentials`. It has one
 /// variant per supported mechanism.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints each password as `[hidden]`, as Kafka's
+/// `org.apache.kafka.common.config.types.Password` does, so logging a
+/// credential set or an error that holds one never shows the secret.
+#[derive(Clone)]
 pub enum SaslCredentials {
     /// SASL/PLAIN: `\0username\0password`.
     Plain { username: String, password: String },
@@ -228,6 +233,48 @@ pub enum OAuthBearerTokenSource {
     /// [`ClientCredentialsTokenProvider`](crate::oauth::ClientCredentialsTokenProvider)
     /// for an OIDC token endpoint (KIP-768).
     Provider(Arc<dyn crate::oauth::OAuthBearerTokenProvider>),
+}
+
+impl fmt::Debug for SaslCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const HIDDEN: &str = "[hidden]";
+        match self {
+            Self::Plain { username, .. } => formatter
+                .debug_struct("Plain")
+                .field("username", username)
+                .field("password", &format_args!("{HIDDEN}"))
+                .finish(),
+            Self::Scram {
+                mechanism,
+                username,
+                delegation_token,
+                ..
+            } => formatter
+                .debug_struct("Scram")
+                .field("mechanism", mechanism)
+                .field("username", username)
+                .field("password", &format_args!("{HIDDEN}"))
+                .field("delegation_token", delegation_token)
+                .finish(),
+            Self::Gssapi {
+                keytab_path,
+                client_principal,
+                service_name,
+                kdc_url,
+            } => formatter
+                .debug_struct("Gssapi")
+                .field("keytab_path", keytab_path)
+                .field("client_principal", client_principal)
+                .field("service_name", service_name)
+                .field("kdc_url", kdc_url)
+                .finish(),
+            Self::OAuthBearer { token, extensions } => formatter
+                .debug_struct("OAuthBearer")
+                .field("token", token)
+                .field("extensions", extensions)
+                .finish(),
+        }
+    }
 }
 
 impl SaslCredentials {
@@ -1019,6 +1066,47 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn debug_hides_every_password() {
+        let cases = [
+            (
+                SaslCredentials::Plain {
+                    username: "alice".into(),
+                    password: "plain-secret".into(),
+                },
+                r#"Plain { username: "alice", password: [hidden] }"#,
+            ),
+            (
+                SaslCredentials::Scram {
+                    mechanism: SaslMechanism::ScramSha512,
+                    username: "token-id".into(),
+                    password: "token-hmac".into(),
+                    delegation_token: true,
+                },
+                r#"Scram { mechanism: ScramSha512, username: "token-id", password: [hidden], delegation_token: true }"#,
+            ),
+            (
+                SaslCredentials::Gssapi {
+                    keytab_path: PathBuf::from("/etc/krb5.keytab"),
+                    client_principal: "kafka/client@EXAMPLE.COM".into(),
+                    service_name: "kafka".into(),
+                    kdc_url: "kdc.example.com:88".into(),
+                },
+                r#"Gssapi { keytab_path: "/etc/krb5.keytab", client_principal: "kafka/client@EXAMPLE.COM", service_name: "kafka", kdc_url: "kdc.example.com:88" }"#,
+            ),
+            (
+                SaslCredentials::OAuthBearer {
+                    token: OAuthBearerTokenSource::File(PathBuf::from("/run/token")),
+                    extensions: BTreeMap::from([("logicalCluster".into(), "lkc-1".into())]),
+                },
+                r#"OAuthBearer { token: File("/run/token"), extensions: {"logicalCluster": "lkc-1"} }"#,
+            ),
+        ];
+        for (credentials, expected) in cases {
+            check!(format!("{credentials:?}") == expected);
+        }
+    }
 
     const TEST_CLIENT_ID: &str = "configured-sasl-client";
 
