@@ -270,8 +270,8 @@ pub(crate) const fn decide_add_offsets_to_txn(attempt: CoordinatorAttempt) -> Tx
 ///
 /// Kafka's `TxnOffsetCommitHandler.handleResponse`: 15, 16 and
 /// `REQUEST_TIMED_OUT` find the group coordinator again, every other
-/// `RetriableException` sends the request again,
-/// `GROUP_AUTHORIZATION_FAILED`, `FENCED_INSTANCE_ID`,
+/// `RetriableException`, `UNKNOWN_TOPIC_ID` among them, sends the request
+/// again, `GROUP_AUTHORIZATION_FAILED`, `FENCED_INSTANCE_ID`,
 /// `TRANSACTION_ABORTABLE`, and the four group metadata mismatch codes
 /// (`UNKNOWN_MEMBER_ID`, `ILLEGAL_GENERATION`, `GROUP_ID_NOT_FOUND`,
 /// `STALE_MEMBER_EPOCH`) give an abortable error, `INVALID_PRODUCER_EPOCH` and
@@ -526,7 +526,7 @@ mod tests {
         use TxnRequestDecision::{Abortable, Done, Fatal, Fenced, Retry};
         let resend = Retry { rediscover: false };
         let rediscover = Retry { rediscover: true };
-        let cases: [RequestDecisionRow; 17] = [
+        let cases: [RequestDecisionRow; 18] = [
             ("none", Answered(0), Done),
             ("loading", Answered(14), resend),
             ("unavailable", Answered(15), rediscover),
@@ -534,6 +534,7 @@ mod tests {
             ("request timed out", Answered(7), rediscover),
             ("transport loss", Lost, rediscover),
             ("unknown topic or partition", Answered(3), resend),
+            ("unknown topic id", Answered(100), resend),
             ("invalid epoch", Answered(47), Fenced),
             ("producer fenced", Answered(90), Fenced),
             ("group authorization", Answered(30), Abortable(30)),

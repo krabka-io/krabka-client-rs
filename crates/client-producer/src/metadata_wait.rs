@@ -18,9 +18,12 @@ use std::{
 
 use dashmap::DashMap;
 use krabka_client_core::ClientError;
-use krabka_protocol::owned::{
-    metadata_request::{MetadataRequest, MetadataRequestTopic},
-    metadata_response::MetadataResponse,
+use krabka_protocol::{
+    owned::{
+        metadata_request::{MetadataRequest, MetadataRequestTopic},
+        metadata_response::MetadataResponse,
+    },
+    primitives::uuid::Uuid,
 };
 use tokio::{sync::Mutex, time::Instant};
 
@@ -360,6 +363,95 @@ impl MetadataWait<'_> {
             }
             backoff = backoff.saturating_mul(2).min(self.max_backoff);
         }
+    }
+
+    /// Return the topic id of each of `topics`, and [`Uuid::ZERO`] for a topic
+    /// that the metadata does not hold or gives no id for.
+    ///
+    /// Kafka's `KafkaProducer.sendOffsetsToTransaction` calls
+    /// `awaitTopicMetadata` first, and `TransactionManager` then reads the ids
+    /// from the metadata cache. The wait is best effort: when a topic is new
+    /// to the cache, it waits for one metadata response that names it, and a
+    /// topic that the response does not hold gets no id. A cached topic needs
+    /// no refresh.
+    ///
+    /// # Errors
+    ///
+    /// [`ProducerError::MetadataTimeout`] when `max_block` ends before the
+    /// response, as Kafka's `ProducerMetadata.awaitUpdate` throws
+    /// `TimeoutException`. [`ProducerError::Client`] for a refresh failure
+    /// that Kafka treats as fatal.
+    pub async fn topic_ids<F, Fut>(
+        &self,
+        topics: &[String],
+        mut refresh: F,
+    ) -> Result<HashMap<String, Uuid>, ProducerError>
+    where
+        F: FnMut(Vec<String>) -> Fut,
+        Fut: Future<Output = Result<MetadataResponse, ClientError>>,
+    {
+        let first_seen = self.refresh.generation();
+        let missing: Vec<&String> = {
+            let cache = self.cache.lock().await;
+            topics
+                .iter()
+                .filter(|topic| !cache.contains_key(topic.as_str()))
+                .collect()
+        };
+        for topic in &missing {
+            self.refresh.add(topic);
+        }
+        let deadline = Instant::now().checked_add(self.max_block);
+        for topic in missing {
+            let timeout = || ProducerError::MetadataTimeout {
+                topic: topic.clone(),
+                partition: None,
+                partition_count: None,
+                waited: self.max_block,
+            };
+            // Every topic starts from the same generation, so a later topic
+            // reads the response that an earlier one got when its request
+            // named both, and the topics share one refresh.
+            let mut seen = first_seen;
+            let mut backoff = self.retry_backoff;
+            loop {
+                let Some(attempt) = before(
+                    deadline,
+                    self.refresh.newer_than(&mut seen, topic, &mut refresh),
+                )
+                .await
+                else {
+                    return Err(timeout());
+                };
+                match attempt {
+                    Ok(response) => {
+                        if let TopicLookup::Known(meta) = lookup(&response, topic) {
+                            self.store(topic, meta, &response).await;
+                        }
+                        break;
+                    }
+                    Err(error) if stops_the_wait(&error) => {
+                        return Err(ProducerError::Client(error));
+                    }
+                    Err(_) => {}
+                }
+                if before(deadline, tokio::time::sleep(backoff))
+                    .await
+                    .is_none()
+                {
+                    return Err(timeout());
+                }
+                backoff = backoff.saturating_mul(2).min(self.max_backoff);
+            }
+        }
+        let cache = self.cache.lock().await;
+        Ok(topics
+            .iter()
+            .map(|topic| {
+                let id = cache.get(topic).map_or(Uuid::ZERO, |meta| meta.topic_id);
+                (topic.clone(), id)
+            })
+            .collect())
     }
 
     /// Cache the count and id of `topic`, and the leader of each partition,
@@ -979,5 +1071,221 @@ mod tests {
         .collect::<Vec<_>>();
         assert2::assert!(results == vec![Ok(6); 8]);
         assert2::assert!(script.refreshes.load(Ordering::SeqCst) == 2);
+    }
+
+    /// One scripted answer to a refresh of [`MetadataWait::topic_ids`].
+    #[derive(Clone, Copy)]
+    enum IdAnswer {
+        /// The response lists each requested topic. A topic of this list has
+        /// one partition and its id, and any other gets
+        /// `UNKNOWN_TOPIC_OR_PARTITION`.
+        Exists(&'static [&'static str]),
+        /// The request times out after `REQUEST_TIMEOUT`.
+        Silent,
+        /// The refresh fails at once with the error that the function makes.
+        Fails(fn() -> ClientError),
+    }
+
+    /// The id of a topic in the scripted metadata.
+    fn id_of(topic: &str) -> Uuid {
+        match topic {
+            "orders" => Uuid([7; 16]),
+            "payments" => Uuid([8; 16]),
+            _ => Uuid([9; 16]),
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TopicIdsOutcome {
+        result: Result<Vec<(String, Uuid)>, String>,
+        waited: Duration,
+        requests: Vec<Vec<String>>,
+    }
+
+    /// `topic_ids` waits for one response that names each topic new to the
+    /// cache, as Kafka's `KafkaProducer.awaitTopicMetadata` waits for one
+    /// metadata update. A topic that the response does not hold gets the zero
+    /// id, a cached topic needs no refresh, and the topics share one refresh.
+    #[tokio::test(start_paused = true)]
+    async fn topic_ids_wait_for_one_response_that_names_the_topics() {
+        let minute = Duration::from_mins(1);
+        let ms = Duration::from_millis;
+        let named = |topics: &[&str]| topics.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let ids = |rows: &[(&str, Uuid)]| {
+            Ok(rows
+                .iter()
+                .map(|(topic, id)| ((*topic).to_owned(), *id))
+                .collect::<Vec<_>>())
+        };
+        for (name, cached, answers, topics, max_block, expected) in [
+            (
+                "a cached topic needs no refresh",
+                vec!["orders"],
+                vec![IdAnswer::Exists(&["orders"])],
+                vec!["orders"],
+                minute,
+                TopicIdsOutcome {
+                    result: ids(&[("orders", id_of("orders"))]),
+                    waited: Duration::ZERO,
+                    requests: vec![],
+                },
+            ),
+            (
+                "a new topic gets its id from one refresh",
+                vec![],
+                vec![IdAnswer::Exists(&["orders"])],
+                vec!["orders"],
+                minute,
+                TopicIdsOutcome {
+                    result: ids(&[("orders", id_of("orders"))]),
+                    waited: Duration::ZERO,
+                    requests: vec![named(&["orders"])],
+                },
+            ),
+            (
+                "an unknown topic gets the zero id without a second refresh",
+                vec![],
+                vec![IdAnswer::Exists(&[])],
+                vec!["orders"],
+                minute,
+                TopicIdsOutcome {
+                    result: ids(&[("orders", Uuid::ZERO)]),
+                    waited: Duration::ZERO,
+                    requests: vec![named(&["orders"])],
+                },
+            ),
+            (
+                "two new topics share one refresh",
+                vec![],
+                vec![IdAnswer::Exists(&["payments"])],
+                vec!["orders", "payments"],
+                minute,
+                TopicIdsOutcome {
+                    result: ids(&[("orders", Uuid::ZERO), ("payments", id_of("payments"))]),
+                    waited: Duration::ZERO,
+                    requests: vec![named(&["orders", "payments"])],
+                },
+            ),
+            (
+                "a request timeout, then the response",
+                vec![],
+                vec![IdAnswer::Silent, IdAnswer::Exists(&["orders"])],
+                vec!["orders"],
+                minute,
+                TopicIdsOutcome {
+                    result: ids(&[("orders", id_of("orders"))]),
+                    waited: ms(1_100),
+                    requests: vec![named(&["orders"]), named(&["orders"])],
+                },
+            ),
+            (
+                "max_block ends before a response",
+                vec![],
+                vec![IdAnswer::Silent],
+                vec!["orders"],
+                ms(300),
+                TopicIdsOutcome {
+                    result: Err("Topic orders not present in metadata after 300 ms.".into()),
+                    waited: ms(300),
+                    requests: vec![named(&["orders"])],
+                },
+            ),
+            (
+                "an unsupported version stops the wait",
+                vec![],
+                vec![IdAnswer::Fails(|| ClientError::IncompatibleVersion {
+                    api_key: 3,
+                    broker_min: 0,
+                    broker_max: 0,
+                    client_min: 1,
+                    client_max: 12,
+                })],
+                vec!["orders"],
+                minute,
+                TopicIdsOutcome {
+                    result: Err("client: incompatible version: broker supports 0..=0, client wants 1..=12 for api_key 3".into()),
+                    waited: Duration::ZERO,
+                    requests: vec![named(&["orders"])],
+                },
+            ),
+        ] {
+            let state = Producerless::new();
+            {
+                let mut cache = state.cache.lock().await;
+                for topic in cached {
+                    cache.insert(
+                        topic.to_owned(),
+                        TopicMetadata {
+                            num_partitions: 1,
+                            topic_id: id_of(topic),
+                        },
+                    );
+                }
+            }
+            let answers = std::sync::Mutex::new(VecDeque::from(answers));
+            let requests = std::sync::Mutex::new(Vec::new());
+            let refresh = |topics: Vec<String>| {
+                requests.lock().expect("requests").push(topics.clone());
+                let answer = {
+                    let mut answers = answers.lock().expect("answers");
+                    if answers.len() > 1 {
+                        answers.pop_front().expect("answer")
+                    } else {
+                        *answers.front().expect("answer")
+                    }
+                };
+                async move {
+                    match answer {
+                        IdAnswer::Exists(existing) => Ok(MetadataResponse {
+                            topics: topics
+                                .iter()
+                                .map(|topic| {
+                                    let exists = existing.contains(&topic.as_str());
+                                    MetadataResponseTopic {
+                                        error_code: if exists {
+                                            0
+                                        } else {
+                                            UNKNOWN_TOPIC_OR_PARTITION
+                                        },
+                                        name: Some(topic.clone()),
+                                        topic_id: if exists { id_of(topic) } else { Uuid::ZERO },
+                                        partitions: if exists {
+                                            vec![MetadataResponsePartition::default()]
+                                        } else {
+                                            Vec::new()
+                                        },
+                                        ..Default::default()
+                                    }
+                                })
+                                .collect(),
+                            ..Default::default()
+                        }),
+                        IdAnswer::Silent => {
+                            tokio::time::sleep(REQUEST_TIMEOUT).await;
+                            Err(ClientError::Timeout(secs(1)))
+                        }
+                        IdAnswer::Fails(error) => Err(error()),
+                    }
+                }
+            };
+            let started = Instant::now();
+            let topics = named(&topics);
+            let result = state
+                .wait(max_block)
+                .topic_ids(&topics, refresh)
+                .await
+                .map(|ids| {
+                    let mut ids: Vec<_> = ids.into_iter().collect();
+                    ids.sort_by(|a, b| a.0.cmp(&b.0));
+                    ids
+                })
+                .map_err(|error| error.to_string());
+            let actual = TopicIdsOutcome {
+                result,
+                waited: started.elapsed(),
+                requests: requests.into_inner().expect("requests"),
+            };
+            assert2::assert!(actual == expected, "{name}");
+        }
     }
 }
