@@ -104,7 +104,6 @@ krabka-units = "0.4.0"
 [patch.crates-io]
 krabka-compression = { git = "https://github.com/krabka-io/krabka-protocol", rev = "2d34902e2074c6e0ce996428b3650678bf78ec50" }
 krabka-ids = { git = "https://github.com/krabka-io/krabka-protocol", rev = "2d34902e2074c6e0ce996428b3650678bf78ec50" }
-krabka-metadata = { git = "https://github.com/krabka-io/krabka-protocol", rev = "2d34902e2074c6e0ce996428b3650678bf78ec50" }
 krabka-protocol = { git = "https://github.com/krabka-io/krabka-protocol", rev = "2d34902e2074c6e0ce996428b3650678bf78ec50" }
 krabka-security = { git = "https://github.com/krabka-io/krabka-protocol", rev = "2d34902e2074c6e0ce996428b3650678bf78ec50" }
 krabka-units = { git = "https://github.com/krabka-io/krabka-protocol", rev = "2d34902e2074c6e0ce996428b3650678bf78ec50" }

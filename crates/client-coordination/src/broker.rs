@@ -1217,6 +1217,8 @@ mod tests {
         check!(message == "the DNS lookup of broker:9092 timed out");
     }
 
+    use std::collections::BTreeSet;
+
     use assert2::{assert, check};
     use krabka_client_admin::KafkaError;
     use krabka_protocol::owned::{
@@ -1727,11 +1729,13 @@ mod tests {
     fn a_described_transaction_becomes_a_fencing_token() {
         let describe = |producer_id, producer_epoch| TransactionDescription {
             transactional_id: "controller".to_owned(),
+            coordinator_id: 1,
             state: "Empty".to_owned(),
-            timeout: secs(30),
-            start_time_ms: GRANTED_AT,
             producer_id,
             producer_epoch,
+            timeout: secs(30),
+            start_time_ms: None,
+            topic_partitions: BTreeSet::new(),
         };
         check!(token_from_description(&describe(4242, 7)) == Some(token(4242, 7)));
         check!(token_from_description(&describe(0, 0)) == Some(token(0, 0)));

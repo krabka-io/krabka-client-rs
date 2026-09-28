@@ -67,6 +67,10 @@ pub use config::{
 };
 pub use config_resources::{ConfigResourceListing, ConfigResourceType};
 pub use configs::{AlterConfigsOutcome, IncrementalAlterOp, TopicConfigOverrides};
+pub use delegation_tokens::{
+    CreateDelegationTokenOptions, DelegationToken, DescribeDelegationTokenOptions,
+    ExpireDelegationTokenOptions, RenewDelegationTokenOptions,
+};
 pub use elections::{ElectionResults, ElectionType};
 pub use features::{FeatureMetadata, FeatureRange, FeatureUpdate, FeatureUpdateOutcome};
 pub use groups::{
@@ -251,27 +255,26 @@ pub trait AdminClientLike: Send {
 
     // ── delegation-token RPCs (KIP-48) ────────────────────────────────
     //
-    // Trait-level return type is `krabka_metadata::DelegationToken`
-    // (the image type) rather than the raw `Create/RenewDelegationToken`
-    // response. The `AdminClientLike for AdminClient` impl below
-    // reshapes wire responses into the image type — see the per-method
-    // comments there for the trade-off on how the renew path recovers
-    // the full token (the renew response carries only the new expiry).
-    async fn create_delegation_token_as_owner(
+    // Each method mirrors the inherent method of the same name in
+    // `delegation_tokens.rs`.
+    async fn create_delegation_token(
         &mut self,
-        owner_principal_name: &str,
-        renewers: &[String],
-        max_lifetime: Option<Time>,
-    ) -> Result<krabka_metadata::DelegationToken, AdminError>;
+        options: &CreateDelegationTokenOptions,
+    ) -> Result<DelegationToken, AdminError>;
     async fn renew_delegation_token(
         &mut self,
         hmac: &[u8],
-    ) -> Result<krabka_metadata::DelegationToken, AdminError>;
-    async fn expire_delegation_token(&mut self, hmac: &[u8]) -> Result<(), AdminError>;
-    async fn describe_delegation_tokens_owned_by(
+        options: RenewDelegationTokenOptions,
+    ) -> Result<i64, AdminError>;
+    async fn expire_delegation_token(
         &mut self,
-        owner_principal: &str,
-    ) -> Result<Vec<krabka_metadata::DelegationToken>, AdminError>;
+        hmac: &[u8],
+        options: ExpireDelegationTokenOptions,
+    ) -> Result<i64, AdminError>;
+    async fn describe_delegation_token(
+        &mut self,
+        options: &DescribeDelegationTokenOptions,
+    ) -> Result<Vec<DelegationToken>, AdminError>;
 }
 
 #[async_trait::async_trait]
@@ -420,129 +423,32 @@ impl AdminClientLike for AdminClient {
         AdminClient::alter_user_quotas(self, username, ops, validate_only).await
     }
 
-    // ── delegation-token RPCs ─────────────────────────────────────────
-    //
-    // The inherent `AdminClient` methods in `delegation_tokens.rs`
-    // return the wire-shaped response (`CreateDelegationTokenResponse`
-    // for create, `i64` new expiry for renew, `()` for expire, image
-    // `DelegationToken` for describe). The trait surface is normalised
-    // to `krabka_metadata::DelegationToken` so the operator's reconcile
-    // path is wire-agnostic.
-    async fn create_delegation_token_as_owner(
+    async fn create_delegation_token(
         &mut self,
-        owner_principal_name: &str,
-        renewers: &[String],
-        max_lifetime: Option<Time>,
-    ) -> Result<krabka_metadata::DelegationToken, AdminError> {
-        // The create-response carries every field the image type needs
-        // *except* the renewer list (the broker does not echo it back),
-        // so we reconstruct that from the caller's input — which is the
-        // ground truth anyway (KIP-48's create accepts the renewer set
-        // verbatim and the broker stores it as-is).
-        let resp = AdminClient::create_delegation_token_as_owner(
-            self,
-            owner_principal_name,
-            renewers,
-            max_lifetime,
-        )
-        .await?;
-        let renewers_image = renewers
-            .iter()
-            .filter_map(|s| renewer_str_to_principal(s))
-            .collect();
-        Ok(krabka_metadata::DelegationToken {
-            token_id: resp.token_id,
-            owner: krabka_security::KafkaPrincipal {
-                principal_type: resp.principal_type,
-                name: resp.principal_name,
-            },
-            hmac: resp.hmac.to_vec(),
-            issue_timestamp_ms: resp.issue_timestamp_ms,
-            expiry_timestamp_ms: resp.expiry_timestamp_ms,
-            max_timestamp_ms: resp.max_timestamp_ms,
-            renewers: renewers_image,
-        })
+        options: &CreateDelegationTokenOptions,
+    ) -> Result<DelegationToken, AdminError> {
+        AdminClient::create_delegation_token(self, options).await
     }
-
     async fn renew_delegation_token(
         &mut self,
         hmac: &[u8],
-    ) -> Result<krabka_metadata::DelegationToken, AdminError> {
-        // The renew-response (`RenewDelegationTokenResponse`) carries
-        // only the new `expiry_timestamp_ms`. To rebuild the full
-        // `DelegationToken` we follow up with `DescribeDelegationToken`
-        // with `owners=None` (describe all) and look up the entry by
-        // hmac. This adds one RPC per renewal — acceptable because the
-        // operator renews each user at most every `renew_before_expiry_ms`
-        // (24h by default). An alternative would have been to thread the
-        // owner principal into the trait method; keeping the surface
-        // `hmac`-only matches the inherent O3 signature.
-        let _new_expiry = AdminClient::renew_delegation_token(self, hmac).await?;
-        let req = krabka_protocol::owned::describe_delegation_token_request::DescribeDelegationTokenRequest::default();
-        let resp = self.conn.send(req).await?;
-        if resp.error_code != 0 {
-            return Err(AdminError::Broker {
-                api: "DescribeDelegationToken",
-                code: resp.error_code,
-                name: kafka_error_name(resp.error_code),
-                message: None,
-            });
-        }
-        let matched = resp
-            .tokens
-            .into_iter()
-            .find(|t| t.hmac.as_ref() == hmac)
-            .ok_or_else(|| {
-                AdminError::Protocol(
-                    "RenewDelegationToken: follow-up describe did not return the renewed token"
-                        .into(),
-                )
-            })?;
-        Ok(krabka_metadata::DelegationToken {
-            token_id: matched.token_id,
-            owner: krabka_security::KafkaPrincipal {
-                principal_type: matched.principal_type,
-                name: matched.principal_name,
-            },
-            hmac: matched.hmac.to_vec(),
-            issue_timestamp_ms: matched.issue_timestamp,
-            expiry_timestamp_ms: matched.expiry_timestamp,
-            max_timestamp_ms: matched.max_timestamp,
-            renewers: matched
-                .renewers
-                .into_iter()
-                .map(|r| krabka_security::KafkaPrincipal {
-                    principal_type: r.principal_type,
-                    name: r.principal_name,
-                })
-                .collect(),
-        })
+        options: RenewDelegationTokenOptions,
+    ) -> Result<i64, AdminError> {
+        AdminClient::renew_delegation_token(self, hmac, options).await
     }
-
-    async fn expire_delegation_token(&mut self, hmac: &[u8]) -> Result<(), AdminError> {
-        AdminClient::expire_delegation_token(self, hmac).await
-    }
-
-    async fn describe_delegation_tokens_owned_by(
+    async fn expire_delegation_token(
         &mut self,
-        owner_principal: &str,
-    ) -> Result<Vec<krabka_metadata::DelegationToken>, AdminError> {
-        AdminClient::describe_delegation_tokens_owned_by(self, owner_principal).await
+        hmac: &[u8],
+        options: ExpireDelegationTokenOptions,
+    ) -> Result<i64, AdminError> {
+        AdminClient::expire_delegation_token(self, hmac, options).await
     }
-}
-
-/// Splits `"Type:Name"` into a `KafkaPrincipal`. The default type is `User`.
-/// Empty input gives `None`, so the create path does not manufacture a
-/// principal from a bare `""` renewer entry.
-fn renewer_str_to_principal(s: &str) -> Option<krabka_security::KafkaPrincipal> {
-    if s.is_empty() {
-        return None;
+    async fn describe_delegation_token(
+        &mut self,
+        options: &DescribeDelegationTokenOptions,
+    ) -> Result<Vec<DelegationToken>, AdminError> {
+        AdminClient::describe_delegation_token(self, options).await
     }
-    let (pt, pn) = s.split_once(':').unwrap_or(("User", s));
-    Some(krabka_security::KafkaPrincipal {
-        principal_type: pt.to_string(),
-        name: pn.to_string(),
-    })
 }
 
 #[derive(Debug, Error)]
