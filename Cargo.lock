@@ -2021,7 +2021,7 @@ dependencies = [
 [[package]]
 name = "krabka-compression"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286#b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf#c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf"
 dependencies = [
  "assert2",
  "bytes",
@@ -2038,7 +2038,7 @@ dependencies = [
 [[package]]
 name = "krabka-ids"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286#b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf#c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf"
 dependencies = [
  "assert2",
  "base64 0.23.1",
@@ -2051,7 +2051,7 @@ dependencies = [
 [[package]]
 name = "krabka-protocol"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286#b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf#c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf"
 dependencies = [
  "assert2",
  "bytes",
@@ -2067,7 +2067,7 @@ dependencies = [
 [[package]]
 name = "krabka-security"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286#b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf#c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf"
 dependencies = [
  "arc-swap",
  "assert2",
@@ -2101,7 +2101,7 @@ dependencies = [
 [[package]]
 name = "krabka-units"
 version = "0.4.0"
-source = "git+https://github.com/krabka-io/krabka-protocol?rev=b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286#b0b78650b3d8e96bac8b0cf6f04fad5db3b3b286"
+source = "git+https://github.com/krabka-io/krabka-protocol?rev=c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf#c413f6e2011ba68e1a7e152ffd41fcbc6e42f9bf"
 dependencies = [
  "num-traits",
  "serde",
