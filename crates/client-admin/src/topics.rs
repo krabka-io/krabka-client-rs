@@ -266,6 +266,8 @@ impl AdminClient {
     }
 
     /// Submits exact replica lists; `None` cancels an active reassignment.
+    /// A reassignment may change a partition's replication factor, Kafka's
+    /// default; [`Self::alter_partition_assignments_with`] can refuse that.
     ///
     /// # Errors
     /// Returns a transport, protocol, or top-level broker error.
@@ -274,10 +276,39 @@ impl AdminClient {
         assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
         timeout: Time,
     ) -> Result<Vec<PartitionAssignmentOutcome>, AdminError> {
-        let request = build_partition_assignment_request(assignments, timeout);
+        self.alter_partition_assignments_with(
+            assignments,
+            timeout,
+            AlterPartitionReassignmentsOptions::default(),
+        )
+        .await
+    }
+
+    /// Submits exact replica lists with Kafka's
+    /// `AlterPartitionReassignmentsOptions`.
+    ///
+    /// # Errors
+    /// Returns [`krabka_client_core::ClientError::IncompatibleVersion`] before sending when
+    /// `allow_replication_factor_change` is false and the controller has no
+    /// v1, as Kafka's `AlterPartitionReassignmentsRequest.Builder` refuses to
+    /// build it. Otherwise a transport, protocol, or top-level broker error.
+    pub async fn alter_partition_assignments_with(
+        &mut self,
+        assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
+        timeout: Time,
+        options: AlterPartitionReassignmentsOptions,
+    ) -> Result<Vec<PartitionAssignmentOutcome>, AdminError> {
+        let request = build_partition_assignment_request(assignments, timeout, options);
+        let min_version = if options.allow_replication_factor_change {
+            0
+        } else {
+            ALLOW_REPLICATION_FACTOR_CHANGE_MIN_VERSION
+        };
         let mut retry = ControllerRetry::new("AlterPartitionReassignments", self.retry);
         loop {
-            let response = retry.bounded(self.conn.send(request.clone())).await?;
+            let response = retry
+                .bounded(self.conn.send_at_least(request.clone(), min_version))
+                .await?;
             if response.error_code != NOT_CONTROLLER {
                 return parse_partition_assignment_response(response);
             }
@@ -941,9 +972,30 @@ impl TopicMutationOutcome for CreatePartitionsOutcome {
     }
 }
 
+/// Kafka's `AlterPartitionReassignmentsOptions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlterPartitionReassignmentsOptions {
+    /// Whether a reassignment may change a partition's replication factor.
+    /// Kafka's default is `true`; `false` needs request v1.
+    pub allow_replication_factor_change: bool,
+}
+
+impl Default for AlterPartitionReassignmentsOptions {
+    fn default() -> Self {
+        Self {
+            allow_replication_factor_change: true,
+        }
+    }
+}
+
+/// The first `AlterPartitionReassignments` version with
+/// `AllowReplicationFactorChange`.
+const ALLOW_REPLICATION_FACTOR_CHANGE_MIN_VERSION: i16 = 1;
+
 fn build_partition_assignment_request(
     assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
     timeout: Time,
+    options: AlterPartitionReassignmentsOptions,
 ) -> AlterPartitionReassignmentsRequest {
     let mut topics = BTreeMap::<String, Vec<ReassignablePartition>>::new();
     for ((topic, partition), replicas) in assignments {
@@ -958,7 +1010,7 @@ fn build_partition_assignment_request(
     }
     AlterPartitionReassignmentsRequest {
         timeout_ms: timeout.millis_i32(),
-        allow_replication_factor_change: true,
+        allow_replication_factor_change: options.allow_replication_factor_change,
         topics: topics
             .into_iter()
             .map(|(name, partitions)| ReassignableTopic {
@@ -1350,7 +1402,11 @@ mod tests {
     #[test]
     fn exact_assignment_request_preserves_replica_order() {
         let assignments = BTreeMap::from([(("orders".into(), 3), Some(vec![4, 2, 1]))]);
-        let request = build_partition_assignment_request(&assignments, krabka_units::secs(30));
+        let request = build_partition_assignment_request(
+            &assignments,
+            krabka_units::secs(30),
+            AlterPartitionReassignmentsOptions::default(),
+        );
         assert2::assert!(
             request
                 == AlterPartitionReassignmentsRequest {
@@ -1368,6 +1424,102 @@ mod tests {
                     ..Default::default()
                 }
         );
+    }
+
+    /// Kafka's `AlterPartitionReassignmentsOptions.allowReplicationFactorChange`
+    /// reaches the wire as it is set. `false` needs v1: against a v0-only
+    /// controller the call is refused before anything is sent, as Kafka's
+    /// request builder throws `UnsupportedVersionException`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allow_replication_factor_change_reaches_the_wire_and_needs_v1_when_false() {
+        use krabka_client_core::{ClientError, MockBroker};
+        use krabka_protocol::owned::{
+            alter_partition_reassignments_request,
+            alter_partition_reassignments_response::AlterPartitionReassignmentsResponse,
+            api_versions_request,
+        };
+
+        use crate::partition_leaders::test_support::{
+            api_versions, decode_request, encode_response,
+        };
+
+        // `None` calls `alter_partition_assignments`, which takes Kafka's
+        // default, and `Some(allow)` calls `alter_partition_assignments_with`.
+        for (name, max_version, allow, expected) in [
+            ("plain call at v1", 1, None, Ok(vec![(1, true)])),
+            ("default at v1", 1, Some(true), Ok(vec![(1, true)])),
+            (
+                "refuse a change at v1",
+                1,
+                Some(false),
+                Ok(vec![(1, false)]),
+            ),
+            ("default at v0", 0, Some(true), Ok(vec![(0, true)])),
+            ("refuse a change at v0", 0, Some(false), Err(())),
+        ] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let requests = Arc::clone(&seen);
+            let broker = MockBroker::start(move |api_key, version, _, body| match api_key {
+                api_versions_request::API_KEY => Some(api_versions(&[(
+                    alter_partition_reassignments_request::API_KEY,
+                    0,
+                    max_version,
+                )])),
+                alter_partition_reassignments_request::API_KEY => {
+                    let request: AlterPartitionReassignmentsRequest =
+                        decode_request(body, version, true);
+                    requests
+                        .lock()
+                        .expect("requests lock")
+                        .push((version, request.allow_replication_factor_change));
+                    Some(encode_response(
+                        &AlterPartitionReassignmentsResponse::default(),
+                        version,
+                        true,
+                    ))
+                }
+                _ => None,
+            })
+            .await;
+            let mut admin = AdminClient::connect(&[broker.addr.to_string()])
+                .await
+                .expect("admin connects");
+
+            let assignments = BTreeMap::from([(("orders".into(), 0), Some(vec![1, 2]))]);
+            let timeout = krabka_units::secs(5);
+            let outcome = match allow {
+                None => {
+                    admin
+                        .alter_partition_assignments(&assignments, timeout)
+                        .await
+                }
+                Some(allow) => {
+                    admin
+                        .alter_partition_assignments_with(
+                            &assignments,
+                            timeout,
+                            AlterPartitionReassignmentsOptions {
+                                allow_replication_factor_change: allow,
+                            },
+                        )
+                        .await
+                }
+            };
+            let result = outcome
+                .map(|_| seen.lock().expect("requests lock").clone())
+                .map_err(|error| {
+                    assert2::assert!(
+                        matches!(
+                            error,
+                            AdminError::Transport(ClientError::IncompatibleVersion { .. })
+                        ),
+                        "case {name}: {error:?}"
+                    );
+                });
+
+            broker.stop();
+            assert2::assert!(result == expected, "case {name}");
+        }
     }
 
     fn reassignment_metadata(assignments: &[&[i32]]) -> MetadataResponse {
