@@ -1443,11 +1443,19 @@ mod tests {
             api_versions, decode_request, encode_response,
         };
 
+        // `None` calls `alter_partition_assignments`, which takes Kafka's
+        // default, and `Some(allow)` calls `alter_partition_assignments_with`.
         for (name, max_version, allow, expected) in [
-            ("default at v1", 1, true, Ok(vec![(1, true)])),
-            ("refuse a change at v1", 1, false, Ok(vec![(1, false)])),
-            ("default at v0", 0, true, Ok(vec![(0, true)])),
-            ("refuse a change at v0", 0, false, Err(())),
+            ("plain call at v1", 1, None, Ok(vec![(1, true)])),
+            ("default at v1", 1, Some(true), Ok(vec![(1, true)])),
+            (
+                "refuse a change at v1",
+                1,
+                Some(false),
+                Ok(vec![(1, false)]),
+            ),
+            ("default at v0", 0, Some(true), Ok(vec![(0, true)])),
+            ("refuse a change at v0", 0, Some(false), Err(())),
         ] {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let requests = Arc::clone(&seen);
@@ -1477,15 +1485,27 @@ mod tests {
                 .await
                 .expect("admin connects");
 
-            let result = admin
-                .alter_partition_assignments_with(
-                    &BTreeMap::from([(("orders".into(), 0), Some(vec![1, 2]))]),
-                    krabka_units::secs(5),
-                    AlterPartitionReassignmentsOptions {
-                        allow_replication_factor_change: allow,
-                    },
-                )
-                .await
+            let assignments = BTreeMap::from([(("orders".into(), 0), Some(vec![1, 2]))]);
+            let timeout = krabka_units::secs(5);
+            let outcome = match allow {
+                None => {
+                    admin
+                        .alter_partition_assignments(&assignments, timeout)
+                        .await
+                }
+                Some(allow) => {
+                    admin
+                        .alter_partition_assignments_with(
+                            &assignments,
+                            timeout,
+                            AlterPartitionReassignmentsOptions {
+                                allow_replication_factor_change: allow,
+                            },
+                        )
+                        .await
+                }
+            };
+            let result = outcome
                 .map(|_| seen.lock().expect("requests lock").clone())
                 .map_err(|error| {
                     assert2::assert!(
