@@ -4,9 +4,11 @@ load(
     "./rustdoc_site.axl",
     "copy_tree",
     "find_rustdoc",
+    "html_escape",
     "landing_page",
     "landing_row",
     "manifest_field",
+    "output_problem",
     "problems",
     "redirect_page",
     "resolve_output",
@@ -41,7 +43,7 @@ rendered from the <code>main</code> branch.</p>
 <thead><tr><th>Crate</th><th>What it is</th></tr></thead>
 <tbody>
 <tr><td><a href="krabka-alpha/krabka_alpha/index.html"><code>krabka-alpha</code></a></td><td>The alpha crate, first of its name</td></tr>
-<tr><td><a href="krabka-beta/krabka_beta/index.html"><code>krabka-beta</code></a></td><td>The "beta" crate &amp; co.</td></tr>
+<tr><td><a href="krabka-beta/krabka_beta/index.html"><code>krabka-beta</code></a></td><td>The &quot;beta&quot; crate &amp; co.</td></tr>
 </tbody>
 </table>
 </html>
@@ -93,14 +95,39 @@ def _test_manifest_field_reads_the_package_section(_ctx):
     check_eq("the package name", manifest_field(lines, "name"), "krabka-log")
     check_eq("the description", manifest_field(lines, "description"), "The log")
 
-def _test_manifest_field_keeps_a_quote_inside_a_value(_ctx):
-    # The match runs to the line's last quote, so a description that quotes
-    # something keeps the quotes on the landing page.
-    check_eq(
-        "an inner quote",
-        manifest_field(['description = "The "beta" crate"'], "description"),
-        'The "beta" crate',
-    )
+def _test_manifest_field_decodes_basic_strings(_ctx):
+    cases = [
+        ("an escaped quote", 'description = "The \\"beta\\" crate"', 'The "beta" crate'),
+        ("an escaped backslash", 'description = "a\\\\b"', "a\\b"),
+        ("a newline", 'description = "a\\nb"', "a\nb"),
+        ("a tab", 'description = "a\\tb"', "a\tb"),
+        ("a carriage return", 'description = "a\\rb"', "a\rb"),
+        ("a backspace", 'description = "a\\bb"', "a\u0008b"),
+        ("a form feed", 'description = "a\\fb"', "a\u000cb"),
+        ("a four-digit code point", 'description = "caf\\u00E9"', "caf\u00e9"),
+        ("an eight-digit code point", 'description = "\\U0001F600!"', "\U0001F600!"),
+        ("an escaped backslash before u", 'description = "\\\\u0041"', "\\u0041"),
+    ]
+    for label, line, expected in cases:
+        check_eq(label, manifest_field([line], "description"), expected)
+
+def _test_manifest_field_rejects_invalid_basic_strings(_ctx):
+    cases = [
+        ("an unescaped inner quote", 'description = "The "beta" crate"'),
+        ("an unknown escape", 'description = "a\\qb"'),
+        ("a truncated unicode escape", 'description = "\\u12"'),
+        ("a non-hex unicode escape", 'description = "\\u12G4"'),
+        ("a surrogate", 'description = "\\uD800"'),
+        ("beyond Unicode", 'description = "\\U00110000"'),
+        ("a dangling backslash", 'description = "abc\\"'),
+    ]
+    for label, line in cases:
+        check_eq(label, manifest_field([line], "description"), "")
+
+def _test_manifest_field_takes_literal_strings_as_written(_ctx):
+    check_eq("no decoding", manifest_field(["description = 'C:\\new \"q\"'"], "description"), 'C:\\new "q"')
+    check_eq("an empty literal", manifest_field(["description = ''"], "description"), "")
+    check_eq("an unclosed literal", manifest_field(["description = 'x"], "description"), "")
 
 def _test_manifest_field_ignores_what_it_cannot_parse(_ctx):
     check_eq("no such field", manifest_field(['name = "krabka-log"'], "description"), "")
@@ -147,12 +174,40 @@ def _test_landing_row(_ctx):
         '<tr><td><a href="krabka-log/krabka_log/index.html"><code>krabka-log</code></a></td><td>The log</td></tr>',
     )
 
+def _test_html_escape(_ctx):
+    check_eq("nothing to escape", html_escape("plain text"), "plain text")
+    check_eq("ampersand first", html_escape("&amp;"), "&amp;amp;")
+    check_eq(
+        "every special character",
+        html_escape("""<a href="x">'&'</a>"""),
+        "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;",
+    )
+
+def _test_landing_row_escapes_manifest_text(_ctx):
+    check_eq(
+        "an escaped row",
+        landing_row(struct(name = "a<b", snake = "a_b", description = 'Types like Vec<T> & "co"')),
+        '<tr><td><a href="a&lt;b/a_b/index.html"><code>a&lt;b</code></a></td><td>Types like Vec&lt;T&gt; &amp; &quot;co&quot;</td></tr>',
+    )
+
+def _test_redirect_page_escapes_the_name(_ctx):
+    check_eq(
+        "an escaped redirect",
+        redirect_page('x"<y', "x_y"),
+        """<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url=x_y/index.html">
+<title>x&quot;&lt;y</title>
+<a href="x_y/index.html">x&quot;&lt;y</a>
+""",
+    )
+
 def _test_landing_page(_ctx):
     check_eq(
         "the landing page",
         landing_page([
             _row("krabka-alpha", "The alpha crate, first of its name"),
-            _row("krabka-beta", 'The "beta" crate &amp; co.'),
+            _row("krabka-beta", 'The "beta" crate & co.'),
         ]),
         _LANDING_PAGE,
     )
@@ -205,6 +260,41 @@ def _test_resolve_output(_ctx):
     check_eq("nested", resolve_output("/w", "build/site"), "/w/build/site")
     check_eq("absolute", resolve_output("/w", "/var/www/site"), "/var/www/site")
 
+def _test_output_problem_rejects_unsafe_directories(_ctx):
+    cases = [
+        ("the current directory", "/w", "."),
+        ("the parent", "/w", ".."),
+        ("the filesystem root", "/w", "/"),
+        ("the root itself", "/w", "/w"),
+        ("the root with a trailing slash", "/w", "/w/"),
+        ("an ancestor of the root", "/a/b", "/a"),
+        ("a sibling of the root", "/w", "../sibling"),
+        ("a prefix lookalike", "/w", "/w2/site"),
+        ("the crates directory", "/w", "crates"),
+        ("inside the crates directory", "/w", "crates/x"),
+        ("the git directory", "/w", ".git"),
+        ("the workflows directory", "/w", ".github"),
+        ("the tasks directory", "/w", ".aspect"),
+        ("the bazel directory", "/w", "bazel"),
+        ("a bazel output symlink", "/w", "bazel-bin"),
+        ("a dot-dot escape from inside", "/w", "site/../.."),
+        ("a protected directory via dot", "/w", "./crates/../crates"),
+    ]
+    for label, root, output in cases:
+        if not output_problem(root, resolve_output(root, output)):
+            fail("%s: %s was accepted" % (label, output))
+
+def _test_output_problem_accepts_a_directory_inside_the_root(_ctx):
+    cases = [
+        ("a relative directory", "/w", "site"),
+        ("a nested directory", "/w", "out/site"),
+        ("an absolute directory inside the root", "/w", "/w/site"),
+        ("a dot-relative directory", "/w", "./site//x"),
+        ("a directory reached through dot-dot", "/w", "crates/../site"),
+    ]
+    for label, root, output in cases:
+        check_eq(label, output_problem(root, resolve_output(root, output)), "")
+
 def _test_copy_tree_reproduces_the_whole_subtree(ctx):
     fs = ctx.std.fs
     root = temp_tree(ctx, {
@@ -248,14 +338,19 @@ def _test_copy_tree_keeps_the_executable_bit(ctx):
 
 rustdoc_site_tests = suite("rustdoc-site", [
     _test_manifest_field_reads_the_package_section,
-    _test_manifest_field_keeps_a_quote_inside_a_value,
+    _test_manifest_field_decodes_basic_strings,
+    _test_manifest_field_rejects_invalid_basic_strings,
+    _test_manifest_field_takes_literal_strings_as_written,
     _test_manifest_field_ignores_what_it_cannot_parse,
     _test_snake_is_the_crates_module_name,
     _test_find_rustdoc_picks_the_doc_directory,
     _test_find_rustdoc_without_one,
     _test_find_rustdoc_is_deterministic,
     _test_redirect_page,
+    _test_html_escape,
     _test_landing_row,
+    _test_landing_row_escapes_manifest_text,
+    _test_redirect_page_escapes_the_name,
     _test_landing_page,
     _test_landing_page_without_crates,
     _test_a_documented_crate_has_no_problem,
@@ -264,6 +359,8 @@ rustdoc_site_tests = suite("rustdoc-site", [
     _test_a_nameless_manifest_is_reported_once,
     _test_every_crate_is_reported_not_only_the_first,
     _test_resolve_output,
+    _test_output_problem_rejects_unsafe_directories,
+    _test_output_problem_accepts_a_directory_inside_the_root,
     _test_copy_tree_reproduces_the_whole_subtree,
     _test_copy_tree_leaves_the_copy_writable,
     _test_copy_tree_keeps_the_executable_bit,

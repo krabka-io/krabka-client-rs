@@ -40,19 +40,102 @@ _LANDING_HEAD = [
 
 _LANDING_TAIL = ["</tbody>", "</table>", "</html>"]
 
+# The single-character escapes a TOML basic string allows.
+_TOML_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "b": "\u0008",
+    "f": "\u000c",
+}
+
+def _hex_value(digits):
+    """The number `digits` spells in hex, or -1 when a character is not a hex digit."""
+    total = 0
+    for i in range(len(digits)):
+        index = "0123456789abcdef".find(digits[i:i + 1].lower())
+        if index < 0:
+            return -1
+        total = total * 16 + index
+    return total
+
+def _decode_basic(text):
+    """Decode the body of a TOML basic string, `text` running from just past the opening quote.
+
+    Returns the decoded value, or None when the string is not valid: an
+    unclosed string, an unknown or truncated escape, a code point that is not
+    a Unicode scalar value, or anything after the closing quote (such as a
+    trailing comment).
+    """
+    out = []
+    skip = 0
+    size = len(text)
+    for i in range(size):
+        if skip > 0:
+            skip -= 1
+            continue
+        char = text[i:i + 1]
+        if char == '"':
+            return "".join(out) if i == size - 1 else None
+        if char != "\\":
+            out.append(char)
+            continue
+        if i + 1 >= size:
+            return None
+        escape = text[i + 1:i + 2]
+        if escape in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[escape])
+            skip = 1
+            continue
+        width = 0
+        if escape == "u":
+            width = 4
+        elif escape == "U":
+            width = 8
+        else:
+            return None
+        digits = text[i + 2:i + 2 + width]
+        if len(digits) != width:
+            return None
+        code = _hex_value(digits)
+        if code < 0 or code > 0x10FFFF or (code >= 0xD800 and code <= 0xDFFF):
+            return None
+        out.append(chr(code))
+        skip = 1 + width
+    return None
+
 def manifest_field(lines, field):
     """The value `field` is assigned on its first `field = "..."` line.
 
     The manifests here open with `[package]`, so the first assignment is the
-    package's own. A value holding a quote keeps it: the match runs to the line's last
-    quote, so a description that quotes something reaches the landing page
-    verbatim.
+    package's own. A basic string (`"..."`) is decoded per TOML, escapes
+    included; a literal string (`'...'`) is taken as written. A line that is
+    not a valid single-line string, or that carries a trailing comment, yields
+    "".
     """
-    prefix = field + ' = "'
+    basic = field + ' = "'
+    literal = field + " = '"
     for line in lines:
-        if line.startswith(prefix) and line.endswith('"') and len(line) > len(prefix):
-            return line[len(prefix):-1]
+        if line.startswith(basic):
+            decoded = _decode_basic(line[len(basic):])
+            return decoded if decoded != None else ""
+        if line.startswith(literal):
+            body = line[len(literal):]
+            if body.endswith("'") and "'" not in body[:-1]:
+                return body[:-1]
+            return ""
     return ""
+
+def html_escape(text):
+    """`text` with the characters HTML gives meaning to written as entities."""
+    return (text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;"))
 
 def snake(name):
     """The Rust module name for the crate Cargo calls `name`."""
@@ -80,18 +163,18 @@ def redirect_page(name, module):
     return "\n".join([
         "<!doctype html>",
         '<meta charset="utf-8">',
-        '<meta http-equiv="refresh" content="0; url=%s/index.html">' % module,
-        "<title>%s</title>" % name,
-        '<a href="%s/index.html">%s</a>' % (module, name),
+        '<meta http-equiv="refresh" content="0; url=%s/index.html">' % html_escape(module),
+        "<title>%s</title>" % html_escape(name),
+        '<a href="%s/index.html">%s</a>' % (html_escape(module), html_escape(name)),
     ]) + "\n"
 
 def landing_row(row):
-    """The landing page's table row for one `struct(name, snake, description)`."""
+    """The landing page's table row for one `struct(name, snake, description)`, HTML-escaped."""
     return '<tr><td><a href="%s/%s/index.html"><code>%s</code></a></td><td>%s</td></tr>' % (
-        row.name,
-        row.snake,
-        row.name,
-        row.description,
+        html_escape(row.name),
+        html_escape(row.snake),
+        html_escape(row.name),
+        html_escape(row.description),
     )
 
 def landing_page(rows):
@@ -124,6 +207,42 @@ def resolve_output(root, output):
     if output.startswith("/"):
         return output
     return root + "/" + output
+
+# Top-level entries of the checkout that the site directory must never be, since
+# `_impl` deletes the output directory before writing it.
+_PROTECTED_TOP_LEVEL = ["crates", ".git", ".github", ".aspect", "bazel"]
+
+def normalize_path(path):
+    """The absolute `path` with `.` and `..` segments and duplicate slashes collapsed."""
+    parts = []
+    for segment in path.split("/"):
+        if segment == "" or segment == ".":
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(segment)
+    return "/" + "/".join(parts)
+
+def output_problem(root, out):
+    """Why `out` is not safe to delete and rewrite, or "" when it is.
+
+    The output directory is removed before the site is written, so it must be
+    a strict descendant of the repository `root` and must not be one of the
+    checkout's own top-level directories (or a `bazel-*` output symlink).
+    """
+    normal_root = normalize_path(root)
+    normal_out = normalize_path(out)
+    prefix = normal_root if normal_root == "/" else normal_root + "/"
+    if normal_out == "/" or normal_out == normal_root:
+        return "refusing to use %s as the output directory: it is the repository root or above" % out
+    if not normal_out.startswith(prefix):
+        return "refusing to use %s as the output directory: it is not inside %s" % (out, root)
+    top = normal_out[len(prefix):].split("/")[0]
+    if top in _PROTECTED_TOP_LEVEL or top.startswith("bazel-"):
+        return "refusing to use %s as the output directory: %s is part of the checkout" % (out, top)
+    return ""
 
 def copy_tree(fs, source, destination):
     """Copy the tree at `source` to `destination` writable, and count the files.
@@ -197,6 +316,10 @@ def _impl(ctx: TaskContext) -> int:
         ctx.std.io.stderr.write("no output directory: pass --output\n")
         return 2
     out = resolve_output(root, ctx.args.output)
+    unsafe = output_problem(root, out)
+    if unsafe:
+        ctx.std.io.stderr.write(unsafe + "\n")
+        return 2
 
     crates = _crates(fs, root)
     if not crates:
