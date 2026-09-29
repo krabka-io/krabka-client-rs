@@ -101,7 +101,7 @@ pub use log_dirs::{
     ReplicaLogDirInfo, TopicPartitionReplica,
 };
 pub use offsets::{IsolationLevel, ListedOffset, OffsetSpec};
-pub use quorum::{MetadataQuorum, QuorumReplica, RaftVoterEndpoint};
+pub use quorum::{MetadataQuorum, QuorumNode, QuorumReplica, RaftVoterEndpoint};
 pub use quotas::{
     ClientQuotaAlteration, ClientQuotaEntity, ClientQuotaFilter, ClientQuotaFilterComponent,
     ClientQuotaMatch, ClientQuotas, ENTITY_CLIENT_ID, ENTITY_IP, ENTITY_USER, QuotaOp,

@@ -145,13 +145,24 @@ pub struct QuorumReplica {
     pub last_caught_up_timestamp: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataQuorum {
     pub leader_id: i32,
     pub leader_epoch: i32,
     pub high_watermark: i64,
     pub voters: Vec<QuorumReplica>,
     pub observers: Vec<QuorumReplica>,
+    /// The listener endpoints of each node, as Kafka's `QuorumInfo.nodes()`
+    /// reads them from the response's `Nodes` (`DescribeQuorum` v2 and
+    /// later). Empty when the controller answered at v0 or v1.
+    pub nodes: Vec<QuorumNode>,
+}
+
+/// One node of `QuorumInfo.nodes()`: its id and listener endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuorumNode {
+    pub node_id: i32,
+    pub endpoints: Vec<RaftVoterEndpoint>,
 }
 
 fn broker_error(api: &'static str, code: i16, message: Option<String>) -> AdminError {
@@ -172,6 +183,24 @@ fn replica(
         log_end_offset: value.log_end_offset,
         last_fetch_timestamp: value.last_fetch_timestamp,
         last_caught_up_timestamp: value.last_caught_up_timestamp,
+    }
+}
+
+/// A response node as Kafka's `DescribeQuorumResponse.getNodes` maps it. The
+/// listener fields come straight from the wire, so they are not re-validated
+/// the way a caller-built `RaftVoterEndpoint` is.
+fn quorum_node(node: &krabka_protocol::owned::describe_quorum_response::Node) -> QuorumNode {
+    QuorumNode {
+        node_id: node.node_id,
+        endpoints: node
+            .listeners
+            .iter()
+            .map(|listener| RaftVoterEndpoint {
+                listener: listener.name.clone(),
+                host: listener.host.clone(),
+                port: listener.port,
+            })
+            .collect(),
     }
 }
 
@@ -202,6 +231,7 @@ impl AdminClient {
                 response.error_message,
             ));
         }
+        let nodes = response.nodes.iter().map(quorum_node).collect();
         let partition = response
             .topics
             .into_iter()
@@ -228,6 +258,7 @@ impl AdminClient {
             high_watermark: partition.high_watermark,
             voters: partition.current_voters.iter().map(replica).collect(),
             observers: partition.observers.iter().map(replica).collect(),
+            nodes,
         })
     }
 
@@ -408,6 +439,111 @@ mod tests {
                     },
                 "case {name}"
             );
+        }
+    }
+
+    /// `describe_metadata_quorum` reads the leader, voters, observers and,
+    /// from v2, every node's listener endpoints, as Kafka's
+    /// `DescribeQuorumResponse.getQuorumInfo` does. A v1 answer carries no
+    /// nodes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn describe_metadata_quorum_reads_nodes_from_v2() {
+        use krabka_protocol::owned::{
+            common::describe_quorum_response::replica_state::ReplicaState,
+            describe_quorum_request,
+            describe_quorum_response::{
+                DescribeQuorumResponse, Listener, Node, PartitionData, TopicData,
+            },
+        };
+
+        let voter = |replica_id| ReplicaState {
+            replica_id,
+            log_end_offset: 40,
+            ..Default::default()
+        };
+        let response = DescribeQuorumResponse {
+            topics: vec![TopicData {
+                topic_name: CLUSTER_METADATA_TOPIC.into(),
+                partitions: vec![PartitionData {
+                    leader_id: 1,
+                    leader_epoch: 3,
+                    high_watermark: 41,
+                    current_voters: vec![voter(1), voter(2)],
+                    observers: vec![voter(7)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            nodes: vec![Node {
+                node_id: 1,
+                listeners: vec![Listener {
+                    name: "CONTROLLER".into(),
+                    host: "c1.example".into(),
+                    port: 9093,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let quorum = |nodes| MetadataQuorum {
+            leader_id: 1,
+            leader_epoch: 3,
+            high_watermark: 41,
+            voters: vec![
+                QuorumReplica {
+                    node_id: 1,
+                    directory_id: uuid::Uuid::nil(),
+                    log_end_offset: 40,
+                    last_fetch_timestamp: -1,
+                    last_caught_up_timestamp: -1,
+                },
+                QuorumReplica {
+                    node_id: 2,
+                    directory_id: uuid::Uuid::nil(),
+                    log_end_offset: 40,
+                    last_fetch_timestamp: -1,
+                    last_caught_up_timestamp: -1,
+                },
+            ],
+            observers: vec![QuorumReplica {
+                node_id: 7,
+                directory_id: uuid::Uuid::nil(),
+                log_end_offset: 40,
+                last_fetch_timestamp: -1,
+                last_caught_up_timestamp: -1,
+            }],
+            nodes,
+        };
+        for (name, max_version, expected) in [
+            (
+                "v2 carries nodes",
+                2,
+                quorum(vec![QuorumNode {
+                    node_id: 1,
+                    endpoints: vec![endpoint("CONTROLLER", "c1.example", 9093)],
+                }]),
+            ),
+            ("v1 carries none", 1, quorum(vec![])),
+        ] {
+            let answer = response.clone();
+            let broker = scripted_broker(
+                vec![(describe_quorum_request::API_KEY, 0, max_version)],
+                move |key, version, _, _| {
+                    if key == describe_quorum_request::API_KEY {
+                        MockReply::Respond(encode_response(&answer, version, true))
+                    } else {
+                        MockReply::Silent
+                    }
+                },
+            )
+            .await;
+            let mut admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
+
+            let described = admin.describe_metadata_quorum().await.expect("describes");
+
+            broker.stop();
+            assert2::assert!(described == expected, "case {name}");
         }
     }
 
