@@ -9,8 +9,7 @@ most of an hour:
     aspect lint       # clippy, over changed targets
     aspect format     # rustfmt/buildifier/yamlfmt, over changed files
     aspect delivery   # push only images whose built output changed
-    aspect rustdoc-site  # assemble the rendered rustdoc into a Pages site
-    aspect axl-tests  # unit tests of the tasks under .aspect/
+    aspect rustdoc-site  # (shared module) assemble the rendered rustdoc into a Pages site
 
 `bazel build|test //...` remains equivalent and is what a developer without the
 CLI runs; nothing here is required to build the repository.
