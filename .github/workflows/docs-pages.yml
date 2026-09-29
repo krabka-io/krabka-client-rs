@@ -1,0 +1,72 @@
+name: docs-pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Publish the rustdoc set to GitHub Pages.
+#
+# The `ci` workflow renders the same set on every run and uploads it as an
+# artifact nobody browses. This renders it once more from `main`, adds a
+# landing page that lists every crate, and deploys it, so the README can link
+# to a page rather than to an artifact.
+#
+# It is its own workflow rather than a job in `ci.yml` because a deployment
+# needs `pages: write` and its own concurrency group, and because a failed
+# deploy should not turn the merge gate red.
+#
+# Pages must be enabled for the repository with its source set to "GitHub
+# Actions" (Settings > Pages); `configure-pages` fails until it is.
+
+permissions:
+  contents: read
+  pages: write
+  # Both the Pages deployment and setup-aspect's log uploads need the OIDC
+  # token, as in `ci.yml`.
+  id-token: write
+
+# One deployment at a time. A push that lands while one is in flight waits
+# rather than cancelling it, so the site never ends between two versions.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: render rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aspect-build/setup-aspect@2306377a61c45954ab2df7c7311698b109364352 # v2026.26.9
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      # The same query `ci.yml`'s docgen job runs, so the two never disagree
+      # about which crates have documentation.
+      - name: docgen
+        run: bazel build $(bazel query 'kind("rust_doc rule", //crates/...)')
+
+      - name: assemble the site
+        run: aspect rustdoc-site --output site
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

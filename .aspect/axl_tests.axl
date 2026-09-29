@@ -1,0 +1,27 @@
+"""Run every `.axl` unit-test suite in this repository.
+
+Each task under `.aspect/` keeps its tests in a `_test.axl` beside it, which
+exports one suite and an `aspect tests <name>` command of its own. This is the
+whole set, which is what CI runs.
+
+    aspect axl-tests
+    aspect axl-tests --suite rustdoc-site
+"""
+
+load("./rustdoc_site_test.axl", "rustdoc_site_tests")
+load("./testing.axl", "run_suites")
+
+SUITES = [
+    rustdoc_site_tests,
+]
+
+def _impl(ctx: TaskContext) -> int:
+    return run_suites(ctx, SUITES, only = ctx.args.suite)
+
+axl_tests = task(
+    summary = "Run the unit tests of the .axl tasks",
+    implementation = _impl,
+    args = {
+        "suite": args.string(default = "", description = "Run only this suite."),
+    },
+)

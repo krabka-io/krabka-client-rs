@@ -1,0 +1,84 @@
+"""The assertion helpers and the runner behind `aspect axl-tests`.
+
+AXL has no test framework: the CLI registers tasks, and that is all. So a test
+is an ordinary function taking the task context, a suite is a named list of
+them, and `run_suites` is what turns a list of suites into a task's exit code.
+The shape mirrors the convention the Aspect CLI uses for its own `.axl` tests.
+
+A failing assertion calls `fail`, which aborts the task -- so a suite reports
+its first failure, not all of them. That is the trade a framework-free runner
+makes, and it keeps every assertion here a one-liner.
+"""
+
+def check(condition, message):
+    """Fail with `message` unless `condition` holds."""
+    if not condition:
+        fail(message)
+
+def check_eq(label, got, want):
+    """Fail unless `got` equals `want`, naming both."""
+    if got != want:
+        fail("%s:\n  got  %r\n  want %r" % (label, got, want))
+
+def check_contains(label, haystack, needle):
+    """Fail unless `needle` appears in the string `haystack`."""
+    if haystack.find(needle) < 0:
+        fail("%s: %r does not contain %r" % (label, haystack, needle))
+
+def suite(name, tests):
+    """A named list of test functions, each called with the task context."""
+    return struct(name = name, tests = tests)
+
+def test_name(test):
+    """The function's own name, which AXL only exposes through its repr."""
+    return str(test).rsplit(".", 1)[-1].lstrip("_")
+
+def temp_tree(ctx, files):
+    """A fresh directory holding `{relative path: content}`, removed at exit.
+
+    `ctx.defer` runs on the way out of the task whether it returned or failed,
+    so a suite that aborts on an assertion still leaves no directory behind.
+    """
+    root = ctx.std.fs.mkdtemp(prefix = "krabka-axl-")
+    ctx.defer(ctx.std.fs.remove_dir_all, root)
+    for relative, content in files.items():
+        path = root + "/" + relative
+        ctx.std.fs.create_dir_all(path.rsplit("/", 1)[0])
+        ctx.std.fs.write(path, content)
+    return root
+
+def suite_task(s):
+    """A `aspect tests <suite name>` command that runs just this suite.
+
+    `aspect axl-tests` runs every suite; this is the per-file entry point, so a
+    suite is runnable from the file that defines it.
+    """
+
+    def _impl(ctx: TaskContext) -> int:
+        return run_suites(ctx, [s])
+
+    return task(
+        summary = "Run the %s unit tests" % s.name,
+        group = ["tests"],
+        kind = s.name,
+        implementation = _impl,
+        args = {},
+    )
+
+def run_suites(ctx, suites, only = ""):
+    """Run every suite (or just the one `only` names) and report the count."""
+    selected = [s for s in suites if not only or s.name == only]
+    if only and not selected:
+        ctx.std.io.stderr.write(
+            "no such suite: %s (have %s)\n" % (only, ", ".join(sorted([s.name for s in suites]))),
+        )
+        return 2
+
+    total = 0
+    for s in selected:
+        for test in s.tests:
+            test(ctx)
+            total += 1
+        ctx.std.io.stdout.write("%s: %d tests passed\n" % (s.name, len(s.tests)))
+    ctx.std.io.stdout.write("%d tests passed across %d suites\n" % (total, len(selected)))
+    return 0
