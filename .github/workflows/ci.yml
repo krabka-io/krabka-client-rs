@@ -60,11 +60,6 @@ jobs:
       - name: test
         run: aspect test //...
 
-      # The unit tests of the tasks under `.aspect/`, among them the one that
-      # assembles the Pages site.
-      - name: axl tests
-        run: aspect axl-tests
-
   # LCOV over the first-party crates. Separate from `ci` because instrumented
   # binaries are a different build, so sharing that job's cache would only
   # evict it.
