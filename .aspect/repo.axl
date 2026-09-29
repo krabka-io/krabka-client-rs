@@ -1,0 +1,17 @@
+"""Filesystem helpers shared by this repository's `.axl` tasks.
+
+`ctx.std.fs` offers `read_dir` and little above it, so the checks a task needs
+more than once live here.
+"""
+
+def is_file(fs, path):
+    """Whether `path` exists and is a regular file.
+
+    `fs.is_file` is deprecated in favour of `fs.metadata`, and `fs.metadata`
+    fails on a path that is not there, so the two go together.
+    """
+    return fs.exists(path) and fs.metadata(path).is_file
+
+def read_lines(fs, path):
+    """The file's lines, without their terminators."""
+    return fs.read_to_string(path).splitlines()

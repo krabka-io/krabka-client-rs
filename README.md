@@ -9,6 +9,8 @@ nothing else in the krabka stack — in particular, not on the broker.
 
 ## Crates
 
+API documentation is published at <https://krabka.io/krabka-client-rs/>.
+
 | Crate | What it is |
 | --- | --- |
 | `krabka-client-core` | Connection management, request dispatch, retries, and the SASL/TLS handshake. |

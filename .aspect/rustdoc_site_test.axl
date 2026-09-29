@@ -1,0 +1,411 @@
+"""Unit tests for `rustdoc_site.axl`."""
+
+load(
+    "./rustdoc_site.axl",
+    "copy_tree",
+    "find_rustdoc",
+    "html_escape",
+    "landing_page",
+    "landing_row",
+    "manifest_field",
+    "output_problem",
+    "problems",
+    "redirect_page",
+    "resolve_output",
+    "snake",
+)
+load("./testing.axl", "check_eq", "suite", "suite_task", "temp_tree")
+
+# The two pages, spelled out rather than assembled, because the site is
+# published: a change here is a change to a page someone has bookmarked.
+_REDIRECT_PAGE = """<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url=krabka_alpha/index.html">
+<title>krabka-alpha</title>
+<a href="krabka_alpha/index.html">krabka-alpha</a>
+"""
+
+_LANDING_PAGE = """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>krabka-client-rs API documentation</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; padding: 0 1rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border-bottom: 1px solid #ccc; padding: 0.5rem; text-align: left; vertical-align: top; }
+</style>
+<h1>krabka-client-rs API documentation</h1>
+<p>Rustdoc for every crate in
+<a href="https://github.com/krabka-io/krabka-client-rs">krabka-io/krabka-client-rs</a>,
+rendered from the <code>main</code> branch.</p>
+<table>
+<thead><tr><th>Crate</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td><a href="krabka-alpha/krabka_alpha/index.html"><code>krabka-alpha</code></a></td><td>The alpha crate, first of its name</td></tr>
+<tr><td><a href="krabka-beta/krabka_beta/index.html"><code>krabka-beta</code></a></td><td>The &quot;beta&quot; crate &amp; co.</td></tr>
+</tbody>
+</table>
+</html>
+"""
+
+_EMPTY_LANDING_PAGE = """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>krabka-client-rs API documentation</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; padding: 0 1rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border-bottom: 1px solid #ccc; padding: 0.5rem; text-align: left; vertical-align: top; }
+</style>
+<h1>krabka-client-rs API documentation</h1>
+<p>Rustdoc for every crate in
+<a href="https://github.com/krabka-io/krabka-client-rs">krabka-io/krabka-client-rs</a>,
+rendered from the <code>main</code> branch.</p>
+<table>
+<thead><tr><th>Crate</th><th>What it is</th></tr></thead>
+<tbody>
+</tbody>
+</table>
+</html>
+"""
+
+def _row(name, description):
+    return struct(name = name, snake = snake(name), description = description)
+
+def _crate(package, name, rustdoc = "bazel-bin/x_doc.rustdoc", has_index = True, description = ""):
+    return struct(
+        package = package,
+        name = name,
+        snake = snake(name),
+        description = description,
+        rustdoc = rustdoc,
+        has_index = has_index,
+    )
+
+def _pkg(line):
+    return ["[package]", line]
+
+def _test_manifest_field_reads_the_package_section(_ctx):
+    lines = [
+        "[package]",
+        'name = "krabka-log"',
+        'description = "The log"',
+        "[dependencies]",
+        'name = "some-dependency"',
+    ]
+    check_eq("the package name", manifest_field(lines, "name"), "krabka-log")
+    check_eq("the description", manifest_field(lines, "description"), "The log")
+
+def _test_manifest_field_decodes_basic_strings(_ctx):
+    cases = [
+        ("an escaped quote", 'description = "The \\"beta\\" crate"', 'The "beta" crate'),
+        ("an escaped backslash", 'description = "a\\\\b"', "a\\b"),
+        ("a newline", 'description = "a\\nb"', "a\nb"),
+        ("a tab", 'description = "a\\tb"', "a\tb"),
+        ("a carriage return", 'description = "a\\rb"', "a\rb"),
+        ("a backspace", 'description = "a\\bb"', "a\u0008b"),
+        ("a form feed", 'description = "a\\fb"', "a\u000cb"),
+        ("a four-digit code point", 'description = "caf\\u00E9"', "caf\u00e9"),
+        ("an eight-digit code point", 'description = "\\U0001F600!"', "\U0001F600!"),
+        ("an escaped backslash before u", 'description = "\\\\u0041"', "\\u0041"),
+    ]
+    for label, line, expected in cases:
+        check_eq(label, manifest_field(_pkg(line), "description"), expected)
+
+def _test_manifest_field_rejects_invalid_basic_strings(_ctx):
+    cases = [
+        ("an unescaped inner quote", 'description = "The "beta" crate"'),
+        ("an unknown escape", 'description = "a\\qb"'),
+        ("a truncated unicode escape", 'description = "\\u12"'),
+        ("a non-hex unicode escape", 'description = "\\u12G4"'),
+        ("a surrogate", 'description = "\\uD800"'),
+        ("beyond Unicode", 'description = "\\U00110000"'),
+        ("a dangling backslash", 'description = "abc\\"'),
+    ]
+    for label, line in cases:
+        check_eq(label, manifest_field(_pkg(line), "description"), "")
+
+def _test_manifest_field_takes_literal_strings_as_written(_ctx):
+    check_eq("no decoding", manifest_field(_pkg("description = 'C:\\new \"q\"'"), "description"), 'C:\\new "q"')
+    check_eq("an empty literal", manifest_field(_pkg("description = ''"), "description"), "")
+    check_eq("an unclosed literal", manifest_field(_pkg("description = 'x"), "description"), "")
+
+def _test_manifest_field_tolerates_valid_toml_layout(_ctx):
+    cases = [
+        ("a trailing comment", 'name = "x" # why', "x"),
+        ("a comment right after the quote", 'name = "x"# why', "x"),
+        ("an indented assignment", '  name = "x"', "x"),
+        ("a tab-indented assignment", '\tname = "x"', "x"),
+        ("no spaces around the equals sign", 'name="x"', "x"),
+        ("extra spaces around the equals sign", 'name   =   "x"', "x"),
+        ("a literal string", "name = 'x'", "x"),
+        ("a literal string with a comment", "name = 'x' # why", "x"),
+        ("a hash inside the string", 'name = "a#b" # why', "a#b"),
+    ]
+    for label, line, expected in cases:
+        check_eq(label, manifest_field(_pkg(line), "name"), expected)
+
+def _test_manifest_field_ignores_what_it_cannot_parse(_ctx):
+    cases = [
+        ("no such field", 'name = "krabka-log"', "description"),
+        ("workspace inheritance", "description.workspace = true", "description"),
+        ("an unclosed value", 'description = "', "description"),
+        ("junk after the string", 'name = "x" y', "name"),
+        ("a longer field name", 'name-suffix = "x"', "name"),
+        ("a non-string value", "name = 5", "name"),
+        ("an empty value", 'description = ""', "description"),
+    ]
+    for label, line, field in cases:
+        check_eq(label, manifest_field(_pkg(line), field), "")
+
+def _test_manifest_field_reads_only_the_package_table(_ctx):
+    check_eq("before any table", manifest_field(['name = "x"'], "name"), "")
+    check_eq(
+        "another table first",
+        manifest_field(["[lib]", 'name = "lib"', "[package]", 'name = "pkg"'], "name"),
+        "pkg",
+    )
+    check_eq(
+        "stops at the next table",
+        manifest_field(["[package]", 'name = "pkg"', "[dependencies]", 'description = "dep"'], "description"),
+        "",
+    )
+    check_eq(
+        "a header with a comment",
+        manifest_field(["[package] # the crate", 'name = "pkg"'], "name"),
+        "pkg",
+    )
+
+def _test_snake_is_the_crates_module_name(_ctx):
+    check_eq("one dash", snake("krabka-log"), "krabka_log")
+    check_eq("two dashes", snake("krabka-remote-storage"), "krabka_remote_storage")
+    check_eq("no dash", snake("krabka"), "krabka")
+
+def _test_find_rustdoc_picks_the_doc_directory(_ctx):
+    check_eq(
+        "among the package's other outputs",
+        find_rustdoc(["libkrabka_log.rlib", "log_doc.rustdoc", "log_doc.rustdoc.log"]),
+        "log_doc.rustdoc",
+    )
+
+def _test_find_rustdoc_without_one(_ctx):
+    check_eq("nothing to find", find_rustdoc(["libkrabka_log.rlib"]), "")
+    check_eq("an empty listing", find_rustdoc([]), "")
+
+def _test_find_rustdoc_is_deterministic(_ctx):
+    # `read_dir` returns entries in whatever order the filesystem holds them,
+    # so taking the first entry would depend on the machine. Sorting is
+    # what keeps two machines from publishing different pages.
+    check_eq(
+        "the sorted first",
+        find_rustdoc(["b_doc.rustdoc", "a_doc.rustdoc"]),
+        "a_doc.rustdoc",
+    )
+
+def _test_redirect_page(_ctx):
+    check_eq("the redirect", redirect_page("krabka-alpha", "krabka_alpha"), _REDIRECT_PAGE)
+
+def _test_landing_row(_ctx):
+    check_eq(
+        "one row",
+        landing_row(_row("krabka-log", "The log")),
+        '<tr><td><a href="krabka-log/krabka_log/index.html"><code>krabka-log</code></a></td><td>The log</td></tr>',
+    )
+
+def _test_html_escape(_ctx):
+    check_eq("nothing to escape", html_escape("plain text"), "plain text")
+    check_eq("ampersand first", html_escape("&amp;"), "&amp;amp;")
+    check_eq(
+        "every special character",
+        html_escape("""<a href="x">'&'</a>"""),
+        "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;",
+    )
+
+def _test_landing_row_escapes_manifest_text(_ctx):
+    check_eq(
+        "an escaped row",
+        landing_row(struct(name = "a<b", snake = "a_b", description = 'Types like Vec<T> & "co"')),
+        '<tr><td><a href="a&lt;b/a_b/index.html"><code>a&lt;b</code></a></td><td>Types like Vec&lt;T&gt; &amp; &quot;co&quot;</td></tr>',
+    )
+
+def _test_redirect_page_escapes_the_name(_ctx):
+    check_eq(
+        "an escaped redirect",
+        redirect_page('x"<y', "x_y"),
+        """<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url=x_y/index.html">
+<title>x&quot;&lt;y</title>
+<a href="x_y/index.html">x&quot;&lt;y</a>
+""",
+    )
+
+def _test_landing_page(_ctx):
+    check_eq(
+        "the landing page",
+        landing_page([
+            _row("krabka-alpha", "The alpha crate, first of its name"),
+            _row("krabka-beta", 'The "beta" crate & co.'),
+        ]),
+        _LANDING_PAGE,
+    )
+
+def _test_landing_page_without_crates(_ctx):
+    check_eq("an empty table", landing_page([]), _EMPTY_LANDING_PAGE)
+
+def _test_a_documented_crate_has_no_problem(_ctx):
+    check_eq("nothing to report", problems([_crate("log", "krabka-log")]), [])
+
+def _test_a_crate_without_rustdoc_output_is_reported(_ctx):
+    check_eq(
+        "no rustdoc directory",
+        problems([_crate("log", "krabka-log", rustdoc = "")]),
+        ["no rustdoc output for krabka-log under bazel-bin/crates/log"],
+    )
+
+def _test_rustdoc_output_without_the_crates_index_is_reported(_ctx):
+    check_eq(
+        "no index.html",
+        problems([_crate("log", "krabka-log", rustdoc = "/w/bazel-bin/crates/log/log_doc.rustdoc", has_index = False)]),
+        ["/w/bazel-bin/crates/log/log_doc.rustdoc has no krabka_log/index.html"],
+    )
+
+def _test_a_nameless_manifest_is_reported_once(_ctx):
+    check_eq(
+        "no package name",
+        problems([_crate("log", "", rustdoc = "")]),
+        ["crates/log/Cargo.toml declares no package name"],
+    )
+
+def _test_every_crate_is_reported_not_only_the_first(_ctx):
+    # Naming every crate at once means a docgen run that produced nothing at
+    # all is not repaired one crate per CI run.
+    check_eq(
+        "both crates",
+        problems([
+            _crate("log", "krabka-log", rustdoc = ""),
+            _crate("raft", "krabka-raft"),
+            _crate("audit", "krabka-audit", rustdoc = ""),
+        ]),
+        [
+            "no rustdoc output for krabka-log under bazel-bin/crates/log",
+            "no rustdoc output for krabka-audit under bazel-bin/crates/audit",
+        ],
+    )
+
+def _test_resolve_output(_ctx):
+    check_eq("relative", resolve_output("/w", "site"), "/w/site")
+    check_eq("nested", resolve_output("/w", "build/site"), "/w/build/site")
+    check_eq("absolute", resolve_output("/w", "/var/www/site"), "/var/www/site")
+
+def _test_output_problem_rejects_unsafe_directories(_ctx):
+    cases = [
+        ("the current directory", "/w", "."),
+        ("the parent", "/w", ".."),
+        ("the filesystem root", "/w", "/"),
+        ("the root itself", "/w", "/w"),
+        ("the root with a trailing slash", "/w", "/w/"),
+        ("an ancestor of the root", "/a/b", "/a"),
+        ("a sibling of the root", "/w", "../sibling"),
+        ("a prefix lookalike", "/w", "/w2/site"),
+        ("the crates directory", "/w", "crates"),
+        ("inside the crates directory", "/w", "crates/x"),
+        ("the git directory", "/w", ".git"),
+        ("the workflows directory", "/w", ".github"),
+        ("the tasks directory", "/w", ".aspect"),
+        ("the bazel directory", "/w", "bazel"),
+        ("a bazel output symlink", "/w", "bazel-bin"),
+        ("a dot-dot escape from inside", "/w", "site/../.."),
+        ("a protected directory via dot", "/w", "./crates/../crates"),
+    ]
+    for label, root, output in cases:
+        if not output_problem(root, resolve_output(root, output)):
+            fail("%s: %s was accepted" % (label, output))
+
+def _test_output_problem_accepts_a_directory_inside_the_root(_ctx):
+    cases = [
+        ("a relative directory", "/w", "site"),
+        ("a nested directory", "/w", "out/site"),
+        ("an absolute directory inside the root", "/w", "/w/site"),
+        ("a dot-relative directory", "/w", "./site//x"),
+        ("a directory reached through dot-dot", "/w", "crates/../site"),
+    ]
+    for label, root, output in cases:
+        check_eq(label, output_problem(root, resolve_output(root, output)), "")
+
+def _test_copy_tree_reproduces_the_whole_subtree(ctx):
+    fs = ctx.std.fs
+    root = temp_tree(ctx, {
+        "src/font.woff2": "binary-ish",
+        "src/krabka_log/index.html": "the crate index\n",
+        "src/krabka_log/nested/deep.html": "deeper\n",
+    })
+
+    # An empty directory is part of the tree `cp -rL` copied, and rustdoc does
+    # emit directories that hold nothing on a crate with no such items.
+    fs.create_dir_all(root + "/src/empty")
+
+    check_eq("files copied", copy_tree(fs, root + "/src", root + "/out"), 3)
+    check_eq("a top-level file", fs.read_to_string(root + "/out/font.woff2"), "binary-ish")
+    check_eq("a nested file", fs.read_to_string(root + "/out/krabka_log/index.html"), "the crate index\n")
+    check_eq("a deeper file", fs.read_to_string(root + "/out/krabka_log/nested/deep.html"), "deeper\n")
+    check_eq("the empty directory", fs.exists(root + "/out/empty"), True)
+
+def _test_copy_tree_leaves_the_copy_writable(ctx):
+    # Bazel writes its outputs read-only, and the redirect page is written into
+    # the copy afterwards, so a copy that kept the source's mode would fail.
+    fs = ctx.std.fs
+    root = temp_tree(ctx, {"src/index.html": "rustdoc wrote this\n"})
+    fs.set_permissions(root + "/src/index.html", 0o444)
+
+    copy_tree(fs, root + "/src", root + "/out")
+    check_eq("read-only source", fs.metadata(root + "/src/index.html").readonly, True)
+    check_eq("writable copy", fs.metadata(root + "/out/index.html").readonly, False)
+
+    fs.write(root + "/out/index.html", "the redirect\n")
+    check_eq("overwritten", fs.read_to_string(root + "/out/index.html"), "the redirect\n")
+
+def _test_copy_tree_keeps_the_executable_bit(ctx):
+    fs = ctx.std.fs
+    root = temp_tree(ctx, {"src/plain.html": "x\n", "src/tool.sh": "y\n"})
+    fs.set_permissions(root + "/src/tool.sh", 0o555)
+
+    copy_tree(fs, root + "/src", root + "/out")
+    check_eq("still executable", fs.metadata(root + "/out/tool.sh").executable, True)
+    check_eq("still not executable", fs.metadata(root + "/out/plain.html").executable, False)
+
+rustdoc_site_tests = suite("rustdoc-site", [
+    _test_manifest_field_reads_the_package_section,
+    _test_manifest_field_decodes_basic_strings,
+    _test_manifest_field_rejects_invalid_basic_strings,
+    _test_manifest_field_takes_literal_strings_as_written,
+    _test_manifest_field_tolerates_valid_toml_layout,
+    _test_manifest_field_ignores_what_it_cannot_parse,
+    _test_manifest_field_reads_only_the_package_table,
+    _test_snake_is_the_crates_module_name,
+    _test_find_rustdoc_picks_the_doc_directory,
+    _test_find_rustdoc_without_one,
+    _test_find_rustdoc_is_deterministic,
+    _test_redirect_page,
+    _test_html_escape,
+    _test_landing_row,
+    _test_landing_row_escapes_manifest_text,
+    _test_redirect_page_escapes_the_name,
+    _test_landing_page,
+    _test_landing_page_without_crates,
+    _test_a_documented_crate_has_no_problem,
+    _test_a_crate_without_rustdoc_output_is_reported,
+    _test_rustdoc_output_without_the_crates_index_is_reported,
+    _test_a_nameless_manifest_is_reported_once,
+    _test_every_crate_is_reported_not_only_the_first,
+    _test_resolve_output,
+    _test_output_problem_rejects_unsafe_directories,
+    _test_output_problem_accepts_a_directory_inside_the_root,
+    _test_copy_tree_reproduces_the_whole_subtree,
+    _test_copy_tree_leaves_the_copy_writable,
+    _test_copy_tree_keeps_the_executable_bit,
+])
+
+test_rustdoc_site = suite_task(rustdoc_site_tests)

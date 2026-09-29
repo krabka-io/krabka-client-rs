@@ -930,7 +930,7 @@ impl AdminClient {
     /// error, and [`AdminError::Transport`] when the connection to any broker
     /// fails. A partial listing from the healthy brokers is not returned;
     /// callers that need per-broker results should read
-    /// [`AdminError`](AdminError) for which broker failed and retry.
+    /// [`AdminError`] for which broker failed and retry.
     pub async fn list_transactions(
         &self,
         filter: &ListTransactionsFilter,
