@@ -84,6 +84,9 @@ def _crate(package, name, rustdoc = "bazel-bin/x_doc.rustdoc", has_index = True,
         has_index = has_index,
     )
 
+def _pkg(line):
+    return ["[package]", line]
+
 def _test_manifest_field_reads_the_package_section(_ctx):
     lines = [
         "[package]",
@@ -109,7 +112,7 @@ def _test_manifest_field_decodes_basic_strings(_ctx):
         ("an escaped backslash before u", 'description = "\\\\u0041"', "\\u0041"),
     ]
     for label, line, expected in cases:
-        check_eq(label, manifest_field([line], "description"), expected)
+        check_eq(label, manifest_field(_pkg(line), "description"), expected)
 
 def _test_manifest_field_rejects_invalid_basic_strings(_ctx):
     cases = [
@@ -122,21 +125,58 @@ def _test_manifest_field_rejects_invalid_basic_strings(_ctx):
         ("a dangling backslash", 'description = "abc\\"'),
     ]
     for label, line in cases:
-        check_eq(label, manifest_field([line], "description"), "")
+        check_eq(label, manifest_field(_pkg(line), "description"), "")
 
 def _test_manifest_field_takes_literal_strings_as_written(_ctx):
-    check_eq("no decoding", manifest_field(["description = 'C:\\new \"q\"'"], "description"), 'C:\\new "q"')
-    check_eq("an empty literal", manifest_field(["description = ''"], "description"), "")
-    check_eq("an unclosed literal", manifest_field(["description = 'x"], "description"), "")
+    check_eq("no decoding", manifest_field(_pkg("description = 'C:\\new \"q\"'"), "description"), 'C:\\new "q"')
+    check_eq("an empty literal", manifest_field(_pkg("description = ''"), "description"), "")
+    check_eq("an unclosed literal", manifest_field(_pkg("description = 'x"), "description"), "")
+
+def _test_manifest_field_tolerates_valid_toml_layout(_ctx):
+    cases = [
+        ("a trailing comment", 'name = "x" # why', "x"),
+        ("a comment right after the quote", 'name = "x"# why', "x"),
+        ("an indented assignment", '  name = "x"', "x"),
+        ("a tab-indented assignment", '\tname = "x"', "x"),
+        ("no spaces around the equals sign", 'name="x"', "x"),
+        ("extra spaces around the equals sign", 'name   =   "x"', "x"),
+        ("a literal string", "name = 'x'", "x"),
+        ("a literal string with a comment", "name = 'x' # why", "x"),
+        ("a hash inside the string", 'name = "a#b" # why', "a#b"),
+    ]
+    for label, line, expected in cases:
+        check_eq(label, manifest_field(_pkg(line), "name"), expected)
 
 def _test_manifest_field_ignores_what_it_cannot_parse(_ctx):
-    check_eq("no such field", manifest_field(['name = "krabka-log"'], "description"), "")
-    check_eq("workspace inheritance", manifest_field(["description.workspace = true"], "description"), "")
-    check_eq("an unclosed value", manifest_field(['description = "'], "description"), "")
-    check_eq("a trailing comment", manifest_field(['name = "x" # why'], "name"), "")
-    check_eq("an indented assignment", manifest_field(['  name = "x"'], "name"), "")
-    check_eq("a longer field name", manifest_field(['name-suffix = "x"'], "name"), "")
-    check_eq("an empty value", manifest_field(['description = ""'], "description"), "")
+    cases = [
+        ("no such field", 'name = "krabka-log"', "description"),
+        ("workspace inheritance", "description.workspace = true", "description"),
+        ("an unclosed value", 'description = "', "description"),
+        ("junk after the string", 'name = "x" y', "name"),
+        ("a longer field name", 'name-suffix = "x"', "name"),
+        ("a non-string value", "name = 5", "name"),
+        ("an empty value", 'description = ""', "description"),
+    ]
+    for label, line, field in cases:
+        check_eq(label, manifest_field(_pkg(line), field), "")
+
+def _test_manifest_field_reads_only_the_package_table(_ctx):
+    check_eq("before any table", manifest_field(['name = "x"'], "name"), "")
+    check_eq(
+        "another table first",
+        manifest_field(["[lib]", 'name = "lib"', "[package]", 'name = "pkg"'], "name"),
+        "pkg",
+    )
+    check_eq(
+        "stops at the next table",
+        manifest_field(["[package]", 'name = "pkg"', "[dependencies]", 'description = "dep"'], "description"),
+        "",
+    )
+    check_eq(
+        "a header with a comment",
+        manifest_field(["[package] # the crate", 'name = "pkg"'], "name"),
+        "pkg",
+    )
 
 def _test_snake_is_the_crates_module_name(_ctx):
     check_eq("one dash", snake("krabka-log"), "krabka_log")
@@ -341,7 +381,9 @@ rustdoc_site_tests = suite("rustdoc-site", [
     _test_manifest_field_decodes_basic_strings,
     _test_manifest_field_rejects_invalid_basic_strings,
     _test_manifest_field_takes_literal_strings_as_written,
+    _test_manifest_field_tolerates_valid_toml_layout,
     _test_manifest_field_ignores_what_it_cannot_parse,
+    _test_manifest_field_reads_only_the_package_table,
     _test_snake_is_the_crates_module_name,
     _test_find_rustdoc_picks_the_doc_directory,
     _test_find_rustdoc_without_one,

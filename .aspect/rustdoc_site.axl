@@ -66,8 +66,7 @@ def _decode_basic(text):
 
     Returns the decoded value, or None when the string is not valid: an
     unclosed string, an unknown or truncated escape, a code point that is not
-    a Unicode scalar value, or anything after the closing quote (such as a
-    trailing comment).
+    a Unicode scalar value, or anything but whitespace or a `#` comment after the closing quote.
     """
     out = []
     skip = 0
@@ -78,7 +77,10 @@ def _decode_basic(text):
             continue
         char = text[i:i + 1]
         if char == '"':
-            return "".join(out) if i == size - 1 else None
+            rest = text[i + 1:].strip()
+            if rest == "" or rest.startswith("#"):
+                return "".join(out)
+            return None
         if char != "\\":
             out.append(char)
             continue
@@ -106,26 +108,44 @@ def _decode_basic(text):
         skip = 1 + width
     return None
 
-def manifest_field(lines, field):
-    """The value `field` is assigned on its first `field = "..."` line.
+def _string_value(text):
+    """The TOML string `text` opens with, or None when it does not open with a valid one.
 
-    The manifests here open with `[package]`, so the first assignment is the
-    package's own. A basic string (`"..."`) is decoded per TOML, escapes
-    included; a literal string (`'...'`) is taken as written. A line that is
-    not a valid single-line string, or that carries a trailing comment, yields
-    "".
+    `text` starts at the value, with any leading whitespace already gone.
     """
-    basic = field + ' = "'
-    literal = field + " = '"
+    if text.startswith('"'):
+        return _decode_basic(text[1:])
+    if text.startswith("'"):
+        end = text.find("'", 1)
+        if end < 0:
+            return None
+        rest = text[end + 1:].strip()
+        if rest == "" or rest.startswith("#"):
+            return text[1:end]
+    return None
+
+def manifest_field(lines, field):
+    """The string value of `field` on its first assignment inside `[package]`.
+
+    Keys of other tables (`[dependencies]` and the like) are skipped. The
+    assignment may be indented, may omit the spaces around `=`, and may end in
+    a `#` comment. A basic string (`"..."`) is decoded per TOML, escapes
+    included; a literal string (`'...'`) is taken as written. Anything else,
+    such as `field.workspace = true` or an invalid string, yields "".
+    """
+    in_package = False
     for line in lines:
-        if line.startswith(basic):
-            decoded = _decode_basic(line[len(basic):])
-            return decoded if decoded != None else ""
-        if line.startswith(literal):
-            body = line[len(literal):]
-            if body.endswith("'") and "'" not in body[:-1]:
-                return body[:-1]
-            return ""
+        text = line.strip()
+        if text.startswith("["):
+            in_package = text.split("#")[0].strip() == "[package]"
+            continue
+        if not in_package or not text.startswith(field):
+            continue
+        rest = text[len(field):].lstrip()
+        if not rest.startswith("="):
+            continue
+        decoded = _string_value(rest[1:].lstrip())
+        return decoded if decoded != None else ""
     return ""
 
 def html_escape(text):
