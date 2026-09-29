@@ -296,6 +296,14 @@ impl Client {
         })
     }
 
+    /// The options of every connection that this client opens, such as the
+    /// socket buffers (`send.buffer.bytes`, `receive.buffer.bytes`) that
+    /// each broker socket gets before it connects.
+    #[must_use]
+    pub fn connection_options(&self) -> &ConnectionOptions {
+        &self.options
+    }
+
     /// The metric registry of a client that pushes its metrics (KIP-714).
     /// A client crate registers its own metrics in it.
     #[must_use]

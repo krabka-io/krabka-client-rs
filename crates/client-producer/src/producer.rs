@@ -36,7 +36,7 @@ use krabka_protocol::{
     },
     primitives::uuid::Uuid,
 };
-use krabka_units::{Time, convert::TimeExt};
+use krabka_units::{ByteSize, Time, convert::TimeExt};
 use tokio::{
     sync::{Mutex, Notify, oneshot},
     task::JoinHandle,
@@ -419,6 +419,14 @@ fn wake_sender_after_append(
     }
 }
 
+/// Kafka's `send.buffer.bytes` and `receive.buffer.bytes` of a producer.
+/// `None` keeps the operating system default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SocketBuffers {
+    pub(crate) send: Option<ByteSize>,
+    pub(crate) receive: Option<ByteSize>,
+}
+
 // accumulators map is inherently complex
 pub struct Producer {
     pub(crate) client: Client,
@@ -434,6 +442,9 @@ pub struct Producer {
     pub(crate) security: Option<ClientSecurity>,
     pub(crate) dispatch_queue_capacity: ConnectionDispatchQueueCapacity,
     pub(crate) frame_max: ClientFrameMax,
+    /// The socket buffers of every connection, so that the coordinator
+    /// connections get those of the bootstrap connection.
+    pub(crate) socket_buffers: SocketBuffers,
     pub(crate) identity: ProducerIdentity,
     // The following config knobs are also copied into `SenderConfig` at
     // construction time. They live on `Producer` for diagnostic
@@ -1217,6 +1228,8 @@ impl Producer {
             .maybe_security(self.security.clone())
             .dispatch_queue_capacity(self.dispatch_queue_capacity.get())
             .frame_max(self.frame_max.size())
+            .send_buffer(self.socket_buffers.send)
+            .receive_buffer(self.socket_buffers.receive)
             .request_timeout(self.request_timeout)
             .build()
             .await?)
@@ -1866,6 +1879,8 @@ impl Producer {
             .maybe_security(self.security.clone())
             .dispatch_queue_capacity(self.dispatch_queue_capacity.get())
             .frame_max(self.frame_max.size())
+            .send_buffer(self.socket_buffers.send)
+            .receive_buffer(self.socket_buffers.receive)
             .build()
             .await
             .map_err(|error| LookupError::Unresolved(error.into()))
