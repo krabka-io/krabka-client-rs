@@ -84,7 +84,10 @@ pub use delegation_tokens::{
     ExpireDelegationTokenOptions, RenewDelegationTokenOptions,
 };
 pub use elections::{ElectionResults, ElectionType};
-pub use features::{FeatureMetadata, FeatureRange, FeatureUpdate, FeatureUpdateOutcome};
+pub use features::{
+    DescribeFeaturesOptions, FeatureMetadata, FeatureRange, FeatureUpdate, UpdateFeaturesOptions,
+    UpdateFeaturesResults, UpgradeType,
+};
 pub use group_deletions::GroupDeletions;
 pub use group_descriptions::{
     ClassicGroupDescription, ConsumerGroupDescription, DescribeGroupsOptions, GroupDescriptions,
@@ -139,12 +142,12 @@ pub use users::{
 /// which needs unique access.
 #[async_trait::async_trait]
 pub trait AdminClientLike: Send {
-    /// Finalize `metadata.version`, using Kafka's safe-downgrade mode when the
-    /// target is below the previously finalized level.
+    /// Finalize `metadata.version` at `level` with `upgrade_type`, as
+    /// [`AdminClient::update_metadata_version`] does.
     async fn update_metadata_version(
         &mut self,
         _level: i16,
-        _safe_downgrade: bool,
+        _upgrade_type: UpgradeType,
         _timeout: Time,
     ) -> Result<MetadataVersionUpdate, AdminError> {
         Err(AdminError::Protocol(
@@ -303,10 +306,10 @@ impl AdminClientLike for AdminClient {
     async fn update_metadata_version(
         &mut self,
         level: i16,
-        safe_downgrade: bool,
+        upgrade_type: UpgradeType,
         timeout: Time,
     ) -> Result<MetadataVersionUpdate, AdminError> {
-        AdminClient::update_metadata_version(self, level, safe_downgrade, timeout).await
+        AdminClient::update_metadata_version(self, level, upgrade_type, timeout).await
     }
 
     async fn describe_metadata_quorum(&mut self) -> Result<MetadataQuorum, AdminError> {

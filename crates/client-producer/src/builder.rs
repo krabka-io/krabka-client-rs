@@ -42,7 +42,7 @@ use crate::{
         DEFAULT_PRODUCER_METADATA_MAX_AGE, DEFAULT_PRODUCER_METADATA_MAX_IDLE, MetadataAge,
     },
     partitioner::{BuiltInPartitioner, Partitioner, PartitionerConfig},
-    producer::{Acks, Producer, ProducerIdentity},
+    producer::{Acks, Producer, ProducerIdentity, SocketBuffers},
     sender,
     transactional::{TxnErrorSlot, TxnState},
     transport::ClientTransport,
@@ -705,9 +705,12 @@ fn resolve_transaction_timeout(
     Ok(transaction_timeout.unwrap_or(DEFAULT_PRODUCER_TRANSACTION_TIMEOUT))
 }
 
-/// Kafka's producer `receive.buffer.bytes` default, half the consumer and
-/// admin default.
-const PRODUCER_RECEIVE_BUFFER: krabka_units::ByteSize = krabka_units::kibibytes(32);
+/// Kafka's producer `send.buffer.bytes` default (128 KiB).
+pub const DEFAULT_PRODUCER_SEND_BUFFER: ByteSize = krabka_units::kibibytes(128);
+
+/// Kafka's producer `receive.buffer.bytes` default (32 KiB), half the
+/// consumer and admin default.
+pub const DEFAULT_PRODUCER_RECEIVE_BUFFER: ByteSize = krabka_units::kibibytes(32);
 
 /// Kafka's `ProducerMetadata` names the topics that the producer sends to,
 /// and lets the broker create a missing one.
@@ -1127,6 +1130,16 @@ impl Producer {
         #[builder(default = DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
         #[builder(default = DEFAULT_CLIENT_FRAME_MAX)] frame_max: ByteSize,
+        /// Kafka's `send.buffer.bytes`: the `SO_SNDBUF` of each broker
+        /// socket. `None` keeps the operating system default, as Kafka's
+        /// `-1` does.
+        #[builder(required, default = Some(DEFAULT_PRODUCER_SEND_BUFFER))]
+        send_buffer: Option<ByteSize>,
+        /// Kafka's `receive.buffer.bytes`: the `SO_RCVBUF` of each broker
+        /// socket. `None` keeps the operating system default, as Kafka's
+        /// `-1` does.
+        #[builder(required, default = Some(DEFAULT_PRODUCER_RECEIVE_BUFFER))]
+        receive_buffer: Option<ByteSize>,
         #[builder(default = DEFAULT_PRODUCER_REQUEST_TIMEOUT)] request_timeout: Duration,
         #[builder(default = DEFAULT_PRODUCER_FLUSH_TIMEOUT)] flush_timeout: Duration,
         #[builder(default = DEFAULT_PRODUCER_RETRIES)] retries: i32,
@@ -1216,7 +1229,8 @@ impl Producer {
             .dispatch_queue_capacity(dispatch_queue_capacity.get())
             .frame_max(frame_max.size())
             .request_timeout(request_timeout)
-            .receive_buffer(Some(PRODUCER_RECEIVE_BUFFER))
+            .send_buffer(send_buffer)
+            .receive_buffer(receive_buffer)
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
             .maybe_security(security.clone())
@@ -1308,6 +1322,10 @@ impl Producer {
             security,
             dispatch_queue_capacity,
             frame_max,
+            socket_buffers: SocketBuffers {
+                send: send_buffer,
+                receive: receive_buffer,
+            },
             identity: ProducerIdentity {
                 id: producer_id,
                 epoch: producer_epoch,
@@ -2436,6 +2454,54 @@ mod security_arg_tests {
             .await
             .expect("valid DNS timeout");
         producer.close().await.expect("close producer");
+    }
+
+    /// `send.buffer.bytes` and `receive.buffer.bytes` reach the options that
+    /// each broker socket of the producer gets before it connects, with
+    /// Kafka's producer defaults of 128 KiB and 32 KiB, and `None` for
+    /// Kafka's `-1`.
+    #[tokio::test]
+    async fn producer_builder_carries_socket_buffers_to_the_client() {
+        let kib = krabka_units::kibibytes;
+        for (name, send, receive, expected) in [
+            ("defaults", None, None, (Some(kib(128)), Some(kib(32)))),
+            (
+                "set",
+                Some(Some(kib(256))),
+                Some(Some(kib(8))),
+                (Some(kib(256)), Some(kib(8))),
+            ),
+            (
+                "operating system default",
+                Some(None),
+                Some(None),
+                (None, None),
+            ),
+        ] {
+            let producer = Producer::builder()
+                .bootstrap("127.0.0.1:1")
+                .enable_idempotence(false)
+                .maybe_send_buffer(send)
+                .maybe_receive_buffer(receive)
+                .build()
+                .await
+                .expect("valid socket buffers");
+
+            let options = producer.client.connection_options();
+            assert2::assert!(
+                (options.send_buffer, options.receive_buffer) == expected,
+                "case {name}"
+            );
+            assert2::assert!(
+                producer.socket_buffers
+                    == crate::producer::SocketBuffers {
+                        send: expected.0,
+                        receive: expected.1,
+                    },
+                "case {name}"
+            );
+            producer.close().await.expect("close producer");
+        }
     }
 
     #[tokio::test]

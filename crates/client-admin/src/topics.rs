@@ -2792,7 +2792,9 @@ mod tests {
             assert_send(admin.delete_topics(names, TopicMutationOptions::default()));
             assert_send(admin.create_partitions(&[], TopicMutationOptions::default()));
             assert_send(admin.unregister_broker(1));
-            assert_send(admin.update_features(&[], krabka_units::secs(1)));
+            assert_send(
+                admin.update_features(&BTreeMap::new(), crate::UpdateFeaturesOptions::default()),
+            );
             assert_send(admin.alter_partition_assignments(&BTreeMap::new(), krabka_units::secs(1)));
             assert_send(admin.reconcile_topic_replication_factor("t", 1, krabka_units::secs(1)));
         };
