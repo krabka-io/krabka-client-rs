@@ -208,9 +208,9 @@ impl ShareConsumer {
     /// records and pairs each one with the broker-reported `delivery_count`
     /// from its `acquired_records` range.
     ///
-    /// With no assignment yet, this method sleeps for `timeout` and returns
-    /// empty. That mirrors the classic
-    /// [`Consumer::poll`](crate::Consumer::poll).
+    /// With no assignment yet, this method waits for the heartbeat loop to
+    /// assign partitions within `timeout`. The fetch uses the remaining wait
+    /// budget. If the assignment stays empty, it returns empty at the deadline.
     #[tracing::instrument(
         name = "share_consumer.poll",
         level = "debug",
@@ -228,19 +228,24 @@ impl ShareConsumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn poll(&mut self, timeout: Time) -> Result<Vec<ShareConsumerRecord>, ConsumerError> {
-        // The heartbeat loop leaves a fatal error, such as an authentication
-        // failure, for the application.
-        if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
-            return Err(error);
-        }
-        // Snapshot the live assignment; with nothing assigned there is nothing
-        // to fetch — sleep out the timeout and return empty (matches classic).
-        let assignment = self.assignment.lock().await.clone();
+        let deadline = tokio::time::Instant::now() + timeout.to_std();
+        let assignment = loop {
+            // A heartbeat can assign partitions or report a fatal error while
+            // this poll waits for the initial assignment or a rejoin.
+            if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
+                return Err(error);
+            }
+            let assignment = self.assignment.lock().await.clone();
+            if !assignment.is_empty() {
+                break assignment;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(Vec::new());
+            }
+            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(20))).await;
+        };
         tracing::Span::current().record("assigned_partitions", assignment.len());
-        if assignment.is_empty() {
-            tokio::time::sleep(timeout.to_std()).await;
-            return Ok(Vec::new());
-        }
 
         // Build the piggyback acknowledgement batches per (topic_id, partition)
         // from the previous poll, draining the source so each ack is sent once.
@@ -256,7 +261,7 @@ impl ShareConsumer {
                 self.group_id.clone(),
                 self.member_id.clone(),
                 self.share_session_epoch,
-                timeout,
+                Time::from_std(deadline.saturating_duration_since(tokio::time::Instant::now())),
                 self.fetch_min,
                 self.fetch_max,
                 self.fetch_max_records,
@@ -648,6 +653,151 @@ mod tests {
             hb_handle: None,
             poll_error: crate::coordinator::PollErrorSlot::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn poll_waits_for_assignment_and_fetches_with_the_remaining_budget() {
+        use bytes::{Buf as _, Bytes, BytesMut};
+        use krabka_client_core::MockBroker;
+        use krabka_protocol::{
+            Decode as _, Encode as _,
+            owned::{
+                api_versions_request,
+                api_versions_response::{ApiVersion, ApiVersionsResponse},
+                share_fetch_request,
+                share_fetch_response::{
+                    AcquiredRecords, ShareFetchResponse, ShareFetchableTopicResponse,
+                },
+            },
+            records::{Record, RecordBatch, RecordsPayload},
+        };
+
+        let fetched = Arc::new(std::sync::Mutex::new(None));
+        let observed = Arc::clone(&fetched);
+        let broker = MockBroker::start(move |api_key, version, _corr, mut body| {
+            let mut encoded = BytesMut::new();
+            if api_key == api_versions_request::API_KEY {
+                ApiVersionsResponse {
+                    api_keys: vec![ApiVersion {
+                        api_key: share_fetch_request::API_KEY,
+                        min_version: share_fetch_request::MIN_VERSION,
+                        max_version: share_fetch_request::MAX_VERSION,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode(&mut encoded, 0)
+                .unwrap();
+            } else if api_key == share_fetch_request::API_KEY {
+                let client_id_len = usize::try_from(body.get_i16()).unwrap_or(0);
+                body.advance(client_id_len);
+                assert2::assert!(body.get_u8() == 0); // Empty flexible request-header tags.
+                *observed.lock().unwrap() =
+                    Some(ShareFetchRequest::decode(&mut body, version).unwrap());
+                encoded.extend_from_slice(&[0]); // Empty flexible response-header tags.
+                ShareFetchResponse {
+                    responses: vec![ShareFetchableTopicResponse {
+                        topic_id: id(7),
+                        partitions: vec![PartitionData {
+                            partition_index: 2,
+                            records: Some(RecordsPayload::V2(vec![RecordBatch {
+                                base_offset: 7,
+                                records: vec![Record {
+                                    value: Some(Bytes::from_static(b"work")),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }])),
+                            acquired_records: vec![AcquiredRecords {
+                                first_offset: 7,
+                                last_offset: 7,
+                                delivery_count: 1,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode(&mut encoded, version)
+                .unwrap();
+            } else {
+                panic!("unexpected API key {api_key}");
+            }
+            Some(encoded.to_vec())
+        })
+        .await;
+        let mut consumer = test_consumer(ShareAckMode::Explicit).await;
+        consumer.client = Client::builder()
+            .bootstrap(broker.addr.to_string())
+            .build()
+            .await
+            .unwrap();
+        consumer.assignment.lock().await.clear();
+        consumer.share_session_epoch = 0;
+        let assignment = Arc::clone(&consumer.assignment);
+        let assigned = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assignment.lock().await.push((id(7), "topic-a".into(), 2));
+        });
+        let started = tokio::time::Instant::now();
+        let records = consumer.poll(krabka_units::secs(1)).await.unwrap();
+        let elapsed = started.elapsed();
+        assigned.await.unwrap();
+        broker.stop();
+
+        assert2::assert!(elapsed < std::time::Duration::from_secs(1));
+        assert2::assert!(records.len() == 1);
+        assert2::assert!(
+            (records[0].offset, records[0].value.as_deref()) == (7, Some(&b"work"[..]))
+        );
+        assert2::assert!(consumer.share_session_epoch == 1);
+        let fetched = fetched.lock().unwrap();
+        let request = fetched
+            .as_ref()
+            .expect("assignment triggers a ShareFetch in this poll");
+        assert2::assert!((1..=900).contains(&request.max_wait_ms));
+        assert2::assert!(request.topics[0].partitions[0].partition_index == 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_without_assignment_respects_zero_and_finite_deadlines() {
+        let mut consumer = test_consumer(ShareAckMode::Explicit).await;
+        consumer.assignment.lock().await.clear();
+        for timeout_ms in [0, 37] {
+            let started = tokio::time::Instant::now();
+            let records = consumer
+                .poll(krabka_units::millis(timeout_ms))
+                .await
+                .unwrap();
+            assert2::assert!(records.is_empty());
+            assert2::assert!(
+                started.elapsed() == std::time::Duration::from_millis(u64::from(timeout_ms))
+            );
+        }
+        assert2::assert!(consumer.share_session_epoch == 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_notices_fatal_errors_while_waiting_for_assignment() {
+        let mut consumer = test_consumer(ShareAckMode::Explicit).await;
+        consumer.assignment.lock().await.clear();
+        let poll_error = Arc::clone(&consumer.poll_error);
+        let rejected = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            crate::coordinator::report_rejoin_error(
+                &poll_error,
+                ConsumerError::GroupAuthorizationFailed("group-a".into()),
+            );
+        });
+        let started = tokio::time::Instant::now();
+        let result = consumer.poll(krabka_units::secs(1)).await;
+        rejected.await.unwrap();
+        assert2::assert!(
+            matches!(result, Err(ConsumerError::GroupAuthorizationFailed(group)) if group == "group-a")
+        );
+        assert2::assert!(started.elapsed() <= std::time::Duration::from_millis(20));
     }
 
     fn only<T>(items: &[T]) -> &T {
