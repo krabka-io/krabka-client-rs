@@ -33,11 +33,29 @@
 //!         value: Some(Bytes::from("hello")),
 //!         ..Default::default()
 //!     })
-//!     .await
-//!     .await??;
+//!     .await?;
 //!
 //! producer.flush().await?;
 //! producer.close().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Pipelined delivery
+//!
+//! Use [`Producer::enqueue`] to queue records without waiting for each
+//! acknowledgement. Each [`DeliveryHandle`] returns one producer result.
+//!
+//! ```no_run
+//! # use krabka_client_producer::{Producer, ProducerError, ProducerRecord};
+//! # async fn run(producer: &Producer, records: Vec<ProducerRecord>) -> Result<(), ProducerError> {
+//! let mut deliveries = Vec::new();
+//! for record in records {
+//!     deliveries.push(producer.enqueue(record).await?);
+//! }
+//! for delivery in deliveries {
+//!     let metadata = delivery.await?;
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -99,7 +117,7 @@ pub use metadata_age::{
 };
 pub use partitioner::{PartitionInfo, Partitioner, partition_for_key};
 pub use producer::{Acks, Producer};
-pub use record::{Header, ProducerRecord, RecordMetadata};
+pub use record::{DeliveryHandle, Header, ProducerRecord, RecordMetadata};
 pub use transactional::{
     EndTransactionError, OwnedTransaction, PreparedTransactionState,
     PreparedTransactionStateParseError, Transaction,

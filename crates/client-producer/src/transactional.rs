@@ -881,7 +881,7 @@ mod tests {
         let acknowledgement = producer.send(ProducerRecord::default()).await;
         assert2::assert!(
             let Err(ProducerError::RecoveryRequired) =
-                acknowledgement.await.expect("recovery error is delivered")
+                acknowledgement
         );
 
         end_txn_silent.store(false, Ordering::SeqCst);
@@ -2388,22 +2388,20 @@ mod tests {
                 .await
                 .expect("begin transaction");
             let record = producer
-                .send(ProducerRecord {
+                .enqueue(ProducerRecord {
                     topic: "topic".to_owned(),
                     partition: Some(0),
                     value: Some(bytes::Bytes::from_static(b"v")),
                     ..Default::default()
                 })
-                .await;
+                .await
+                .expect("record is queued");
             producer
                 .send_offsets_to_transaction([(("topic".to_owned(), 0), 42)], &group)
                 .await
                 .expect("send offsets");
             transaction.commit().await.expect("commit");
-            record
-                .await
-                .expect("the record is resolved")
-                .expect("the record is delivered");
+            record.await.expect("the record is delivered");
             let mut actual = coordinator
                 .lock()
                 .expect("scripted coordinator")
@@ -2599,11 +2597,7 @@ mod tests {
             ..Default::default()
         });
         let outcome = match tokio::time::timeout(Duration::from_secs(2), send).await {
-            Ok(receiver) => receiver
-                .await
-                .expect("the send is resolved")
-                .map(drop)
-                .map_err(|error| error.to_string()),
+            Ok(result) => result.map(drop).map_err(|error| error.to_string()),
             Err(_) => Err("waited".to_owned()),
         };
         mock.stop();
@@ -2649,11 +2643,7 @@ mod tests {
                 ..Default::default()
             });
             let outcome = match tokio::time::timeout(Duration::from_secs(2), send).await {
-                Ok(receiver) => receiver
-                    .await
-                    .expect("the send is resolved")
-                    .map(drop)
-                    .map_err(|error| error.to_string()),
+                Ok(result) => result.map(drop).map_err(|error| error.to_string()),
                 Err(_) => Err("waited".to_owned()),
             };
             let actual = PreparedSend {
@@ -2690,7 +2680,7 @@ mod tests {
             .await
             .expect("begin transaction");
         let sends = (0..200).map(|_| {
-            producer.send(ProducerRecord {
+            producer.enqueue(ProducerRecord {
                 topic: "topic".to_owned(),
                 partition: Some(0),
                 value: Some(bytes::Bytes::from_static(b"v")),
@@ -2729,9 +2719,7 @@ mod tests {
                 value: Some(bytes::Bytes::from_static(b"v")),
                 ..Default::default()
             })
-            .await
-            .await
-            .expect("the record is resolved");
+            .await;
 
         let commit = transaction.commit().await;
         let (commit_result, transaction) = match commit {
@@ -2905,15 +2893,16 @@ mod tests {
             .await
             .expect("begin transaction");
         let receiver = producer
-            .send(ProducerRecord {
+            .enqueue(ProducerRecord {
                 topic: "topic".to_owned(),
                 partition: Some(0),
                 value: Some(bytes::Bytes::from_static(b"v")),
                 ..Default::default()
             })
-            .await;
+            .await
+            .expect("record is queued");
         let prepare = TxnResult::from(transaction.prepare().await.map(drop));
-        let record = TxnResult::from(receiver.await.expect("the record is resolved").map(drop));
+        let record = TxnResult::from(receiver.await.map(drop));
         let actual = PrepareAfterFailedFlush {
             record,
             prepare,
@@ -3120,8 +3109,7 @@ mod tests {
                 .expect("begin transaction");
             let (trigger_result, transaction) = match trigger {
                 Trigger::Send => {
-                    let receiver = producer.send(record()).await;
-                    let result = receiver.await.expect("the record is resolved").map(drop);
+                    let result = producer.send(record()).await.map(drop);
                     (TxnResult::from(result), transaction)
                 }
                 Trigger::SendOffsets => {
@@ -3136,14 +3124,7 @@ mod tests {
                 },
             };
             let state = *producer.txn_state.lock().await;
-            let send = TxnResult::from(
-                producer
-                    .send(record())
-                    .await
-                    .await
-                    .expect("the record is resolved")
-                    .map(drop),
-            );
+            let send = TxnResult::from(producer.send(record()).await.map(drop));
             let send_offsets = TxnResult::from(
                 producer
                     .send_offsets_to_transaction([(("topic".to_owned(), 0), 43)], &group)
@@ -3362,8 +3343,6 @@ mod tests {
                         ..Default::default()
                     })
                     .await
-                    .await
-                    .expect("acknowledgement channel")
                     .map(|_| ()),
                 SendOffsets => {
                     producer

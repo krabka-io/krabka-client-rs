@@ -86,8 +86,6 @@ async fn produce_one(bootstrap: &str, topic: &str) {
             ..Default::default()
         })
         .await
-        .await
-        .expect("producer ack channel closed")
         .expect("produce record");
 
     producer.flush().await.expect("flush");

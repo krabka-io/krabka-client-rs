@@ -1026,11 +1026,7 @@ async fn send_one(
     producer: &Producer,
     record: ProducerRecord,
 ) -> Result<RecordMetadata, ProducerError> {
-    producer
-        .send(record)
-        .await
-        .await
-        .unwrap_or(Err(ProducerError::Closed))
+    producer.send(record).await
 }
 
 /// Reports whether the broker fenced the writer.

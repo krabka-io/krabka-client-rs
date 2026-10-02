@@ -69,16 +69,16 @@ async fn non_idempotent_acks_zero_fire_and_forget() {
         .expect("producer build");
 
     let acknowledgement = producer
-        .send(ProducerRecord {
+        .enqueue(ProducerRecord {
             topic: topic.clone(),
             value: Some(Bytes::from_static(b"x")),
             ..Default::default()
         })
-        .await;
+        .await
+        .expect("record is queued");
     producer.flush().await.expect("flush");
-    // acks=0 is fire-and-forget. The oneshot may resolve with Ok, or the
-    // sender may drop it. Both outcomes are correct. The case only proves
-    // that the send does not hang.
+    // acks=0 is fire-and-forget. The case only proves that delivery does
+    // not hang.
     let _ = tokio::time::timeout(Duration::from_secs(2), acknowledgement).await;
 
     producer.close().await.expect("close");
@@ -117,12 +117,13 @@ async fn produce_records(bootstrap: &str, topic: &str) {
     for i in 0..PRODUCE_N {
         acknowledgements.push(
             producer
-                .send(ProducerRecord {
+                .enqueue(ProducerRecord {
                     topic: topic.to_owned(),
                     value: Some(Bytes::from(format!("v{i}"))),
                     ..Default::default()
                 })
-                .await,
+                .await
+                .expect("record is queued"),
         );
     }
     producer.flush().await.expect("flush");
@@ -130,7 +131,6 @@ async fn produce_records(bootstrap: &str, topic: &str) {
     for (i, acknowledgement) in acknowledgements.into_iter().enumerate() {
         let metadata = acknowledgement
             .await
-            .expect("oneshot")
             .unwrap_or_else(|e| panic!("record {i} failed: {e:?}"));
         assert2::assert!(metadata.partition == 0);
     }
