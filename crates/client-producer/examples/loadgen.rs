@@ -268,14 +268,19 @@ async fn run_producer(
     while !counters.stop.load(Ordering::Relaxed) {
         while window.len() < settings.inflight {
             let acknowledgement = producer
-                .send(ProducerRecord {
+                .enqueue(ProducerRecord {
                     topic: settings.topic.clone(),
                     value: Some(value.clone()),
                     ..Default::default()
                 })
                 .await;
             counters.sent.fetch_add(1, Ordering::Relaxed);
-            window.push_back(acknowledgement);
+            if let Ok(handle) = acknowledgement {
+                window.push_back(handle);
+            } else {
+                counters.rejected.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
         }
         if let Some(acknowledgement) = window.pop_front() {
             count_acknowledgement(&counters, &acknowledgement.await);
@@ -292,14 +297,9 @@ async fn run_producer(
 
 /// Count one acknowledgement.
 ///
-/// The outer `Result` reports the oneshot channel, and the inner one reports
-/// the broker. Only a record that satisfies both is delivered. A record the
-/// broker refused, such as one above its size limit, counts as rejected.
-fn count_acknowledgement<T, BrokerError, ChannelError>(
-    counters: &Counters,
-    acknowledgement: &Result<Result<T, BrokerError>, ChannelError>,
-) {
-    if matches!(acknowledgement, Ok(Ok(_))) {
+/// A record the producer or broker refused counts as rejected.
+fn count_acknowledgement<T, Error>(counters: &Counters, acknowledgement: &Result<T, Error>) {
+    if acknowledgement.is_ok() {
         counters.acked.fetch_add(1, Ordering::Relaxed);
     } else {
         counters.rejected.fetch_add(1, Ordering::Relaxed);

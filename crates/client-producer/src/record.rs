@@ -2,7 +2,14 @@
 //! `RecordMetadata` is what it gets back, and `Header` holds the per-record key
 //! and value pairs.
 
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use bytes::Bytes;
+use tokio::sync::oneshot;
 
 use crate::error::ProducerError;
 
@@ -70,6 +77,32 @@ pub struct RecordMetadata {
     pub serialized_value_size: i32,
 }
 
+/// The delivery result of a record queued by [`crate::Producer::enqueue`].
+///
+/// Await the handle to get metadata or a producer error. Dropping it leaves
+/// the queued record in the producer; it does not cancel delivery.
+#[derive(Debug)]
+#[must_use = "await the handle to observe delivery errors"]
+pub struct DeliveryHandle {
+    receiver: oneshot::Receiver<Result<RecordMetadata, ProducerError>>,
+}
+
+impl DeliveryHandle {
+    pub(crate) fn new(receiver: oneshot::Receiver<Result<RecordMetadata, ProducerError>>) -> Self {
+        Self { receiver }
+    }
+}
+
+impl Future for DeliveryHandle {
+    type Output = Result<RecordMetadata, ProducerError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.receiver)
+            .poll(cx)
+            .map(|result| result.unwrap_or(Err(ProducerError::Closed)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -88,5 +121,36 @@ mod tests {
                 timestamp_ms: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_handle_reports_metadata_errors_and_closed_sender() {
+        let metadata = RecordMetadata {
+            topic: "events".into(),
+            partition: 2,
+            offset: 42,
+            timestamp_ms: 7,
+            serialized_key_size: -1,
+            serialized_value_size: 5,
+        };
+        let (sender, receiver) = oneshot::channel();
+        let mut handle = DeliveryHandle::new(receiver);
+        assert2::assert!(futures::FutureExt::now_or_never(&mut handle).is_none());
+        sender.send(Ok(metadata.clone())).expect("handle is open");
+        assert2::assert!(handle.await.expect("delivery succeeds") == metadata);
+
+        for (result, expected) in [
+            (Some(Err(ProducerError::Server(42))), "broker error_code 42"),
+            (None, "producer closed"),
+        ] {
+            let (sender, receiver) = oneshot::channel();
+            let handle = DeliveryHandle::new(receiver);
+            if let Some(result) = result {
+                sender.send(result).expect("handle is open");
+            } else {
+                drop(sender);
+            }
+            assert2::assert!(handle.await.expect_err("delivery fails").to_string() == expected);
+        }
     }
 }

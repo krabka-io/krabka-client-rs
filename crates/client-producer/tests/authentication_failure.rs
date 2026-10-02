@@ -192,17 +192,16 @@ async fn send_fails_the_record_with_a_sasl_rejection() {
             .await
             .unwrap();
 
-        let mut receiver = producer
-            .send(ProducerRecord {
+        let result = producer
+            .enqueue(ProducerRecord {
                 topic: "orders".into(),
                 value: Some(Bytes::from_static(b"v")),
                 ..Default::default()
             })
             .await;
-        let outcome = match receiver.try_recv() {
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => Outcome::Pending,
-            Ok(Err(error)) => classify(&error),
-            other => Outcome::Other(format!("{other:?}")),
+        let outcome = match result {
+            Ok(_) => Outcome::Pending,
+            Err(error) => classify(&error),
         };
         let observed = Observed {
             outcome,

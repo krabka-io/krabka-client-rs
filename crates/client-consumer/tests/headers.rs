@@ -80,8 +80,6 @@ async fn consumer_record_carries_headers() {
             timestamp_ms: None,
         })
         .await
-        .await
-        .expect("producer ack channel")
         .expect("producer ack");
     producer.flush().await.expect("producer flush");
 

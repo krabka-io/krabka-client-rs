@@ -85,8 +85,7 @@ let delivered = producer
         value: Some(Bytes::from_static(br#"{"status":"created"}"#)),
         ..Default::default()
     })
-    .await
-    .await??;
+    .await?;
 
 println!("wrote offset {}", delivered.offset);
 producer.close().await?;

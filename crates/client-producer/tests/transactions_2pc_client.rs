@@ -208,8 +208,6 @@ async fn prepare_record(
             ..Default::default()
         })
         .await
-        .await
-        .expect("producer acknowledgement channel")
         .expect("transactional produce");
     let prepared = transaction.prepare().await.expect("prepare transaction");
     drop(transaction);

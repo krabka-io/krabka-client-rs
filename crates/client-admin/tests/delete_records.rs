@@ -108,8 +108,6 @@ async fn produce_frames(bootstrap: &str, topic: &str) {
                 ..Default::default()
             })
             .await
-            .await
-            .expect("producer ack channel closed")
             .expect("produce frame");
     }
 

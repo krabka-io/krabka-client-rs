@@ -57,8 +57,6 @@ async fn produce_n(bootstrap: &str, topic: &str, partition: i32, n: u32) {
                 timestamp_ms: None,
             })
             .await
-            .await
-            .expect("producer ack channel")
             .expect("producer ack");
     }
     producer.flush().await.expect("producer flush");

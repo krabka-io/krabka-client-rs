@@ -38,7 +38,7 @@ use krabka_protocol::{
 };
 use krabka_units::{ByteSize, Time, convert::TimeExt};
 use tokio::{
-    sync::{Mutex, Notify, oneshot},
+    sync::{Mutex, Notify},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -57,7 +57,7 @@ use crate::{
         BuiltInPartitioner, PartitionInfo, Partitioner, RackPreference, StickyPartition,
         TopicPartitions,
     },
-    record::{ProducerRecord, RecordMetadata},
+    record::{DeliveryHandle, ProducerRecord, RecordMetadata},
     sender::DrainIntent,
     transactional::{
         AbortableError, FatalError, OwnedTransaction, PreparedTransactionState, Transaction,
@@ -2076,6 +2076,18 @@ impl Producer {
             .ok();
     }
 
+    /// Send a record and wait for its delivery result.
+    ///
+    /// Use [`Self::enqueue`] to queue multiple records before waiting for
+    /// delivery. Once queued, dropping this future does not cancel the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns enqueue or delivery failures as [`ProducerError`].
+    pub async fn send(&self, record: ProducerRecord) -> Result<RecordMetadata, ProducerError> {
+        self.enqueue(record).await?.await
+    }
+
     /// Enqueue a record and return a future that resolves when the broker
     /// acks, or when the producer fences or closes.
     ///
@@ -2089,50 +2101,30 @@ impl Producer {
     /// `KafkaProducer.doSend` fails the same way in
     /// `TransactionManager.maybeAddPartition`.
     ///
-    /// This returns a `oneshot::Receiver`. The outer call is `async` because
-    /// it waits for metadata that holds the topic, for at most `max_block`, as
-    /// Kafka's `KafkaProducer.waitOnMetadata` does. When the wait fails, the
-    /// receiver holds the error and the producer sends no Produce for the
-    /// record.
-    pub async fn send(
-        &self,
-        record: ProducerRecord,
-    ) -> oneshot::Receiver<Result<RecordMetadata, ProducerError>> {
+    /// Waits for metadata and buffer space for at most `max_block` before
+    /// queueing. Dropping the returned handle does not cancel delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, producer state, metadata, or buffer allocation
+    /// failures before queueing. Delivery errors are returned by the handle.
+    pub async fn enqueue(&self, record: ProducerRecord) -> Result<DeliveryHandle, ProducerError> {
         let span = tracing::debug_span!(
             "producer.send",
             topic = %record.topic,
             partition = tracing::field::Empty,
         );
-        self.send_inner(record).instrument(span).await
+        self.enqueue_inner(record).instrument(span).await
     }
 
-    async fn send_inner(
-        &self,
-        record: ProducerRecord,
-    ) -> oneshot::Receiver<Result<RecordMetadata, ProducerError>> {
+    async fn enqueue_inner(&self, record: ProducerRecord) -> Result<DeliveryHandle, ProducerError> {
         // Kafka checks the record when the application creates it, before
         // `send` makes any other check.
-        if let Err(e) = record.validate() {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(e));
-            return rx;
-        }
-        if let Err(e) = self.is_active() {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(e));
-            return rx;
-        }
+        record.validate()?;
+        self.is_active()?;
         if self.transactional_id.is_some() && self.transaction_recovery_required() {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(ProducerError::RecoveryRequired));
-            return rx;
+            return Err(ProducerError::RecoveryRequired);
         }
-
-        let failed = |error: ProducerError| {
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Err(error));
-            rx
-        };
 
         // Kafka's `KafkaProducer.doSend` calls `throwIfInPreparedState` before
         // `waitOnMetadata`, so a send after `prepare_transaction` does not
@@ -2145,18 +2137,15 @@ impl Producer {
         // `maybeAddPartition`.
         if self.transactional_id.is_some() {
             let state = *self.txn_state.lock().await;
-            if let Err(error) = self.append_transaction_generation(Some(state)) {
-                return failed(error);
-            }
+            self.append_transaction_generation(Some(state))?;
         }
 
         // Produce v13 carries only the `topic_id` on the wire, so the cache
         // must hold the topic also when the caller names the partition.
         let metadata_started = tokio::time::Instant::now();
-        let partition_count = match self.partition_count(&record.topic, record.partition).await {
-            Ok(count) => count,
-            Err(error) => return failed(error),
-        };
+        let partition_count = self
+            .partition_count(&record.topic, record.partition)
+            .await?;
         // A record that names no partition goes to a custom partitioner when
         // one is set (Kafka's `KafkaProducer.partition`), or otherwise to its
         // keyed partition, or to the sticky partition when it has neither.
@@ -2173,7 +2162,7 @@ impl Producer {
                         &all,
                     );
                     if picked < 0 {
-                        return failed(ProducerError::InvalidPartitionerResult(picked));
+                        return Err(ProducerError::InvalidPartitionerResult(picked));
                     }
                     Some(picked)
                 }
@@ -2207,7 +2196,7 @@ impl Producer {
             &record.headers,
         );
         if let Some(limit) = self.record_size_limit(serialized_size) {
-            return failed(ProducerError::RecordTooLarge {
+            return Err(ProducerError::RecordTooLarge {
                 record_size: serialized_size,
                 limit,
             });
@@ -2253,10 +2242,7 @@ impl Producer {
                     Some(_) => Some(*self.txn_state.lock().await),
                     None => None,
                 };
-                let expected_generation = match self.append_transaction_generation(state) {
-                    Ok(generation) => generation,
-                    Err(error) => return failed(error),
-                };
+                let expected_generation = self.append_transaction_generation(state)?;
                 let needs_memory = {
                     let mut a = acc.lock().await;
                     if self.sticky_partition_changed(&record.topic, sticky, &a, &partitions) {
@@ -2274,10 +2260,7 @@ impl Producer {
                 };
                 if needs_memory {
                     let size = self.batch_size.max(record_size);
-                    match self.buffer_pool.allocate(size, remaining_block).await {
-                        Ok(reservation) => memory = Some(reservation),
-                        Err(error) => return failed(error),
-                    }
+                    memory = Some(self.buffer_pool.allocate(size, remaining_block).await?);
                 }
             }
 
@@ -2291,10 +2274,7 @@ impl Producer {
                 None
             };
             let transaction_generation =
-                match self.append_transaction_generation(transaction_state.as_deref().copied()) {
-                    Ok(generation) => generation,
-                    Err(error) => return failed(error),
-                };
+                self.append_transaction_generation(transaction_state.as_deref().copied())?;
             if transaction_generation.is_some()
                 && let Err(error) = self
                     .register_transaction_partition(&record.topic, partition)
@@ -2306,7 +2286,7 @@ impl Producer {
                 {
                     *state = fatal.state();
                 }
-                return failed(error);
+                return Err(error);
             }
             let mut a = acc.lock().await;
             if self.sticky_partition_changed(&record.topic, sticky, &a, &partitions) {
@@ -2321,9 +2301,7 @@ impl Producer {
                 // the transaction again has no effect.
                 continue;
             }
-            if let Err(error) = self.is_active() {
-                return failed(error);
-            }
+            self.is_active()?;
             let AppendResult {
                 receiver: rx,
                 wakes_sender,
@@ -2348,7 +2326,7 @@ impl Producer {
             drop(a);
             drop(transaction_state);
             wake_sender_after_append(&self.wake_tx, self.linger, wakes_sender);
-            return rx;
+            return Ok(DeliveryHandle::new(rx));
         }
     }
 
@@ -3568,8 +3546,6 @@ mod tests {
         let delivered = producer
             .send(record)
             .await
-            .await
-            .expect("the producer answers the send")
             .map(|metadata| metadata.partition)
             .map_err(|error| error.to_string());
         producer.flush().await.expect("flush");
@@ -3911,25 +3887,18 @@ mod tests {
                 .build()
                 .await
                 .expect("producer connects to mock broker");
-            let receiver = producer
-                .send(ProducerRecord {
-                    topic: METADATA_TOPIC.into(),
-                    partition,
-                    timestamp_ms,
-                    value: Some(Bytes::from_static(b"v")),
-                    ..Default::default()
-                })
-                .await;
+            let receiver = producer.send(ProducerRecord {
+                topic: METADATA_TOPIC.into(),
+                partition,
+                timestamp_ms,
+                value: Some(Bytes::from_static(b"v")),
+                ..Default::default()
+            });
             let delivered = tokio::time::timeout(Duration::from_secs(5), receiver)
                 .await
                 .map_or_else(
                     |_| Err("pending".to_owned()),
-                    |answer| {
-                        answer
-                            .expect("the producer answers the send")
-                            .map(drop)
-                            .map_err(|error| error.to_string())
-                    },
+                    |answer| answer.map(drop).map_err(|error| error.to_string()),
                 );
             let actual = ValidatedSend {
                 delivered,
@@ -4005,14 +3974,11 @@ mod tests {
             ..Default::default()
         };
 
-        let first = producer.send(record()).await;
-        let second = producer.send(record()).await;
+        let first = producer.enqueue(record()).await.expect("first is queued");
+        let second = producer.enqueue(record()).await.expect("second is queued");
         let delivered = tokio::time::timeout(Duration::from_secs(5), async {
-            let first = first.await.expect("first is resolved").map(drop);
-            let second = producer
-                .flush()
-                .await
-                .and(second.await.expect("second is resolved").map(drop));
+            let first = first.await.map(drop);
+            let second = producer.flush().await.and(second.await.map(drop));
             (
                 first.map_err(|e| e.to_string()),
                 second.map_err(|e| e.to_string()),
@@ -4169,8 +4135,6 @@ mod tests {
                     ..Default::default()
                 })
                 .await
-                .await
-                .expect("the producer answers the send")
                 .map(drop)
                 .map_err(|error| error.to_string());
             mock.stop();
@@ -4217,8 +4181,8 @@ mod tests {
             value: Some(Bytes::from_static(b"v")),
             ..Default::default()
         };
-        let _first = producer.send(pinned(0)).await;
-        let _second = producer.send(pinned(1)).await;
+        let _first = producer.enqueue(pinned(0)).await.expect("first is queued");
+        let _second = producer.enqueue(pinned(1)).await.expect("second is queued");
         if let Some(delay) = answer_after {
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
@@ -4226,18 +4190,14 @@ mod tests {
             });
         }
         let started = std::time::Instant::now();
-        let mut third = producer.send(pinned(2)).await;
+        let third = producer.enqueue(pinned(2)).await;
         let blocked = started.elapsed() >= Duration::from_millis(80);
-        let delivered = match third.try_recv() {
-            Ok(result) => result.map(drop).map_err(|error| error.to_string()),
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err("closed".to_owned()),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                match tokio::time::timeout(Duration::from_secs(3), third).await {
-                    Ok(Ok(result)) => result.map(drop).map_err(|error| error.to_string()),
-                    Ok(Err(_)) => Err("closed".to_owned()),
-                    Err(_) => Err("pending".to_owned()),
-                }
-            }
+        let delivered = match third {
+            Err(error) => Err(error.to_string()),
+            Ok(handle) => match tokio::time::timeout(Duration::from_secs(3), handle).await {
+                Ok(result) => result.map(drop).map_err(|error| error.to_string()),
+                Err(_) => Err("pending".to_owned()),
+            },
         };
         mock.stop();
         drop(producer);
@@ -4483,8 +4443,6 @@ mod tests {
                         ..Default::default()
                     })
                     .await
-                    .await
-                    .expect("the producer answers the send")
                     .expect("the record is delivered")
                     .partition;
                 if key.is_some() {
