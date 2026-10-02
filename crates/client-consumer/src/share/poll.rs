@@ -366,13 +366,12 @@ impl ShareConsumer {
         Ok(())
     }
 
-    /// Renew the acquisition lock on a single delivered `record`, the KIP-932
-    /// RENEW.
+    /// Renew the acquisition lock on a single delivered `record` (KIP-1222).
     ///
     /// This method sends a standalone `ShareAcknowledge` with
-    /// `is_renew_ack = true` and an empty `acknowledge_types` for the record's
-    /// offset. That extends the broker-side lock deadline without a change to
-    /// the record's state. Like [`acknowledge`](ShareConsumer::acknowledge),
+    /// `is_renew_ack = true` and `acknowledge_types = [4]` for the record's
+    /// offset. The Renew wire type extends the broker-side lock deadline without
+    /// changing the record's state. Like [`acknowledge`](ShareConsumer::acknowledge),
     /// this is only valid in explicit ack mode. It advances the session epoch on
     /// success.
     ///
@@ -407,7 +406,7 @@ impl ShareConsumer {
             record.partition,
             record.offset,
             record.offset,
-            0,
+            4,
         )]);
 
         let resp = self
@@ -557,7 +556,7 @@ impl ShareConsumer {
 fn build_ack_topics(acks: Vec<(WireUuid, i32, i64, i64, i8)>) -> Vec<AcknowledgeTopic> {
     let mut by_topic: HashMap<WireUuid, HashMap<i32, Vec<AckAckBatch>>> = HashMap::new();
     for (tid, partition, first, last, ack) in acks {
-        let count = if ack == 0 { 0 } else { range_len(first, last) };
+        let count = range_len(first, last);
         by_topic
             .entry(tid)
             .or_default()
@@ -1053,6 +1052,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renew_sends_the_wire_type_and_preserves_response_epoch_boundaries() {
+        use bytes::{Buf as _, BytesMut};
+        use krabka_client_core::MockBroker;
+        use krabka_protocol::{
+            Decode as _, Encode as _,
+            owned::{
+                api_versions_request,
+                api_versions_response::{ApiVersion, ApiVersionsResponse},
+                share_acknowledge_request,
+                share_acknowledge_response::{PartitionData, ShareAcknowledgeTopicResponse},
+            },
+        };
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&requests);
+        let mut responses = [(0, 0), (17, 0), (0, 121)].into_iter();
+        let broker = MockBroker::start(move |api_key, version, _corr, mut body| {
+            let mut encoded = BytesMut::new();
+            if api_key == api_versions_request::API_KEY {
+                ApiVersionsResponse {
+                    api_keys: vec![ApiVersion {
+                        api_key: share_acknowledge_request::API_KEY,
+                        min_version: 2,
+                        max_version: 2,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode(&mut encoded, 0)
+                .unwrap();
+            } else if api_key == share_acknowledge_request::API_KEY {
+                let client_id_len = usize::try_from(body.get_i16()).unwrap_or(0);
+                body.advance(client_id_len);
+                assert2::assert!(body.get_u8() == 0);
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(ShareAcknowledgeRequest::decode(&mut body, version).unwrap());
+                let (error_code, partition_error) =
+                    responses.next().expect("one response per renew");
+                encoded.extend_from_slice(&[0]);
+                ShareAcknowledgeResponse {
+                    error_code,
+                    responses: vec![ShareAcknowledgeTopicResponse {
+                        topic_id: id(7),
+                        partitions: vec![PartitionData {
+                            partition_index: 2,
+                            error_code: partition_error,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .encode(&mut encoded, version)
+                .unwrap();
+            } else {
+                panic!("unexpected API key {api_key}");
+            }
+            Some(encoded.to_vec())
+        })
+        .await;
+        let mut consumer = test_consumer(ShareAckMode::Explicit).await;
+        consumer.client = Client::builder()
+            .bootstrap(broker.addr.to_string())
+            .build()
+            .await
+            .unwrap();
+        let record = ShareConsumerRecord {
+            topic: "topic-a".into(),
+            partition: 2,
+            offset: 10,
+            timestamp: 0,
+            timestamp_type: TimestampType::CreateTime,
+            key: None,
+            value: None,
+            headers: Vec::new(),
+            delivery_count: 1,
+        };
+        let mut outcomes = Vec::new();
+        for _ in 0..3 {
+            let error_code = match consumer.renew(&record).await {
+                Ok(()) => 0,
+                Err(ConsumerError::Server(code)) => code,
+                Err(error) => panic!("unexpected renew error: {error}"),
+            };
+            outcomes.push((error_code, consumer.share_session_epoch));
+        }
+        broker.stop();
+        assert2::assert!(outcomes == vec![(0, 5), (17, 5), (121, 6)]);
+        let requests = requests.lock().unwrap();
+        assert2::assert!(requests.len() == 3);
+        for (request, epoch) in requests.iter().zip([4, 5, 5]) {
+            assert2::assert!(request.group_id.as_deref() == Some("group-a"));
+            assert2::assert!(request.member_id.as_deref() == Some("member-a"));
+            assert2::assert!((request.share_session_epoch, request.is_renew_ack) == (epoch, true));
+            let topic = only(&request.topics);
+            assert2::assert!(topic.topic_id == id(7));
+            let partition = only(&topic.partitions);
+            assert2::assert!(partition.partition_index == 2);
+            assert2::assert!(
+                *only(&partition.acknowledgement_batches)
+                    == AckAckBatch {
+                        first_offset: 10,
+                        last_offset: 10,
+                        acknowledge_types: vec![4],
+                        ..Default::default()
+                    }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn take_piggyback_acks_drains_implicit_deliveries_as_accept_ranges() {
         let mut consumer = test_consumer(ShareAckMode::Implicit).await;
         consumer.prev_delivered = vec![(id(7), 2, 10, 12)];
@@ -1142,14 +1254,14 @@ mod tests {
                 }
         );
 
-        let renew = build_ack_topics(vec![(id(7), 2, 10, 10, 0)]);
+        let renew = build_ack_topics(vec![(id(7), 2, 10, 10, 4)]);
         let renew_batch = only(&only(&only(&renew).partitions).acknowledgement_batches);
         assert2::assert!(
             *renew_batch
                 == AckAckBatch {
                     first_offset: 10,
                     last_offset: 10,
-                    acknowledge_types: Vec::new(),
+                    acknowledge_types: vec![4],
                     unknown_tagged_fields: UnknownTaggedFields(Vec::new()),
                 }
         );
