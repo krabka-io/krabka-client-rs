@@ -1,8 +1,8 @@
 //! `ShareConsumer`, the public lifecycle handle for a KIP-932 share group.
 //!
 //! Build it with [`ShareConsumer::builder`]. The constructor joins the share
-//! group with one `ShareGroupHeartbeat` that carries an empty member id, epoch
-//! 0, and the subscription. It captures the broker-assigned member id, epoch,
+//! group with one `ShareGroupHeartbeat` that carries a client-generated member
+//! UUID, epoch 0, and the subscription. It captures the returned member id, epoch,
 //! heartbeat interval, and assignment. It resolves the assignment's topic ids
 //! to names with Metadata, then spawns the background heartbeat loop.
 
@@ -178,6 +178,7 @@ fn build_join_heartbeat_request(
 ) -> ShareGroupHeartbeatRequest {
     ShareGroupHeartbeatRequest {
         group_id,
+        member_id: uuid::Uuid::new_v4().to_string(),
         subscribed_topic_names: Some(subscribe),
         ..Default::default()
     }
@@ -288,8 +289,8 @@ pub struct ShareConsumer {
 impl ShareConsumer {
     /// Join a share group and start heartbeating.
     ///
-    /// This method sends one `ShareGroupHeartbeat` that carries an empty member
-    /// id, epoch 0, and `subscribe`. It captures the assigned member id, epoch,
+    /// This method sends one `ShareGroupHeartbeat` that carries a client-generated
+    /// member UUID, epoch 0, and `subscribe`. It captures the returned member id, epoch,
     /// heartbeat interval, and assignment. It resolves the assignment topic ids
     /// → names with Metadata, then spawns the heartbeat loop.
     #[builder(start_fn = builder, finish_fn = build)]
@@ -411,8 +412,8 @@ impl ShareConsumer {
             .await?;
         client.metadata_topics().set(subscribe.iter().cloned());
 
-        // 1. Join: empty member id + epoch 0 + the subscription. The broker
-        //    assigns a member id and bumps us to a live epoch.
+        // 1. Join: client-generated member UUID + epoch 0 + the subscription.
+        //    The broker returns the member id and bumps us to a live epoch.
         let join = client
             .send(build_join_heartbeat_request(
                 group_id.clone(),
@@ -425,7 +426,7 @@ impl ShareConsumer {
         let member_id = join.member_id.clone().unwrap_or_default();
         if member_id.is_empty() {
             return Err(ConsumerError::RebalanceFailed(
-                "broker did not assign a member_id".into(),
+                "broker did not return a member_id".into(),
             ));
         }
         let member_epoch_val = join.member_epoch;
@@ -530,7 +531,7 @@ impl ShareConsumer {
         &self.group_id
     }
 
-    /// The member id that the broker assigned at join time.
+    /// The client-generated member id returned by the broker at join time.
     #[must_use]
     pub fn member_id(&self) -> &str {
         &self.member_id
@@ -796,13 +797,20 @@ mod tests {
     }
 
     #[test]
-    fn join_heartbeat_request_preserves_group_member_epoch_and_subscription() {
+    fn join_heartbeat_request_mints_uuid_and_preserves_group_epoch_and_subscription() {
         let req = build_join_heartbeat_request("group-a".into(), vec!["topic-a".into()]);
+        let second = build_join_heartbeat_request("group-a".into(), vec!["topic-a".into()]);
+
+        for member_id in [&req.member_id, &second.member_id] {
+            assert2::assert!(uuid::Uuid::parse_str(member_id).is_ok());
+            assert2::assert!(member_id.len() == 36);
+        }
+        assert2::assert!(req.member_id != second.member_id);
 
         assert2::assert!(
             req == ShareGroupHeartbeatRequest {
                 group_id: "group-a".into(),
-                member_id: String::new(),
+                member_id: req.member_id.clone(),
                 member_epoch: 0,
                 rack_id: None,
                 subscribed_topic_names: Some(vec!["topic-a".into()]),
