@@ -99,7 +99,13 @@ jobs:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}-docs
           repository-cache: true
-      - run: bazel build $(bazel query 'kind("rust_doc rule", //crates/...)')
+      - name: build rustdoc
+        run: |
+          set -euo pipefail
+          targets="${RUNNER_TEMP}/rustdoc-targets.txt"
+          bazel query 'kind("rust_doc rule", //crates/...)' > "${targets}"
+          test -s "${targets}"
+          bazel build --target_pattern_file="${targets}"
       - uses: actions/upload-artifact@v4
         with:
           name: rustdoc
