@@ -70,7 +70,7 @@
 //! it. It does not change the broker, and it needs no broker-side feature. A
 //! caller supplies its own producer and consumer, and this crate supplies the
 //! succession rules, the lease clock, and the codec below.
-#![doc(html_root_url = "https://docs.rs/krabka-client-coordination/0.4.0")]
+#![doc(html_root_url = "https://docs.rs/krabka-client-coordination/0.5.0")]
 
 mod broker;
 mod error;

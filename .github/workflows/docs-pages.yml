@@ -50,7 +50,12 @@ jobs:
       # The same query `ci.yml`'s docgen job runs, so the two never disagree
       # about which crates have documentation.
       - name: docgen
-        run: bazel build $(bazel query 'kind("rust_doc rule", //crates/...)')
+        run: |
+          set -euo pipefail
+          targets="${RUNNER_TEMP}/rustdoc-targets.txt"
+          bazel query 'kind("rust_doc rule", //crates/...)' > "${targets}"
+          test -s "${targets}"
+          bazel build --target_pattern_file="${targets}"
 
       - name: assemble the site
         run: aspect rustdoc-site --output site --repo krabka-client-rs

@@ -94,10 +94,18 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Temporary DataFusion pin for profile query support.
     "https://github.com/apache/datafusion",
-    # Temporary compatibility pin until testcontainers-modules publishes a
-    # release that depends on testcontainers 0.28.
+    "https://github.com/krabka-io/krabka-broker",
+    "https://github.com/krabka-io/krabka-cli",
+    "https://github.com/krabka-io/krabka-connect",
+    "https://github.com/krabka-io/krabka-gateway",
+    "https://github.com/krabka-io/krabka-o11y",
+    "https://github.com/krabka-io/krabka-operator",
+    "https://github.com/krabka-io/krabka-protocol",
+    "https://github.com/krabka-io/krabka-rebalancer",
+    "https://github.com/krabka-io/krabka-schema-registry",
+    "https://github.com/krabka-io/krabka-streams-rs",
+    "https://github.com/robot-head/sspi-rs",
     "https://github.com/testcontainers/testcontainers-rs-modules-community",
 ]
 
