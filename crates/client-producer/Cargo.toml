@@ -22,8 +22,8 @@ default = []
 [dependencies]
 assert2 = { workspace = true }
 krabka-protocol = { version = "0.4.0", default-features = false }
-krabka-client-core = { version = "0.4.0", path = "../client-core" }
-krabka-client-consumer = { version = "0.4.0", path = "../client-consumer" }
+krabka-client-core = { version = "0.5.0", path = "../client-core" }
+krabka-client-consumer = { version = "0.5.0", path = "../client-consumer" }
 krabka-compression = { version = "0.4.0" }
 krabka-units = { workspace = true }
 async-trait = { workspace = true }
