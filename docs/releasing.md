@@ -27,7 +27,10 @@ manifest sets `publish = false`.
 
 Each published crate takes `repository`, `license`, `authors`, `edition` and
 `rust-version` from the workspace. Its `include` list ships the library source,
-its README and its CHANGELOG, but not its tests, examples or fixtures. Cargo
+its README, its CHANGELOG, and `LICENSE` and `NOTICE`, which are symlinks to
+the workspace root copies. It leaves out the integration tests and examples.
+`krabka-client-core` also ships `tests/fixtures/tls`, because its unit tests
+include those files at compile time. Cargo
 prints an "ignoring test" or "ignoring example" warning for each target that
 the package leaves out. The warnings are expected.
 
