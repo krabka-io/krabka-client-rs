@@ -124,7 +124,9 @@ here and wait for a newer image.
 
 ## Publishing
 
-These crates are published to crates.io from
-[`robot-head/crabka`](https://github.com/robot-head/crabka), which is still the
-release home for the `krabka-*` names. This repository has no release
-automation; consumers pin it by git revision.
+A `vX.Y.Z` tag on `main` publishes `krabka-client-core`, `krabka-client-admin`,
+`krabka-client-consumer` and `krabka-client-producer` to crates.io through
+[`publish.yml`](.github/workflows/publish.yml).
+[`docs/releasing.md`](docs/releasing.md) is the procedure. The first release
+waits on `krabka-security` from krabka-protocol, which is not on crates.io
+yet.

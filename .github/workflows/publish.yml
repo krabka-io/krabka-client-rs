@@ -1,0 +1,280 @@
+name: publish
+
+# Publish this repository's client crates to crates.io.
+#
+# A `v*` tag push publishes. A manual run is a dry run unless `dry_run` is off,
+# and a manual run that publishes must be started from a `v*` tag.
+#
+# `cargo publish` ignores `[patch.crates-io]`, so every krabka-protocol crate
+# that these crates name must already be on crates.io at the required version.
+# docs/releasing.md says which one is missing today.
+#
+# The publish job authenticates in one of two ways:
+#
+# - Token. When the `CARGO_REGISTRY_TOKEN` secret of the `crates-io`
+#   environment is set, cargo uses it. crates.io allows trusted publishing only
+#   for a crate that already exists, so the first publish of each new name
+#   needs this token.
+# - Trusted publishing. When the secret is not set,
+#   `rust-lang/crates-io-auth-action` exchanges the job's GitHub OIDC token for
+#   a crates.io token that expires after 30 minutes and is revoked at the end
+#   of the job.
+#
+# docs/releasing.md gives the procedure: bootstrap with the token, configure
+# trusted publishing for each crate, then delete the secret.
+#
+# A rerun is safe. The plan step asks crates.io which versions exist and
+# publishes only the others.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Package and verify every pending crate, but upload nothing
+        type: boolean
+        default: true
+      crates:
+        description: Space-separated crate names to limit the run to; empty means every publishable crate
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # crates.io refuses an API request without a User-Agent that names the caller.
+  USER_AGENT: krabka-client-rs-publish (https://github.com/krabka-io/krabka-client-rs)
+
+jobs:
+  # Checks that the ref is releasable, finds the crates whose version is not on
+  # crates.io yet, and packages and verifies them with `cargo publish
+  # --dry-run`. It holds no credential.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # `gh run list` below reads this repository's workflow runs.
+      actions: read
+    outputs:
+      crates: ${{ steps.pending.outputs.crates }}
+      publish: ${{ steps.mode.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: decide whether this run uploads
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "${EVENT}" = push ] || [ "${DRY_RUN}" = false ]; then
+            if [ "${GITHUB_REF_TYPE}" != tag ] || [[ "${GITHUB_REF_NAME}" != v* ]]; then
+              echo "A publish runs from a v* tag. ${GITHUB_REF} is not one; start a dry run instead." >&2
+              exit 1
+            fi
+            echo publish=true >>"${GITHUB_OUTPUT}"
+          else
+            echo publish=false >>"${GITHUB_OUTPUT}"
+          fi
+
+      # The same checks as krabka-broker's release workflow: the commit under
+      # the tag merged into main, and main's own CI passed on it.
+      - name: the tagged commit is on main
+        if: steps.mode.outputs.publish == 'true'
+        run: |
+          git fetch --no-tags --force origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "${GITHUB_REF_NAME} names ${GITHUB_SHA}, which is not an ancestor of origin/main." >&2
+            echo 'A release is cut from a commit that merged into main, never from a branch.' >&2
+            exit 1
+          fi
+
+      - name: main CI succeeded for this commit
+        if: steps.mode.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          runs="$(gh run list --workflow ci.yml --commit "${GITHUB_SHA}" \
+            --branch main --limit 100 --json conclusion,event,url)"
+          jq -r '.[] | "\(.conclusion)\t\(.event)\t\(.url)"' <<<"${runs}"
+          passed="$(jq '[.[] | select(.event == "push" and .conclusion == "success")] | length' <<<"${runs}")"
+          if [ "${passed}" -eq 0 ]; then
+            echo "No successful push run of ci.yml for ${GITHUB_SHA}." >&2
+            echo 'Only a commit whose main CI run went green is releasable.' >&2
+            exit 1
+          fi
+
+      # Every publishable crate inherits `[workspace.package] version`, so each
+      # one must say the version that the tag names.
+      - name: the crate versions name the tag
+        if: github.ref_type == 'tag'
+        run: |
+          expected="${GITHUB_REF_NAME#v}"
+          cargo metadata --no-deps --format-version 1 --locked >"${RUNNER_TEMP}/metadata.json"
+          wrong="$(jq -r --arg v "${expected}" '
+            .packages[] | select(.publish != []) | select(.version != $v)
+            | "\(.name) \(.version)"' "${RUNNER_TEMP}/metadata.json")"
+          if [ -n "${wrong}" ]; then
+            echo "${GITHUB_REF_NAME} names version ${expected}, but these crates say otherwise:" >&2
+            echo "${wrong}" >&2
+            exit 1
+          fi
+
+      # Lists the crates with `publish` unset, in dependency order, and keeps
+      # those whose version crates.io does not have. The order matters for the
+      # one-crate-at-a-time upload in the publish job.
+      - name: find the pending crates
+        id: pending
+        env:
+          ONLY: ${{ inputs.crates }}
+        run: |
+          cargo metadata --no-deps --format-version 1 --locked >"${RUNNER_TEMP}/metadata.json"
+          # Each publishable crate with the workspace crates that its published
+          # manifest names. Cargo drops a dev-dependency that has no version,
+          # so only a versioned one counts.
+          jq -r '
+            [.packages[] | select(.publish != [])] as $pub
+            | ($pub | map(.name)) as $names
+            | $pub[]
+            | "\(.name) \(.version) \([.dependencies[]
+                | select(.kind != "dev" or .req != "*")
+                | select(.name as $n | $names | index($n))
+                | .name] | unique | join(","))"
+          ' "${RUNNER_TEMP}/metadata.json" >"${RUNNER_TEMP}/graph.txt"
+          cat "${RUNNER_TEMP}/graph.txt"
+
+          # Topological order: take every crate whose dependencies are placed.
+          ordered=()
+          remaining="$(wc -l <"${RUNNER_TEMP}/graph.txt")"
+          for _ in $(seq "${remaining}"); do
+            progress=0
+            while read -r name version deps; do
+              [[ " ${ordered[*]} " == *" ${name}@${version} "* ]] && continue
+              ready=1
+              for dep in ${deps//,/ }; do
+                [[ " ${ordered[*]} " == *" ${dep}@"* ]] || ready=0
+              done
+              if [ "${ready}" = 1 ]; then
+                ordered+=("${name}@${version}")
+                progress=1
+              fi
+            done <"${RUNNER_TEMP}/graph.txt"
+            [ "${progress}" = 0 ] && break
+          done
+          if [ "${#ordered[@]}" -ne "${remaining}" ]; then
+            echo "Could not order the crates; placed: ${ordered[*]}" >&2
+            exit 1
+          fi
+
+          for crate in ${ONLY}; do
+            if [[ " ${ordered[*]} " != *" ${crate}@"* ]]; then
+              echo "${crate} is not a publishable crate of this workspace" >&2
+              exit 1
+            fi
+          done
+
+          pending=()
+          for entry in "${ordered[@]}"; do
+            name="${entry%@*}"
+            version="${entry#*@}"
+            if [ -n "${ONLY}" ] && [[ " ${ONLY} " != *" ${name} "* ]]; then
+              echo "${name} is not in the crates input; skipping"
+              continue
+            fi
+            status="$(curl -sS -o /dev/null -w '%{http_code}' -A "${USER_AGENT}" \
+              "https://crates.io/api/v1/crates/${name}/${version}")"
+            case "${status}" in
+              200) echo "${name} ${version} is on crates.io; skipping" ;;
+              404) echo "${name} ${version} is pending"; pending+=("${name}") ;;
+              *) echo "crates.io answered ${status} for ${name} ${version}" >&2; exit 1 ;;
+            esac
+            sleep 1
+          done
+          echo "crates=${pending[*]}" >>"${GITHUB_OUTPUT}"
+
+      # Packages each pending crate and builds it from the packaged sources.
+      # Cargo resolves a pending sibling from the packages it has just made,
+      # and every other dependency, the krabka-protocol crates among them,
+      # from crates.io.
+      - name: package and verify
+        if: steps.pending.outputs.crates != ''
+        env:
+          CRATES: ${{ steps.pending.outputs.crates }}
+        run: |
+          args=()
+          for crate in ${CRATES}; do args+=(-p "${crate}"); done
+          cargo publish --dry-run --locked "${args[@]}"
+
+  publish:
+    name: publish
+    needs: plan
+    if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.crates != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # crates.io's trusted-publisher entry for each crate names this
+    # environment. It also holds the bootstrap token, so the secret is
+    # unreadable to every other job and workflow.
+    environment: crates-io
+    permissions:
+      contents: read
+      # The OIDC token that crates-io-auth-action exchanges for a crates.io
+      # token.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: choose the credential
+        id: credential
+        env:
+          HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: |
+          if [ "${HAS_TOKEN}" = true ]; then
+            echo 'CARGO_REGISTRY_TOKEN is set: publishing with the bootstrap token.'
+            echo mode=token >>"${GITHUB_OUTPUT}"
+          else
+            echo 'CARGO_REGISTRY_TOKEN is not set: publishing through trusted publishing.'
+            echo mode=oidc >>"${GITHUB_OUTPUT}"
+          fi
+
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        if: steps.credential.outputs.mode == 'oidc'
+        id: auth
+
+      # One crate at a time, in dependency order. `cargo publish` waits until a
+      # crate is in the index before it returns, so the next crate resolves
+      # it. The plan job already verified every package, so this run does not
+      # build them again; that keeps the upload inside the 30-minute life of a
+      # trusted-publishing token.
+      #
+      # crates.io rate-limits uploads, and a new crate name has the lowest
+      # limit: a burst of five, then one every ten minutes. A 429 answer waits
+      # and tries again. A crate that still fails stops the job; a rerun skips
+      # every crate that went through.
+      - name: publish
+        env:
+          CRATES: ${{ needs.plan.outputs.crates }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -o pipefail
+          for crate in ${CRATES}; do
+            for attempt in 1 2 3 4 5 6 7; do
+              if cargo publish --locked --no-verify -p "${crate}" 2>&1 | tee "${RUNNER_TEMP}/publish.log"; then
+                break
+              fi
+              if ! grep -q '429' "${RUNNER_TEMP}/publish.log" || [ "${attempt}" = 7 ]; then
+                echo "::error::cargo publish failed for ${crate}"
+                exit 1
+              fi
+              echo "crates.io rate-limited ${crate} (attempt ${attempt}); waiting ten minutes"
+              sleep 600
+            done
+          done

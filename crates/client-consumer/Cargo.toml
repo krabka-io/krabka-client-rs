@@ -6,9 +6,12 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "Subscribe-style consumer client for Apache Kafka in Rust"
-repository = "https://github.com/robot-head/crabka"
-homepage = "https://github.com/robot-head/crabka"
+repository.workspace = true
 documentation = "https://docs.rs/krabka-client-consumer"
+# Ship the library source with the license and notices. The tests and
+# examples stay in the repository. LICENSE and NOTICE are symlinks to the
+# workspace root copies.
+include = ["src/**/*", "/Cargo.toml", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
 readme = "README.md"
 keywords = ["kafka", "consumer", "client", "streaming", "krabka"]
 categories = ["api-bindings", "network-programming"]

@@ -2,11 +2,11 @@
 
 [![Crates.io](https://img.shields.io/crates/v/krabka-client-consumer.svg)](https://crates.io/crates/krabka-client-consumer)
 [![Docs.rs](https://docs.rs/krabka-client-consumer/badge.svg)](https://docs.rs/krabka-client-consumer)
-[![CI](https://github.com/robot-head/crabka/actions/workflows/ci.yml/badge.svg)](https://github.com/robot-head/crabka/actions/workflows/ci.yml)
+[![CI](https://github.com/krabka-io/krabka-client-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/krabka-io/krabka-client-rs/actions/workflows/ci.yml)
 
 Subscribe-style Kafka consumer client for Rust.
 
-Part of [Krabka](https://github.com/robot-head/crabka), a Rust implementation
+Part of [Krabka](https://github.com/krabka-io/krabka-client-rs), a Rust implementation
 of Apache Kafka-compatible infrastructure and clients.
 
 ## Overview
@@ -86,10 +86,10 @@ consumer.close().await?;
 ## Documentation
 
 - [API documentation](https://docs.rs/krabka-client-consumer)
-- [Krabka repository](https://github.com/robot-head/crabka)
-- [Kafka compatibility matrix](https://github.com/robot-head/crabka/blob/main/docs/KIP_MATRIX.md)
+- [krabka-client-rs repository](https://github.com/krabka-io/krabka-client-rs)
+- [Kafka compatibility matrix](https://github.com/krabka-io/krabka-broker/blob/main/docs/KIP_MATRIX.md)
 
 ## License
 
 Apache-2.0. Derivative work of [Apache Kafka](https://kafka.apache.org); see
-[NOTICE](https://github.com/robot-head/crabka/blob/main/NOTICE).
+[NOTICE](https://github.com/krabka-io/krabka-client-rs/blob/main/NOTICE).

@@ -6,12 +6,14 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "Leader election, leases, and fencing tokens as a Kafka client API"
-repository = "https://github.com/robot-head/crabka"
-homepage = "https://github.com/robot-head/crabka"
+repository.workspace = true
 documentation = "https://docs.rs/krabka-client-coordination"
 readme = "README.md"
 keywords = ["kafka", "coordination", "leader-election", "lease", "krabka"]
 categories = ["api-bindings", "network-programming"]
+# Not published: it is not one of the client libraries that other repositories
+# build on. See docs/releasing.md.
+publish = false
 
 [lints]
 workspace = true

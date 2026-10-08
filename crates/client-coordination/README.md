@@ -5,7 +5,7 @@
 
 Leader election, leases, and fencing tokens for Apache Kafka clients.
 
-Part of [Krabka](https://github.com/robot-head/crabka), a Rust implementation
+Part of [Krabka](https://github.com/krabka-io/krabka-client-rs), a Rust implementation
 of Apache Kafka-compatible infrastructure and clients.
 
 ## Overview
