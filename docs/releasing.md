@@ -52,10 +52,17 @@ crates.io at the `version` that the manifests name. So a release of this
 repository needs a krabka-protocol release with the same version on crates.io
 first.
 
-`krabka-security` is not on crates.io yet. It uses `sspi` from a git fork, and
-it can publish only when an upstream `sspi` release that builds is on
-crates.io. See the "The sspi dependency" section of krabka-protocol's
+crates.io must have `krabka-security`, which waits on `krabka-sspi`.
+`krabka-security` uses `sspi` from a git fork, which a crates.io package cannot
+name. The fork is to be published to crates.io as `krabka-sspi` 0.23.0, which
+keeps the library name `sspi`. krabka-protocol then switches `krabka-security`
+to `sspi = { package = "krabka-sspi", version = "0.23.0" }` and publishes it.
+See the "The sspi dependency" section of krabka-protocol's
 [`docs/releasing.md`](https://github.com/krabka-io/krabka-protocol/blob/main/docs/releasing.md).
+
+`krabka-sspi` is temporary. The fork's fixes are being upstreamed, and
+`krabka-sspi` will be deprecated and yanked once an upstream `sspi` release has
+them.
 
 Every crate of this repository reaches `krabka-security` through
 `krabka-client-core`. Until crates.io has `krabka-security`, `cargo publish

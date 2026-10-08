@@ -126,8 +126,9 @@ it from the published manifest.
 
 `cargo publish` ignores `[patch.crates-io]`, so crates.io must already have the
 krabka-protocol crates at the version that the manifests name.
-`krabka-security` is not there yet: it waits on an upstream `sspi` release, and
-every client crate reaches it through `krabka-client-core`. Until it publishes,
+`krabka-security` is not there yet: it waits on `krabka-sspi`, a temporary
+crates.io release of the `sspi` fork, and every client crate reaches it through
+`krabka-client-core`. Until it publishes,
 `cargo publish --dry-run` fails for every crate here, for that reason only.
 
 [`docs/releasing.md`](docs/releasing.md) is the procedure, including that
