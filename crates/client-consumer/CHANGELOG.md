@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.5.1] — 2026-10-08
+
+- First release on crates.io from krabka-io/krabka-client-rs, under the
+  `krabka-*` name. Earlier versions were published as `crabka-*`; those names
+  are being retired.
+
 ## [0.4.0] — 2026-08-12
 
 

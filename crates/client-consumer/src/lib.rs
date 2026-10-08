@@ -70,7 +70,7 @@
 //!
 //! None for now.
 
-#![doc(html_root_url = "https://docs.rs/krabka-client-consumer/0.5.0")]
+#![doc(html_root_url = "https://docs.rs/krabka-client-consumer/0.5.1")]
 
 mod assignment;
 mod assignor;
