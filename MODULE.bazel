@@ -7,7 +7,7 @@ so there is no second dependency set to keep in sync.
 
 module(
     name = "krabka_client_rs",
-    version = "0.5.1",
+    version = "0.6.0",
 )
 
 bazel_dep(name = "rules_rs", version = "0.0.112")

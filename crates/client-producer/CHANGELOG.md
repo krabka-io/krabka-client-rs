@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.1] — 2026-10-08
+## [0.6.0] — 2026-10-08
 
 - First release on crates.io from krabka-io/krabka-client-rs, under the
   `krabka-*` name. Earlier versions were published as `crabka-*`; those names
   are being retired.
+- Moves to the krabka-protocol 0.6 crates. The client crates expose their
+  types in the public API, so this is a breaking release.
 
 ## [0.4.0] — 2026-08-12
 

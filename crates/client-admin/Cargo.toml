@@ -22,10 +22,10 @@ workspace = true
 [dependencies]
 assert2            = { workspace = true }
 krabka-units = { workspace = true }
-krabka-client-core = { version = "0.5.1", path = "../client-core" }
-krabka-ids = { version = "0.5.0" }
-krabka-protocol = { version = "0.5.0", default-features = false }
-krabka-security = { version = "0.5.0" }
+krabka-client-core = { version = "0.6.0", path = "../client-core" }
+krabka-ids = { version = "0.6.0" }
+krabka-protocol = { version = "0.6.0", default-features = false }
+krabka-security = { version = "0.6.0" }
 async-trait        = { workspace = true }
 bytes              = { workspace = true }
 futures-util       = { workspace = true }
