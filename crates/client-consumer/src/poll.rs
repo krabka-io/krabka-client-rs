@@ -2683,7 +2683,7 @@ pub(crate) mod partition_error_tests {
     use std::{
         sync::{
             Arc,
-            atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicUsize, Ordering},
+            atomic::{AtomicU16, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -2705,14 +2705,10 @@ pub(crate) mod partition_error_tests {
         primitives::uuid::Uuid as WireUuid,
     };
     use krabka_units::secs;
-    use tokio::sync::{Mutex, Notify};
-    use tokio_util::sync::CancellationToken;
+    use tokio::sync::Mutex;
 
     use super::*;
-    use crate::{
-        Assignor,
-        consumer::{CommitIdentity, ConsumerRetryPolicy},
-    };
+    use crate::{Assignor, consumer::CommitIdentity};
 
     const TOPIC_ID: WireUuid = WireUuid([7; 16]);
 
@@ -2767,63 +2763,18 @@ pub(crate) mod partition_error_tests {
 
     /// A consumer of `group-a` on `client` that owns `orders-0` at offset 5.
     pub(crate) fn consumer_with_client(client: Client) -> Consumer {
-        Consumer {
-            client,
-            group_id: "group-a".into(),
-            coordinator_id: Arc::new(AtomicI32::new(0)),
-            retry_policy: ConsumerRetryPolicy::default().into(),
-            member_id: tokio::sync::watch::channel("member-a".to_owned()).1,
-            commit_identity: Arc::new(Mutex::new(CommitIdentity {
+        Consumer::test_builder(client)
+            .commit_identity(Arc::new(Mutex::new(CommitIdentity {
                 generation: 1,
                 member_id: "member-a".into(),
                 ownership_ids: HashMap::from([(("orders".into(), 0), 1)]),
                 rejoin_on_poll: false,
-            })),
-            commit_serialization: Arc::new(Mutex::new(())),
-            commit_async_state: Arc::new(AtomicU8::new(0)),
-            commit_async_callbacks: Arc::default(),
-            group_instance_id: None,
-            current_generation: Arc::new(AtomicI32::new(1)),
-            subscription: crate::subscription::shared(vec!["orders".into()], None, true),
-            group_protocol: crate::GroupProtocol::Classic,
-            assigned: Arc::new(Mutex::new(vec![("orders".into(), 0)])),
-            assignment_changed: Arc::new(Notify::new()),
-            next_offsets: Arc::new(Mutex::new(HashMap::from([(("orders".into(), 0), 5)]))),
-            end_offsets: Arc::new(Mutex::new(HashMap::new())),
-            positions: Arc::new(Mutex::new(HashMap::new())),
-            topic_ids: Arc::new(Mutex::new(HashMap::from([("orders".into(), TOPIC_ID)]))),
-            session_timeout: secs(45),
-            heartbeat_interval: secs(3),
-            rebalance_protocol: crate::assignor::RebalanceProtocol::Eager,
-            coordinator_shutdown: CancellationToken::new(),
-            coordinator_handle: None,
-            isolation_level: IsolationLevel::ReadUncommitted,
-            fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
-            fetch_max: DEFAULT_FETCH_MAX,
-            fetch_partition_max: DEFAULT_FETCH_PARTITION_MAX,
-            fetch_max_wait: crate::consumer::DEFAULT_CONSUMER_FETCH_MAX_WAIT,
-            fetches: crate::poll::Fetches::default(),
-            client_rack: None,
-            metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
-            request_timeout: krabka_units::secs(30),
-            wakeup: crate::control::WakeupHandle::default(),
-            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().0,
-            default_api_timeout: crate::consumer::DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
-            paused: std::sync::Mutex::default(),
-            auto_offset_reset: AutoOffsetReset::Latest,
-            poll_error: crate::coordinator::PollErrorSlot::default(),
-            auto_commit: None,
-            poll_signal: crate::coordinator::PollSignal::default(),
-            rebalance_pending: tokio::sync::watch::channel(false).1,
-            max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
-            fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
-            close_operation: tokio::sync::watch::Sender::new(
-                crate::control::CloseRequest::default(),
-            ),
-            rebalance_listener: None,
-            listener_calls: tokio::sync::mpsc::unbounded_channel().1,
-            assigned_callback_pending: Arc::default(),
-        }
+            })))
+            .subscription(crate::subscription::shared(vec!["orders".into()], None, true))
+            .assigned(vec![("orders".into(), 0)])
+            .next_offsets(HashMap::from([(("orders".into(), 0), 5)]))
+            .topic_ids(HashMap::from([("orders".into(), TOPIC_ID)]))
+            .build()
     }
 
     /// A Fetch v13 response row: the topic by id only, one partition with

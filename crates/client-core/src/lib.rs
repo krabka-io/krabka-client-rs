@@ -124,7 +124,7 @@ pub use metadata_topics::{MetadataScope, MetadataTopics, all_topics_request, top
 pub use mock::{MockBroker, MockReply, MockSaslAnswer};
 pub use offset_for_leader_epoch::{EpochEndOffset, offset_for_leader_epoch};
 pub use pool::{BrokerInfo, BrokerPool};
-pub use request::ProtocolRequest;
+pub use request::{ProtocolRequest, TopicNameOffsetCommit};
 pub use sasl::{
     OAuthBearerTokenSource, OutboundSaslError, SaslAuthenticationError, SaslCredentials,
     SaslSession, outbound_sasl,

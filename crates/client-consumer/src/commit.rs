@@ -1579,13 +1579,9 @@ mod tests {
         primitives::uuid::Uuid,
     };
     use krabka_units::secs;
-    use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::{
-        AutoOffsetReset, IsolationLevel, consumer::ConsumerRetryPolicy,
-        coordinator::CoordinatorRetryPolicy,
-    };
+    use crate::coordinator::CoordinatorRetryPolicy;
 
     fn response(errors: &[i16]) -> OffsetCommitResponse {
         OffsetCommitResponse {
@@ -1812,58 +1808,13 @@ mod tests {
             .cloned()
             .map(|partition| (partition, 12))
             .collect();
-        Consumer {
-            client,
-            group_id: "group-a".into(),
-            coordinator_id: Arc::new(AtomicI32::new(0)),
-            retry_policy: ConsumerRetryPolicy::default().into(),
-            member_id: tokio::sync::watch::channel("member-a".to_owned()).1,
-            commit_identity,
-            commit_serialization: Arc::new(Mutex::new(())),
-            commit_async_state: Arc::new(std::sync::atomic::AtomicU8::new(ASYNC_COMMIT_IDLE)),
-            commit_async_callbacks: Arc::default(),
-            group_instance_id: None,
-            current_generation: generation,
-            subscription: crate::subscription::shared(vec!["topic".into()], None, true),
-            group_protocol: crate::GroupProtocol::Classic,
-            assigned: Arc::new(Mutex::new(assigned)),
-            assignment_changed,
-            next_offsets: Arc::new(Mutex::new(next_offsets)),
-            end_offsets: Arc::new(Mutex::new(HashMap::new())),
-            positions: Arc::new(Mutex::new(HashMap::new())),
-            topic_ids: Arc::new(Mutex::new(HashMap::new())),
-            session_timeout: secs(45),
-            heartbeat_interval: secs(3),
-            rebalance_protocol: crate::assignor::RebalanceProtocol::Eager,
-            coordinator_shutdown: CancellationToken::new(),
-            coordinator_handle: None,
-            isolation_level: IsolationLevel::ReadUncommitted,
-            fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
-            fetch_max: crate::poll::DEFAULT_FETCH_MAX,
-            fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
-            fetch_max_wait: crate::consumer::DEFAULT_CONSUMER_FETCH_MAX_WAIT,
-            fetches: crate::poll::Fetches::default(),
-            client_rack: None,
-            metadata_max_age: crate::consumer::DEFAULT_CONSUMER_METADATA_MAX_AGE,
-            request_timeout: krabka_units::secs(30),
-            wakeup: crate::control::WakeupHandle::default(),
-            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().0,
-            default_api_timeout: crate::consumer::DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
-            paused: std::sync::Mutex::default(),
-            auto_offset_reset: AutoOffsetReset::Latest,
-            poll_error: crate::coordinator::PollErrorSlot::default(),
-            auto_commit: None,
-            poll_signal: crate::coordinator::PollSignal::default(),
-            rebalance_pending: tokio::sync::watch::channel(false).1,
-            max_poll_records: crate::consumer::DEFAULT_CONSUMER_MAX_POLL_RECORDS,
-            fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
-            close_operation: tokio::sync::watch::Sender::new(
-                crate::control::CloseRequest::default(),
-            ),
-            rebalance_listener: None,
-            listener_calls: tokio::sync::mpsc::unbounded_channel().1,
-            assigned_callback_pending: Arc::default(),
-        }
+        Consumer::test_builder(client)
+            .commit_identity(commit_identity)
+            .current_generation(generation)
+            .assigned(assigned)
+            .assignment_changed(assignment_changed)
+            .next_offsets(next_offsets)
+            .build()
     }
 
     /// Kafka's `OffsetAndMetadata` rejects a negative offset, and Kafka's

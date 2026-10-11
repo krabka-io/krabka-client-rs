@@ -237,6 +237,34 @@ mod tests {
         }
     }
 
+    fn mock_delete_groups(
+        _broker: usize,
+        api_key: i16,
+        version: i16,
+        body: &[u8],
+        _addr: std::net::SocketAddr,
+    ) -> MockReply {
+        if api_key != delete_groups_request::API_KEY {
+            return MockReply::Silent;
+        }
+        let request: DeleteGroupsRequest = decode_request(body, version, version >= 2);
+        MockReply::Respond(encode_response(
+            &DeleteGroupsResponse {
+                results: request
+                    .groups_names
+                    .into_iter()
+                    .map(|group_id| DeletableGroupResult {
+                        group_id,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            version,
+            version >= 2,
+        ))
+    }
+
     /// A broker at `FindCoordinator` v4 or later gets one lookup for every
     /// group, and a broker below v4 gets one lookup for each group, sent all at
     /// once. Each row compares the version and keys of every lookup, sorted
@@ -269,27 +297,7 @@ mod tests {
                     ),
                 ],
                 |_, _| Lookup::At(0),
-                |_, api_key, version, body, _| {
-                    if api_key != delete_groups_request::API_KEY {
-                        return MockReply::Silent;
-                    }
-                    let request: DeleteGroupsRequest = decode_request(body, version, version >= 2);
-                    MockReply::Respond(encode_response(
-                        &DeleteGroupsResponse {
-                            results: request
-                                .groups_names
-                                .into_iter()
-                                .map(|group_id| DeletableGroupResult {
-                                    group_id,
-                                    ..Default::default()
-                                })
-                                .collect(),
-                            ..Default::default()
-                        },
-                        version,
-                        version >= 2,
-                    ))
-                },
+                mock_delete_groups,
             )
             .await;
             let admin = cluster.admin(krabka_units::secs(5)).await;
@@ -335,27 +343,7 @@ mod tests {
                 ),
             ],
             |_, _| Lookup::At(0),
-            |_, api_key, version, body, _| {
-                if api_key != delete_groups_request::API_KEY {
-                    return MockReply::Silent;
-                }
-                let request: DeleteGroupsRequest = decode_request(body, version, version >= 2);
-                MockReply::Respond(encode_response(
-                    &DeleteGroupsResponse {
-                        results: request
-                            .groups_names
-                            .into_iter()
-                            .map(|group_id| DeletableGroupResult {
-                                group_id,
-                                ..Default::default()
-                            })
-                            .collect(),
-                        ..Default::default()
-                    },
-                    version,
-                    version >= 2,
-                ))
-            },
+            mock_delete_groups,
         )
         .await;
         let admin = cluster.admin(krabka_units::secs(5)).await;

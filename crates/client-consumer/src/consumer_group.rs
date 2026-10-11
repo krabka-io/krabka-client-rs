@@ -1324,27 +1324,127 @@ mod group_protocol_tests {
         }
     }
 
+    enum SubscriptionMode {
+        Topics(Vec<String>),
+        Regex(String),
+        Pattern(crate::TopicPattern),
+    }
+
+    struct TestConsumerBuilder<'a> {
+        mock: &'a MockBroker,
+        subscription: SubscriptionMode,
+        server_assignor: Option<String>,
+    }
+
+    impl<'a> TestConsumerBuilder<'a> {
+        fn new(mock: &'a MockBroker) -> Self {
+            Self {
+                mock,
+                subscription: SubscriptionMode::Topics(vec![TOPIC.to_owned()]),
+                server_assignor: None,
+            }
+        }
+
+        fn subscribe_regex(mut self, regex: impl Into<String>) -> Self {
+            self.subscription = SubscriptionMode::Regex(regex.into());
+            self
+        }
+
+        fn subscribe_pattern(mut self, pattern: crate::TopicPattern) -> Self {
+            self.subscription = SubscriptionMode::Pattern(pattern);
+            self
+        }
+
+        fn group_remote_assignor(mut self, assignor: impl Into<String>) -> Self {
+            self.server_assignor = Some(assignor.into());
+            self
+        }
+
+        async fn build(self) -> Consumer {
+            match self.subscription {
+                SubscriptionMode::Topics(topics) => {
+                    Consumer::builder()
+                        .bootstrap(self.mock.addr.to_string())
+                        .group_id("group-a")
+                        .group_protocol(GroupProtocol::Consumer)
+                        .heartbeat_interval(millis(20))
+                        .request_timeout(secs(5))
+                        .maybe_group_remote_assignor(self.server_assignor)
+                        .subscribe(topics)
+                        .build()
+                        .await
+                        .expect("build")
+                }
+                SubscriptionMode::Regex(regex) => {
+                    Consumer::builder()
+                        .bootstrap(self.mock.addr.to_string())
+                        .group_id("group-a")
+                        .group_protocol(GroupProtocol::Consumer)
+                        .heartbeat_interval(millis(20))
+                        .request_timeout(secs(5))
+                        .maybe_group_remote_assignor(self.server_assignor)
+                        .subscribe_regex(regex)
+                        .build()
+                        .await
+                        .expect("build")
+                }
+                SubscriptionMode::Pattern(pattern) => {
+                    Consumer::builder()
+                        .bootstrap(self.mock.addr.to_string())
+                        .group_id("group-a")
+                        .group_protocol(GroupProtocol::Consumer)
+                        .heartbeat_interval(millis(20))
+                        .request_timeout(secs(5))
+                        .maybe_group_remote_assignor(self.server_assignor)
+                        .subscribe_pattern(pattern)
+                        .build()
+                        .await
+                        .expect("build")
+                }
+            }
+        }
+
+        async fn build_and_assign(self) -> Consumer {
+            let mut consumer = self.build().await;
+            poll_until_assigned(&mut consumer).await;
+            consumer
+        }
+    }
+
+    async fn poll_until_assigned(consumer: &mut Consumer) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
+            let _ = consumer.poll(millis(20)).await;
+        }
+    }
+
+    async fn poll_until_error(consumer: &mut Consumer) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut error = None;
+        while error.is_none() && tokio::time::Instant::now() < deadline {
+            error = consumer
+                .poll(millis(20))
+                .await
+                .err()
+                .map(|error| error.to_string());
+        }
+        error
+    }
+
+    async fn started_consumer_group(mock: &MockBroker) -> Consumer {
+        TestConsumerBuilder::new(mock).build_and_assign().await
+    }
+
     /// The first heartbeat of a member joins with epoch 0 and carries every
     /// field: Kafka's `ConsumerHeartbeatRequestManager.HeartbeatState`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_first_heartbeat_joins_the_group_with_every_field() {
         let recorder = Recorder::default();
         let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
-            .subscribe([TOPIC.to_owned()])
-            .group_protocol(GroupProtocol::Consumer)
+        let consumer = TestConsumerBuilder::new(&mock)
             .group_remote_assignor("uniform")
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
-            .build()
-            .await
-            .expect("build");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
-            let _ = consumer.poll(millis(20)).await;
-        }
+            .build_and_assign()
+            .await;
         consumer.close().await.expect("close");
         mock.stop();
         let first = recorder.heartbeats().first().cloned();
@@ -1377,20 +1477,10 @@ mod group_protocol_tests {
     async fn a_regular_expression_subscription_resolves_its_topics_by_id() {
         let recorder = Recorder::default();
         let mock = heartbeat_coordinator_with(vec![assigns(1, &[0, 1])], &recorder, true).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
+        let consumer = TestConsumerBuilder::new(&mock)
             .subscribe_regex("orders-.*")
-            .group_protocol(GroupProtocol::Consumer)
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
-            .build()
-            .await
-            .expect("build");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
-            let _ = consumer.poll(millis(20)).await;
-        }
+            .build_and_assign()
+            .await;
         let assignment = consumer.assignment().await;
         let subscription = consumer.subscription();
         consumer.close().await.expect("close");
@@ -1421,20 +1511,10 @@ mod group_protocol_tests {
     async fn a_client_side_pattern_sends_the_topics_that_matched() {
         let recorder = Recorder::default();
         let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
+        let consumer = TestConsumerBuilder::new(&mock)
             .subscribe_pattern(crate::TopicPattern::new(|topic| topic.starts_with("ord")))
-            .group_protocol(GroupProtocol::Consumer)
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
-            .build()
-            .await
-            .expect("build");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
-            let _ = consumer.poll(millis(20)).await;
-        }
+            .build_and_assign()
+            .await;
         let assignment = consumer.assignment().await;
         consumer.close().await.expect("close");
         mock.stop();
@@ -1547,25 +1627,8 @@ mod group_protocol_tests {
             } else {
                 classic_only_coordinator().await
             };
-            let mut consumer = Consumer::builder()
-                .bootstrap(mock.addr.to_string())
-                .group_id("group-a")
-                .subscribe([TOPIC.to_owned()])
-                .group_protocol(GroupProtocol::Consumer)
-                .heartbeat_interval(millis(20))
-                .request_timeout(secs(5))
-                .build()
-                .await
-                .expect("build");
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-            let mut error = None;
-            while error.is_none() && tokio::time::Instant::now() < deadline {
-                error = consumer
-                    .poll(millis(20))
-                    .await
-                    .err()
-                    .map(|error| error.to_string());
-            }
+            let mut consumer = TestConsumerBuilder::new(&mock).build().await;
+            let error = poll_until_error(&mut consumer).await;
             consumer.close().await.expect("close");
             mock.stop();
             actual.push((name, error));
@@ -1625,25 +1688,11 @@ mod group_protocol_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_regular_expression_needs_heartbeat_version_1() {
         let mock = coordinator_with_heartbeat_versions(0, 0).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
+        let mut consumer = TestConsumerBuilder::new(&mock)
             .subscribe_regex("orders-.*")
-            .group_protocol(GroupProtocol::Consumer)
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
             .build()
-            .await
-            .expect("build");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut error = None;
-        while error.is_none() && tokio::time::Instant::now() < deadline {
-            error = consumer
-                .poll(millis(20))
-                .await
-                .err()
-                .map(|error| error.to_string());
-        }
+            .await;
+        let error = poll_until_error(&mut consumer).await;
         consumer.close().await.expect("close");
         mock.stop();
         assert2::assert!(
@@ -1662,16 +1711,10 @@ mod group_protocol_tests {
     async fn a_regular_expression_subscription_keeps_fetching_after_a_resubscribe() {
         let recorder = Recorder::default();
         let mock = heartbeat_coordinator_with(vec![assigns(1, &[0, 1])], &recorder, true).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
+        let mut consumer = TestConsumerBuilder::new(&mock)
             .subscribe_regex("orders-.*")
-            .group_protocol(GroupProtocol::Consumer)
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
             .build()
-            .await
-            .expect("build");
+            .await;
         // Poll until the member owns the partitions and their positions are
         // ready, so that the fetch of the next poll would go out.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1714,20 +1757,7 @@ mod group_protocol_tests {
     async fn unsubscribe_leaves_the_group_and_a_new_subscription_joins_again() {
         let recorder = Recorder::default();
         let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
-            .subscribe([TOPIC.to_owned()])
-            .group_protocol(GroupProtocol::Consumer)
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
-            .build()
-            .await
-            .expect("build");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
-            let _ = consumer.poll(millis(20)).await;
-        }
+        let mut consumer = started_consumer_group(&mock).await;
         consumer.unsubscribe().await.expect("unsubscribe");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         while !recorder.epochs().contains(&LEAVE_GROUP_MEMBER_EPOCH)
@@ -1740,10 +1770,7 @@ mod group_protocol_tests {
             .subscribe([TOPIC.to_owned()])
             .await
             .expect("subscribe");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
-            let _ = consumer.poll(millis(20)).await;
-        }
+        poll_until_assigned(&mut consumer).await;
         let joined_again = consumer.assignment().await;
         consumer.close().await.expect("close");
         mock.stop();
@@ -1970,20 +1997,7 @@ mod group_protocol_tests {
         let recorder = Recorder::default();
         let mock =
             heartbeat_coordinator(vec![named(assigns(1, &[0, 1]), "server-id")], &recorder).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
-            .subscribe([TOPIC.to_owned()])
-            .group_protocol(GroupProtocol::Consumer)
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
-            .build()
-            .await
-            .expect("build");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
-            let _ = consumer.poll(millis(20)).await;
-        }
+        let mut consumer = started_consumer_group(&mock).await;
         let member_id = consumer.member_id();
         consumer
             .subscribe([TOPIC.to_owned(), "payments".to_owned()])

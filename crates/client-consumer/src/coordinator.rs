@@ -530,6 +530,15 @@ pub(crate) struct CoordinatorState {
     pub poll_timeout_in_callback: bool,
 }
 
+#[cfg(test)]
+impl CoordinatorState {
+    pub(crate) fn test_builder(
+        client: krabka_client_core::Client,
+    ) -> crate::test_support::CoordinatorStateTestBuilder {
+        crate::test_support::CoordinatorStateTestBuilder::new(client)
+    }
+}
+
 /// Remember the owned partitions as lost before a reset clears them.
 async fn remember_lost_partitions(state: &mut CoordinatorState) {
     let owned = state.assigned.lock().await.clone();
@@ -3493,62 +3502,7 @@ mod retry_tests {
 
     /// A coordinator task state of `group-a` on `client`.
     fn test_state(client: Client) -> CoordinatorState {
-        CoordinatorState {
-            client,
-            group_id: "group-a".into(),
-            coordinator_id: Arc::new(AtomicI32::new(0)),
-            member_id: "member-a".into(),
-            published_member_id: tokio::sync::watch::Sender::new("member-a".to_owned()),
-            commit_identity: Arc::new(Mutex::new(CommitIdentity {
-                generation: 1,
-                member_id: "member-a".into(),
-                ownership_ids: HashMap::new(),
-                rejoin_on_poll: false,
-            })),
-            group_instance_id: None,
-            generation_id: 1,
-            current_generation: Arc::new(AtomicI32::new(1)),
-            assignors: vec![Assignor::Range],
-            rebalance_protocol: RebalanceProtocol::Eager,
-            subscription: crate::subscription::shared(vec!["topic".into()], None, true),
-            subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
-            joined_topics: Vec::new(),
-            seen_unsubscribes: 0,
-            group_protocol: crate::GroupProtocol::Classic,
-            server_assignor: None,
-            member_epoch: 0,
-            sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
-            assigned: Arc::new(Mutex::new(Vec::new())),
-            assignment_changed: Arc::new(Notify::new()),
-            next_ownership_id: 1,
-            next_offsets: Arc::new(Mutex::new(HashMap::new())),
-            end_offsets: Arc::new(Mutex::new(HashMap::new())),
-            positions: Arc::new(Mutex::new(HashMap::new())),
-            topic_ids: Arc::new(Mutex::new(HashMap::new())),
-            session_timeout: secs(45),
-            max_poll_interval: minutes(1),
-            heartbeat_interval: secs(3),
-            subscription_metadata_refresh_interval: millis(37),
-            leave_group_timeout: millis(37),
-            auto_offset_reset: AutoOffsetReset::Latest,
-            client_rack: None,
-            initial_subscribed_counts: HashMap::new(),
-            retry_policy: retry(Duration::from_secs(30)),
-            poll_error: PollErrorSlot::default(),
-            auto_commit: None,
-            commit_serialization: Arc::new(Mutex::new(())),
-            join_prepared: false,
-            polls: PollSignal::default().subscribe(),
-            rebalance_pending: tokio::sync::watch::Sender::new(false),
-            close_operation: tokio::sync::watch::channel(crate::control::CloseRequest::default()).1,
-            rejoin_reason: String::new(),
-            listener_calls: None,
-            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().1,
-            lost_partitions: Vec::new(),
-            assigned_callback_pending: Arc::default(),
-            poll_timer: PollTimer::new(secs(300)),
-            poll_timeout_in_callback: false,
-        }
+        CoordinatorState::test_builder(client).build()
     }
 
     /// A subscription change makes the partition counts of the new topics the
@@ -4317,66 +4271,28 @@ mod retry_tests {
         let orders_0 = (ORDERS.to_string(), 0);
         // The application does not poll during the case.
         let poll_signal = PollSignal::default();
-        let state = CoordinatorState {
-            client,
-            group_id: "group-a".into(),
-            coordinator_id: Arc::new(AtomicI32::new(0)),
-            member_id: "member-a".into(),
-            published_member_id: tokio::sync::watch::Sender::new("member-a".to_owned()),
-            commit_identity: Arc::new(Mutex::new(CommitIdentity {
+        let state = CoordinatorState::test_builder(client)
+            .commit_identity(Arc::new(Mutex::new(CommitIdentity {
                 generation: 1,
                 member_id: "member-a".into(),
                 ownership_ids: HashMap::from([(orders_0.clone(), 1)]),
                 rejoin_on_poll: false,
-            })),
-            group_instance_id: Some("instance-a".into()),
-            generation_id: 1,
-            current_generation: Arc::new(AtomicI32::new(1)),
-            assignors: vec![Assignor::Range],
-            rebalance_protocol: RebalanceProtocol::Eager,
-            subscription: crate::subscription::shared(vec![ORDERS.into()], None, true),
-            subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
-            joined_topics: Vec::new(),
-            seen_unsubscribes: 0,
-            group_protocol: crate::GroupProtocol::Classic,
-            server_assignor: None,
-            member_epoch: 0,
-            sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
-            assigned: Arc::new(Mutex::new(vec![orders_0.clone()])),
-            assignment_changed: Arc::new(Notify::new()),
-            next_ownership_id: 2,
-            next_offsets: Arc::new(Mutex::new(HashMap::from([(orders_0, 5)]))),
-            end_offsets: Arc::new(Mutex::new(HashMap::new())),
-            positions: Arc::new(Mutex::new(HashMap::new())),
-            topic_ids: Arc::new(Mutex::new(HashMap::new())),
-            session_timeout: secs(45),
-            max_poll_interval: minutes(1),
-            heartbeat_interval: millis(20),
-            subscription_metadata_refresh_interval: minutes(10),
-            leave_group_timeout: millis(200),
-            auto_offset_reset: AutoOffsetReset::Latest,
-            client_rack: None,
-            initial_subscribed_counts: HashMap::new(),
-            retry_policy: CoordinatorRetryPolicy {
+            })))
+            .group_instance_id(Some("instance-a".into()))
+            .subscription(crate::subscription::shared(vec![ORDERS.into()], None, true))
+            .assigned(vec![orders_0.clone()])
+            .next_ownership_id(2)
+            .next_offsets(HashMap::from([(orders_0, 5)]))
+            .heartbeat_interval(millis(20))
+            .subscription_metadata_refresh_interval(minutes(10))
+            .leave_group_timeout(millis(200))
+            .retry_policy(CoordinatorRetryPolicy {
                 timeout: Duration::from_secs(1),
                 initial_backoff: Duration::from_millis(1),
                 max_backoff: Duration::from_millis(1),
-            },
-            poll_error: PollErrorSlot::default(),
-            auto_commit: None,
-            commit_serialization: Arc::new(Mutex::new(())),
-            join_prepared: false,
-            polls: poll_signal.subscribe(),
-            rebalance_pending: tokio::sync::watch::Sender::new(false),
-            close_operation: tokio::sync::watch::channel(crate::control::CloseRequest::default()).1,
-            rejoin_reason: String::new(),
-            listener_calls: None,
-            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().1,
-            lost_partitions: Vec::new(),
-            assigned_callback_pending: Arc::default(),
-            poll_timer: PollTimer::new(secs(300)),
-            poll_timeout_in_callback: false,
-        };
+            })
+            .polls(poll_signal.subscribe())
+            .build();
         let poll_error = Arc::clone(&state.poll_error);
         let assigned = Arc::clone(&state.assigned);
         let generation = Arc::clone(&state.current_generation);

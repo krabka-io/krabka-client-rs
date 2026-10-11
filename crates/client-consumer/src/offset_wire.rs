@@ -18,10 +18,7 @@ use bytes::BufMut;
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
     owned::{
-        offset_commit_request::{
-            self, OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
-        },
-        offset_commit_response::OffsetCommitResponse,
+        offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
         offset_fetch_request::{
             self, OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic,
             OffsetFetchRequestTopics,
@@ -347,38 +344,7 @@ pub(crate) fn is_retriable_error(code: i16) -> bool {
 }
 
 /// An `OffsetCommit` request that names its topics, capped at v9.
-///
-/// `OffsetCommit` v10 names each topic by id only. Apache Kafka's classic
-/// `ConsumerCoordinator.sendOffsetCommitRequest` uses
-/// `OffsetCommitRequest.Builder.forTopicNames`, which allows
-/// `ApiKeys.OFFSET_COMMIT.oldestVersion()` to 9. This type gives the same
-/// range to version negotiation. When the coordinator supports only v10 or
-/// higher, the send fails with `ClientError::IncompatibleVersion` before the
-/// request goes out. Kafka's builder fails with `UnsupportedVersionException`
-/// in that case.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TopicNameOffsetCommit(pub(crate) OffsetCommitRequest);
-
-impl Encode for TopicNameOffsetCommit {
-    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
-        self.0.encode(buf, version)
-    }
-
-    fn encoded_len(&self, version: i16) -> usize {
-        self.0.encoded_len(version)
-    }
-}
-
-impl ProtocolRequest for TopicNameOffsetCommit {
-    const API_KEY: i16 = offset_commit_request::API_KEY;
-    const MIN_VERSION: i16 = offset_commit_request::MIN_VERSION;
-    /// The last `OffsetCommit` version that carries topic names.
-    const MAX_VERSION: i16 = 9;
-    /// The cap is a released version, so it is also the stable maximum.
-    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
-    const FLEXIBLE_MIN: i16 = offset_commit_request::FLEXIBLE_MIN;
-    type Response = OffsetCommitResponse;
-}
+pub(crate) use krabka_client_core::TopicNameOffsetCommit;
 
 /// Build the `topics` for an `OffsetCommit`.
 ///
