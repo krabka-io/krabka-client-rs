@@ -4529,6 +4529,7 @@ mod transport_configuration_tests {
         .await;
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
+            .request_timeout(std::time::Duration::from_millis(10))
             .acks(Acks::Zero)
             .enable_idempotence(false)
             .enable_metrics_push(false)
@@ -4570,6 +4571,7 @@ mod transport_configuration_tests {
                 )
             );
         }
+        assert!(producer.client.refresh_metadata().await.is_err());
         coordinator.close();
         producer.close().await.expect("close producer");
         mock.stop();
