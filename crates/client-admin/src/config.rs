@@ -3,10 +3,15 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use krabka_client_core::{
-    ClientDnsTimeout, ConnectionOptions, DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
-    MetadataRecoveryStrategy, security::ClientSecurity,
+    ClientDnsLookup, ClientDnsTimeout, ClientFrameMax, ConnectionDispatchQueueCapacity,
+    ConnectionOptions, DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER, MetadataRecoveryStrategy,
+    security::ClientSecurity,
 };
-use krabka_units::{Time, convert::TimeExt as _, millis, secs};
+use krabka_units::{
+    ByteSize, Time,
+    convert::{ByteSizeExt as _, TimeExt as _},
+    millis, secs,
+};
 
 use crate::{AdminError, retry::RetryPolicy};
 
@@ -69,6 +74,20 @@ pub struct AdminClientConfig {
     pub connections_max_idle: Time,
     /// The DNS lookup deadline of one broker address.
     pub dns_timeout: ClientDnsTimeout,
+    /// Bootstrap DNS address selection policy.
+    pub client_dns_lookup: ClientDnsLookup,
+    /// Initial reconnect delay.
+    pub reconnect_backoff: Time,
+    /// Maximum reconnect delay.
+    pub reconnect_backoff_max: Time,
+    /// Outbound socket send buffer; None selects the OS default.
+    pub send_buffer: Option<ByteSize>,
+    /// Outbound socket receive buffer; None selects the OS default.
+    pub receive_buffer: Option<ByteSize>,
+    /// Capacity of every connection's dispatch queue.
+    pub dispatch_queue_capacity: ConnectionDispatchQueueCapacity,
+    /// Maximum accepted response frame size.
+    pub frame_max: ClientFrameMax,
     /// `security.protocol` and its TLS and SASL settings. `None` is
     /// plaintext.
     pub security: Option<ClientSecurity>,
@@ -97,6 +116,13 @@ impl Default for AdminClientConfig {
             socket_connection_setup_timeout_max: DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX,
             connections_max_idle: DEFAULT_ADMIN_CONNECTIONS_MAX_IDLE,
             dns_timeout: ClientDnsTimeout::default(),
+            client_dns_lookup: ClientDnsLookup::default(),
+            reconnect_backoff: krabka_client_core::DEFAULT_RECONNECT_BACKOFF,
+            reconnect_backoff_max: krabka_client_core::DEFAULT_RECONNECT_BACKOFF_MAX,
+            send_buffer: Some(krabka_client_core::DEFAULT_SEND_BUFFER),
+            receive_buffer: Some(krabka_client_core::DEFAULT_RECEIVE_BUFFER),
+            dispatch_queue_capacity: ConnectionDispatchQueueCapacity::default(),
+            frame_max: ClientFrameMax::default(),
             security: None,
             metadata_recovery_strategy: MetadataRecoveryStrategy::default(),
             metadata_recovery_rebootstrap_trigger: DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
@@ -116,6 +142,42 @@ pub(crate) struct ResolvedAdminConfig {
 }
 
 impl AdminClientConfig {
+    fn validate_transport(&self) -> Result<(), AdminError> {
+        for (name, value) in [
+            ("reconnect_backoff", self.reconnect_backoff),
+            ("reconnect_backoff_max", self.reconnect_backoff_max),
+        ] {
+            if !value.secs_f64().is_finite() || value < Time::ZERO {
+                return Err(AdminError::InvalidConfig(format!(
+                    "{name} must be finite and nonnegative"
+                )));
+            }
+        }
+        if self.reconnect_backoff_max < self.reconnect_backoff {
+            return Err(AdminError::InvalidConfig(
+                "reconnect_backoff_max is below reconnect_backoff".into(),
+            ));
+        }
+        for (name, value) in [
+            ("send_buffer", self.send_buffer),
+            ("receive_buffer", self.receive_buffer),
+        ] {
+            if let Some(value) = value {
+                let bytes = value.bytes_f64();
+                if !bytes.is_finite()
+                    || bytes < 1.0
+                    || bytes.fract() != 0.0
+                    || bytes > f64::from(i32::MAX)
+                {
+                    return Err(AdminError::InvalidConfig(format!(
+                        "{name} must contain positive whole int32 bytes"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Check the settings and derive the connection options and the call
     /// retry policy.
     ///
@@ -135,7 +197,6 @@ impl AdminClientConfig {
                 "socket_connection_setup_timeout_max",
                 self.socket_connection_setup_timeout_max,
             ),
-            ("connections_max_idle", self.connections_max_idle),
         ] {
             if !value.secs_f64().is_finite() || value <= Time::ZERO {
                 return Err(AdminError::InvalidConfig(format!(
@@ -151,6 +212,7 @@ impl AdminClientConfig {
             ));
         }
         for (name, value) in [
+            ("connections_max_idle", self.connections_max_idle),
             ("retry_backoff", self.retry_backoff),
             ("retry_backoff_max", self.retry_backoff_max),
         ] {
@@ -160,22 +222,39 @@ impl AdminClientConfig {
                 )));
             }
         }
+        self.validate_transport()?;
+        if self.socket_connection_setup_timeout_max < self.socket_connection_setup_timeout
+            || self.retry_backoff_max < self.retry_backoff
+        {
+            return Err(AdminError::InvalidConfig(
+                "maximum delay is below initial delay".into(),
+            ));
+        }
         let api_timeout = default_api_timeout(self.request_timeout, self.default_api_timeout)?;
         let client_id = match self.client_id {
             Some(id) if !id.is_empty() => id,
             _ => generate_client_id(),
         };
+        let connection = ConnectionOptions {
+            client_id,
+            dns_timeout: self.dns_timeout,
+            client_dns_lookup: self.client_dns_lookup,
+            reconnect_backoff: self.reconnect_backoff,
+            reconnect_backoff_max: self.reconnect_backoff_max,
+            send_buffer: self.send_buffer,
+            receive_buffer: self.receive_buffer,
+            dispatch_queue_capacity: self.dispatch_queue_capacity,
+            frame_max: self.frame_max,
+            socket_connection_setup_timeout: self.socket_connection_setup_timeout,
+            socket_connection_setup_timeout_max: self.socket_connection_setup_timeout_max,
+            connections_max_idle: self.connections_max_idle,
+            request_timeout: self.request_timeout,
+            security: self.security.map(Box::new),
+            ..ConnectionOptions::default()
+        };
+        connection.validate().map_err(AdminError::InvalidConfig)?;
         Ok(ResolvedAdminConfig {
-            connection: ConnectionOptions {
-                client_id,
-                dns_timeout: self.dns_timeout,
-                socket_connection_setup_timeout: self.socket_connection_setup_timeout,
-                socket_connection_setup_timeout_max: self.socket_connection_setup_timeout_max,
-                connections_max_idle: self.connections_max_idle,
-                request_timeout: self.request_timeout,
-                security: self.security.map(Box::new),
-                ..ConnectionOptions::default()
-            },
+            connection,
             retry: RetryPolicy {
                 timeout: api_timeout.to_std(),
                 initial_backoff: self.retry_backoff.to_std(),
@@ -583,5 +662,56 @@ mod tests {
                 "{name}: {client_ids:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod transport_configuration_tests {
+    use assert2::assert;
+    use krabka_client_core::{ClientDnsLookup, ClientFrameMax, ConnectionDispatchQueueCapacity};
+    use krabka_units::{kibibytes, mebibytes, millis};
+
+    use super::AdminClientConfig;
+
+    #[test]
+    fn admin_resolves_transport_resources_without_losing_retry_policy() {
+        let config = AdminClientConfig {
+            client_dns_lookup: ClientDnsLookup::ResolveCanonicalBootstrapServersOnly,
+            reconnect_backoff: millis(27),
+            reconnect_backoff_max: millis(127),
+            send_buffer: None,
+            receive_buffer: Some(kibibytes(19)),
+            dispatch_queue_capacity: ConnectionDispatchQueueCapacity::new(7).expect("capacity"),
+            frame_max: ClientFrameMax::try_from(mebibytes(2)).expect("frame"),
+            retry_backoff: millis(37),
+            ..Default::default()
+        };
+        let resolved = config.resolve().expect("valid config");
+        let options = resolved.connection;
+        assert!(
+            (
+                options.client_dns_lookup,
+                options.reconnect_backoff,
+                options.reconnect_backoff_max,
+                options.send_buffer,
+                options.receive_buffer,
+                options.dispatch_queue_capacity.get(),
+                options.frame_max.size()
+            ) == (
+                ClientDnsLookup::ResolveCanonicalBootstrapServersOnly,
+                millis(27),
+                millis(127),
+                None,
+                Some(kibibytes(19)),
+                7,
+                mebibytes(2)
+            )
+        );
+        assert!(resolved.retry.initial_backoff == std::time::Duration::from_millis(37));
+        let invalid = AdminClientConfig {
+            reconnect_backoff: millis(2000),
+            ..Default::default()
+        };
+        assert!(invalid.resolve().is_err());
     }
 }

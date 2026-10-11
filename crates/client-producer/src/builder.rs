@@ -1052,6 +1052,34 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
     }
 }
 
+async fn initial_producer_identity(
+    client: &Client,
+    enable_idempotence: bool,
+    retry_policy: ProducerRetryPolicy,
+    first_backoff: Time,
+) -> Result<(i64, i16), ProducerError> {
+    if !enable_idempotence {
+        return Ok(disabled_idempotence_identity());
+    }
+    let init = init_producer_id_with_retry(
+        client,
+        build_init_producer_id_request(),
+        retry_policy.init_retry_timeout().as_time(),
+        first_backoff,
+        retry_policy.retry_backoff_max().as_time(),
+    )
+    .await?;
+    producer_identity_from_init(&init)
+}
+
+fn producer_telemetry(
+    enabled: bool,
+    transactional_id: Option<&str>,
+) -> Option<krabka_client_core::telemetry::ClientTelemetryConfig> {
+    enabled
+        .then(|| krabka_client_core::telemetry::ClientTelemetryConfig::producer(transactional_id))
+}
+
 #[bon::bon]
 impl Producer {
     /// Build a [`Producer`] pointed at the given bootstrap address.
@@ -1127,6 +1155,24 @@ impl Producer {
         #[builder(into)] client_rack: Option<String>,
         #[builder(default = DEFAULT_PRODUCER_PARTITIONER_RACK_AWARE)] partitioner_rack_aware: bool,
         #[builder(default = DEFAULT_CLIENT_DNS_TIMEOUT)] dns_timeout: Time,
+        /// DNS address selection policy for all producer clients.
+        #[builder(default)]
+        client_dns_lookup: krabka_client_core::ClientDnsLookup,
+        /// Initial delay before reconnecting to an unavailable broker.
+        #[builder(default = krabka_client_core::DEFAULT_RECONNECT_BACKOFF)]
+        reconnect_backoff: Time,
+        /// Maximum reconnect delay.
+        #[builder(default = krabka_client_core::DEFAULT_RECONNECT_BACKOFF_MAX)]
+        reconnect_backoff_max: Time,
+        /// Maximum interval without requests before a connection is closed.
+        #[builder(default = krabka_client_core::DEFAULT_CONNECTIONS_MAX_IDLE)]
+        connections_max_idle: Time,
+        /// Initial deadline for opening and negotiating a connection.
+        #[builder(default = krabka_client_core::DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT)]
+        socket_connection_setup_timeout: Time,
+        /// Maximum deadline after repeated connection failures.
+        #[builder(default = krabka_client_core::DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX)]
+        socket_connection_setup_timeout_max: Time,
         #[builder(default = DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
         #[builder(default = DEFAULT_CLIENT_FRAME_MAX)] frame_max: ByteSize,
@@ -1163,11 +1209,7 @@ impl Producer {
         security: Option<krabka_client_core::security::ClientSecurity>,
         #[builder(default = true)] enable_metrics_push: bool,
     ) -> Result<Self, ProducerError> {
-        let telemetry = enable_metrics_push.then(|| {
-            krabka_client_core::telemetry::ClientTelemetryConfig::producer(
-                transactional_id.as_deref(),
-            )
-        });
+        let telemetry = producer_telemetry(enable_metrics_push, transactional_id.as_deref());
         let ResolvedProducerConfig {
             client_id,
             enable_idempotence,
@@ -1226,6 +1268,12 @@ impl Producer {
             .bootstrap(bootstrap)
             .client_id(client_id.clone())
             .dns_timeout(dns_timeout.time())
+            .client_dns_lookup(client_dns_lookup)
+            .reconnect_backoff(reconnect_backoff)
+            .reconnect_backoff_max(reconnect_backoff_max)
+            .connections_max_idle(connections_max_idle)
+            .socket_connection_setup_timeout(socket_connection_setup_timeout)
+            .socket_connection_setup_timeout_max(socket_connection_setup_timeout_max)
             .dispatch_queue_capacity(dispatch_queue_capacity.get())
             .frame_max(frame_max.size())
             .request_timeout(request_timeout)
@@ -1249,19 +1297,9 @@ impl Producer {
         // internal state loads, and a conformant client retries these with
         // backoff rather than surfacing the first error. `init_producer_id`
         // does that retry and returns the final response.
-        let (producer_id, producer_epoch) = if enable_idempotence {
-            let init = init_producer_id_with_retry(
-                &client,
-                build_init_producer_id_request(),
-                retry_policy.init_retry_timeout().as_time(),
-                first_backoff,
-                retry_policy.retry_backoff_max().as_time(),
-            )
-            .await?;
-            producer_identity_from_init(&init)?
-        } else {
-            disabled_idempotence_identity()
-        };
+        let (producer_id, producer_epoch) =
+            initial_producer_identity(&client, enable_idempotence, retry_policy, first_backoff)
+                .await?;
 
         // 3. Spawn the sender. The runtime binds the built-in partitioner to
         //    `partitioner`, so the `partitioner.class` plugin moves aside first.
@@ -1320,6 +1358,15 @@ impl Producer {
             client,
             client_id,
             security,
+            dns_timeout: dns_timeout.time(),
+            metadata_recovery_strategy,
+            metadata_recovery_rebootstrap_trigger,
+            client_dns_lookup,
+            reconnect_backoff,
+            reconnect_backoff_max,
+            connections_max_idle,
+            socket_connection_setup_timeout,
+            socket_connection_setup_timeout_max,
             dispatch_queue_capacity,
             frame_max,
             socket_buffers: SocketBuffers {

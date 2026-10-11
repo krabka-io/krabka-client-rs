@@ -76,6 +76,24 @@ client.close();
 
 - `mock` - exposes `MockBroker` support for downstream tests.
 
+## Transport policy
+
+`Client::builder` accepts DNS and request deadlines, socket setup timeout/max,
+reconnect backoff/max, idle lifetime, DNS selection, socket buffers, dispatch
+capacity, and frame limit. Direct `Connection` callers configure the same values
+in `ConnectionOptions`; `validate()` checks them before I/O.
+
+Request and setup deadlines must be positive and representable. Reconnect delays
+and idle lifetime may be zero; maximum setup/reconnect values must cover their
+initial values. Zero idle lifetime disables eviction. Socket buffers accept
+positive whole bytes that fit `i32`, or `None` for OS defaults. Invalid settings
+return `ClientError::InvalidConfig` before bootstrap or stream negotiation.
+
+Defaults remain DNS 10s, request 30s, setup 10s/max 30s, reconnect 50ms/max 1s,
+idle 9min, send 128KiB/receive 64KiB, dispatch64, and frame100MiB. Higher-level
+clients may retain different role defaults, such as the admin five-minute idle
+lifetime and producer 32KiB receive buffer.
+
 ## Documentation
 
 - [API documentation](https://docs.rs/krabka-client-core)

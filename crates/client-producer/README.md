@@ -93,6 +93,21 @@ producer.close().await?;
 # }
 ```
 
+## Transport policy
+
+The producer builder exposes `client_dns_lookup`, `reconnect_backoff`,
+`reconnect_backoff_max`, `connections_max_idle`,
+`socket_connection_setup_timeout`, and `socket_connection_setup_timeout_max`.
+It also accepts DNS and request deadlines and optional socket buffers. The same
+settings and metadata recovery policy are retained for transaction and group
+coordinator clients.
+
+Defaults remain DNS 10s, setup 10s/max 30s, reconnect 50ms/max 1s, idle 9min,
+send 128KiB, and receive 32KiB. Socket buffers set to `None` use OS defaults.
+Zero idle lifetime disables eviction. Invalid or unrepresentable timing and
+socket budgets fail configuration before I/O; setup/reconnect maximum values
+must cover their initial values.
+
 ## Documentation
 
 - [API documentation](https://docs.rs/krabka-client-producer)

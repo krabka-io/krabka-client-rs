@@ -83,6 +83,24 @@ consumer.close().await?;
 # }
 ```
 
+## Transport and startup policy
+
+The consumer builder exposes `dns_timeout`, `send_buffer`, and `receive_buffer`,
+with defaults 10s, 128KiB, and 64KiB. `None` for a buffer selects the OS default.
+These overrides apply to topic-pattern resolution, the main client, and the
+coordinator client. Existing request, DNS selection, reconnect, setup, idle,
+frame, dispatch, and metadata recovery settings follow the same paths.
+
+Use `retry_policy(ConsumerRetryPolicy)` to control internal startup attempts,
+the total startup deadline, startup backoff, and coordinator retries. Defaults
+remain 90s per attempt, five minutes total startup, startup backoff 500ms/max 1s,
+and coordinator retry 30s with 100ms/max 1s backoff. The total startup deadline now
+bounds all attempts and sleeps; a last attempt receives only the remaining time.
+Startup cancellation before completion does not leave a coordinator task running.
+
+Transport settings are validated before I/O. Zero idle lifetime disables eviction;
+setup/reconnect maximum values must cover their initial values.
+
 ## Documentation
 
 - [API documentation](https://docs.rs/krabka-client-consumer)

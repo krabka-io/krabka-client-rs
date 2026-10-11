@@ -258,6 +258,76 @@ pub struct ConnectionOptions {
     pub network_metrics: Option<crate::telemetry::NetworkMetrics>,
 }
 
+impl ConnectionOptions {
+    /// Validate transport budgets before converting durations or opening sockets.
+    ///
+    /// # Errors
+    /// Rejects nonfinite, unrepresentable or invalid durations, inverted retry
+    /// bounds, and nonpositive or fractional socket buffer sizes.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value, allow_zero) in [
+            ("request_timeout", self.request_timeout, false),
+            (
+                "socket_connection_setup_timeout",
+                self.socket_connection_setup_timeout,
+                false,
+            ),
+            (
+                "socket_connection_setup_timeout_max",
+                self.socket_connection_setup_timeout_max,
+                false,
+            ),
+            ("reconnect_backoff", self.reconnect_backoff, true),
+            ("reconnect_backoff_max", self.reconnect_backoff_max, true),
+            ("connections_max_idle", self.connections_max_idle, true),
+        ] {
+            let seconds = value.secs_f64();
+            let duration = std::time::Duration::try_from_secs_f64(seconds);
+            if !seconds.is_finite()
+                || seconds < 0.0
+                || duration.as_ref().is_err()
+                || (!allow_zero && duration.as_ref().is_ok_and(std::time::Duration::is_zero))
+                || duration.as_ref().is_ok_and(|duration| {
+                    std::time::Instant::now().checked_add(*duration).is_none()
+                })
+            {
+                return Err(format!(
+                    "{name} must be {} and representable as a transport deadline",
+                    if allow_zero {
+                        "nonnegative"
+                    } else {
+                        "positive"
+                    }
+                ));
+            }
+        }
+        if self.socket_connection_setup_timeout_max < self.socket_connection_setup_timeout {
+            return Err("socket_connection_setup_timeout_max must not be below socket_connection_setup_timeout".into());
+        }
+        if self.reconnect_backoff_max < self.reconnect_backoff {
+            return Err("reconnect_backoff_max must not be below reconnect_backoff".into());
+        }
+        for (name, value) in [
+            ("send_buffer", self.send_buffer),
+            ("receive_buffer", self.receive_buffer),
+        ] {
+            if let Some(value) = value {
+                let bytes = value.bytes_f64();
+                if !bytes.is_finite()
+                    || bytes < 1.0
+                    || bytes > f64::from(i32::MAX)
+                    || bytes.fract().abs() > f64::EPSILON
+                {
+                    return Err(format!(
+                        "{name} must contain positive whole bytes fitting i32"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for ConnectionOptions {
     fn default() -> Self {
         Self {
@@ -396,6 +466,7 @@ async fn within_setup_timeout<T>(
     options: &ConnectionOptions,
     setup: impl Future<Output = Result<T, ClientError>>,
 ) -> Result<T, ClientError> {
+    options.validate().map_err(ClientError::InvalidConfig)?;
     tokio::time::timeout(options.socket_connection_setup_timeout.to_std(), setup)
         .await
         .map_err(|_| ClientError::Timeout(options.socket_connection_setup_timeout))?
@@ -567,6 +638,7 @@ impl Connection {
         options: ConnectionOptions,
         reauth: Option<crate::reauth::Reauth>,
     ) -> Result<Self, ClientError> {
+        options.validate().map_err(ClientError::InvalidConfig)?;
         let (writer_tx, writer_rx) =
             mpsc::channel::<DispatchItem>(options.dispatch_queue_capacity.get());
         let shutdown = CancellationToken::new();
@@ -1150,7 +1222,7 @@ async fn write_loop<W>(
                 }
                 activity.touch();
             }
-            () = tokio::time::sleep_until(idle_deadline) => {
+            () = tokio::time::sleep_until(idle_deadline), if !max_idle.is_zero() => {
                 let idle = activity.last() + max_idle <= tokio::time::Instant::now();
                 if idle && pending.is_empty() && writer_rx.is_empty() {
                     tracing::debug!(
@@ -1343,6 +1415,7 @@ mod tests {
     use krabka_units::{ByteSize, bytes, kibibytes, mebibytes, micros, millis};
 
     use super::*;
+    use crate::Client;
 
     #[test]
     fn client_dns_timeout_validates_and_preserves_milliseconds() {
@@ -1388,6 +1461,121 @@ mod tests {
         assert!(ConnectionDispatchQueueCapacity::default().get() == 64);
         assert!(ClientFrameMax::default().size() == mebibytes(100));
         assert!(MAX_CLIENT_FRAME_BYTES == mebibytes(100));
+    }
+
+    #[test]
+    fn transport_options_validate_duration_and_socket_boundaries() {
+        let setters: [fn(&mut ConnectionOptions, Time); 6] = [
+            |options, value| options.request_timeout = value,
+            |options, value| options.socket_connection_setup_timeout = value,
+            |options, value| options.socket_connection_setup_timeout_max = value,
+            |options, value| options.reconnect_backoff = value,
+            |options, value| options.reconnect_backoff_max = value,
+            |options, value| options.connections_max_idle = value,
+        ];
+        for set in setters {
+            for value in [
+                Time::from_secs_f64(-1.0),
+                Time::from_secs_f64(f64::NAN),
+                Time::from_secs_f64(f64::INFINITY),
+                Time::from_secs_f64(f64::MAX),
+            ] {
+                let mut options = ConnectionOptions::default();
+                set(&mut options, value);
+                assert!(options.validate().is_err());
+            }
+        }
+        for value in [
+            ByteSize::ZERO,
+            ByteSize::from_bytes_f64(-1.0),
+            ByteSize::from_bytes_f64(0.5),
+            ByteSize::from_bytes_f64(f64::NAN),
+            ByteSize::from_bytes_f64(f64::INFINITY),
+            ByteSize::from_bytes_f64(f64::from(i32::MAX) + 1.0),
+        ] {
+            assert!(
+                (ConnectionOptions {
+                    send_buffer: Some(value),
+                    ..Default::default()
+                })
+                .validate()
+                .is_err()
+            );
+            assert!(
+                (ConnectionOptions {
+                    receive_buffer: Some(value),
+                    ..Default::default()
+                })
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            (ConnectionOptions {
+                request_timeout: Time::ZERO,
+                ..Default::default()
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            (ConnectionOptions {
+                socket_connection_setup_timeout: Time::ZERO,
+                ..Default::default()
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            (ConnectionOptions {
+                socket_connection_setup_timeout: secs(31),
+                ..Default::default()
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            (ConnectionOptions {
+                reconnect_backoff: secs(2),
+                ..Default::default()
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            (ConnectionOptions {
+                reconnect_backoff: Time::ZERO,
+                reconnect_backoff_max: Time::ZERO,
+                connections_max_idle: Time::ZERO,
+                send_buffer: None,
+                receive_buffer: Some(bytes(1)),
+                request_timeout: millis(1),
+                socket_connection_setup_timeout: millis(1),
+                socket_connection_setup_timeout_max: millis(1),
+                ..Default::default()
+            })
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_options_fail_before_connect_or_stream_negotiation() {
+        let options = ConnectionOptions {
+            request_timeout: Time::from_secs_f64(f64::NAN),
+            ..Default::default()
+        };
+        let result = Connection::connect("127.0.0.1:1".parse().unwrap(), options.clone()).await;
+        assert!(matches!(result, Err(ClientError::InvalidConfig(_))));
+        let result = Client::builder()
+            .bootstrap("invalid-bootstrap")
+            .request_timeout(Time::from_secs_f64(f64::NAN))
+            .build()
+            .await;
+        assert!(matches!(result, Err(ClientError::InvalidConfig(_))));
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let result = Connection::from_stream(Box::new(stream), options).await;
+        assert!(matches!(result, Err(ClientError::InvalidConfig(_))));
     }
 
     #[test]
@@ -1833,6 +2021,18 @@ mod connection_policy_tests {
                 waiter.abort();
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_idle_budget_disables_eviction_instead_of_closing_immediately() {
+        let (connection, _server) = connection(ConnectionOptions {
+            connections_max_idle: Time::ZERO,
+            ..ConnectionOptions::default()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_hours(24)).await;
+        check!(!connection.is_closed());
+        connection.close();
     }
 
     /// Kafka's `NetworkClient.handleTimedOutRequests` closes the connection

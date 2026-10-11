@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Expose DNS selection, reconnect backoff/max, idle lifetime, and socket setup
+  timeout/max on the producer builder. Retain these settings, DNS/socket budgets,
+  request timeout, and metadata recovery policy in transaction and group coordinator clients.
+  Existing producer socket defaults remain 128KiB send and 32KiB receive.
+
 ## [0.6.0] — 2026-10-08
 
 - First release on crates.io from krabka-io/krabka-client-rs, under the

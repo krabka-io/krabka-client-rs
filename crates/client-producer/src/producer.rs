@@ -440,6 +440,16 @@ pub struct Producer {
     /// unauthenticated, a secured listener would drop them, and the
     /// transactional flow would fail with `Client(Disconnected)`.
     pub(crate) security: Option<ClientSecurity>,
+    pub(crate) dns_timeout: Time,
+    pub(crate) metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
+    pub(crate) metadata_recovery_rebootstrap_trigger:
+        krabka_client_core::MetadataRecoveryRebootstrapTrigger,
+    pub(crate) client_dns_lookup: krabka_client_core::ClientDnsLookup,
+    pub(crate) reconnect_backoff: Time,
+    pub(crate) reconnect_backoff_max: Time,
+    pub(crate) connections_max_idle: Time,
+    pub(crate) socket_connection_setup_timeout: Time,
+    pub(crate) socket_connection_setup_timeout_max: Time,
     pub(crate) dispatch_queue_capacity: ConnectionDispatchQueueCapacity,
     pub(crate) frame_max: ClientFrameMax,
     /// The socket buffers of every connection, so that the coordinator
@@ -1226,6 +1236,17 @@ impl Producer {
             .bootstrap(address)
             .client_id(self.client_id.clone())
             .maybe_security(self.security.clone())
+            .dns_timeout(self.dns_timeout)
+            .metadata_recovery_strategy(self.metadata_recovery_strategy)
+            .metadata_recovery_rebootstrap_trigger(
+                self.metadata_recovery_rebootstrap_trigger.time(),
+            )
+            .client_dns_lookup(self.client_dns_lookup)
+            .reconnect_backoff(self.reconnect_backoff)
+            .reconnect_backoff_max(self.reconnect_backoff_max)
+            .connections_max_idle(self.connections_max_idle)
+            .socket_connection_setup_timeout(self.socket_connection_setup_timeout)
+            .socket_connection_setup_timeout_max(self.socket_connection_setup_timeout_max)
             .dispatch_queue_capacity(self.dispatch_queue_capacity.get())
             .frame_max(self.frame_max.size())
             .send_buffer(self.socket_buffers.send)
@@ -1877,8 +1898,20 @@ impl Producer {
             .bootstrap(group_addr)
             .client_id(self.client_id.clone())
             .maybe_security(self.security.clone())
+            .dns_timeout(self.dns_timeout)
+            .metadata_recovery_strategy(self.metadata_recovery_strategy)
+            .metadata_recovery_rebootstrap_trigger(
+                self.metadata_recovery_rebootstrap_trigger.time(),
+            )
+            .client_dns_lookup(self.client_dns_lookup)
+            .reconnect_backoff(self.reconnect_backoff)
+            .reconnect_backoff_max(self.reconnect_backoff_max)
+            .connections_max_idle(self.connections_max_idle)
+            .socket_connection_setup_timeout(self.socket_connection_setup_timeout)
+            .socket_connection_setup_timeout_max(self.socket_connection_setup_timeout_max)
             .dispatch_queue_capacity(self.dispatch_queue_capacity.get())
             .frame_max(self.frame_max.size())
+            .request_timeout(self.request_timeout)
             .send_buffer(self.socket_buffers.send)
             .receive_buffer(self.socket_buffers.receive)
             .build()
@@ -4465,5 +4498,80 @@ mod tests {
             expected_rows.push((name, expected));
         }
         assert2::assert!(actual_rows == expected_rows);
+    }
+}
+
+#[cfg(test)]
+mod transport_configuration_tests {
+    use assert2::assert;
+    use bytes::BytesMut;
+    use krabka_client_core::{ClientDnsLookup, MockBroker};
+    use krabka_protocol::{
+        Encode,
+        owned::{api_versions_request, api_versions_response::ApiVersionsResponse},
+    };
+    use krabka_units::{millis, secs};
+
+    use super::{Acks, Producer};
+
+    #[tokio::test]
+    async fn producer_retains_transport_overrides_in_primary_and_coordinator_clients() {
+        let mock = MockBroker::start(|api, _, _, _| {
+            if api != api_versions_request::API_KEY {
+                return None;
+            }
+            let mut body = BytesMut::new();
+            ApiVersionsResponse::default()
+                .encode(&mut body, 0)
+                .expect("encode ApiVersions");
+            Some(body.to_vec())
+        })
+        .await;
+        let producer = Producer::builder()
+            .bootstrap(mock.addr.to_string())
+            .acks(Acks::Zero)
+            .enable_idempotence(false)
+            .enable_metrics_push(false)
+            .dns_timeout(millis(95))
+            .client_dns_lookup(ClientDnsLookup::UseAllDnsIps)
+            .reconnect_backoff(millis(37))
+            .reconnect_backoff_max(millis(137))
+            .connections_max_idle(secs(67))
+            .socket_connection_setup_timeout(secs(17))
+            .socket_connection_setup_timeout_max(secs(27))
+            .build()
+            .await
+            .expect("producer");
+        let coordinator = producer
+            .connect_txn_coordinator(mock.addr.to_string())
+            .await
+            .expect("coordinator");
+        for options in [
+            producer.client.connection_options(),
+            coordinator.connection_options(),
+        ] {
+            assert!(
+                (
+                    options.dns_timeout.time(),
+                    options.client_dns_lookup,
+                    options.reconnect_backoff,
+                    options.reconnect_backoff_max,
+                    options.connections_max_idle,
+                    options.socket_connection_setup_timeout,
+                    options.socket_connection_setup_timeout_max
+                ) == (
+                    millis(95),
+                    ClientDnsLookup::UseAllDnsIps,
+                    millis(37),
+                    millis(137),
+                    secs(67),
+                    secs(17),
+                    secs(27)
+                )
+            );
+        }
+        coordinator.close();
+        producer.close().await.expect("close producer");
+        mock.stop();
     }
 }
