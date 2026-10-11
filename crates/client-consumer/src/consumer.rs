@@ -6939,6 +6939,7 @@ mod transport_configuration_tests {
         .await;
         let consumer = Consumer::builder()
             .bootstrap(mock.addr.to_string())
+            .request_timeout(millis(10))
             .dns_timeout(millis(95))
             .send_buffer(None)
             .receive_buffer(Some(kibibytes(19)))
@@ -6954,6 +6955,7 @@ mod transport_configuration_tests {
                 options.receive_buffer
             ) == (millis(95), None, Some(kibibytes(19)))
         );
+        assert!(consumer.client.refresh_metadata().await.is_err());
         consumer.close().await.expect("close consumer");
         mock.stop();
     }

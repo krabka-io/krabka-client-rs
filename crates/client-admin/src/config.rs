@@ -669,7 +669,10 @@ mod tests {
 mod transport_configuration_tests {
     use assert2::assert;
     use krabka_client_core::{ClientDnsLookup, ClientFrameMax, ConnectionDispatchQueueCapacity};
-    use krabka_units::{kibibytes, mebibytes, millis};
+    use krabka_units::{
+        convert::{ByteSizeExt as _, TimeExt as _},
+        kibibytes, mebibytes, millis,
+    };
 
     use super::AdminClientConfig;
 
@@ -713,5 +716,26 @@ mod transport_configuration_tests {
             ..Default::default()
         };
         assert!(invalid.resolve().is_err());
+    }
+
+    #[test]
+    fn admin_rejects_invalid_transport_bounds_and_socket_sizes() {
+        let invalid_backoff = AdminClientConfig {
+            reconnect_backoff: krabka_units::Time::from_secs_f64(f64::NAN),
+            ..Default::default()
+        };
+        assert!(invalid_backoff.resolve().is_err());
+
+        let fractional_socket_buffer = AdminClientConfig {
+            send_buffer: Some(krabka_units::ByteSize::from_bytes_f64(0.5)),
+            ..Default::default()
+        };
+        assert!(fractional_socket_buffer.resolve().is_err());
+
+        let inverted_setup_bounds = AdminClientConfig {
+            socket_connection_setup_timeout_max: krabka_units::millis(1),
+            ..Default::default()
+        };
+        assert!(inverted_setup_bounds.resolve().is_err());
     }
 }
