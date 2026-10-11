@@ -217,6 +217,7 @@ impl Client {
             // `start_with_options` sets it for a client that pushes metrics.
             network_metrics: None,
         };
+        options.validate().map_err(ClientError::InvalidConfig)?;
         Self::start_with_options(
             bootstrap,
             options,

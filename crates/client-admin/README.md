@@ -83,6 +83,20 @@ println!("topics: {:?}", metadata.topics);
 # }
 ```
 
+## Transport policy
+
+`AdminClientConfig` exposes `client_dns_lookup`, `reconnect_backoff`,
+`reconnect_backoff_max`, `send_buffer`, `receive_buffer`,
+`dispatch_queue_capacity`, and `frame_max`. Use `connect_with_config` to combine
+these settings with DNS/setup/request deadlines, API retries, metadata recovery,
+and client metrics policy.
+
+Defaults remain DNS 10s, setup 10s/max 30s, reconnect 50ms/max 1s,
+send 128KiB/receive 64KiB, dispatch64, and frame100MiB. The admin idle lifetime
+remains five minutes; setting it to zero disables eviction. `None` socket buffers
+use OS defaults. Transport policy is validated before I/O, including coherent
+setup/reconnect maximum bounds and positive representable request/setup deadlines.
+
 ## Documentation
 
 - [API documentation](https://docs.rs/krabka-client-admin)

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `ConnectionOptions::validate` and validate transport policy before socket I/O,
+  stream negotiation, or client bootstrap. Invalid or unrepresentable durations,
+  inverted setup/reconnect bounds, and invalid socket buffers return configuration errors.
+- Make `connections_max_idle = 0` disable idle eviction. Positive idle budgets retain
+  their existing behavior; socket buffers set to `None` retain OS defaults.
+
 ## [0.6.0] — 2026-10-08
 
 - First release on crates.io from krabka-io/krabka-client-rs, under the

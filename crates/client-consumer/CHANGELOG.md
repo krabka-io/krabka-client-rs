@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Expose DNS lookup timeout and socket send/receive buffers on the consumer builder.
+  Apply overrides to subscription resolution, main connections, and coordinator clients.
+  Defaults remain 10s DNS timeout, 128KiB send buffer, and 64KiB receive buffer.
+- Enforce the total `ConsumerRetryPolicy` startup deadline across attempts and retry
+  sleeps. Each attempt and sleep is limited to the remaining budget; timed-out startup
+  does not leave an orphan coordinator task.
+
 ## [0.6.0] — 2026-10-08
 
 - First release on crates.io from krabka-io/krabka-client-rs, under the

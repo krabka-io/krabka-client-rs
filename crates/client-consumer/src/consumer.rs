@@ -216,6 +216,9 @@ struct StartConfig {
     metadata_max_age: Time,
     default_api_timeout: Time,
     request_timeout: Time,
+    dns_timeout: Time,
+    send_buffer: Option<ByteSize>,
+    receive_buffer: Option<ByteSize>,
     dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity,
     frame_max: krabka_client_core::ClientFrameMax,
     metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
@@ -738,6 +741,9 @@ async fn pattern_topics(config: &StartConfig) -> Result<Vec<String>, ConsumerErr
         .bootstrap(&config.bootstrap)
         .client_id(config.client_id.clone())
         .request_timeout(config.request_timeout)
+        .dns_timeout(config.dns_timeout)
+        .send_buffer(config.send_buffer)
+        .receive_buffer(config.receive_buffer)
         .dispatch_queue_capacity(config.dispatch_queue_capacity.get())
         .frame_max(config.frame_max.size())
         .metadata_recovery_strategy(config.metadata_recovery_strategy)
@@ -1108,6 +1114,15 @@ impl Consumer {
         #[builder(default = DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT)]
         default_api_timeout: Time,
         #[builder(default = secs(30))] request_timeout: Time,
+        /// Deadline for DNS lookup during client bootstrap.
+        #[builder(default = krabka_client_core::DEFAULT_CLIENT_DNS_TIMEOUT)]
+        dns_timeout: Time,
+        /// Outbound socket send buffer. `None` selects the operating system default.
+        #[builder(required, default = Some(krabka_client_core::DEFAULT_SEND_BUFFER))]
+        send_buffer: Option<ByteSize>,
+        /// Outbound socket receive buffer. `None` selects the operating system default.
+        #[builder(required, default = Some(krabka_client_core::DEFAULT_RECEIVE_BUFFER))]
+        receive_buffer: Option<ByteSize>,
         #[builder(default = krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)]
         dispatch_queue_capacity: usize,
         #[builder(default = krabka_client_core::DEFAULT_CLIENT_FRAME_MAX)] frame_max: ByteSize,
@@ -1216,6 +1231,8 @@ impl Consumer {
                 "group_instance_id must not be empty".into(),
             ));
         }
+        krabka_client_core::ClientDnsTimeout::new(dns_timeout)
+            .map_err(ConsumerError::InvalidConfig)?;
         let fetch_min = FetchMinBytes::try_from(fetch_min)
             .map_err(ConsumerError::InvalidConfig)?
             .size();
@@ -1318,6 +1335,9 @@ impl Consumer {
             metadata_max_age,
             default_api_timeout,
             request_timeout,
+            dns_timeout,
+            send_buffer,
+            receive_buffer,
             dispatch_queue_capacity,
             frame_max,
             metadata_recovery_strategy,
@@ -1349,10 +1369,23 @@ impl Consumer {
         rebalance_listener: Option<Box<dyn crate::ConsumerRebalanceListener>>,
     ) -> Result<Self, ConsumerError> {
         let started = tokio::time::Instant::now();
+        let total = config.retry_policy.startup_deadline().to_std();
         let mut backoff = config.retry_policy.startup_initial_backoff().to_std();
         loop {
+            let remaining = total.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(ConsumerError::Client(
+                    krabka_client_core::ClientError::Timeout(
+                        config.retry_policy.startup_deadline(),
+                    ),
+                ));
+            }
             match tokio::time::timeout(
-                config.retry_policy.startup_attempt_timeout().to_std(),
+                config
+                    .retry_policy
+                    .startup_attempt_timeout()
+                    .to_std()
+                    .min(remaining),
                 Box::pin(Self::start_once(config.clone())),
             )
             .await
@@ -1379,7 +1412,7 @@ impl Consumer {
                     if started.elapsed().as_time() >= config.retry_policy.startup_deadline() {
                         return Err(ConsumerError::Client(
                             krabka_client_core::ClientError::Timeout(
-                                config.retry_policy.startup_attempt_timeout(),
+                                config.retry_policy.startup_deadline(),
                             ),
                         ));
                     }
@@ -1392,11 +1425,10 @@ impl Consumer {
                     );
                 }
             }
-            tokio::time::sleep(backoff).await;
-            backoff = std::cmp::min(
-                backoff * 2,
-                config.retry_policy.startup_max_backoff().to_std(),
-            );
+            tokio::time::sleep(backoff.min(total.saturating_sub(started.elapsed()))).await;
+            backoff = backoff
+                .saturating_mul(2)
+                .min(config.retry_policy.startup_max_backoff().to_std());
         }
     }
 
@@ -1450,6 +1482,9 @@ impl Consumer {
             group_instance_id,
             assignors,
             request_timeout,
+            dns_timeout,
+            send_buffer,
+            receive_buffer,
             dispatch_queue_capacity,
             frame_max,
             metadata_recovery_strategy,
@@ -1469,6 +1504,9 @@ impl Consumer {
             .bootstrap(&bootstrap)
             .client_id(client_id.clone())
             .request_timeout(request_timeout)
+            .dns_timeout(dns_timeout)
+            .send_buffer(send_buffer)
+            .receive_buffer(receive_buffer)
             .dispatch_queue_capacity(dispatch_queue_capacity.get())
             .frame_max(frame_max.size())
             .metadata_recovery_strategy(metadata_recovery_strategy)
@@ -1809,6 +1847,9 @@ async fn start_without_subscription(config: StartConfig) -> Result<Consumer, Con
         .bootstrap(&config.bootstrap)
         .client_id(config.client_id.clone())
         .request_timeout(config.request_timeout)
+        .dns_timeout(config.dns_timeout)
+        .send_buffer(config.send_buffer)
+        .receive_buffer(config.receive_buffer)
         .dispatch_queue_capacity(config.dispatch_queue_capacity.get())
         .frame_max(config.frame_max.size())
         .metadata_recovery_strategy(config.metadata_recovery_strategy)
@@ -1878,6 +1919,9 @@ async fn coordinator_task_client(
         .bootstrap(&config.bootstrap)
         .client_id(config.client_id.clone())
         .request_timeout(config.request_timeout)
+        .dns_timeout(config.dns_timeout)
+        .send_buffer(config.send_buffer)
+        .receive_buffer(config.receive_buffer)
         .dispatch_queue_capacity(config.dispatch_queue_capacity.get())
         .frame_max(config.frame_max.size())
         .metadata_recovery_strategy(config.metadata_recovery_strategy)
@@ -4192,6 +4236,9 @@ mod auto_commit_tests {
             metadata_max_age: DEFAULT_CONSUMER_METADATA_MAX_AGE,
             default_api_timeout: DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
             request_timeout: secs(30),
+            dns_timeout: krabka_client_core::DEFAULT_CLIENT_DNS_TIMEOUT,
+            send_buffer: Some(krabka_client_core::DEFAULT_SEND_BUFFER),
+            receive_buffer: Some(krabka_client_core::DEFAULT_RECEIVE_BUFFER),
             dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::new(
                 krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY,
             )
@@ -6861,5 +6908,100 @@ mod rebalance_listener_tests {
             wanted.push((name, expected));
         }
         assert2::assert!(actual == wanted);
+    }
+}
+
+#[cfg(test)]
+mod transport_configuration_tests {
+    use assert2::assert;
+    use bytes::BytesMut;
+    use krabka_client_core::MockBroker;
+    use krabka_protocol::{
+        Encode,
+        owned::{api_versions_request, api_versions_response::ApiVersionsResponse},
+    };
+    use krabka_units::{kibibytes, millis};
+
+    use super::Consumer;
+
+    #[tokio::test]
+    async fn consumer_retains_dns_and_socket_overrides_in_its_client() {
+        let mock = MockBroker::start(|api, _, _, _| {
+            if api != api_versions_request::API_KEY {
+                return None;
+            }
+            let mut body = BytesMut::new();
+            ApiVersionsResponse::default()
+                .encode(&mut body, 0)
+                .expect("encode ApiVersions");
+            Some(body.to_vec())
+        })
+        .await;
+        let consumer = Consumer::builder()
+            .bootstrap(mock.addr.to_string())
+            .dns_timeout(millis(95))
+            .send_buffer(None)
+            .receive_buffer(Some(kibibytes(19)))
+            .enable_metrics_push(false)
+            .build()
+            .await
+            .expect("build consumer");
+        let options = consumer.client.connection_options();
+        assert!(
+            (
+                options.dns_timeout.time(),
+                options.send_buffer,
+                options.receive_buffer
+            ) == (millis(95), None, Some(kibibytes(19)))
+        );
+        consumer.close().await.expect("close consumer");
+        mock.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consumer_total_startup_deadline_bounds_attempts_and_retry_sleeps() {
+        use krabka_units::{convert::TimeExt as _, secs};
+
+        use super::ConsumerRetryPolicy;
+        for backoff in [millis(100), secs(1), secs(2)] {
+            let mock = MockBroker::start(|_, _, _, _| None).await;
+            let policy = ConsumerRetryPolicy::new(
+                secs(2),
+                secs(3),
+                backoff,
+                backoff,
+                secs(1),
+                millis(100),
+                secs(1),
+            )
+            .expect("policy");
+            let started = tokio::time::Instant::now();
+            let result = Consumer::builder()
+                .bootstrap(mock.addr.to_string())
+                .group_id("startup-guard")
+                .subscribe(["startup-topic".to_owned()])
+                .retry_policy(policy)
+                .enable_metrics_push(false)
+                .build()
+                .await;
+            assert!(matches!(result, Err(super::ConsumerError::Client(
+                krabka_client_core::ClientError::Timeout(deadline)
+            )) if deadline == secs(3)));
+            assert!(started.elapsed() == secs(3).to_std());
+            mock.stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_rejects_invalid_dns_before_retrying_bootstrap() {
+        let result = Consumer::builder()
+            .bootstrap("127.0.0.1:1")
+            .dns_timeout(millis(0))
+            .build()
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::ConsumerError::InvalidConfig(_))
+        ));
     }
 }

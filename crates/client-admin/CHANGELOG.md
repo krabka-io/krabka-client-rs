@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Expose DNS selection, reconnect backoff/max, socket buffers, dispatch capacity,
+  and frame limit through `AdminClientConfig`, alongside existing API retry settings.
+  Resolved options reach administrative connections without losing retry or recovery policy.
+- Validate transport budgets and accept zero idle lifetime to disable idle eviction.
+  The default administrative idle lifetime remains five minutes.
+
 ## [0.6.0] — 2026-10-08
 
 - First release on crates.io from krabka-io/krabka-client-rs, under the
