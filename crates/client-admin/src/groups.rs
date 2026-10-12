@@ -1123,9 +1123,10 @@ impl AdminClient {
 }
 
 fn delete_share_offset_topic(topic_name: &str) -> DeleteShareGroupOffsetsRequestTopic {
-    let mut topic = DeleteShareGroupOffsetsRequestTopic::default();
-    topic.topic_name = topic_name.to_owned();
-    topic
+    DeleteShareGroupOffsetsRequestTopic {
+        topic_name: topic_name.into(),
+        ..Default::default()
+    }
 }
 
 /// `COORDINATOR_LOAD_IN_PROGRESS`: the coordinator is loading the group.
