@@ -409,7 +409,7 @@ where
     }
 }
 
-impl<'a, F, C> CoordinatorRetryRequest<'a, F, C> {
+impl<F, C> CoordinatorRetryRequest<'_, F, C> {
     pub(crate) async fn run_with_refind<R, Fut>(self) -> Result<R, ConsumerError>
     where
         F: Fn() -> Fut,

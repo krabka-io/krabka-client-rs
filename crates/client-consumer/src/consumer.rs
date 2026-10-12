@@ -32,7 +32,10 @@ use krabka_units::{
     convert::{ByteSizeExt as _, StdDurationExt as _, TimeExt as _},
     millis, minutes, secs,
 };
-use refined_type::rule::{GreaterI32, GreaterI64, MinMaxI64, MinMaxU128};
+use refined_type::{
+    Refined,
+    rule::{GreaterI32, GreaterI64, MinMaxI64, MinMaxU128},
+};
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -62,7 +65,7 @@ use crate::{
 
 pub(crate) fn validated_positive_i32(value: i32, name: &str) -> Result<i32, String> {
     GreaterI32::<0>::new(value)
-        .map(|value| value.into_value())
+        .map(Refined::into_value)
         .map_err(|error| format!("{name}: {error}"))
 }
 
