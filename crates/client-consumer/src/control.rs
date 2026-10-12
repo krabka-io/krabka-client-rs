@@ -176,20 +176,38 @@ mod tests {
 
     #[test]
     fn close_timeout_follows_kafkas_close() {
-        let actual = [
-            CloseOptions::builder().build(),
-            CloseOptions::timeout(millis(250)),
-            CloseOptions::timeout(Time::from_secs_f64(-1.0)),
-        ]
-        .map(|options| close_timeout(options).map_err(|error| error.to_string()));
-        assert2::assert!(
-            actual
-                == [
-                    Ok(DEFAULT_CONSUMER_CLOSE_TIMEOUT),
-                    Ok(millis(250)),
-                    Err("invalid argument: The timeout cannot be negative.".to_owned()),
-                ]
-        );
+        let cases = [
+            (
+                "default timeout",
+                CloseOptions::builder().build(),
+                Ok(DEFAULT_CONSUMER_CLOSE_TIMEOUT),
+            ),
+            (
+                "finite timeout",
+                CloseOptions::timeout(millis(250)),
+                Ok(millis(250)),
+            ),
+            (
+                "negative timeout",
+                CloseOptions::timeout(Time::from_secs_f64(-1.0)),
+                Err("invalid argument: The timeout cannot be negative.".to_owned()),
+            ),
+            (
+                "NaN timeout",
+                CloseOptions::timeout(Time::from_secs_f64(f64::NAN)),
+                Err("invalid argument: The timeout cannot be negative.".to_owned()),
+            ),
+            (
+                "infinite timeout",
+                CloseOptions::timeout(Time::from_secs_f64(f64::INFINITY)),
+                Err("invalid argument: The timeout cannot be negative.".to_owned()),
+            ),
+        ];
+
+        for (name, options, expected) in cases {
+            let actual = close_timeout(options).map_err(|error| error.to_string());
+            assert2::assert!(actual == expected, "case: {name}");
+        }
     }
 
     #[tokio::test]
