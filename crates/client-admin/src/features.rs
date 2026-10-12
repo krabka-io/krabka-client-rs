@@ -426,9 +426,6 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use crate::partition_leaders::test_support::{
-        ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
-    };
     use krabka_client_core::{ClientError, MockBroker, MockReply};
     use krabka_protocol::owned::{
         api_versions_request,
@@ -437,6 +434,9 @@ mod tests {
         metadata_response::{MetadataResponse, MetadataResponseBroker},
         update_features_request,
         update_features_response::UpdatableFeatureResult,
+    };
+    use crate::partition_leaders::test_support::{
+        ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
     };
 
     use super::*;
