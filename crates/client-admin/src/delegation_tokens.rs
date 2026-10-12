@@ -40,7 +40,6 @@ pub struct CreateDelegationTokenOptions {
     /// The owner of the token, of any principal type. `None` makes the
     /// caller the owner. Another owner needs the `CreateTokens` operation on
     /// the owner's `User` resource, and `CreateDelegationToken` v3 (KIP-373).
-    #[builder(default)]
     pub owner: Option<KafkaPrincipal>,
     /// The principals that may renew the token.
     #[builder(default)]
@@ -49,7 +48,7 @@ pub struct CreateDelegationTokenOptions {
     /// broker then uses `delegation.token.max.lifetime.ms`. The broker also
     /// uses that ceiling for a lifetime of zero or less, and caps a longer
     /// one at it.
-    #[builder(default, with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
     pub max_lifetime: Option<Time>,
 }
 
@@ -62,7 +61,7 @@ pub struct RenewDelegationTokenOptions {
     /// also uses that default for a period of zero or less, caps a longer
     /// one at it, and never moves the expiry past the token's maximum
     /// timestamp.
-    #[builder(default, with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
     pub renew_time_period: Option<Time>,
 }
 
@@ -74,7 +73,7 @@ pub struct ExpireDelegationTokenOptions {
     /// expires the token now, as does any negative period. A period of zero
     /// or more sets the expiry to that time, capped at the token's maximum
     /// timestamp.
-    #[builder(default, with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
     pub expiry_time_period: Option<Time>,
 }
 
@@ -87,7 +86,6 @@ pub struct DescribeDelegationTokenOptions {
     /// and the broker returns every token that the caller owns or may
     /// describe. An empty list sends an empty owner list, and the broker
     /// returns no tokens.
-    #[builder(default)]
     pub owners: Option<Vec<KafkaPrincipal>>,
 }
 
@@ -738,11 +736,7 @@ mod tests {
             let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
             let result = admin
-                .create_delegation_token(
-                    &CreateDelegationTokenOptions::builder()
-                        .owner(owner)
-                        .build(),
-                )
+                .create_delegation_token(&CreateDelegationTokenOptions::builder().owner(owner).build())
                 .await
                 .map(|_| requests.lock().expect("requests lock").len())
                 .map_err(|error| match error {
@@ -807,8 +801,7 @@ mod tests {
                         b"\x01\x02",
                         RenewDelegationTokenOptions::builder()
                             .renew_time_period(
-                                renew_time_period
-                                    .map(krabka_units::convert::TimeExt::millis_i64),
+                                renew_time_period.map(krabka_units::convert::TimeExt::millis_i64),
                             )
                             .build(),
                     )
@@ -877,8 +870,7 @@ mod tests {
                         b"\xaa",
                         ExpireDelegationTokenOptions::builder()
                             .expiry_time_period(
-                                expiry_time_period
-                                    .map(krabka_units::convert::TimeExt::millis_i64),
+                                expiry_time_period.map(krabka_units::convert::TimeExt::millis_i64),
                             )
                             .build(),
                     )

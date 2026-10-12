@@ -30,7 +30,6 @@ use crate::{
 pub struct ListShareGroupOffsetsSpec {
     /// The partitions to list, or `None` for every partition that the group
     /// has an offset for.
-    #[builder(default)]
     pub topic_partitions: Option<Vec<(String, i32)>>,
 }
 
@@ -229,7 +228,10 @@ mod tests {
     #[test]
     fn request_names_the_partitions_of_each_spec() {
         let specs = BTreeMap::from([
-            ("all".to_owned(), ListShareGroupOffsetsSpec::builder().build()),
+            (
+                "all".to_owned(),
+                ListShareGroupOffsetsSpec::builder().build(),
+            ),
             (
                 "some".to_owned(),
                 ListShareGroupOffsetsSpec::builder()
@@ -409,8 +411,14 @@ mod tests {
             .await;
         let admin = cluster.admin(krabka_units::secs(5)).await;
         let specs = BTreeMap::from([
-            ("ready".to_owned(), ListShareGroupOffsetsSpec::builder().build()),
-            ("loading".to_owned(), ListShareGroupOffsetsSpec::builder().build()),
+            (
+                "ready".to_owned(),
+                ListShareGroupOffsetsSpec::builder().build(),
+            ),
+            (
+                "loading".to_owned(),
+                ListShareGroupOffsetsSpec::builder().build(),
+            ),
         ]);
 
         let result = admin.list_share_group_offsets(&specs).await;

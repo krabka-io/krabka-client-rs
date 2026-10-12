@@ -1495,7 +1495,10 @@ mod tests {
             .await;
 
         let result = admin
-            .describe_streams_groups(&["with", "without"], DescribeGroupsOptions::builder().build())
+            .describe_streams_groups(
+                &["with", "without"],
+                DescribeGroupsOptions::builder().build(),
+            )
             .await;
 
         let seen = cluster.stop();

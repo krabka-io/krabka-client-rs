@@ -169,7 +169,7 @@ pub struct ListTransactionsFilter {
     pub producer_id_filters: Vec<i64>,
     /// Only transactions that have run for at least this long. `None`
     /// matches every duration, as Kafka's `-1` filter does.
-    #[builder(default, with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
     pub min_duration: Option<Time>,
 }
 

@@ -1325,7 +1325,7 @@ pub struct MemberToRemove {
 pub struct RemoveMembersOptions {
     /// The reason that the coordinator logs for each member. `None` or empty
     /// sends Kafka's default reason.
-    #[builder(default, into)]
+    #[builder(into)]
     pub reason: Option<String>,
 }
 

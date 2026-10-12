@@ -128,7 +128,7 @@ pub struct UpdateFeaturesOptions {
     /// The deadline of the call, including retries. Each request carries the
     /// time that remains as its `timeout_ms`. `None` uses the client's
     /// `default.api.timeout.ms`.
-    #[builder(default, with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
     pub timeout: Option<Time>,
     /// Ask the controller to validate the updates and apply none. Needs
     /// `UpdateFeatures` v1.
@@ -142,13 +142,12 @@ pub struct UpdateFeaturesOptions {
 pub struct DescribeFeaturesOptions {
     /// The deadline of the call, including retries. `None` uses the client's
     /// `default.api.timeout.ms`.
-    #[builder(default, with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
     pub timeout: Option<Time>,
     /// The node to ask. `None` asks the node of the client's connection, as
     /// Kafka's `LeastLoadedBrokerOrActiveKController` picks one. A node id
     /// goes to that broker, or to that controller with a controller
     /// bootstrap, as Kafka's `ConstantNodeIdProvider` does.
-    #[builder(default)]
     pub node_id: Option<i32>,
 }
 
@@ -842,11 +841,7 @@ mod tests {
             ("node 2", Some(2), "on.node.2"),
         ] {
             let metadata = admin
-                .describe_features(
-                    DescribeFeaturesOptions::builder()
-                        .node_id(node_id)
-                        .build(),
-                )
+                .describe_features(DescribeFeaturesOptions::builder().node_id(node_id).build())
                 .await
                 .expect("describe succeeds");
             assert2::assert!(

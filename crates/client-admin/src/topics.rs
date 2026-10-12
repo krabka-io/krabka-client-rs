@@ -1684,7 +1684,10 @@ mod tests {
                 .name("foo")
                 .partitions(3)
                 .replicas(1)
-                .configs(BTreeMap::from([("retention.ms".to_string(), "60000".to_string())]))
+                .configs(BTreeMap::from([(
+                    "retention.ms".to_string(),
+                    "60000".to_string(),
+                )]))
                 .build()],
             5_000,
         );
@@ -2802,9 +2805,10 @@ mod tests {
             assert_send(admin.delete_topics(names, TopicMutationOptions::default()));
             assert_send(admin.create_partitions(&[], TopicMutationOptions::default()));
             assert_send(admin.unregister_broker(1));
-            assert_send(
-                admin.update_features(&BTreeMap::new(), crate::UpdateFeaturesOptions::builder().build()),
-            );
+            assert_send(admin.update_features(
+                &BTreeMap::new(),
+                crate::UpdateFeaturesOptions::builder().build(),
+            ));
             assert_send(admin.alter_partition_assignments(&BTreeMap::new(), krabka_units::secs(1)));
             assert_send(admin.reconcile_topic_replication_factor("t", 1, krabka_units::secs(1)));
         };

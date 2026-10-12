@@ -1243,7 +1243,11 @@ mod tests {
             .await;
             let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
             let result = admin
-                .list_topics(ListTopicsOptions::builder().list_internal(list_internal).build())
+                .list_topics(
+                    ListTopicsOptions::builder()
+                        .list_internal(list_internal)
+                        .build(),
+                )
                 .await
                 .expect("list topics");
             broker.stop();

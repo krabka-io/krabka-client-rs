@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use krabka_units::{Time, convert::TimeExt as _, secs};
+use krabka_units::{Time, secs};
 
 use crate::{
     consumer::{Consumer, GroupMembershipOperation},
@@ -29,7 +29,7 @@ pub struct CloseOptions {
     pub group_membership_operation: GroupMembershipOperation,
     /// The time that the close can take. `None` is
     /// [`DEFAULT_CONSUMER_CLOSE_TIMEOUT`].
-    #[builder(default, with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
     pub timeout: Option<Time>,
 }
 
@@ -37,7 +37,10 @@ impl CloseOptions {
     /// The options with `timeout`. Kafka's `CloseOptions.timeout`.
     #[must_use]
     pub fn timeout(timeout: Time) -> Self {
-        Self::builder().timeout(Some(timeout.millis_i64())).build()
+        Self {
+            timeout: Some(timeout),
+            ..Self::default()
+        }
     }
 
     /// The options with `operation`. Kafka's

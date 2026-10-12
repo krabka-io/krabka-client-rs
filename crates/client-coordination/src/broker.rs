@@ -789,7 +789,10 @@ fn coordination_topic_spec(partitions: i32, replication: i32) -> CreateTopicSpec
         .name(COORDINATION_STATE_TOPIC)
         .partitions(partitions)
         .replicas(replication)
-        .configs(BTreeMap::from([("cleanup.policy".to_owned(), "compact".to_owned())]))
+        .configs(BTreeMap::from([(
+            "cleanup.policy".to_owned(),
+            "compact".to_owned(),
+        )]))
         .build()
 }
 

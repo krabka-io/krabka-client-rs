@@ -105,19 +105,15 @@ pub struct AclEntry {
 /// anything.
 #[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct AclEntryFilter {
-    #[builder(default)]
     pub resource_type: Option<ResourceType>,
-    #[builder(default, into)]
+    #[builder(into)]
     pub resource_name: Option<String>,
-    #[builder(default)]
     pub pattern_type: Option<PatternType>,
-    #[builder(default, into)]
+    #[builder(into)]
     pub principal: Option<String>,
-    #[builder(default, into)]
+    #[builder(into)]
     pub host: Option<String>,
-    #[builder(default)]
     pub operation: Option<AclOperation>,
-    #[builder(default)]
     pub permission_type: Option<PermissionType>,
 }
 
