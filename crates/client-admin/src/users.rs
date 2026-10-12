@@ -978,13 +978,13 @@ mod tests {
     #[test]
     fn acl_filter_to_wire_passes_concrete_axes_through() {
         let f = AclEntryFilter::builder()
-            .resource_type(Some(ResourceType::Topic))
-            .resource_name(Some("orders".into()))
-            .pattern_type(Some(PatternType::Literal))
-            .principal(Some("User:alice".into()))
-            .host(Some("10.0.0.0".into()))
-            .operation(Some(AclOperation::Read))
-            .permission_type(Some(PermissionType::Allow))
+            .resource_type(ResourceType::Topic)
+            .resource_name("orders")
+            .pattern_type(PatternType::Literal)
+            .principal("User:alice")
+            .host("10.0.0.0")
+            .operation(AclOperation::Read)
+            .permission_type(PermissionType::Allow)
             .build();
         let w = acl_filter_to_wire(&f);
         assert2::assert!(
@@ -1043,8 +1043,8 @@ mod tests {
             .await
             .expect("admin connects to mock broker");
         let filter = AclEntryFilter::builder()
-            .resource_type(Some(ResourceType::Topic))
-            .resource_name(Some("orders".into()))
+            .resource_type(ResourceType::Topic)
+            .resource_name("orders")
             .build();
 
         let outcomes = admin
@@ -1171,7 +1171,7 @@ mod tests {
     #[test]
     fn describe_request_uses_any_for_unspecified_axes() {
         let f = AclEntryFilter::builder()
-            .principal(Some("User:alice".into()))
+            .principal("User:alice")
             .build();
         let r = filter_to_describe_request(&f);
         // 1 == Kafka's `AclBindingFilter.ANY` discriminant (`WIRE_ANY`).
@@ -1385,13 +1385,13 @@ mod tests {
     #[test]
     fn describe_request_passes_resource_name_and_host_filters_through() {
         let f = AclEntryFilter::builder()
-            .resource_type(Some(ResourceType::Topic))
-            .resource_name(Some("orders".into()))
-            .pattern_type(Some(PatternType::Literal))
-            .principal(Some("User:alice".into()))
-            .host(Some("10.0.0.0".into()))
-            .operation(Some(AclOperation::Read))
-            .permission_type(Some(PermissionType::Allow))
+            .resource_type(ResourceType::Topic)
+            .resource_name("orders")
+            .pattern_type(PatternType::Literal)
+            .principal("User:alice")
+            .host("10.0.0.0")
+            .operation(AclOperation::Read)
+            .permission_type(PermissionType::Allow)
             .build();
 
         let r = filter_to_describe_request(&f);

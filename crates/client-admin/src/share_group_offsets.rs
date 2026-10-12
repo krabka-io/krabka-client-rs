@@ -235,11 +235,11 @@ mod tests {
             (
                 "some".to_owned(),
                 ListShareGroupOffsetsSpec::builder()
-                    .topic_partitions(Some(vec![
+                    .topic_partitions(vec![
                         ("orders".to_owned(), 2),
                         ("audit".to_owned(), 0),
                         ("orders".to_owned(), 0),
-                    ]))
+                    ])
                     .build(),
             ),
         ]);

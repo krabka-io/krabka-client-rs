@@ -841,7 +841,11 @@ mod tests {
             ("node 2", Some(2), "on.node.2"),
         ] {
             let metadata = admin
-                .describe_features(DescribeFeaturesOptions::builder().node_id(node_id).build())
+                .describe_features(
+                    DescribeFeaturesOptions::builder()
+                        .maybe_node_id(node_id)
+                        .build(),
+                )
                 .await
                 .expect("describe succeeds");
             assert2::assert!(
@@ -863,7 +867,7 @@ mod tests {
             .describe_features(
                 DescribeFeaturesOptions::builder()
                     .timeout(50)
-                    .node_id(Some(9))
+                    .node_id(9)
                     .build(),
             )
             .await;

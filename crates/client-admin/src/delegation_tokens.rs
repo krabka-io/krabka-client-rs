@@ -517,7 +517,7 @@ mod tests {
             (
                 "owner of another principal type, renewers, lifetime",
                 CreateDelegationTokenOptions::builder()
-                    .owner(Some(group("ops")))
+                    .owner(group("ops"))
                     .renewers(renewers.clone())
                     .max_lifetime(60_000)
                     .build(),
@@ -546,7 +546,7 @@ mod tests {
             (
                 "not authorized to create for the owner",
                 CreateDelegationTokenOptions::builder()
-                    .owner(Some(user("alice")))
+                    .owner(user("alice"))
                     .build(),
                 CreateDelegationTokenRequest {
                     owner_principal_type: Some("User".to_owned()),
@@ -740,7 +740,9 @@ mod tests {
 
             let result = admin
                 .create_delegation_token(
-                    &CreateDelegationTokenOptions::builder().owner(owner).build(),
+                    &CreateDelegationTokenOptions::builder()
+                        .maybe_owner(owner)
+                        .build(),
                 )
                 .await
                 .map(|_| requests.lock().expect("requests lock").len())
@@ -987,7 +989,7 @@ mod tests {
                 admin
                     .describe_delegation_token(
                         &DescribeDelegationTokenOptions::builder()
-                            .owners(owners)
+                            .maybe_owners(owners)
                             .build(),
                     )
                     .await,
