@@ -529,8 +529,7 @@ impl AdminClient {
                 .conn
                 .send(offset_commit_request(update.group, update.offsets))
                 .await
-                .map(offset_commit_retry_action)
-                .unwrap_or_else(connection_failure_action),
+                .map_or_else(connection_failure_action, offset_commit_retry_action),
             GroupOffsetKind::Share => self
                 .conn
                 .send(alter_share_group_offsets_request(
@@ -538,8 +537,9 @@ impl AdminClient {
                     update.offsets,
                 ))
                 .await
-                .map(|response| alter_share_group_offsets_retry_action(update.offsets, response))
-                .unwrap_or_else(connection_failure_action),
+                .map_or_else(connection_failure_action, |response| {
+                    alter_share_group_offsets_retry_action(update.offsets, response)
+                }),
         }
     }
 
