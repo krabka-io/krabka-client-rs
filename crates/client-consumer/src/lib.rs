@@ -97,9 +97,9 @@ mod rebalance_listener;
 mod seek;
 mod share;
 mod subscription;
-mod validate;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod validate;
 
 pub use assignor::Assignor;
 pub use builder::{AutoOffsetReset, IsolationLevel};

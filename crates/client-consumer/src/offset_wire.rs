@@ -14,16 +14,17 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use bytes::BufMut;
+pub(crate) use krabka_client_core::TopicNameOffsetFetch;
 use krabka_protocol::{
-    Encode, ProtocolError, ProtocolRequest,
     owned::{
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
         offset_fetch_request::{
-            self, OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic,
+            OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic,
             OffsetFetchRequestTopics,
         },
-        offset_fetch_response::OffsetFetchResponse,
+        offset_fetch_response::{
+            OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponsePartitions,
+        },
     },
     primitives::uuid::Uuid as WireUuid,
 };
@@ -43,30 +44,6 @@ use crate::{
 /// supports only v10 or higher, the send fails with
 /// `ClientError::IncompatibleVersion` before the request goes out. Kafka's
 /// builder fails with `UnsupportedVersionException` in that case.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TopicNameOffsetFetch(pub(crate) OffsetFetchRequest);
-
-impl Encode for TopicNameOffsetFetch {
-    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
-        self.0.encode(buf, version)
-    }
-
-    fn encoded_len(&self, version: i16) -> usize {
-        self.0.encoded_len(version)
-    }
-}
-
-impl ProtocolRequest for TopicNameOffsetFetch {
-    const API_KEY: i16 = offset_fetch_request::API_KEY;
-    const MIN_VERSION: i16 = offset_fetch_request::MIN_VERSION;
-    /// The last `OffsetFetch` version that carries topic names.
-    const MAX_VERSION: i16 = 9;
-    /// The cap is a released version, so it is also the stable maximum.
-    const LATEST_STABLE_VERSION: i16 = Self::MAX_VERSION;
-    const FLEXIBLE_MIN: i16 = offset_fetch_request::FLEXIBLE_MIN;
-    type Response = OffsetFetchResponse;
-}
-
 /// Build an `OffsetFetch` request that covers `by_topic` and is valid at each
 /// version from v1 to v9.
 ///
@@ -102,7 +79,7 @@ pub(crate) fn build_offset_fetch(
             ..Default::default()
         })
         .collect();
-    TopicNameOffsetFetch(OffsetFetchRequest {
+    TopicNameOffsetFetch::new(OffsetFetchRequest {
         group_id: group_id.to_string(),
         topics: Some(legacy_topics),
         groups: vec![OffsetFetchRequestGroup {
@@ -123,30 +100,72 @@ pub(crate) fn parse_offset_fetch(resp: &OffsetFetchResponse) -> Vec<(String, i32
     let mut out = Vec::new();
     if resp.groups.is_empty() {
         for t in &resp.topics {
-            for p in &t.partitions {
-                out.push((
-                    t.name.clone(),
-                    p.partition_index,
-                    p.committed_offset,
-                    p.committed_leader_epoch,
-                ));
-            }
+            append_topic_offsets(&mut out, &t.name, &t.partitions);
         }
     } else {
         for g in &resp.groups {
             for t in &g.topics {
-                for p in &t.partitions {
-                    out.push((
-                        t.name.clone(),
-                        p.partition_index,
-                        p.committed_offset,
-                        p.committed_leader_epoch,
-                    ));
-                }
+                append_topic_offsets(&mut out, &t.name, &t.partitions);
             }
         }
     }
     out
+}
+
+trait OffsetFetchPartitionData {
+    fn offset_fields(&self) -> (i32, i64, i32);
+    fn error_code(&self) -> i16;
+}
+
+impl OffsetFetchPartitionData for OffsetFetchResponsePartition {
+    fn offset_fields(&self) -> (i32, i64, i32) {
+        (
+            self.partition_index,
+            self.committed_offset,
+            self.committed_leader_epoch,
+        )
+    }
+
+    fn error_code(&self) -> i16 {
+        self.error_code
+    }
+}
+
+impl OffsetFetchPartitionData for OffsetFetchResponsePartitions {
+    fn offset_fields(&self) -> (i32, i64, i32) {
+        (
+            self.partition_index,
+            self.committed_offset,
+            self.committed_leader_epoch,
+        )
+    }
+
+    fn error_code(&self) -> i16 {
+        self.error_code
+    }
+}
+
+fn append_topic_offsets<P: OffsetFetchPartitionData>(
+    out: &mut Vec<(String, i32, i64, i32)>,
+    topic: &str,
+    partitions: &[P],
+) {
+    out.extend(partitions.iter().map(|partition| {
+        let (index, offset, leader_epoch) = partition.offset_fields();
+        (topic.to_owned(), index, offset, leader_epoch)
+    }));
+}
+
+fn append_topic_errors<'a, P: OffsetFetchPartitionData>(
+    out: &mut Vec<(&'a str, i16)>,
+    topic: &'a str,
+    partitions: &[P],
+) {
+    out.extend(
+        partitions
+            .iter()
+            .map(|partition| (topic, partition.error_code())),
+    );
 }
 
 /// The committed offsets of an `OffsetFetch` response. Kafka's
@@ -258,20 +277,19 @@ pub(crate) fn classify_offset_fetch(resp: &OffsetFetchResponse) -> OffsetFetchAc
         return classify_group_error(code);
     }
 
-    let legacy = resp.topics.iter().flat_map(|t| {
-        t.partitions
-            .iter()
-            .map(move |p| (t.name.as_str(), p.error_code))
-    });
-    let grouped = resp.groups.iter().flat_map(|g| &g.topics).flat_map(|t| {
-        t.partitions
-            .iter()
-            .map(move |p| (t.name.as_str(), p.error_code))
-    });
+    let mut partitions = Vec::new();
+    for topic in &resp.topics {
+        append_topic_errors(&mut partitions, &topic.name, &topic.partitions);
+    }
+    for group in &resp.groups {
+        for topic in &group.topics {
+            append_topic_errors(&mut partitions, &topic.name, &topic.partitions);
+        }
+    }
     let mut unauthorized_topics = BTreeSet::new();
     let mut unstable = false;
     let mut unknown_topic = None;
-    for (topic, code) in legacy.chain(grouped) {
+    for (topic, code) in partitions {
         match code {
             0 => {}
             UNKNOWN_TOPIC_OR_PARTITION | UNKNOWN_TOPIC_ID => {
@@ -396,12 +414,7 @@ mod tests {
     };
 
     use super::*;
-
-    fn id(n: u8) -> WireUuid {
-        let mut b = [0u8; 16];
-        b[15] = n;
-        WireUuid(b)
-    }
+    use crate::test_support::wire_uuid;
 
     #[test]
     fn build_offset_fetch_populates_legacy_and_groups() {
@@ -411,7 +424,7 @@ mod tests {
         let req = build_offset_fetch("g", &by_topic);
         // Legacy single-group fields (v0-7) AND v8+ groups[] by topic name.
         assert2::assert!(
-            req == TopicNameOffsetFetch(OffsetFetchRequest {
+            req == TopicNameOffsetFetch::new(OffsetFetchRequest {
                 group_id: "g".to_string(),
                 topics: Some(vec![OffsetFetchRequestTopic {
                     name: "t".to_string(),
@@ -445,6 +458,30 @@ mod tests {
         }
     }
 
+    trait MissingOffsetFetchPartition {
+        fn with_error_code(error_code: i16) -> Self;
+    }
+
+    impl MissingOffsetFetchPartition for OffsetFetchResponsePartition {
+        fn with_error_code(error_code: i16) -> Self {
+            Self {
+                committed_offset: -1,
+                error_code,
+                ..Default::default()
+            }
+        }
+    }
+
+    impl MissingOffsetFetchPartition for OffsetFetchResponsePartitions {
+        fn with_error_code(error_code: i16) -> Self {
+            Self {
+                committed_offset: -1,
+                error_code,
+                ..Default::default()
+            }
+        }
+    }
+
     /// A v8 or v9 response for group `g`. Each row is `(topic number, partition
     /// error code)`, and `topic_name` gives the name of the topic number.
     fn grouped(group_error: i16, rows: &[(u8, i16)]) -> OffsetFetchResponse {
@@ -456,11 +493,9 @@ mod tests {
                     .iter()
                     .map(|(topic, error_code)| OffsetFetchResponseTopics {
                         name: topic_name(*topic),
-                        partitions: vec![OffsetFetchResponsePartitions {
-                            committed_offset: -1,
-                            error_code: *error_code,
-                            ..Default::default()
-                        }],
+                        partitions: vec![OffsetFetchResponsePartitions::with_error_code(
+                            *error_code,
+                        )],
                         ..Default::default()
                     })
                     .collect(),
@@ -478,11 +513,7 @@ mod tests {
                 .iter()
                 .map(|(name, error_code)| OffsetFetchResponseTopic {
                     name: (*name).into(),
-                    partitions: vec![OffsetFetchResponsePartition {
-                        committed_offset: -1,
-                        error_code: *error_code,
-                        ..Default::default()
-                    }],
+                    partitions: vec![OffsetFetchResponsePartition::with_error_code(*error_code)],
                     ..Default::default()
                 })
                 .collect(),
@@ -687,8 +718,8 @@ mod tests {
     #[test]
     fn id_to_name_inverts_the_map() {
         let mut ids = HashMap::new();
-        ids.insert("t".to_string(), id(7));
+        ids.insert("t".to_string(), wire_uuid(7));
         let inv = id_to_name(&ids);
-        assert2::assert!(inv.get(&id(7)) == Some(&"t".to_string()));
+        assert2::assert!(inv.get(&wire_uuid(7)) == Some(&"t".to_string()));
     }
 }

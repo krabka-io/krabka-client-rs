@@ -11,6 +11,10 @@
 //! cover the wire round-trip of the local enum copies.
 
 use bytes::Bytes;
+#[cfg(test)]
+use krabka_protocol::owned::alter_user_scram_credentials_response;
+#[cfg(test)]
+use krabka_protocol::owned::describe_user_scram_credentials_response;
 use krabka_protocol::owned::{
     alter_user_scram_credentials_request::{
         AlterUserScramCredentialsRequest, ScramCredentialDeletion, ScramCredentialUpsertion,
@@ -1186,7 +1190,7 @@ mod tests {
 
     #[test]
     fn users_describe_scram_top_level_error_returns_broker_error() {
-        let resp = krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
+        let resp = describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             error_code: 31,
             error_message: Some("cluster auth denied".to_string()),
             ..Default::default()
@@ -1218,17 +1222,17 @@ mod tests {
 
     #[test]
     fn users_describe_scram_preserves_credential_iterations() {
-        let resp = krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
+        let resp = describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             results: vec![
-                krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
+                describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
                     user: "alice".to_string(),
                     credential_infos: vec![
-                        krabka_protocol::owned::describe_user_scram_credentials_response::CredentialInfo {
+                        describe_user_scram_credentials_response::CredentialInfo {
                             mechanism: 1,
                             iterations: 4096,
                             ..Default::default()
                         },
-                        krabka_protocol::owned::describe_user_scram_credentials_response::CredentialInfo {
+                        describe_user_scram_credentials_response::CredentialInfo {
                             mechanism: 2,
                             iterations: 8192,
                             ..Default::default()
@@ -1268,9 +1272,9 @@ mod tests {
 
     #[test]
     fn users_describe_scram_unknown_user_preserves_resource_not_found_name() {
-        let resp = krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
+        let resp = describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             results: vec![
-                krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
+                describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
                     user: "ghost".to_string(),
                     error_code: 91,
                     error_message: Some("no such SCRAM user".to_string()),
@@ -1302,9 +1306,9 @@ mod tests {
 
     #[test]
     fn users_describe_scram_duplicate_user_preserves_duplicate_resource_name() {
-        let resp = krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
+        let resp = describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             results: vec![
-                krabka_protocol::owned::describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
+                describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
                     user: "alice".to_string(),
                     error_code: 92,
                     error_message: Some("duplicate user".to_string()),
@@ -1336,15 +1340,15 @@ mod tests {
 
     #[test]
     fn users_alter_scram_preserves_scram_error_names() {
-        let resp = krabka_protocol::owned::alter_user_scram_credentials_response::AlterUserScramCredentialsResponse {
+        let resp = alter_user_scram_credentials_response::AlterUserScramCredentialsResponse {
             results: vec![
-                krabka_protocol::owned::alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
+                alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
                     user: "alice".to_string(),
                     error_code: 33,
                     error_message: Some("unknown mechanism".to_string()),
                     ..Default::default()
                 },
-                krabka_protocol::owned::alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
+                alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
                     user: "bob".to_string(),
                     error_code: 93,
                     error_message: Some("too many iterations".to_string()),

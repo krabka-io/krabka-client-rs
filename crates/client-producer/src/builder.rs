@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use krabka_client_core::{
     Client, ClientDnsTimeout, ClientError, ClientFrameMax, ConnectionDispatchQueueCapacity,
     DEFAULT_CLIENT_DNS_TIMEOUT, DEFAULT_CLIENT_FRAME_MAX,
-    DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY,
+    DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY, telemetry,
 };
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
@@ -41,7 +41,9 @@ use crate::{
     metadata_age::{
         DEFAULT_PRODUCER_METADATA_MAX_AGE, DEFAULT_PRODUCER_METADATA_MAX_IDLE, MetadataAge,
     },
+    metadata_wait,
     partitioner::{BuiltInPartitioner, Partitioner, PartitionerConfig},
+    producer,
     producer::{Acks, Producer, ProducerIdentity, SocketBuffers},
     sender,
     transactional::{TxnErrorSlot, TxnState},
@@ -915,8 +917,8 @@ struct ProducerRuntime {
     wake_tx: mpsc::Sender<sender::DrainIntent>,
     shutdown: CancellationToken,
     state: Arc<AtomicU8>,
-    metadata_cache: Arc<Mutex<HashMap<String, crate::producer::TopicMetadata>>>,
-    metadata_refresh: Arc<crate::metadata_wait::MetadataRefresh>,
+    metadata_cache: Arc<Mutex<HashMap<String, producer::TopicMetadata>>>,
+    metadata_refresh: Arc<metadata_wait::MetadataRefresh>,
     partition_leaders: Arc<DashMap<(String, i32), i32>>,
     accumulators: crate::accumulator::AccumulatorMap,
     next_seq: Arc<DashMap<(String, i32), i32>>,
@@ -987,7 +989,7 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
     let txn_error = Arc::new(TxnErrorSlot::default());
     let transaction_v2 = Arc::new(AtomicBool::new(false));
 
-    let metadata_refresh = Arc::new(crate::metadata_wait::MetadataRefresh::default());
+    let metadata_refresh = Arc::new(metadata_wait::MetadataRefresh::default());
     MetadataAge::new(client, &retry_policy)
         .with_ages(metadata_max_age, metadata_max_idle)
         .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
@@ -1075,9 +1077,8 @@ async fn initial_producer_identity(
 fn producer_telemetry(
     enabled: bool,
     transactional_id: Option<&str>,
-) -> Option<krabka_client_core::telemetry::ClientTelemetryConfig> {
-    enabled
-        .then(|| krabka_client_core::telemetry::ClientTelemetryConfig::producer(transactional_id))
+) -> Option<telemetry::ClientTelemetryConfig> {
+    enabled.then(|| telemetry::ClientTelemetryConfig::producer(transactional_id))
 }
 
 #[bon::bon]
@@ -2541,7 +2542,7 @@ mod security_arg_tests {
             );
             assert2::assert!(
                 producer.socket_buffers
-                    == crate::producer::SocketBuffers {
+                    == producer::SocketBuffers {
                         send: expected.0,
                         receive: expected.1,
                     },

@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use krabka_units::{Time, fmt::Human as _};
 use thiserror::Error;
 
+use crate::sasl;
+
 /// Errors returned by `Client`, `Connection`, and the broker pool.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -37,7 +39,7 @@ pub enum ClientError {
     Sasl {
         addr: SocketAddr,
         #[source]
-        source: crate::sasl::OutboundSaslError,
+        source: sasl::OutboundSaslError,
     },
 
     /// The TLS peer or the SASL broker rejected authentication.
@@ -118,7 +120,7 @@ pub enum AuthenticationError {
 
     /// The broker or the SASL mechanism rejected authentication.
     #[error(transparent)]
-    Sasl(#[from] crate::sasl::SaslAuthenticationError),
+    Sasl(#[from] sasl::SaslAuthenticationError),
 }
 
 #[cfg(test)]

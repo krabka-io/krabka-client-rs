@@ -26,6 +26,7 @@ default = []
 assert2 = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+derive_more = { workspace = true }
 krabka-protocol = { version = "0.6.0", default-features = false }
 krabka-client-core = { version = "0.6.0", path = "../client-core" }
 krabka-ids = { version = "0.6.0" }

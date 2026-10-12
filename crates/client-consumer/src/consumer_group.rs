@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use krabka_protocol::{
     owned::{
+        consumer_group_heartbeat_request,
         consumer_group_heartbeat_request::{ConsumerGroupHeartbeatRequest, TopicPartitions},
         consumer_group_heartbeat_response::ConsumerGroupHeartbeatResponse,
         metadata_request::{MetadataRequest, MetadataRequestTopic},
@@ -19,6 +20,8 @@ use krabka_protocol::{
     primitives::uuid::Uuid as WireUuid,
 };
 use krabka_units::convert::TimeExt as _;
+
+use crate::{consumer, coordinator, error, offset_wire, rebalance_listener};
 
 /// The group protocol of a consumer. Kafka's `group.protocol`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -180,10 +183,10 @@ pub(crate) enum HeartbeatAction {
 pub(crate) fn heartbeat_action(error_code: i16) -> HeartbeatAction {
     match error_code {
         0 => HeartbeatAction::Ok,
-        crate::coordinator::COORDINATOR_NOT_AVAILABLE | crate::coordinator::NOT_COORDINATOR => {
+        coordinator::COORDINATOR_NOT_AVAILABLE | coordinator::NOT_COORDINATOR => {
             HeartbeatAction::FindCoordinator
         }
-        crate::coordinator::COORDINATOR_LOAD_IN_PROGRESS => HeartbeatAction::Retry,
+        coordinator::COORDINATOR_LOAD_IN_PROGRESS => HeartbeatAction::Retry,
         FENCED_MEMBER_EPOCH | UNKNOWN_MEMBER_ID => HeartbeatAction::Fenced,
         // `UNSUPPORTED_ASSIGNOR (112)`, `UNRELEASED_INSTANCE_ID (111)`,
         // `GROUP_MAX_SIZE_REACHED (81)`, `INVALID_REQUEST (42)`,
@@ -198,9 +201,9 @@ pub(crate) fn heartbeat_action(error_code: i16) -> HeartbeatAction {
 /// with the default operation keeps its place in the group with `-2`.
 pub(crate) fn leave_group_epoch(
     group_instance_id: Option<&str>,
-    operation: crate::consumer::GroupMembershipOperation,
+    operation: consumer::GroupMembershipOperation,
 ) -> i32 {
-    if operation == crate::consumer::GroupMembershipOperation::LeaveGroup {
+    if operation == consumer::GroupMembershipOperation::LeaveGroup {
         return LEAVE_GROUP_MEMBER_EPOCH;
     }
     if group_instance_id.is_some() {
@@ -217,13 +220,12 @@ pub(crate) fn leave_group_epoch(
 pub(crate) fn should_send_leave_heartbeat(
     member_id: &str,
     group_instance_id: Option<&str>,
-    operation: crate::consumer::GroupMembershipOperation,
+    operation: consumer::GroupMembershipOperation,
 ) -> bool {
     if member_id.is_empty() {
         return false;
     }
-    !(group_instance_id.is_none()
-        && operation == crate::consumer::GroupMembershipOperation::RemainInGroup)
+    !(group_instance_id.is_none() && operation == consumer::GroupMembershipOperation::RemainInGroup)
 }
 
 /// The partitions of an assignment, by topic name.
@@ -280,7 +282,7 @@ pub(crate) fn owned_by_topic_id(
 /// acknowledges it. Kafka's `ConsumerHeartbeatRequestManager` and
 /// `ConsumerMembershipManager` do the same.
 pub(crate) async fn run(
-    mut state: crate::coordinator::CoordinatorState,
+    mut state: coordinator::CoordinatorState,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     if let Err(error) = state.client.refresh_metadata().await {
@@ -288,7 +290,7 @@ pub(crate) async fn run(
     }
     // Kafka's `Heartbeat.pollTimer`: `poll` resets it, and the member leaves
     // the group when it expires.
-    state.poll_timer = crate::coordinator::PollTimer::new(state.max_poll_interval);
+    state.poll_timer = coordinator::PollTimer::new(state.max_poll_interval);
     let mut interval = state.heartbeat_interval.to_std();
     let mut send_now = true;
     let mut polls_open = true;
@@ -379,14 +381,14 @@ pub(crate) async fn run(
         // sends the topics that matched, and the coordinator assigns them.
         if state.subscription.borrow().pattern.is_some()
             && last_pattern_check.is_none_or(|last| {
-                crate::coordinator::subscription_metadata_refresh_due(
+                coordinator::subscription_metadata_refresh_due(
                     last,
                     state.subscription_metadata_refresh_interval,
                 )
             })
         {
             last_pattern_check = Some(tokio::time::Instant::now());
-            crate::coordinator::refresh_pattern_topics(&mut state).await;
+            coordinator::refresh_pattern_topics(&mut state).await;
         }
         send_now = false;
         let outcome = tokio::select! {
@@ -456,22 +458,14 @@ enum TaskEvent {
 /// Kafka's `AbstractHeartbeatRequestManager.poll` calls
 /// `transitionToSendingLeaveGroup(true)` for an expired poll timer, sends the
 /// leave heartbeat and then makes the member stale until the next `poll`.
-async fn leave_after_poll_timeout(state: &mut crate::coordinator::CoordinatorState) {
-    tracing::warn!(
-        group = %state.group_id,
-        max_poll_interval = ?state.max_poll_interval,
-        "consumer poll timeout has expired: the time between two poll calls was longer than \
-         max_poll_interval; the member leaves the group and joins again on the next poll"
-    );
-    state.member_epoch = leave_group_epoch(
-        state.group_instance_id.as_deref(),
-        crate::consumer::GroupMembershipOperation::Default,
-    );
+async fn leave_after_poll_timeout(state: &mut coordinator::CoordinatorState) {
+    coordinator::warn_poll_timeout(state);
+    set_leave_epoch(state);
     let leave_timeout = state.leave_group_timeout.to_std();
     let leave = send_heartbeat(state, HeartbeatKind::Leave).await;
     let _ = tokio::time::timeout(leave_timeout, leave.send()).await;
-    crate::coordinator::release_partitions_after_poll_timeout(state).await;
-    if let Err(error) = crate::coordinator::call_lost_listener(state).await {
+    coordinator::release_partitions_after_poll_timeout(state).await;
+    if let Err(error) = coordinator::call_lost_listener(state).await {
         tracing::warn!(%error, group = %state.group_id, "the lost callback failed");
     }
     state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
@@ -482,18 +476,22 @@ async fn leave_after_poll_timeout(state: &mut crate::coordinator::CoordinatorSta
 /// `AbstractMembershipManager.leaveGroup`: the member sends a heartbeat with
 /// its leave epoch and gives up its partitions. The `Consumer` already ran the
 /// revoke callback and cleared the assignment.
-async fn leave_after_unsubscribe(state: &mut crate::coordinator::CoordinatorState) {
-    state.member_epoch = leave_group_epoch(
-        state.group_instance_id.as_deref(),
-        crate::consumer::GroupMembershipOperation::Default,
-    );
+async fn leave_after_unsubscribe(state: &mut coordinator::CoordinatorState) {
+    set_leave_epoch(state);
     let leave_timeout = state.leave_group_timeout.to_std();
     let leave = send_heartbeat(state, HeartbeatKind::Leave).await;
     let _ = tokio::time::timeout(leave_timeout, leave.send()).await;
-    crate::coordinator::forget_member_keeping_id(state).await;
+    coordinator::forget_member_keeping_id(state).await;
     state.rebalance_pending.send_replace(false);
     state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
     state.sent_heartbeat_fields = SentFields::default();
+}
+
+fn set_leave_epoch(state: &mut coordinator::CoordinatorState) {
+    state.member_epoch = leave_group_epoch(
+        state.group_instance_id.as_deref(),
+        consumer::GroupMembershipOperation::Default,
+    );
 }
 
 /// Keep the member in the group while `poll` runs a rebalance listener
@@ -504,12 +502,10 @@ async fn leave_after_unsubscribe(state: &mut crate::coordinator::CoordinatorStat
 /// state and asks for nothing new. The heartbeat after the callback acts on
 /// the response of the member state.
 pub(crate) async fn heartbeat_during_callback(
-    state: &crate::coordinator::CoordinatorState,
+    state: &coordinator::CoordinatorState,
     done: &tokio_util::sync::CancellationToken,
 ) {
-    let interval = state.heartbeat_interval.to_std();
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticker = coordinator::heartbeat_ticker(state.heartbeat_interval);
     loop {
         tokio::select! {
             biased;
@@ -555,7 +551,7 @@ enum HeartbeatOutcome {
 }
 
 /// Send one heartbeat and act on the response.
-async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> HeartbeatOutcome {
+async fn heartbeat_once(state: &mut coordinator::CoordinatorState) -> HeartbeatOutcome {
     let kind = if state.member_epoch == JOIN_GROUP_MEMBER_EPOCH {
         HeartbeatKind::Join
     } else {
@@ -569,7 +565,7 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
             // next heartbeat sends every field again. Kafka's
             // `ConsumerHeartbeatRequestManager.resetHeartbeatState`.
             state.sent_heartbeat_fields = SentFields::default();
-            if !crate::coordinator::is_retriable_transport_error(&error) {
+            if !coordinator::is_retriable_transport_error(&error) {
                 // Kafka's `AbstractHeartbeatRequestManager.onFailure` retries
                 // only a `RetriableException`, and hands every other failure
                 // to the application. A broker without api key 68 fails here.
@@ -578,9 +574,9 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
                     group = %state.group_id,
                     "the consumer group heartbeat failed for good; the member stops"
                 );
-                crate::coordinator::report_fatal_error(
+                coordinator::report_fatal_error(
                     &state.poll_error,
-                    crate::error::ConsumerError::Client(error),
+                    error::ConsumerError::Client(error),
                 );
                 return HeartbeatOutcome::Stop;
             }
@@ -602,7 +598,7 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
         HeartbeatAction::Ok => {}
         HeartbeatAction::Retry => return HeartbeatOutcome::Backoff,
         HeartbeatAction::FindCoordinator => {
-            crate::coordinator::find_coordinator_again(state).await;
+            coordinator::find_coordinator_again(state).await;
             return HeartbeatOutcome::Backoff;
         }
         HeartbeatAction::Fenced => {
@@ -612,10 +608,10 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
                 "the coordinator fenced the member; giving up the partitions and joining again"
             );
             state.member_epoch = JOIN_GROUP_MEMBER_EPOCH;
-            crate::coordinator::forget_member_keeping_id(state).await;
+            coordinator::forget_member_keeping_id(state).await;
             // Kafka's `transitionToFenced` gives the partitions to
             // `onPartitionsLost` before the member joins again.
-            if let Err(error) = crate::coordinator::call_lost_listener(state).await {
+            if let Err(error) = coordinator::call_lost_listener(state).await {
                 tracing::warn!(%error, group = %state.group_id, "the lost callback failed");
             }
             return HeartbeatOutcome::Backoff;
@@ -627,9 +623,9 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
                 error = ?response.error_message,
                 "the consumer group heartbeat failed with a fatal error"
             );
-            crate::coordinator::report_fatal_error(
+            coordinator::report_fatal_error(
                 &state.poll_error,
-                crate::error::ConsumerError::Server(response.error_code),
+                error::ConsumerError::Server(response.error_code),
             );
             return HeartbeatOutcome::Stop;
         }
@@ -638,8 +634,8 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
         state.member_id = member_id;
     }
     state.member_epoch = response.member_epoch;
-    crate::coordinator::publish_member_epoch(state).await;
-    let names = crate::offset_wire::id_to_name(&state.topic_ids.lock().await.clone());
+    coordinator::publish_member_epoch(state).await;
+    let names = offset_wire::id_to_name(&state.topic_ids.lock().await.clone());
     let Some((mut target, mut unresolved)) = assignment_partitions(&response, &names) else {
         state.rebalance_pending.send_replace(false);
         return HeartbeatOutcome::Interval(interval);
@@ -650,7 +646,7 @@ async fn heartbeat_once(state: &mut crate::coordinator::CoordinatorState) -> Hea
         // `ConsumerMembershipManager` keeps an unresolved assignment until a
         // metadata update names its topics.
         refresh_topic_ids(state, &unresolved).await;
-        let names = crate::offset_wire::id_to_name(&state.topic_ids.lock().await.clone());
+        let names = offset_wire::id_to_name(&state.topic_ids.lock().await.clone());
         if let Some(resolved) = assignment_partitions(&response, &names) {
             (target, unresolved) = resolved;
         }
@@ -705,7 +701,7 @@ enum HeartbeatKind {
 /// `ConsumerHeartbeatRequestManager.HeartbeatState.buildRequestData` keeps them
 /// in the same way.
 async fn send_heartbeat(
-    state: &mut crate::coordinator::CoordinatorState,
+    state: &mut coordinator::CoordinatorState,
     kind: HeartbeatKind,
 ) -> HeartbeatCall<'_> {
     let mut sent = state.sent_heartbeat_fields.clone();
@@ -726,7 +722,7 @@ async fn send_heartbeat(
 
 /// The heartbeat fields of the current member state.
 async fn heartbeat_fields(
-    state: &crate::coordinator::CoordinatorState,
+    state: &coordinator::CoordinatorState,
     kind: HeartbeatKind,
 ) -> HeartbeatFields<'_> {
     let topic_ids = state.topic_ids.lock().await.clone();
@@ -753,7 +749,7 @@ async fn heartbeat_fields(
         member_epoch: state.member_epoch,
         instance_id: state.group_instance_id.as_deref(),
         rack_id: state.client_rack.as_deref(),
-        rebalance_timeout_ms: crate::consumer::protocol_millis_i32(state.max_poll_interval),
+        rebalance_timeout_ms: consumer::protocol_millis_i32(state.max_poll_interval),
         subscribed_topic_names,
         regex,
         server_assignor: state.server_assignor.as_deref(),
@@ -782,13 +778,11 @@ impl krabka_protocol::Encode for RegexHeartbeat {
 }
 
 impl krabka_protocol::ProtocolRequest for RegexHeartbeat {
-    const API_KEY: i16 = krabka_protocol::owned::consumer_group_heartbeat_request::API_KEY;
+    const API_KEY: i16 = consumer_group_heartbeat_request::API_KEY;
     const MIN_VERSION: i16 = 1;
-    const MAX_VERSION: i16 = krabka_protocol::owned::consumer_group_heartbeat_request::MAX_VERSION;
-    const LATEST_STABLE_VERSION: i16 =
-        krabka_protocol::owned::consumer_group_heartbeat_request::LATEST_STABLE_VERSION;
-    const FLEXIBLE_MIN: i16 =
-        krabka_protocol::owned::consumer_group_heartbeat_request::FLEXIBLE_MIN;
+    const MAX_VERSION: i16 = consumer_group_heartbeat_request::MAX_VERSION;
+    const LATEST_STABLE_VERSION: i16 = consumer_group_heartbeat_request::LATEST_STABLE_VERSION;
+    const FLEXIBLE_MIN: i16 = consumer_group_heartbeat_request::FLEXIBLE_MIN;
     type Response = ConsumerGroupHeartbeatResponse;
 }
 
@@ -817,10 +811,7 @@ impl HeartbeatCall<'_> {
 /// names the `unresolved` topic ids. Kafka's
 /// `ConsumerMetadata.newMetadataRequestBuilder` asks for the assigned topic
 /// ids of such a subscription, and for the topic names of every other one.
-async fn refresh_topic_ids(
-    state: &crate::coordinator::CoordinatorState,
-    unresolved: &HashSet<WireUuid>,
-) {
+async fn refresh_topic_ids(state: &coordinator::CoordinatorState, unresolved: &HashSet<WireUuid>) {
     let by_id = state.subscription.borrow().regex.is_some();
     let request = if by_id {
         MetadataRequest {
@@ -873,9 +864,9 @@ fn heartbeat_interval(
 /// the assignment no longer holds, with `onPartitionsRevoked`, and then takes
 /// the new ones with `onPartitionsAssigned`.
 async fn reconcile(
-    state: &mut crate::coordinator::CoordinatorState,
+    state: &mut coordinator::CoordinatorState,
     target: &[(String, i32)],
-) -> Result<bool, crate::error::ConsumerError> {
+) -> Result<bool, error::ConsumerError> {
     let owned = state.assigned.lock().await.clone();
     let target_set: HashSet<(String, i32)> = target.iter().cloned().collect();
     let owned_set: HashSet<(String, i32)> = owned.iter().cloned().collect();
@@ -898,9 +889,9 @@ async fn reconcile(
     state.rebalance_pending.send_replace(true);
     let epoch = state.member_epoch;
     if !revoked.is_empty() {
-        crate::coordinator::call_listener_kind(
+        coordinator::call_listener_kind(
             state,
-            crate::rebalance_listener::ListenerCallKind::Revoked,
+            rebalance_listener::ListenerCallKind::Revoked,
             revoked.clone(),
         )
         .await?;
@@ -909,14 +900,14 @@ async fn reconcile(
             .filter(|partition| target_set.contains(*partition))
             .cloned()
             .collect();
-        crate::coordinator::publish_group_assignment(state, &kept, epoch).await;
+        coordinator::publish_group_assignment(state, &kept, epoch).await;
     }
-    crate::coordinator::prime_added_offsets(state, &added).await?;
-    let gate = crate::coordinator::assigned_callback_gate(state, &added);
-    crate::coordinator::publish_group_assignment(state, target, epoch).await;
-    let result = crate::coordinator::call_listener_kind(
+    coordinator::prime_added_offsets(state, &added).await?;
+    let gate = coordinator::assigned_callback_gate(state, &added);
+    coordinator::publish_group_assignment(state, target, epoch).await;
+    let result = coordinator::call_listener_kind(
         state,
-        crate::rebalance_listener::ListenerCallKind::Assigned,
+        rebalance_listener::ListenerCallKind::Assigned,
         added,
     )
     .await;
@@ -935,7 +926,7 @@ mod group_protocol_tests {
         Decode as _,
         owned::{
             api_versions_request,
-            api_versions_response::{ApiVersion, ApiVersionsResponse},
+            api_versions_response::ApiVersionsResponse,
             common::consumer_group_heartbeat_response::topic_partitions::TopicPartitions as AssignedPartitions,
             consumer_group_heartbeat_request,
             consumer_group_heartbeat_response::Assignment,
@@ -948,19 +939,21 @@ mod group_protocol_tests {
                 ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
             },
             metadata_request,
-            metadata_response::{
-                MetadataResponse, MetadataResponsePartition, MetadataResponseTopic,
-            },
+            metadata_response::{MetadataResponse, MetadataResponseTopic},
             offset_fetch_request,
             offset_fetch_response::{
                 OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
             },
         },
     };
-    use krabka_units::{millis, secs};
+    use krabka_units::{Time, millis, secs};
 
     use super::*;
-    use crate::{CloseOptions, Consumer, consumer::GroupMembershipOperation};
+    use crate::{
+        CloseOptions, Consumer,
+        consumer::GroupMembershipOperation,
+        test_support::{ListenerCall, ListenerCalls, RecordingListener},
+    };
 
     const TOPIC: &str = "orders";
     const TOPIC_ID: WireUuid = WireUuid([3; 16]);
@@ -1036,6 +1029,13 @@ mod group_protocol_tests {
                 .map(|request| request.member_epoch)
                 .collect()
         }
+
+        fn first_heartbeat(&self) -> ConsumerGroupHeartbeatRequest {
+            self.heartbeats()
+                .into_iter()
+                .next()
+                .expect("a first heartbeat")
+        }
     }
 
     fn encode(response: &impl krabka_protocol::Encode, version: i16) -> Vec<u8> {
@@ -1054,26 +1054,15 @@ mod group_protocol_tests {
 
     /// The `ApiVersions` of a coordinator that speaks `ConsumerGroupHeartbeat`.
     fn api_versions() -> ApiVersionsResponse {
-        ApiVersionsResponse {
-            api_keys: [
-                (api_versions_request::API_KEY, 3),
-                (metadata_request::API_KEY, 12),
-                (find_coordinator_request::API_KEY, 2),
-                (offset_fetch_request::API_KEY, 5),
-                (list_offsets_request::API_KEY, 7),
-                (fetch_request::API_KEY, 12),
-                (consumer_group_heartbeat_request::API_KEY, 1),
-            ]
-            .into_iter()
-            .map(|(api_key, max_version)| ApiVersion {
-                api_key,
-                min_version: 0,
-                max_version,
-                ..Default::default()
-            })
-            .collect(),
-            ..Default::default()
-        }
+        krabka_client_core::mock_test_support::api_versions_response([
+            (api_versions_request::API_KEY, 3),
+            (metadata_request::API_KEY, 12),
+            (find_coordinator_request::API_KEY, 2),
+            (offset_fetch_request::API_KEY, 5),
+            (list_offsets_request::API_KEY, 7),
+            (fetch_request::API_KEY, 12),
+            (consumer_group_heartbeat_request::API_KEY, 1),
+        ])
     }
 
     /// The metadata of `orders`, which names the topic id of the assignment.
@@ -1082,12 +1071,7 @@ mod group_protocol_tests {
             topics: vec![MetadataResponseTopic {
                 name: Some(TOPIC.into()),
                 topic_id: TOPIC_ID,
-                partitions: (0..2)
-                    .map(|partition_index| MetadataResponsePartition {
-                        partition_index,
-                        ..Default::default()
-                    })
-                    .collect(),
+                partitions: crate::test_support::metadata_partitions(2),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1095,19 +1079,23 @@ mod group_protocol_tests {
     }
 
     /// The log start and end of `orders`: both partitions are empty.
+    fn empty_list_offset_partitions() -> Vec<ListOffsetsPartitionResponse> {
+        (0..2)
+            .map(|partition_index| ListOffsetsPartitionResponse {
+                partition_index,
+                timestamp: -1,
+                offset: 0,
+                leader_epoch: -1,
+                ..Default::default()
+            })
+            .collect()
+    }
+
     fn list_offsets() -> ListOffsetsResponse {
         ListOffsetsResponse {
             topics: vec![ListOffsetsTopicResponse {
                 name: TOPIC.into(),
-                partitions: (0..2)
-                    .map(|partition_index| ListOffsetsPartitionResponse {
-                        partition_index,
-                        timestamp: -1,
-                        offset: 0,
-                        leader_epoch: -1,
-                        ..Default::default()
-                    })
-                    .collect(),
+                partitions: empty_list_offset_partitions(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1116,18 +1104,22 @@ mod group_protocol_tests {
 
     /// The committed offsets of the group: `orders` has none, so the member
     /// starts its partitions at the `auto_offset_reset`.
+    fn missing_committed_partitions() -> Vec<OffsetFetchResponsePartition> {
+        (0..2)
+            .map(|partition_index| OffsetFetchResponsePartition {
+                partition_index,
+                committed_offset: -1,
+                committed_leader_epoch: -1,
+                ..Default::default()
+            })
+            .collect()
+    }
+
     fn no_committed_offsets() -> OffsetFetchResponse {
         OffsetFetchResponse {
             topics: vec![OffsetFetchResponseTopic {
                 name: TOPIC.into(),
-                partitions: (0..2)
-                    .map(|partition_index| OffsetFetchResponsePartition {
-                        partition_index,
-                        committed_offset: -1,
-                        committed_leader_epoch: -1,
-                        ..Default::default()
-                    })
-                    .collect(),
+                partitions: missing_committed_partitions(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1245,6 +1237,21 @@ mod group_protocol_tests {
         .await
     }
 
+    async fn assigned_coordinator(recorder: &Recorder) -> MockBroker {
+        heartbeat_coordinator(vec![assigns(1, &[0, 1])], recorder).await
+    }
+
+    struct AssignedGroupFixture {
+        recorder: Recorder,
+        mock: MockBroker,
+    }
+
+    async fn assigned_group_fixture() -> AssignedGroupFixture {
+        let recorder = Recorder::default();
+        let mock = assigned_coordinator(&recorder).await;
+        AssignedGroupFixture { recorder, mock }
+    }
+
     /// Kafka's `Heartbeat` api key, which the classic protocol uses.
     const CLASSIC_HEARTBEAT_API_KEY: i16 = 12;
 
@@ -1277,27 +1284,59 @@ mod group_protocol_tests {
             .collect()
     }
 
+    enum GroupPollTarget<'a> {
+        Acknowledged {
+            recorder: &'a Recorder,
+            count: usize,
+        },
+        Assignment,
+    }
+
+    #[derive(bon::Builder)]
+    struct GroupPollWait<'a> {
+        consumer: &'a mut Consumer,
+        target: GroupPollTarget<'a>,
+    }
+
+    impl GroupPollWait<'_> {
+        async fn wait(self) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let ready = match self.target {
+                    GroupPollTarget::Acknowledged { recorder, count } => {
+                        recorder.acknowledged().len() >= count
+                    }
+                    GroupPollTarget::Assignment => !self.consumer.assignment().await.is_empty(),
+                };
+                if ready || tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let _ = self.consumer.poll(millis(20)).await;
+            }
+        }
+    }
+
     /// Run one member against `answers` until its heartbeats carried `acks`
     /// partition lists, then close it.
     async fn run_member(answers: Vec<Answer>, instance_id: Option<&str>, acks: usize) -> Observed {
         let recorder = Recorder::default();
         let mock = heartbeat_coordinator(answers, &recorder).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
-            .subscribe([TOPIC.to_owned()])
-            .group_protocol(GroupProtocol::Consumer)
-            .group_remote_assignor("uniform")
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
+        let mut consumer = TestConsumerOptions::builder()
+            .mock(&mock)
+            .server_assignor("uniform".into())
             .maybe_group_instance_id(instance_id.map(str::to_owned))
             .build()
-            .await
-            .expect("build");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while recorder.acknowledged().len() < acks && tokio::time::Instant::now() < deadline {
-            let _ = consumer.poll(millis(20)).await;
-        }
+            .start()
+            .await;
+        GroupPollWait::builder()
+            .consumer(&mut consumer)
+            .target(GroupPollTarget::Acknowledged {
+                recorder: &recorder,
+                count: acks,
+            })
+            .build()
+            .wait()
+            .await;
         let owned: Vec<i32> = consumer
             .assignment()
             .await
@@ -1330,82 +1369,50 @@ mod group_protocol_tests {
         Pattern(crate::TopicPattern),
     }
 
-    struct TestConsumerBuilder<'a> {
+    #[derive(bon::Builder)]
+    struct TestConsumerOptions<'a> {
         mock: &'a MockBroker,
+        #[builder(default = SubscriptionMode::Topics(vec![TOPIC.to_owned()]))]
         subscription: SubscriptionMode,
         server_assignor: Option<String>,
+        #[builder(default = millis(20))]
+        heartbeat_interval: Time,
+        #[builder(default = secs(5))]
+        request_timeout: Time,
+        max_poll_interval: Option<Time>,
+        group_instance_id: Option<String>,
+        rebalance_listener: Option<Box<dyn crate::ConsumerRebalanceListener>>,
     }
 
-    impl<'a> TestConsumerBuilder<'a> {
-        fn new(mock: &'a MockBroker) -> Self {
-            Self {
-                mock,
-                subscription: SubscriptionMode::Topics(vec![TOPIC.to_owned()]),
-                server_assignor: None,
-            }
-        }
-
-        fn subscribe_regex(mut self, regex: impl Into<String>) -> Self {
-            self.subscription = SubscriptionMode::Regex(regex.into());
-            self
-        }
-
-        fn subscribe_pattern(mut self, pattern: crate::TopicPattern) -> Self {
-            self.subscription = SubscriptionMode::Pattern(pattern);
-            self
-        }
-
-        fn group_remote_assignor(mut self, assignor: impl Into<String>) -> Self {
-            self.server_assignor = Some(assignor.into());
-            self
-        }
-
-        async fn build(self) -> Consumer {
+    impl TestConsumerOptions<'_> {
+        async fn start(self) -> Consumer {
+            let builder = Consumer::builder()
+                .bootstrap(self.mock.addr.to_string())
+                .group_id("group-a")
+                .group_protocol(GroupProtocol::Consumer)
+                .heartbeat_interval(self.heartbeat_interval)
+                .request_timeout(self.request_timeout)
+                .maybe_group_remote_assignor(self.server_assignor)
+                .maybe_group_instance_id(self.group_instance_id)
+                .maybe_rebalance_listener(self.rebalance_listener)
+                .maybe_max_poll_interval(self.max_poll_interval);
             match self.subscription {
                 SubscriptionMode::Topics(topics) => {
-                    Consumer::builder()
-                        .bootstrap(self.mock.addr.to_string())
-                        .group_id("group-a")
-                        .group_protocol(GroupProtocol::Consumer)
-                        .heartbeat_interval(millis(20))
-                        .request_timeout(secs(5))
-                        .maybe_group_remote_assignor(self.server_assignor)
-                        .subscribe(topics)
-                        .build()
-                        .await
-                        .expect("build")
+                    builder.subscribe(topics).build().await.expect("build")
                 }
                 SubscriptionMode::Regex(regex) => {
-                    Consumer::builder()
-                        .bootstrap(self.mock.addr.to_string())
-                        .group_id("group-a")
-                        .group_protocol(GroupProtocol::Consumer)
-                        .heartbeat_interval(millis(20))
-                        .request_timeout(secs(5))
-                        .maybe_group_remote_assignor(self.server_assignor)
-                        .subscribe_regex(regex)
-                        .build()
-                        .await
-                        .expect("build")
+                    builder.subscribe_regex(regex).build().await.expect("build")
                 }
-                SubscriptionMode::Pattern(pattern) => {
-                    Consumer::builder()
-                        .bootstrap(self.mock.addr.to_string())
-                        .group_id("group-a")
-                        .group_protocol(GroupProtocol::Consumer)
-                        .heartbeat_interval(millis(20))
-                        .request_timeout(secs(5))
-                        .maybe_group_remote_assignor(self.server_assignor)
-                        .subscribe_pattern(pattern)
-                        .build()
-                        .await
-                        .expect("build")
-                }
+                SubscriptionMode::Pattern(pattern) => builder
+                    .subscribe_pattern(pattern)
+                    .build()
+                    .await
+                    .expect("build"),
             }
         }
 
-        async fn build_and_assign(self) -> Consumer {
-            let mut consumer = self.build().await;
+        async fn start_and_assign(self) -> Consumer {
+            let mut consumer = self.start().await;
             poll_until_assigned(&mut consumer).await;
             consumer
         }
@@ -1432,23 +1439,35 @@ mod group_protocol_tests {
     }
 
     async fn started_consumer_group(mock: &MockBroker) -> Consumer {
-        TestConsumerBuilder::new(mock).build_and_assign().await
+        TestConsumerOptions::builder()
+            .mock(mock)
+            .build()
+            .start_and_assign()
+            .await
+    }
+
+    async fn close_and_first_heartbeat(
+        consumer: Consumer,
+        mock: MockBroker,
+        recorder: &Recorder,
+    ) -> ConsumerGroupHeartbeatRequest {
+        consumer.close().await.expect("close");
+        mock.stop();
+        recorder.first_heartbeat()
     }
 
     /// The first heartbeat of a member joins with epoch 0 and carries every
     /// field: Kafka's `ConsumerHeartbeatRequestManager.HeartbeatState`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_first_heartbeat_joins_the_group_with_every_field() {
-        let recorder = Recorder::default();
-        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
-        let consumer = TestConsumerBuilder::new(&mock)
-            .group_remote_assignor("uniform")
-            .build_and_assign()
+        let AssignedGroupFixture { recorder, mock } = assigned_group_fixture().await;
+        let consumer = TestConsumerOptions::builder()
+            .mock(&mock)
+            .server_assignor("uniform".into())
+            .build()
+            .start_and_assign()
             .await;
-        consumer.close().await.expect("close");
-        mock.stop();
-        let first = recorder.heartbeats().first().cloned();
-        let first = first.expect("a first heartbeat");
+        let first = close_and_first_heartbeat(consumer, mock, &recorder).await;
         assert2::assert!(
             ConsumerGroupHeartbeatRequest {
                 member_id: String::new(),
@@ -1477,16 +1496,15 @@ mod group_protocol_tests {
     async fn a_regular_expression_subscription_resolves_its_topics_by_id() {
         let recorder = Recorder::default();
         let mock = heartbeat_coordinator_with(vec![assigns(1, &[0, 1])], &recorder, true).await;
-        let consumer = TestConsumerBuilder::new(&mock)
-            .subscribe_regex("orders-.*")
-            .build_and_assign()
+        let consumer = TestConsumerOptions::builder()
+            .mock(&mock)
+            .subscription(SubscriptionMode::Regex("orders-.*".into()))
+            .build()
+            .start_and_assign()
             .await;
         let assignment = consumer.assignment().await;
         let subscription = consumer.subscription();
-        consumer.close().await.expect("close");
-        mock.stop();
-        let first = recorder.heartbeats().first().cloned();
-        let first = first.expect("a first heartbeat");
+        let first = close_and_first_heartbeat(consumer, mock, &recorder).await;
         assert2::assert!(
             (
                 first.subscribed_topic_regex,
@@ -1509,17 +1527,17 @@ mod group_protocol_tests {
     /// `AsyncKafkaConsumer.updateAssignmentMetadataIfNeeded`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_client_side_pattern_sends_the_topics_that_matched() {
-        let recorder = Recorder::default();
-        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
-        let consumer = TestConsumerBuilder::new(&mock)
-            .subscribe_pattern(crate::TopicPattern::new(|topic| topic.starts_with("ord")))
-            .build_and_assign()
+        let AssignedGroupFixture { recorder, mock } = assigned_group_fixture().await;
+        let consumer = TestConsumerOptions::builder()
+            .mock(&mock)
+            .subscription(SubscriptionMode::Pattern(crate::TopicPattern::new(
+                |topic| topic.starts_with("ord"),
+            )))
+            .build()
+            .start_and_assign()
             .await;
         let assignment = consumer.assignment().await;
-        consumer.close().await.expect("close");
-        mock.stop();
-        let first = recorder.heartbeats().first().cloned();
-        let first = first.expect("a first heartbeat");
+        let first = close_and_first_heartbeat(consumer, mock, &recorder).await;
         assert2::assert!(
             (
                 first.subscribed_topic_names,
@@ -1533,76 +1551,13 @@ mod group_protocol_tests {
         );
     }
 
-    /// The kind and partitions of one rebalance listener call.
-    type ListenerCall = (crate::rebalance_listener::ListenerCallKind, Vec<i32>);
-
-    /// The listener calls of one run.
-    type ListenerCalls = Arc<Mutex<Vec<ListenerCall>>>;
-
-    /// A rebalance listener that records its calls.
-    struct RecordingListener {
-        calls: ListenerCalls,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::ConsumerRebalanceListener for RecordingListener {
-        async fn on_partitions_revoked(
-            &mut self,
-            _consumer: &Consumer,
-            partitions: &[(String, i32)],
-        ) -> Result<(), crate::RebalanceListenerError> {
-            self.record(
-                crate::rebalance_listener::ListenerCallKind::Revoked,
-                partitions,
-            );
-            Ok(())
-        }
-
-        async fn on_partitions_assigned(
-            &mut self,
-            _consumer: &Consumer,
-            partitions: &[(String, i32)],
-        ) -> Result<(), crate::RebalanceListenerError> {
-            self.record(
-                crate::rebalance_listener::ListenerCallKind::Assigned,
-                partitions,
-            );
-            Ok(())
-        }
-
-        async fn on_partitions_lost(
-            &mut self,
-            _consumer: &Consumer,
-            partitions: &[(String, i32)],
-        ) -> Result<(), crate::RebalanceListenerError> {
-            self.record(
-                crate::rebalance_listener::ListenerCallKind::Lost,
-                partitions,
-            );
-            Ok(())
-        }
-    }
-
-    impl RecordingListener {
-        fn record(
-            &self,
-            kind: crate::rebalance_listener::ListenerCallKind,
-            partitions: &[(String, i32)],
-        ) {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push((kind, partitions.iter().map(|(_, index)| *index).collect()));
-        }
-    }
-
     /// The first lost callback of `calls`.
     fn first_lost(calls: &ListenerCalls) -> Option<ListenerCall> {
         calls
             .lock()
             .expect("calls lock")
             .iter()
-            .find(|(kind, _)| *kind == crate::rebalance_listener::ListenerCallKind::Lost)
+            .find(|(kind, _)| *kind == rebalance_listener::ListenerCallKind::Lost)
             .cloned()
     }
 
@@ -1627,7 +1582,11 @@ mod group_protocol_tests {
             } else {
                 classic_only_coordinator().await
             };
-            let mut consumer = TestConsumerBuilder::new(&mock).build().await;
+            let mut consumer = TestConsumerOptions::builder()
+                .mock(&mock)
+                .build()
+                .start()
+                .await;
             let error = poll_until_error(&mut consumer).await;
             consumer.close().await.expect("close");
             mock.stop();
@@ -1682,16 +1641,22 @@ mod group_protocol_tests {
         .await
     }
 
+    async fn regex_consumer(mock: &MockBroker) -> Consumer {
+        TestConsumerOptions::builder()
+            .mock(mock)
+            .subscription(SubscriptionMode::Regex("orders-.*".into()))
+            .build()
+            .start()
+            .await
+    }
+
     /// A regular expression subscription needs `ConsumerGroupHeartbeat` v1,
     /// which added `subscribed_topic_regex`. A coordinator that speaks only
     /// v0 fails the call, because a v0 request would name no topic at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_regular_expression_needs_heartbeat_version_1() {
         let mock = coordinator_with_heartbeat_versions(0, 0).await;
-        let mut consumer = TestConsumerBuilder::new(&mock)
-            .subscribe_regex("orders-.*")
-            .build()
-            .await;
+        let mut consumer = regex_consumer(&mock).await;
         let error = poll_until_error(&mut consumer).await;
         consumer.close().await.expect("close");
         mock.stop();
@@ -1711,10 +1676,7 @@ mod group_protocol_tests {
     async fn a_regular_expression_subscription_keeps_fetching_after_a_resubscribe() {
         let recorder = Recorder::default();
         let mock = heartbeat_coordinator_with(vec![assigns(1, &[0, 1])], &recorder, true).await;
-        let mut consumer = TestConsumerBuilder::new(&mock)
-            .subscribe_regex("orders-.*")
-            .build()
-            .await;
+        let mut consumer = regex_consumer(&mock).await;
         // Poll until the member owns the partitions and their positions are
         // ready, so that the fetch of the next poll would go out.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1756,7 +1718,7 @@ mod group_protocol_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unsubscribe_leaves_the_group_and_a_new_subscription_joins_again() {
         let recorder = Recorder::default();
-        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
+        let mock = assigned_coordinator(&recorder).await;
         let mut consumer = started_consumer_group(&mock).await;
         consumer.unsubscribe().await.expect("unsubscribe");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1803,33 +1765,34 @@ mod group_protocol_tests {
     async fn a_member_that_stops_polling_leaves_and_joins_again() {
         let recorder = Recorder::default();
         let calls: ListenerCalls = Arc::default();
-        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
-            .subscribe([TOPIC.to_owned()])
-            .group_protocol(GroupProtocol::Consumer)
-            .heartbeat_interval(millis(20))
+        let mock = assigned_coordinator(&recorder).await;
+        let mut consumer = TestConsumerOptions::builder()
+            .mock(&mock)
             .max_poll_interval(millis(300))
-            .request_timeout(secs(5))
-            .rebalance_listener(Box::new(RecordingListener {
-                calls: Arc::clone(&calls),
-            }))
+            .rebalance_listener(Box::new(
+                RecordingListener::builder()
+                    .calls(Arc::clone(&calls))
+                    .build(),
+            ))
             .build()
-            .await
-            .expect("build");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
-            let _ = consumer.poll(millis(20)).await;
-        }
+            .start()
+            .await;
+        GroupPollWait::builder()
+            .consumer(&mut consumer)
+            .target(GroupPollTarget::Assignment)
+            .build()
+            .wait()
+            .await;
         // The application stops polling for longer than `max_poll_interval`.
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         let left = consumer.assignment().await;
         let epochs_after_leave = recorder.epochs();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while consumer.assignment().await.is_empty() && tokio::time::Instant::now() < deadline {
-            let _ = consumer.poll(millis(20)).await;
-        }
+        GroupPollWait::builder()
+            .consumer(&mut consumer)
+            .target(GroupPollTarget::Assignment)
+            .build()
+            .wait()
+            .await;
         let joined_again = consumer.assignment().await;
         consumer.close().await.expect("close");
         mock.stop();
@@ -1846,10 +1809,7 @@ mod group_protocol_tests {
                 Vec::new(),
                 true,
                 vec![(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)],
-                Some((
-                    crate::rebalance_listener::ListenerCallKind::Lost,
-                    vec![0, 1]
-                )),
+                Some((rebalance_listener::ListenerCallKind::Lost, vec![0, 1])),
             )
         );
     }
@@ -1869,19 +1829,16 @@ mod group_protocol_tests {
             &recorder,
         )
         .await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
-            .subscribe([TOPIC.to_owned()])
-            .group_protocol(GroupProtocol::Consumer)
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
-            .rebalance_listener(Box::new(RecordingListener {
-                calls: Arc::clone(&calls),
-            }))
+        let mut consumer = TestConsumerOptions::builder()
+            .mock(&mock)
+            .rebalance_listener(Box::new(
+                RecordingListener::builder()
+                    .calls(Arc::clone(&calls))
+                    .build(),
+            ))
             .build()
-            .await
-            .expect("build");
+            .start()
+            .await;
         let member_id = consumer.member_id();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         while first_lost(&calls).is_none() && tokio::time::Instant::now() < deadline {
@@ -1893,10 +1850,7 @@ mod group_protocol_tests {
         assert2::assert!(
             (first_lost(&calls), kept_id == member_id)
                 == (
-                    Some((
-                        crate::rebalance_listener::ListenerCallKind::Lost,
-                        vec![0, 1]
-                    )),
+                    Some((rebalance_listener::ListenerCallKind::Lost, vec![0, 1])),
                     true,
                 )
         );
@@ -1954,21 +1908,16 @@ mod group_protocol_tests {
     async fn heartbeats_go_on_during_a_rebalance_callback() {
         let recorder = Recorder::default();
         let in_callback: Arc<Mutex<Option<usize>>> = Arc::default();
-        let mock = heartbeat_coordinator(vec![assigns(1, &[0, 1])], &recorder).await;
-        let mut consumer = Consumer::builder()
-            .bootstrap(mock.addr.to_string())
-            .group_id("group-a")
-            .subscribe([TOPIC.to_owned()])
-            .group_protocol(GroupProtocol::Consumer)
-            .heartbeat_interval(millis(20))
-            .request_timeout(secs(5))
+        let mock = assigned_coordinator(&recorder).await;
+        let mut consumer = TestConsumerOptions::builder()
+            .mock(&mock)
             .rebalance_listener(Box::new(HeartbeatWaitingListener {
                 recorder: recorder.clone(),
                 in_callback: Arc::clone(&in_callback),
             }))
             .build()
-            .await
-            .expect("build");
+            .start()
+            .await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         while in_callback.lock().expect("in callback lock").is_none()
             && tokio::time::Instant::now() < deadline
@@ -2128,13 +2077,13 @@ mod group_protocol_tests {
 
 #[cfg(test)]
 mod tests {
+    use consumer::GroupMembershipOperation;
     use krabka_protocol::owned::{
         common::consumer_group_heartbeat_response::topic_partitions::TopicPartitions as ResponseTopicPartitions,
         consumer_group_heartbeat_response::Assignment,
     };
 
     use super::*;
-    use crate::consumer::GroupMembershipOperation;
 
     const TOPIC_ID: WireUuid = WireUuid([7; 16]);
 

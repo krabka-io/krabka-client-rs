@@ -35,6 +35,8 @@ use krabka_protocol::{
 };
 use krabka_units::{Time, convert::TimeExt as _};
 
+#[cfg(test)]
+use crate::AdminClientConfig;
 use crate::{
     AdminClient, AdminError, KafkaError, format_host_port, kafka_error_name,
     partition_leaders::{PartitionKey, PartitionResults, complete_results},
@@ -2114,7 +2116,7 @@ mod tests {
                 default_api_timeout: Some(krabka_units::millis(1500)),
                 retry_backoff: krabka_units::millis(100),
                 retry_backoff_max: krabka_units::millis(100),
-                ..crate::AdminClientConfig::default()
+                ..AdminClientConfig::default()
             },
         )
         .await
@@ -2626,7 +2628,7 @@ mod tests {
                 retry_backoff: krabka_units::millis(1),
                 retry_backoff_max: krabka_units::millis(1),
                 default_api_timeout: Some(krabka_units::secs(5)),
-                ..crate::AdminClientConfig::default()
+                ..AdminClientConfig::default()
             },
         )
         .await

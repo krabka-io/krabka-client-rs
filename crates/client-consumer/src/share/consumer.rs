@@ -8,7 +8,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use krabka_client_core::Client;
+use krabka_client_core::{Client, security, telemetry};
 use krabka_protocol::{
     owned::share_group_heartbeat_request::ShareGroupHeartbeatRequest,
     primitives::uuid::Uuid as WireUuid,
@@ -18,7 +18,7 @@ use krabka_units::{
     convert::{ByteSizeExt as _, TimeExt as _},
     mebibytes, secs,
 };
-use refined_type::rule::{GreaterI32, GreaterI64};
+use refined_type::rule::GreaterI64;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +26,11 @@ use super::{
     coordinator::ShareCoordinatorState,
     types::{ShareAckMode, ShareAcquireMode},
 };
-use crate::error::ConsumerError;
+use crate::{
+    consumer::{client_instance_id, protocol_bytes, validated_positive_i32},
+    coordinator,
+    error::ConsumerError,
+};
 
 /// Default deadline for the final best-effort `ShareGroup` leave heartbeat.
 pub const DEFAULT_SHARE_CONSUMER_LEAVE_HEARTBEAT_TIMEOUT: Time = secs(5);
@@ -39,7 +43,7 @@ pub const DEFAULT_SHARE_CONSUMER_FETCH_MAX: ByteSize = mebibytes(50);
 pub const DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS: i32 = 500;
 
 /// Validated minimum response bytes for a `ShareFetch`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ShareConsumerFetchMinBytes(i32);
 
 impl ShareConsumerFetchMinBytes {
@@ -49,9 +53,7 @@ impl ShareConsumerFetchMinBytes {
     ///
     /// Returns an error when `value` is zero or negative.
     pub fn new(value: i32) -> Result<Self, String> {
-        GreaterI32::<0>::new(value)
-            .map(|value| Self(value.into_value()))
-            .map_err(|error| format!("share consumer fetch min bytes: {error}"))
+        validated_positive_i32(value, "share consumer fetch min bytes").map(Self)
     }
 
     /// Return the validated byte count.
@@ -77,7 +79,7 @@ impl Default for ShareConsumerFetchMinBytes {
 }
 
 /// Validated maximum response bytes for a `ShareFetch`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ShareConsumerFetchMaxBytes(i32);
 
 impl ShareConsumerFetchMaxBytes {
@@ -87,9 +89,7 @@ impl ShareConsumerFetchMaxBytes {
     ///
     /// Returns an error when `value` is zero or negative.
     pub fn new(value: i32) -> Result<Self, String> {
-        GreaterI32::<0>::new(value)
-            .map(|value| Self(value.into_value()))
-            .map_err(|error| format!("share consumer fetch max bytes: {error}"))
+        validated_positive_i32(value, "share consumer fetch max bytes").map(Self)
     }
 
     /// Return the validated byte count.
@@ -115,7 +115,7 @@ impl Default for ShareConsumerFetchMaxBytes {
 }
 
 /// Validated maximum records acquired by a `ShareFetch`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ShareConsumerFetchMaxRecords(i32);
 
 impl ShareConsumerFetchMaxRecords {
@@ -125,9 +125,7 @@ impl ShareConsumerFetchMaxRecords {
     ///
     /// Returns an error when `value` is zero or negative.
     pub fn new(value: i32) -> Result<Self, String> {
-        GreaterI32::<0>::new(value)
-            .map(|value| Self(value.into_value()))
-            .map_err(|error| format!("share consumer fetch max records: {error}"))
+        validated_positive_i32(value, "share consumer fetch max records").map(Self)
     }
 
     /// Return the validated record count.
@@ -145,7 +143,7 @@ impl Default for ShareConsumerFetchMaxRecords {
 }
 
 /// Validated deadline for the final best-effort `ShareGroup` leave heartbeat.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, derive_more::Into)]
 pub struct ShareConsumerLeaveHeartbeatTimeout(Time);
 
 impl ShareConsumerLeaveHeartbeatTimeout {
@@ -172,6 +170,46 @@ impl Default for ShareConsumerLeaveHeartbeatTimeout {
     }
 }
 
+#[derive(bon::Builder)]
+#[builder(start_fn = builder, finish_fn = build)]
+struct ShareClientStart {
+    #[builder(into)]
+    bootstrap: String,
+    #[builder(into)]
+    client_id: String,
+    dispatch_queue_capacity: usize,
+    frame_max: ByteSize,
+    metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
+    metadata_recovery_rebootstrap_trigger: Time,
+    security: Option<security::ClientSecurity>,
+    allow_auto_create_topics: bool,
+}
+
+#[derive(bon::Builder, Default)]
+struct ShareClientOptions {
+    telemetry: Option<telemetry::ClientTelemetryConfig>,
+}
+
+async fn build_share_client(
+    start: &ShareClientStart,
+    options: ShareClientOptions,
+) -> Result<Client, ConsumerError> {
+    Ok(Client::builder()
+        .bootstrap(&start.bootstrap)
+        .client_id(start.client_id.clone())
+        .dispatch_queue_capacity(start.dispatch_queue_capacity)
+        .frame_max(start.frame_max)
+        .metadata_recovery_strategy(start.metadata_recovery_strategy)
+        .metadata_recovery_rebootstrap_trigger(start.metadata_recovery_rebootstrap_trigger)
+        .maybe_security(start.security.clone())
+        .metadata_scope(krabka_client_core::MetadataScope::Topics {
+            allow_auto_topic_creation: start.allow_auto_create_topics,
+        })
+        .maybe_telemetry(options.telemetry)
+        .build()
+        .await?)
+}
+
 fn build_join_heartbeat_request(
     group_id: String,
     subscribe: Vec<String>,
@@ -196,17 +234,6 @@ fn validated_time(name: &str, value: Time) -> Result<Time, String> {
         Ok(value)
     } else {
         Err(format!("{name} must be a whole number of milliseconds"))
-    }
-}
-
-fn protocol_bytes(name: &str, value: ByteSize) -> Result<i32, String> {
-    let bytes = value.bytes_f64();
-    if bytes.is_finite() && bytes.fract() == 0.0 && (1.0..=f64::from(i32::MAX)).contains(&bytes) {
-        Ok(value.bytes_i32())
-    } else {
-        Err(format!(
-            "{name} must be a positive whole-byte value that fits i32"
-        ))
     }
 }
 
@@ -282,7 +309,7 @@ pub struct ShareConsumer {
     pub(crate) hb_handle: Option<JoinHandle<()>>,
     /// A fatal heartbeat error that the next `poll()` returns. The heartbeat
     /// loop holds the other `Arc`.
-    pub(crate) poll_error: crate::coordinator::PollErrorSlot,
+    pub(crate) poll_error: coordinator::PollErrorSlot,
 }
 
 #[bon::bon]
@@ -315,9 +342,15 @@ impl ShareConsumer {
         #[builder(into)] subscribe: Vec<String>,
         #[builder(default = ShareAckMode::Implicit)] ack_mode: ShareAckMode,
         #[builder(default = ShareAcquireMode::BatchOptimized)] acquire_mode: ShareAcquireMode,
-        #[builder(default = DEFAULT_SHARE_CONSUMER_FETCH_MIN)] fetch_min: ByteSize,
-        #[builder(default = DEFAULT_SHARE_CONSUMER_FETCH_MAX)] fetch_max: ByteSize,
-        #[builder(default = DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS)] fetch_max_records: i32,
+        /// The minimum `ShareFetch` response bytes, as a raw protocol count.
+        #[builder(default = DEFAULT_SHARE_CONSUMER_FETCH_MIN.bytes_i32())]
+        fetch_min: i32,
+        /// The maximum `ShareFetch` response bytes, as a raw protocol count.
+        #[builder(default = DEFAULT_SHARE_CONSUMER_FETCH_MAX.bytes_i32())]
+        fetch_max: i32,
+        /// The maximum records acquired by one `ShareFetch`.
+        #[builder(default = DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS)]
+        fetch_max_records: i32,
         #[builder(default = secs(3))] heartbeat_interval: Time,
         #[builder(default = DEFAULT_SHARE_CONSUMER_LEAVE_HEARTBEAT_TIMEOUT)]
         leave_heartbeat_timeout: Time,
@@ -328,7 +361,7 @@ impl ShareConsumer {
         metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy,
         #[builder(default = krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
         metadata_recovery_rebootstrap_trigger: Time,
-        security: Option<krabka_client_core::security::ClientSecurity>,
+        security: Option<security::ClientSecurity>,
         /// Kafka's `allow.auto.create.topics`, which
         /// `ShareConsumerMetadata` reads.
         #[builder(default = true)]
@@ -347,17 +380,15 @@ impl ShareConsumer {
         if group_id.is_empty() {
             return Err(ConsumerError::RebalanceFailed("group_id required".into()));
         }
-        // The two fetch-size newtypes below still speak `i32`: both derive `Eq`,
-        // which an `f64`-backed quantity cannot satisfy. Their whole job is to
-        // police the positive-`int32` invariant, so the quantity meets them at
-        // their own boundary and comes straight back.
+        // The newtypes validate the raw protocol values before turning them
+        // into quantities for the fetch implementation.
         let fetch_min = ByteSize::from_bytes_i64(i64::from(
-            ShareConsumerFetchMinBytes::try_from(fetch_min)
+            ShareConsumerFetchMinBytes::new(fetch_min)
                 .map_err(ConsumerError::RebalanceFailed)?
                 .bytes(),
         ));
         let fetch_max = ByteSize::from_bytes_i64(i64::from(
-            ShareConsumerFetchMaxBytes::try_from(fetch_max)
+            ShareConsumerFetchMaxBytes::new(fetch_max)
                 .map_err(ConsumerError::RebalanceFailed)?
                 .bytes(),
         ));
@@ -387,29 +418,29 @@ impl ShareConsumer {
             )
             .map_err(ConsumerError::RebalanceFailed)?;
 
-        let client = Client::builder()
-            .bootstrap(&bootstrap)
+        let client_start = ShareClientStart::builder()
+            .bootstrap(bootstrap.clone())
             .client_id(client_id.clone())
             .dispatch_queue_capacity(dispatch_queue_capacity.get())
             .frame_max(frame_max.size())
             .metadata_recovery_strategy(metadata_recovery_strategy)
             .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
             .maybe_security(security.clone())
-            .metadata_scope(krabka_client_core::MetadataScope::Topics {
-                allow_auto_topic_creation: allow_auto_create_topics,
-            })
-            .maybe_telemetry(enable_metrics_push.then(|| {
-                // `ClientTelemetryProvider` labels a consumer's metrics with
-                // its `group.id`. A share consumer has no
-                // `group.instance.id` and no `client.rack`.
-                krabka_client_core::telemetry::ClientTelemetryConfig::consumer(
-                    Some(&group_id),
-                    None,
-                    None,
-                )
-            }))
-            .build()
-            .await?;
+            .allow_auto_create_topics(allow_auto_create_topics)
+            .build();
+        let telemetry = enable_metrics_push.then(|| {
+            // `ClientTelemetryProvider` labels a consumer's metrics with
+            // its `group.id`. A share consumer has no
+            // `group.instance.id` and no `client.rack`.
+            telemetry::ClientTelemetryConfig::consumer(Some(&group_id), None, None)
+        });
+        let client = build_share_client(
+            &client_start,
+            ShareClientOptions::builder()
+                .maybe_telemetry(telemetry)
+                .build(),
+        )
+        .await?;
         client.metadata_topics().set(subscribe.iter().cloned());
 
         // 1. Join: client-generated member UUID + epoch 0 + the subscription.
@@ -467,24 +498,13 @@ impl ShareConsumer {
         let assignment = Arc::new(Mutex::new(assignment_vec));
         let topic_names = Arc::new(Mutex::new(topic_names));
         let shutdown = CancellationToken::new();
-        let poll_error = crate::coordinator::PollErrorSlot::default();
+        let poll_error = coordinator::PollErrorSlot::default();
 
         // 4. Spawn the heartbeat loop on its own connection so a parked
         //    request on the data path can't head-of-line-block heartbeats
         //    (the broker serves a connection's requests serially).
-        let coordinator_client = Client::builder()
-            .bootstrap(&bootstrap)
-            .client_id(client_id.clone())
-            .dispatch_queue_capacity(dispatch_queue_capacity.get())
-            .frame_max(frame_max.size())
-            .metadata_recovery_strategy(metadata_recovery_strategy)
-            .metadata_recovery_rebootstrap_trigger(metadata_recovery_rebootstrap_trigger.time())
-            .maybe_security(security.clone())
-            .metadata_scope(krabka_client_core::MetadataScope::Topics {
-                allow_auto_topic_creation: allow_auto_create_topics,
-            })
-            .build()
-            .await?;
+        let coordinator_client =
+            build_share_client(&client_start, ShareClientOptions::default()).await?;
         coordinator_client
             .metadata_topics()
             .set(subscribe.iter().cloned());
@@ -602,13 +622,13 @@ impl ShareConsumer {
     /// `timeout`, as Kafka throws an `IllegalStateException` and an
     /// `IllegalArgumentException`.
     ///
-    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
-    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
+    /// [`ClientError::TelemetryDisabled`]: ClientError::TelemetryDisabled
+    /// [`ClientError::InvalidArgument`]: ClientError::InvalidArgument
     pub async fn client_instance_id(
         &self,
         timeout: Time,
     ) -> Result<Option<uuid::Uuid>, ConsumerError> {
-        Ok(self.client.client_instance_id(timeout).await?)
+        client_instance_id(&self.client, timeout).await
     }
 }
 
@@ -619,12 +639,7 @@ mod tests {
     use krabka_units::millis;
 
     use super::*;
-
-    fn id(n: u8) -> WireUuid {
-        let mut b = [0u8; 16];
-        b[15] = n;
-        WireUuid(b)
-    }
+    use crate::test_support::wire_uuid;
 
     #[test]
     fn leave_heartbeat_timeout_uses_default_and_valid_override() {
@@ -725,8 +740,8 @@ mod tests {
             .bootstrap("invalid.invalid:9092")
             .group_id("fetch-limit-validation")
             .subscribe(["topic".to_owned()])
-            .fetch_min(bytes(2))
-            .fetch_max(bytes(1))
+            .fetch_min(2)
+            .fetch_max(1)
             .build()
             .await
             .err()
@@ -740,18 +755,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fractional_share_fetch_limit_fails_before_broker_lookup() {
+    async fn non_positive_share_fetch_limit_fails_before_broker_lookup() {
         let error = ShareConsumer::builder()
             .bootstrap("invalid.invalid:9092")
             .group_id("fetch-limit-validation")
             .subscribe(["topic".to_owned()])
-            .fetch_min(ByteSize::from_bytes_f64(1.5))
+            .fetch_min(0)
             .build()
             .await
             .err()
-            .expect("fractional fetch limit must fail");
+            .expect("non-positive fetch limit must fail");
 
-        check!(error.to_string().contains("positive whole-byte"));
+        check!(error.to_string().contains("must be greater than 0"));
     }
 
     #[tokio::test]
@@ -780,7 +795,7 @@ mod tests {
             group_id: "group-a".into(),
             member_id: "member-a".into(),
             member_epoch: Arc::new(Mutex::new(3)),
-            assignment: Arc::new(Mutex::new(vec![(id(7), "topic-a".into(), 2)])),
+            assignment: Arc::new(Mutex::new(vec![(wire_uuid(7), "topic-a".into(), 2)])),
             topic_names: Arc::new(Mutex::new(HashMap::new())),
             share_session_epoch: 0,
             fetch_min: DEFAULT_SHARE_CONSUMER_FETCH_MIN,
@@ -792,7 +807,7 @@ mod tests {
             prev_delivered: Vec::new(),
             shutdown: CancellationToken::new(),
             hb_handle: None,
-            poll_error: crate::coordinator::PollErrorSlot::default(),
+            poll_error: coordinator::PollErrorSlot::default(),
         }
     }
 
@@ -849,7 +864,7 @@ mod tests {
 
     #[test]
     fn stage_implicit_accepts_moves_delivered_ranges_to_pending_acks() {
-        let mut prev = vec![(id(7), 2, 10, 12)];
+        let mut prev = vec![(wire_uuid(7), 2, 10, 12)];
         let mut pending = Vec::new();
 
         stage_implicit_accepts(&mut prev, &mut pending);
@@ -858,7 +873,7 @@ mod tests {
         assert2::assert!(
             pending
                 == vec![(
-                    id(7),
+                    wire_uuid(7),
                     2,
                     10,
                     12,

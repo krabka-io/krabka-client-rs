@@ -6,16 +6,24 @@ use std::{
     sync::Arc,
 };
 
-use bytes::BufMut;
+use krabka_client_core::VersionBoundedRequest;
+#[cfg(test)]
+use krabka_client_core::mock_test_support;
 use krabka_ids::LeaderEpoch;
+#[cfg(test)]
+use krabka_protocol::owned::fetch_request;
+#[cfg(test)]
+use krabka_protocol::records::RecordsPayload;
 use krabka_protocol::{
-    Encode, ProtocolError, ProtocolRequest,
+    ProtocolRequest,
     owned::{
         fetch_request::{FetchPartition, FetchRequest, FetchTopic, ForgottenTopic},
+        fetch_response,
         fetch_response::FetchResponse,
         list_offsets_request::{self, ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
         list_offsets_response::ListOffsetsResponse,
     },
+    primitives::uuid,
     records::{Record, RecordBatch},
 };
 use krabka_units::{
@@ -24,14 +32,22 @@ use krabka_units::{
     mebibytes,
 };
 
+#[cfg(test)]
+use crate::poll;
+#[cfg(test)]
+use crate::test_support;
 use crate::{
+    assignor,
     builder::{AutoOffsetReset, IsolationLevel},
+    consumer,
     consumer::{Consumer, ConsumerRecord, Header, TimestampType},
+    control, coordinator,
     error::ConsumerError,
     fetch_buffer::BufferedPartition,
     fetch_session::{
         FINAL_EPOCH, FetchSession, INVALID_SESSION_ID, SessionPartition, SessionRequest,
     },
+    offset_wire,
     position::PartitionPosition,
 };
 
@@ -78,15 +94,7 @@ fn is_read_committed(isolation_level: IsolationLevel) -> bool {
 }
 
 pub(crate) fn is_transient_transport_error(e: &krabka_client_core::ClientError) -> bool {
-    matches!(
-        e,
-        krabka_client_core::ClientError::Connect { .. }
-            | krabka_client_core::ClientError::Tls { .. }
-            | krabka_client_core::ClientError::Sasl { .. }
-            | krabka_client_core::ClientError::Disconnected
-            | krabka_client_core::ClientError::Timeout(_)
-            | krabka_client_core::ClientError::Io(_)
-    )
+    crate::error::is_transport_error(e, true)
 }
 
 fn is_transient_poll_error(e: &ConsumerError) -> bool {
@@ -175,7 +183,7 @@ pub(crate) fn record_timestamp(batch: &RecordBatch, record: &Record) -> (i64, Ti
 
 /// The `max_bytes` of one partition in a Fetch request.
 fn session_partition(
-    topic_id: krabka_protocol::primitives::uuid::Uuid,
+    topic_id: uuid::Uuid,
     (_, fetch_offset, leader_epoch, last_fetched_epoch): FetchSpec,
     partition_max: ByteSize,
 ) -> SessionPartition {
@@ -391,7 +399,7 @@ fn reset_timestamp(policy: AutoOffsetReset, now_ms: i64) -> i64 {
 /// Run `future`, or return [`ConsumerError::Wakeup`] when `wakeup` comes
 /// first.
 async fn until_woken<F: std::future::Future>(
-    wakeup: Option<&crate::control::WakeupHandle>,
+    wakeup: Option<&control::WakeupHandle>,
     future: F,
 ) -> Result<F::Output, ConsumerError> {
     match wakeup {
@@ -466,28 +474,8 @@ fn build_offsets_request(
 /// negotiation. When the broker supports only version 0 or 1, the send fails
 /// with `ClientError::IncompatibleVersion` before the request goes out.
 /// Kafka fails with `UnsupportedVersionException` in that case.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ReadCommittedListOffsets(pub(crate) ListOffsetsRequest);
-
-impl Encode for ReadCommittedListOffsets {
-    fn encode<B: BufMut>(&self, buf: &mut B, version: i16) -> Result<(), ProtocolError> {
-        self.0.encode(buf, version)
-    }
-
-    fn encoded_len(&self, version: i16) -> usize {
-        self.0.encoded_len(version)
-    }
-}
-
-impl ProtocolRequest for ReadCommittedListOffsets {
-    const API_KEY: i16 = list_offsets_request::API_KEY;
-    /// The first `ListOffsets` version that carries `isolation_level`.
-    const MIN_VERSION: i16 = 2;
-    const MAX_VERSION: i16 = list_offsets_request::MAX_VERSION;
-    const LATEST_STABLE_VERSION: i16 = list_offsets_request::LATEST_STABLE_VERSION;
-    const FLEXIBLE_MIN: i16 = list_offsets_request::FLEXIBLE_MIN;
-    type Response = ListOffsetsResponse;
-}
+pub(crate) type ReadCommittedListOffsets =
+    VersionBoundedRequest<ListOffsetsRequest, 2, { list_offsets_request::MAX_VERSION }>;
 
 /// Group `ListOffsets` partitions by the broker that gets the request.
 ///
@@ -543,7 +531,7 @@ fn classify_list_offsets_row(error_code: i16, offset: i64) -> ListOffsetsRowActi
 
 /// What the consumer takes from the `ListOffsets` answers for a set of
 /// partitions.
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ListOffsetsResult {
     /// The offset for each requested partition that got one.
     offsets: HashMap<(String, i32), i64>,
@@ -729,14 +717,14 @@ impl Consumer {
         if !*self.rebalance_pending.borrow() {
             return first_error.map_or(Ok(true), Err);
         }
-        let eager = self.rebalance_protocol == crate::assignor::RebalanceProtocol::Eager;
+        let eager = self.rebalance_protocol == assignor::RebalanceProtocol::Eager;
         if first_error.is_none() && !eager && !self.assigned.lock().await.is_empty() {
             return Ok(true);
         }
         // The coordinator task can request the rejoin after the start of this
         // `poll` signalled it. Signal again, so that this `poll` starts the
         // join that it waits for, as Kafka's `ensureActiveGroup` does.
-        crate::coordinator::note_poll(&self.poll_signal);
+        coordinator::note_poll(&self.poll_signal);
         let wakeup = self.wakeup.clone();
         let joined = loop {
             // A slow callback must not keep this `poll` past its timeout. The
@@ -870,8 +858,8 @@ impl Consumer {
     /// partition errors.
     async fn process_fetch_responses(
         &mut self,
-        responses: Vec<krabka_protocol::owned::fetch_response::FetchResponse>,
-        topic_ids: &HashMap<String, krabka_protocol::primitives::uuid::Uuid>,
+        responses: Vec<fetch_response::FetchResponse>,
+        topic_ids: &HashMap<String, uuid::Uuid>,
     ) -> Result<(), ConsumerError> {
         // 3. Decode each partition's RecordBatches, advance next-offsets.
         //
@@ -880,7 +868,7 @@ impl Consumer {
         // per Record, and bump next_offsets to the highest seen offset + 1.
         // Reverse-map topic_id → name. At Fetch v ≥ 13 the response carries
         // only `topic_id`; `topic.topic` is empty.
-        let id_to_name = crate::offset_wire::id_to_name(topic_ids);
+        let id_to_name = offset_wire::id_to_name(topic_ids);
 
         // Re-snapshot the assignment: a cooperative rebalance may have
         // revoked partitions while this Fetch was in flight. Records for
@@ -1103,12 +1091,8 @@ impl Consumer {
 
     /// Send a Fetch to each leader in `by_leader` that has no Fetch in flight.
     /// Each request runs in its own task, so the leaders answer in parallel.
-    fn send_fetches(
-        &mut self,
-        by_leader: FetchByLeader,
-        topic_ids: &HashMap<String, krabka_protocol::primitives::uuid::Uuid>,
-    ) {
-        let max_wait_ms = crate::consumer::protocol_millis_i32(self.fetch_max_wait);
+    fn send_fetches(&mut self, by_leader: FetchByLeader, topic_ids: &HashMap<String, uuid::Uuid>) {
+        let max_wait_ms = consumer::protocol_millis_i32(self.fetch_max_wait);
         for (leader, by_topic) in by_leader {
             if self.fetches.in_flight.contains_key(&leader) {
                 continue;
@@ -1207,13 +1191,13 @@ impl Consumer {
     /// Returns a transport error that is not transient.
     async fn take_completed_fetches(
         &mut self,
-        topic_ids: &HashMap<String, krabka_protocol::primitives::uuid::Uuid>,
+        topic_ids: &HashMap<String, uuid::Uuid>,
     ) -> Result<Vec<FetchResponse>, ConsumerError> {
         self.fetches.collect_ready();
         if self.fetches.ready.is_empty() {
             return Ok(Vec::new());
         }
-        let id_to_name = crate::offset_wire::id_to_name(topic_ids);
+        let id_to_name = offset_wire::id_to_name(topic_ids);
         let offsets = self.next_offsets.lock().await.clone();
         let mut responses = Vec::new();
         let mut failure = None;
@@ -1301,7 +1285,7 @@ impl Consumer {
     /// sends a Fetch with the session id, epoch `-1` and no partitions to each
     /// broker that holds a session.
     pub(crate) async fn close_fetch_sessions(&mut self, timeout: std::time::Duration) {
-        let max_wait_ms = crate::consumer::protocol_millis_i32(self.fetch_max_wait);
+        let max_wait_ms = consumer::protocol_millis_i32(self.fetch_max_wait);
         let closes: Vec<_> = self
             .fetches
             .sessions
@@ -1441,7 +1425,7 @@ impl Consumer {
     ) -> Result<bool, ConsumerError> {
         // Kafka's consumer raises a fatal `OffsetFetch` error from `poll()`.
         // A rejoin in the coordinator task leaves such an error here.
-        if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
+        if let Some(error) = coordinator::take_poll_error(&self.poll_error) {
             return Err(error);
         }
         // Kafka's `ConsumerCoordinator.poll` sends the interval auto commit
@@ -1450,7 +1434,7 @@ impl Consumer {
         // This `poll` resets the poll timer of the coordinator task, and lets
         // it start a rejoin that waits for a `poll`. The positions for the
         // commit before that join are already recorded above.
-        crate::coordinator::note_poll(&self.poll_signal);
+        coordinator::note_poll(&self.poll_signal);
         // Metadata comes first. A partition that has no position yet (a new
         // assignment without a committed offset) gets its leader id and
         // epoch here, so its first `ListOffsets` goes to the leader and not
@@ -1490,7 +1474,7 @@ impl Consumer {
     /// check.
     pub(crate) async fn update_fetch_positions(
         &self,
-        wakeup: Option<&crate::control::WakeupHandle>,
+        wakeup: Option<&control::WakeupHandle>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<bool, ConsumerError> {
         if let Err(error) = until_woken(wakeup, self.refresh_leader_epochs()).await? {
@@ -1540,7 +1524,7 @@ impl Consumer {
         offsets: &HashMap<(String, i32), i64>,
         key: &(String, i32),
         topic_name: &str,
-        part: &krabka_protocol::owned::fetch_response::PartitionData,
+        part: &fetch_response::PartitionData,
     ) -> Option<BufferedPartition> {
         // Legacy MessageSet payloads are skipped here; the consumer
         // only handles v2 batches.
@@ -1820,7 +1804,7 @@ impl Consumer {
         } else {
             self.committed_until(&keys, deadline).await?
         };
-        let reset = crate::consumer::reset_starting_offset(self.auto_offset_reset);
+        let reset = consumer::reset_starting_offset(self.auto_offset_reset);
         let mut offsets = self.next_offsets.lock().await;
         let mut positions = self.positions.lock().await;
         for key in keys {
@@ -1874,7 +1858,7 @@ impl Consumer {
         for (leader, by_topic) in by_leader {
             let request = build_offsets_request(by_topic, timestamp, self.isolation_level);
             let answer = if is_read_committed(self.isolation_level) {
-                self.send_list_offsets(leader, ReadCommittedListOffsets(request))
+                self.send_list_offsets(leader, ReadCommittedListOffsets::new(request))
                     .await
             } else {
                 self.send_list_offsets(leader, request).await
@@ -2527,6 +2511,11 @@ mod offset_advance_tests {
             ..Default::default()
         };
         let requested = [("topic-a".to_string(), 0), ("topic-a".to_string(), 1)];
+        let retry_with_first_offset = ListOffsetsResult {
+            offsets: HashMap::from([(("topic-a".to_string(), 0), 5)]),
+            retry: true,
+            unauthorized: BTreeSet::new(),
+        };
         for (name, answers, expected) in [
             (
                 "every partition answered",
@@ -2543,20 +2532,12 @@ mod offset_advance_tests {
             (
                 "an error row is retried",
                 vec![answer("topic-a", vec![row(0, 0, 5), row(1, 6, -1)])],
-                ListOffsetsResult {
-                    offsets: HashMap::from([(("topic-a".to_string(), 0), 5)]),
-                    retry: true,
-                    unauthorized: BTreeSet::new(),
-                },
+                retry_with_first_offset.clone(),
             ),
             (
                 "a missing row is retried and an unrequested row is ignored",
                 vec![answer("topic-a", vec![row(0, 0, 5), row(2, 0, 3)])],
-                ListOffsetsResult {
-                    offsets: HashMap::from([(("topic-a".to_string(), 0), 5)]),
-                    retry: true,
-                    unauthorized: BTreeSet::new(),
-                },
+                retry_with_first_offset.clone(),
             ),
             (
                 "an unauthorized answer gives no offsets",
@@ -2694,7 +2675,6 @@ pub(crate) mod partition_error_tests {
         Encode,
         owned::{
             api_versions_request,
-            api_versions_response::{ApiVersion, ApiVersionsResponse},
             fetch_response::{
                 EpochEndOffset, FetchResponse, FetchableTopicResponse, LeaderIdAndEpoch,
                 PartitionData,
@@ -2705,10 +2685,9 @@ pub(crate) mod partition_error_tests {
         primitives::uuid::Uuid as WireUuid,
     };
     use krabka_units::secs;
-    use tokio::sync::Mutex;
 
     use super::*;
-    use crate::{Assignor, consumer::CommitIdentity};
+    use crate::Assignor;
 
     const TOPIC_ID: WireUuid = WireUuid([7; 16]);
 
@@ -2723,24 +2702,10 @@ pub(crate) mod partition_error_tests {
     async fn metadata_counting_broker(metadata_requests: Arc<AtomicUsize>) -> MockBroker {
         MockBroker::start(move |api_key, version, _corr_id, _body| {
             if api_key == api_versions_request::API_KEY {
-                let versions = ApiVersionsResponse {
-                    error_code: 0,
-                    api_keys: vec![
-                        ApiVersion {
-                            api_key: api_versions_request::API_KEY,
-                            min_version: 0,
-                            max_version: 3,
-                            ..Default::default()
-                        },
-                        ApiVersion {
-                            api_key: metadata_request::API_KEY,
-                            min_version: 0,
-                            max_version: 8,
-                            ..Default::default()
-                        },
-                    ],
-                    ..Default::default()
-                };
+                let versions = mock_test_support::api_versions_response([
+                    (api_versions_request::API_KEY, 3),
+                    (metadata_request::API_KEY, 8),
+                ]);
                 return Some(encode(&versions, 0));
             }
             if api_key == metadata_request::API_KEY {
@@ -2764,13 +2729,12 @@ pub(crate) mod partition_error_tests {
     /// A consumer of `group-a` on `client` that owns `orders-0` at offset 5.
     pub(crate) fn consumer_with_client(client: Client) -> Consumer {
         Consumer::test_builder(client)
-            .commit_identity(Arc::new(Mutex::new(CommitIdentity {
-                generation: 1,
-                member_id: "member-a".into(),
-                ownership_ids: HashMap::from([(("orders".into(), 0), 1)]),
-                rejoin_on_poll: false,
-            })))
-            .subscription(crate::subscription::shared(vec!["orders".into()], None, true))
+            .commit_identity(test_support::orders_partition_commit_identity(1))
+            .subscription(crate::subscription::shared(
+                vec!["orders".into()],
+                None,
+                true,
+            ))
             .assigned(vec![("orders".into(), 0)])
             .next_offsets(HashMap::from([(("orders".into(), 0), 5)]))
             .topic_ids(HashMap::from([("orders".into(), TOPIC_ID)]))
@@ -2826,7 +2790,7 @@ pub(crate) mod partition_error_tests {
         let broker = metadata_counting_broker(Arc::default()).await;
         let mut consumer = consumer_on(&broker).await;
         let topics = std::collections::BTreeSet::from(["orders".to_string()]);
-        crate::coordinator::report_rejoin_error(
+        coordinator::report_rejoin_error(
             &consumer.poll_error,
             ConsumerError::TopicAuthorizationFailed(topics.clone()),
         );
@@ -2944,7 +2908,7 @@ pub(crate) mod partition_error_tests {
         ] {
             let mut consumer = consumer_on(&broker).await;
             consumer.rebalance_protocol =
-                crate::assignor::rebalance_protocol_of(&[assignor]).expect("assignor protocol");
+                assignor::rebalance_protocol_of(&[assignor]).expect("assignor protocol");
             if !owns_partitions {
                 consumer.assigned.lock().await.clear();
             }
@@ -2993,35 +2957,17 @@ pub(crate) mod partition_error_tests {
         let fetches_in_mock = Arc::clone(&fetches);
         let broker = MockBroker::start(move |api_key, version, _corr_id, _body| {
             if api_key == api_versions_request::API_KEY {
-                let versions = ApiVersionsResponse {
-                    api_keys: vec![
-                        ApiVersion {
-                            api_key: api_versions_request::API_KEY,
-                            min_version: 0,
-                            max_version: 3,
-                            ..Default::default()
-                        },
-                        ApiVersion {
-                            api_key: metadata_request::API_KEY,
-                            min_version: 0,
-                            max_version: 8,
-                            ..Default::default()
-                        },
-                        ApiVersion {
-                            api_key: krabka_protocol::owned::fetch_request::API_KEY,
-                            min_version: 4,
-                            max_version: 11,
-                            ..Default::default()
-                        },
-                    ],
-                    ..Default::default()
-                };
+                let versions = mock_test_support::api_versions_response_ranges([
+                    (api_versions_request::API_KEY, 0, 3),
+                    (metadata_request::API_KEY, 0, 8),
+                    (fetch_request::API_KEY, 4, 11),
+                ]);
                 return Some(encode(&versions, 0));
             }
             if api_key == metadata_request::API_KEY {
                 return Some(encode(&MetadataResponse::default(), version));
             }
-            if api_key != krabka_protocol::owned::fetch_request::API_KEY {
+            if api_key != fetch_request::API_KEY {
                 return None;
             }
             fetches_in_mock.fetch_add(1, Ordering::SeqCst);
@@ -3040,8 +2986,7 @@ pub(crate) mod partition_error_tests {
             let mut response = fetch_response(0);
             response.responses[0].topic = "orders".into();
             response.responses[0].partitions[0].high_watermark = 1205;
-            response.responses[0].partitions[0].records =
-                Some(krabka_protocol::records::RecordsPayload::V2(vec![batch]));
+            response.responses[0].partitions[0].records = Some(RecordsPayload::V2(vec![batch]));
             Some(encode(&response, version))
         })
         .await;
@@ -3342,68 +3287,35 @@ pub(crate) mod partition_error_tests {
         sent: SentListOffsets,
         metadata_requests: Arc<AtomicUsize>,
     ) -> MockBroker {
-        use bytes::Buf as _;
-        use krabka_protocol::{
-            Decode as _,
-            owned::{
-                list_offsets_request::{self, FLEXIBLE_MIN},
-                metadata_response::{
-                    MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
-                },
-            },
-        };
+        use krabka_protocol::owned::list_offsets_request;
         MockBroker::start(move |api_key, version, _corr_id, mut body| {
             if api_key == api_versions_request::API_KEY {
-                let versions = ApiVersionsResponse {
-                    api_keys: [
-                        (api_versions_request::API_KEY, 3),
-                        (metadata_request::API_KEY, 8),
-                        (list_offsets_request::API_KEY, list_offsets_max_version),
-                    ]
-                    .into_iter()
-                    .map(|(api_key, max_version)| ApiVersion {
-                        api_key,
-                        min_version: 0,
-                        max_version,
-                        ..Default::default()
-                    })
-                    .collect(),
-                    ..Default::default()
-                };
+                let versions = mock_test_support::api_versions_response([
+                    (api_versions_request::API_KEY, 3),
+                    (metadata_request::API_KEY, 8),
+                    (list_offsets_request::API_KEY, list_offsets_max_version),
+                ]);
                 return Some(encode(&versions, 0));
             }
             if api_key == metadata_request::API_KEY {
                 metadata_requests.fetch_add(1, Ordering::SeqCst);
-                let metadata = MetadataResponse {
-                    brokers: vec![MetadataResponseBroker {
-                        node_id: LEADER_ID,
-                        host: "127.0.0.1".into(),
-                        port: i32::from(leader_port.load(Ordering::SeqCst)),
-                        ..Default::default()
-                    }],
-                    topics: vec![MetadataResponseTopic {
-                        name: Some("orders".into()),
-                        topic_id: TOPIC_ID,
-                        partitions: vec![MetadataResponsePartition {
-                            partition_index: 0,
-                            leader_id: LEADER_ID,
-                            leader_epoch: LEADER_EPOCH,
+                let metadata = test_support::OrdersMetadata::builder()
+                    .topic_id(TOPIC_ID.0)
+                    .leader_id(LEADER_ID)
+                    .leader_epoch(LEADER_EPOCH)
+                    .brokers(vec![
+                        krabka_protocol::owned::metadata_response::MetadataResponseBroker {
+                            node_id: LEADER_ID,
+                            host: "127.0.0.1".into(),
+                            port: i32::from(leader_port.load(Ordering::SeqCst)),
                             ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
+                        },
+                    ])
+                    .build();
                 return Some(encode(&metadata, version));
             }
             if api_key == list_offsets_request::API_KEY {
-                let client_id_len = usize::try_from(body.get_i16()).expect("client id length");
-                body.advance(client_id_len);
-                if version >= FLEXIBLE_MIN {
-                    body.advance(1);
-                }
-                let request =
-                    ListOffsetsRequest::decode(&mut body, version).expect("ListOffsets decodes");
+                let request = test_support::decode_list_offsets_request(&mut body, version);
                 sent.lock()
                     .expect("sent lock")
                     .push((name, version, request));
@@ -3939,9 +3851,10 @@ pub(crate) mod partition_error_tests {
 #[cfg(test)]
 pub(crate) mod timestamp_cases {
     use bytes::Bytes;
+    use consumer::TimestampType;
     use krabka_protocol::records::{Attributes, Record, RecordBatch};
 
-    use crate::consumer::TimestampType;
+    use crate::consumer;
 
     pub(crate) const BASE_OFFSET: i64 = 5;
     pub(crate) const LEADER_EPOCH: i32 = 3;
@@ -4035,14 +3948,10 @@ mod fetch_path_tests {
     use krabka_protocol::{
         Decode as _, Encode,
         owned::{
-            api_versions_request,
-            api_versions_response::{ApiVersion, ApiVersionsResponse},
-            fetch_request,
+            api_versions_request, fetch_request,
             fetch_response::{FetchableTopicResponse, PartitionData},
-            list_offsets_request::{self, ListOffsetsRequest},
-            list_offsets_response::{
-                ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
-            },
+            list_offsets_request,
+            list_offsets_response::ListOffsetsResponse,
             metadata_request,
             metadata_response::{
                 MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
@@ -4052,6 +3961,7 @@ mod fetch_path_tests {
         primitives::uuid::Uuid as WireUuid,
     };
     use krabka_units::{millis, secs};
+    use test_support::RecordingListener;
 
     use super::*;
 
@@ -4097,23 +4007,12 @@ mod fetch_path_tests {
             let last = std::sync::Mutex::new(FetchAnswer::Silent);
             let broker = MockBroker::start(move |api_key, version, _corr_id, mut body| {
                 if api_key == api_versions_request::API_KEY {
-                    let versions = ApiVersionsResponse {
-                        api_keys: [
-                            (api_versions_request::API_KEY, 0, 3),
-                            (metadata_request::API_KEY, 0, 8),
-                            (fetch_request::API_KEY, 4, 11),
-                            (list_offsets_request::API_KEY, 1, 5),
-                        ]
-                        .into_iter()
-                        .map(|(api_key, min_version, max_version)| ApiVersion {
-                            api_key,
-                            min_version,
-                            max_version,
-                            ..Default::default()
-                        })
-                        .collect(),
-                        ..Default::default()
-                    };
+                    let versions = mock_test_support::api_versions_response_ranges([
+                        (api_versions_request::API_KEY, 0, 3),
+                        (metadata_request::API_KEY, 0, 8),
+                        (fetch_request::API_KEY, 4, 11),
+                        (list_offsets_request::API_KEY, 1, 5),
+                    ]);
                     return Some(encode(&versions, 0));
                 }
                 if api_key == metadata_request::API_KEY {
@@ -4196,39 +4095,7 @@ mod fetch_path_tests {
                 // Every partition resolves to offset 0, whichever timestamp
                 // the request asked for.
                 if api_key == list_offsets_request::API_KEY {
-                    let client_id_len = usize::try_from(body.get_i16()).expect("client id");
-                    body.advance(client_id_len);
-                    let flexible = version >= list_offsets_request::FLEXIBLE_MIN;
-                    if flexible {
-                        body.advance(1);
-                    }
-                    let request = ListOffsetsRequest::decode(&mut body, version)
-                        .expect("decode list offsets");
-                    let mut response = if flexible { vec![0] } else { Vec::new() };
-                    response.extend(encode(
-                        &ListOffsetsResponse {
-                            topics: request
-                                .topics
-                                .iter()
-                                .map(|topic| ListOffsetsTopicResponse {
-                                    name: topic.name.clone(),
-                                    partitions: topic
-                                        .partitions
-                                        .iter()
-                                        .map(|p| ListOffsetsPartitionResponse {
-                                            partition_index: p.partition_index,
-                                            offset: 0,
-                                            ..Default::default()
-                                        })
-                                        .collect(),
-                                    ..Default::default()
-                                })
-                                .collect(),
-                            ..Default::default()
-                        },
-                        version,
-                    ));
-                    return Some(response);
+                    return Some(test_support::list_offsets_mock_response(&mut body, version));
                 }
                 None
             })
@@ -4251,13 +4118,35 @@ mod fetch_path_tests {
         let partitions: Vec<(String, i32)> = (0..brokers.len())
             .map(|index| ("orders".to_owned(), i32::try_from(index).expect("index")))
             .collect();
-        let consumer = crate::poll::partition_error_tests::consumer_with_client(client);
+        let consumer = poll::partition_error_tests::consumer_with_client(client);
         *consumer.assigned.lock().await = partitions.clone();
         *consumer.next_offsets.lock().await =
             partitions.iter().map(|key| (key.clone(), 5)).collect();
         consumer.commit_identity.lock().await.ownership_ids =
             partitions.into_iter().zip(1..).collect();
         consumer
+    }
+
+    struct TwoPartitionFetchSetup {
+        brokers: Vec<MockBroker>,
+        consumer: Consumer,
+        sent: SentFetches,
+    }
+
+    async fn two_partition_fetch_setup() -> TwoPartitionFetchSetup {
+        let answer = FetchAnswer::Respond {
+            error_code: 0,
+            session_id: 0,
+        };
+        let sent = SentFetches::default();
+        let brokers = start_brokers(&[vec![answer.clone()], vec![answer]], &sent).await;
+        let consumer = consumer_on(&brokers).await;
+        consumer.refresh_leader_epochs().await.expect("metadata");
+        TwoPartitionFetchSetup {
+            brokers,
+            consumer,
+            sent,
+        }
     }
 
     fn stop(brokers: Vec<MockBroker>) {
@@ -4329,14 +4218,11 @@ mod fetch_path_tests {
     /// `pendingOnAssignedCallback` is set.
     #[tokio::test]
     async fn fetch_leaves_out_a_partition_that_waits_for_its_assign_callback() {
-        let respond = vec![FetchAnswer::Respond {
-            error_code: 0,
-            session_id: 0,
-        }];
-        let sent = SentFetches::default();
-        let brokers = start_brokers(&[respond.clone(), respond], &sent).await;
-        let mut consumer = consumer_on(&brokers).await;
-        consumer.refresh_leader_epochs().await.expect("metadata");
+        let TwoPartitionFetchSetup {
+            sent,
+            brokers,
+            mut consumer,
+        } = two_partition_fetch_setup().await;
         let gate = crate::rebalance_listener::AssignedCallbackGate::new(
             &consumer.assigned_callback_pending,
             &[("orders".to_owned(), 0)],
@@ -4419,14 +4305,11 @@ mod fetch_path_tests {
     /// partition, so its leader gets no Fetch until `resume`.
     #[tokio::test]
     async fn fetch_leaves_out_a_paused_partition_until_resume() {
-        let respond = vec![FetchAnswer::Respond {
-            error_code: 0,
-            session_id: 0,
-        }];
-        let sent = SentFetches::default();
-        let brokers = start_brokers(&[respond.clone(), respond], &sent).await;
-        let mut consumer = consumer_on(&brokers).await;
-        consumer.refresh_leader_epochs().await.expect("metadata");
+        let TwoPartitionFetchSetup {
+            sent,
+            brokers,
+            mut consumer,
+        } = two_partition_fetch_setup().await;
         let fetched = |sent: &SentFetches| {
             let mut partitions: Vec<(i32, i32)> = sent
                 .lock()
@@ -4549,21 +4432,10 @@ mod fetch_path_tests {
         let silent = MockBroker::start(|api_key, _version, _corr_id, _body| {
             (api_key == api_versions_request::API_KEY).then(|| {
                 encode(
-                    &ApiVersionsResponse {
-                        api_keys: [
-                            (api_versions_request::API_KEY, 0, 3),
-                            (metadata_request::API_KEY, 0, 8),
-                        ]
-                        .into_iter()
-                        .map(|(api_key, min_version, max_version)| ApiVersion {
-                            api_key,
-                            min_version,
-                            max_version,
-                            ..Default::default()
-                        })
-                        .collect(),
-                        ..Default::default()
-                    },
+                    &mock_test_support::api_versions_response_ranges([
+                        (api_versions_request::API_KEY, 0, 3),
+                        (metadata_request::API_KEY, 0, 8),
+                    ]),
                     0,
                 )
             })
@@ -4575,7 +4447,7 @@ mod fetch_path_tests {
             .build()
             .await
             .expect("client");
-        let mut consumer = crate::poll::partition_error_tests::consumer_with_client(client);
+        let mut consumer = poll::partition_error_tests::consumer_with_client(client);
         let handle = consumer.wakeup_handle();
         let waker = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4650,39 +4522,6 @@ mod fetch_path_tests {
         assert2::assert!(names == vec!["orders".to_owned(), "payments".to_owned()]);
     }
 
-    /// A listener that records its calls. A consumer without a group runs no
-    /// callback.
-    struct CallRecorder {
-        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::ConsumerRebalanceListener for CallRecorder {
-        async fn on_partitions_revoked(
-            &mut self,
-            _consumer: &Consumer,
-            partitions: &[(String, i32)],
-        ) -> Result<(), crate::RebalanceListenerError> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push(format!("revoked {partitions:?}"));
-            Ok(())
-        }
-
-        async fn on_partitions_assigned(
-            &mut self,
-            _consumer: &Consumer,
-            partitions: &[(String, i32)],
-        ) -> Result<(), crate::RebalanceListenerError> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push(format!("assigned {partitions:?}"));
-            Ok(())
-        }
-    }
-
     /// Kafka's `updateFetchPositions` gives the committed offsets the timer of
     /// the `poll`, so an unresponsive coordinator does not hold a short poll
     /// for the whole `default.api.timeout.ms`.
@@ -4725,9 +4564,11 @@ mod fetch_path_tests {
         let mut consumer = Consumer::builder()
             .bootstrap(brokers[0].addr.to_string())
             .auto_offset_reset(AutoOffsetReset::Earliest)
-            .rebalance_listener(Box::new(CallRecorder {
-                calls: std::sync::Arc::clone(&calls),
-            }))
+            .rebalance_listener(Box::new(
+                RecordingListener::builder()
+                    .calls(std::sync::Arc::clone(&calls))
+                    .build(),
+            ))
             .build()
             .await
             .expect("build");
@@ -4792,7 +4633,7 @@ mod fetch_path_tests {
                 Some((1, "orders".to_owned(), 0, 0)),
                 (invalid_group.clone(), invalid_group.clone(), invalid_group),
                 (Vec::new(), 0),
-                Vec::<String>::new()
+                Vec::<test_support::ListenerCall>::new()
             )
         );
     }
@@ -5122,7 +4963,7 @@ mod fetch_path_tests {
                 partitions: vec![PartitionData {
                     partition_index: 0,
                     high_watermark: 6,
-                    records: Some(krabka_protocol::records::RecordsPayload::V2(vec![record])),
+                    records: Some(RecordsPayload::V2(vec![record])),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -5174,57 +5015,31 @@ mod fetch_path_tests {
         const NODE_ID: i32 = 1;
         MockBroker::start(move |api_key, version, _corr_id, mut body| {
             if api_key == api_versions_request::API_KEY {
-                let versions = ApiVersionsResponse {
-                    api_keys: [
-                        (api_versions_request::API_KEY, 0, 3),
-                        (metadata_request::API_KEY, 0, 8),
-                        (
-                            list_offsets_request::API_KEY,
-                            0,
-                            list_offsets_request::MAX_VERSION,
-                        ),
-                        (fetch_request::API_KEY, 4, 11),
-                    ]
-                    .into_iter()
-                    .map(|(api_key, min_version, max_version)| ApiVersion {
-                        api_key,
-                        min_version,
-                        max_version,
-                        ..Default::default()
-                    })
-                    .collect(),
-                    ..Default::default()
-                };
+                let versions = mock_test_support::api_versions_response_ranges([
+                    (api_versions_request::API_KEY, 0, 3),
+                    (metadata_request::API_KEY, 0, 8),
+                    (
+                        list_offsets_request::API_KEY,
+                        0,
+                        list_offsets_request::MAX_VERSION,
+                    ),
+                    (fetch_request::API_KEY, 4, 11),
+                ]);
                 return Some(encode(&versions, 0));
             }
             if api_key == metadata_request::API_KEY {
                 // No `brokers` entry for `NODE_ID`: the pool cannot dial it,
                 // so `orders-0` falls back to the bootstrap connection, which
                 // is this same mock broker.
-                let metadata = MetadataResponse {
-                    topics: vec![MetadataResponseTopic {
-                        name: Some("orders".into()),
-                        topic_id: WireUuid([9; 16]),
-                        partitions: vec![MetadataResponsePartition {
-                            partition_index: 0,
-                            leader_id: NODE_ID,
-                            leader_epoch: 1,
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
+                let metadata = test_support::OrdersMetadata::builder()
+                    .topic_id([9; 16])
+                    .leader_id(NODE_ID)
+                    .leader_epoch(1)
+                    .build();
                 return Some(encode(&metadata, version));
             }
             if api_key == list_offsets_request::API_KEY {
-                let client_id_len = usize::try_from(body.get_i16()).expect("client id length");
-                body.advance(client_id_len);
-                if version >= FLEXIBLE_MIN {
-                    body.advance(1);
-                }
-                let request =
-                    ListOffsetsRequest::decode(&mut body, version).expect("decode ListOffsets");
+                let request = test_support::decode_list_offsets_request(&mut body, version);
                 let timestamp = request.topics[0].partitions[0].timestamp;
                 list_offsets_timestamps
                     .lock()
@@ -5286,11 +5101,11 @@ mod fetch_path_tests {
             .build()
             .await
             .expect("client");
-        let mut consumer = crate::poll::partition_error_tests::consumer_with_client(client);
+        let mut consumer = poll::partition_error_tests::consumer_with_client(client);
         consumer.auto_offset_reset = policy;
         consumer.next_offsets.lock().await.insert(
             ("orders".to_owned(), 0),
-            crate::consumer::reset_starting_offset(policy),
+            consumer::reset_starting_offset(policy),
         );
         consumer
     }

@@ -40,6 +40,7 @@ krabka-compression = { version = "0.6.0" }
 krabka-units = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+derive_more = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "net", "rt", "rt-multi-thread", "io-util", "macros", "sync", "time"] }

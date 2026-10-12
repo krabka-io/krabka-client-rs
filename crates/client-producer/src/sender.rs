@@ -76,6 +76,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use crate::accumulator;
 use crate::{
     accumulator::{Accumulator, AccumulatorMap, InProgressBatch, PendingRecord},
     buffer_pool::MemoryReservation,
@@ -3792,7 +3794,7 @@ mod harness {
         let mut rxs = Vec::with_capacity(n);
         for _ in 0..n {
             let mut a = acc.lock().await;
-            let crate::accumulator::AppendResult { receiver: rx, .. } =
+            let accumulator::AppendResult { receiver: rx, .. } =
                 a.try_append(None, Some(bytes::Bytes::from_static(b"x")), vec![], 0, None);
             // Seal so each record becomes its own ready batch with a distinct
             // base_sequence — maximizing same-partition pipelining pressure.
@@ -3837,7 +3839,7 @@ mod harness {
         {
             let mut a = acc.lock().await;
             for _ in 0..n {
-                let crate::accumulator::AppendResult { receiver: rx, .. } =
+                let accumulator::AppendResult { receiver: rx, .. } =
                     a.try_append(None, Some(bytes::Bytes::from_static(b"x")), vec![], 0, None);
                 rxs.push(rx);
             }
@@ -3861,7 +3863,7 @@ mod harness {
         let mut receivers = Vec::with_capacity(n);
         let mut accumulator = accumulator.lock().await;
         for _ in 0..n {
-            let crate::accumulator::AppendResult { receiver, .. } = accumulator.try_append(
+            let accumulator::AppendResult { receiver, .. } = accumulator.try_append(
                 None,
                 Some(bytes::Bytes::from_static(b"x")),
                 vec![],
@@ -3919,7 +3921,7 @@ mod harness {
             .insert(("t".to_owned(), 0), Arc::clone(&rollover));
         let (ready_rx, current_rx) = {
             let mut accumulator = rollover.lock().await;
-            let crate::accumulator::AppendResult {
+            let accumulator::AppendResult {
                 receiver: ready, ..
             } = accumulator.try_append(
                 None,
@@ -3928,7 +3930,7 @@ mod harness {
                 0,
                 None,
             );
-            let crate::accumulator::AppendResult {
+            let accumulator::AppendResult {
                 receiver: current, ..
             } = accumulator.try_append(
                 None,
@@ -3943,7 +3945,7 @@ mod harness {
         let unrelated = Arc::new(Mutex::new(Accumulator::new(1024)));
         h.accumulators
             .insert(("t".to_owned(), 1), Arc::clone(&unrelated));
-        let crate::accumulator::AppendResult {
+        let accumulator::AppendResult {
             receiver: unrelated_rx,
             ..
         } = unrelated.lock().await.try_append(
@@ -6407,7 +6409,7 @@ mod harness {
             .clone();
         let (ready_receiver, current_receiver) = {
             let mut accumulator = accumulator.lock().await;
-            let crate::accumulator::AppendResult {
+            let accumulator::AppendResult {
                 receiver: ready_receiver,
                 ..
             } = accumulator.try_append(
@@ -6418,7 +6420,7 @@ mod harness {
                 Some(0),
             );
             accumulator.seal_current();
-            let crate::accumulator::AppendResult {
+            let accumulator::AppendResult {
                 receiver: current_receiver,
                 ..
             } = accumulator.try_append(
@@ -6468,14 +6470,13 @@ mod harness {
         let accumulator = Arc::new(Mutex::new(Accumulator::new(1024)));
         h.accumulators
             .insert(("t".to_string(), 0), Arc::clone(&accumulator));
-        let crate::accumulator::AppendResult { receiver: rx, .. } =
-            accumulator.lock().await.try_append(
-                None,
-                Some(bytes::Bytes::from_static(b"old")),
-                vec![],
-                0,
-                Some(0),
-            );
+        let accumulator::AppendResult { receiver: rx, .. } = accumulator.lock().await.try_append(
+            None,
+            Some(bytes::Bytes::from_static(b"old")),
+            vec![],
+            0,
+            Some(0),
+        );
 
         h.recovery_required.store(true, Ordering::Release);
         h.recovery_generation.store(1, Ordering::Release);
@@ -6576,7 +6577,7 @@ mod harness {
             let accumulator = Arc::new(Mutex::new(Accumulator::new(1024)));
             h.accumulators
                 .insert(("t".to_string(), 0), Arc::clone(&accumulator));
-            let crate::accumulator::AppendResult { receiver: rx, .. } =
+            let accumulator::AppendResult { receiver: rx, .. } =
                 accumulator.lock().await.try_append(
                     None,
                     Some(bytes::Bytes::from_static(b"queued")),
@@ -6649,7 +6650,7 @@ mod harness {
             let accumulator = Arc::new(Mutex::new(Accumulator::new(1024)));
             h.accumulators
                 .insert(("t".to_string(), 0), Arc::clone(&accumulator));
-            let crate::accumulator::AppendResult { receiver: rx, .. } =
+            let accumulator::AppendResult { receiver: rx, .. } =
                 accumulator.lock().await.try_append(
                     None,
                     Some(bytes::Bytes::from_static(b"queued")),
@@ -6706,14 +6707,13 @@ mod harness {
         let accumulator = Arc::new(Mutex::new(Accumulator::new(1024)));
         h.accumulators
             .insert(("t".to_string(), 0), Arc::clone(&accumulator));
-        let crate::accumulator::AppendResult { receiver: rx, .. } =
-            accumulator.lock().await.try_append(
-                None,
-                Some(bytes::Bytes::from_static(b"old")),
-                vec![],
-                0,
-                Some(0),
-            );
+        let accumulator::AppendResult { receiver: rx, .. } = accumulator.lock().await.try_append(
+            None,
+            Some(bytes::Bytes::from_static(b"old")),
+            vec![],
+            0,
+            Some(0),
+        );
 
         let initial_send = transport.send_started.notified();
         h.wake_tx

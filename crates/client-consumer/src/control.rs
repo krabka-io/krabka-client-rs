@@ -20,7 +20,7 @@ pub const DEFAULT_CONSUMER_CLOSE_TIMEOUT: Time = secs(30);
 /// Kafka's `ClassicKafkaConsumer.DEFAULT_REASON`.
 pub(crate) const ENFORCED_REBALANCE_REASON: &str = "rebalance enforced by user";
 
-/// How [`Consumer::close_with`](crate::Consumer::close_with) closes the
+/// How [`Consumer::close_with`](Consumer::close_with) closes the
 /// consumer. Kafka's `CloseOptions` (KIP-1092).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CloseOptions {
@@ -69,10 +69,10 @@ pub(crate) fn close_timeout(options: CloseOptions) -> Result<Time, ConsumerError
     Ok(timeout)
 }
 
-/// A handle that wakes a [`Consumer::poll`](crate::Consumer::poll) from
+/// A handle that wakes a [`Consumer::poll`](Consumer::poll) from
 /// another task. Kafka's `KafkaConsumer.wakeup`.
 ///
-/// Get it with [`Consumer::wakeup_handle`](crate::Consumer::wakeup_handle).
+/// Get it with [`Consumer::wakeup_handle`](Consumer::wakeup_handle).
 /// The poll that runs, or the next poll, returns [`ConsumerError::Wakeup`]
 /// once.
 #[derive(Clone, Debug, Default)]

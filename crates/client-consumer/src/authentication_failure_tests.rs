@@ -24,10 +24,7 @@ use krabka_client_core::{
 use krabka_protocol::{
     Encode,
     owned::{
-        api_versions_request,
-        api_versions_response::{ApiVersion, ApiVersionsResponse},
-        metadata_request,
-        metadata_response::MetadataResponse,
+        api_versions_request, metadata_request, metadata_response::MetadataResponse,
         sasl_handshake_request,
     },
 };
@@ -37,10 +34,10 @@ use krabka_units::{millis, minutes, secs};
 use crate::{
     Consumer,
     coordinator::{
-        CoordinatorRetryPolicy, CoordinatorState, HeartbeatOutcome, heartbeat_once,
-        take_poll_error,
+        CoordinatorRetryPolicy, CoordinatorState, HeartbeatOutcome, heartbeat_once, take_poll_error,
     },
     error::ConsumerError,
+    subscription,
 };
 
 const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
@@ -96,23 +93,10 @@ async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) 
         }
         match api_key {
             api_versions_request::API_KEY => MockReply::Respond(encode(
-                &ApiVersionsResponse {
-                    api_keys: vec![
-                        ApiVersion {
-                            api_key: api_versions_request::API_KEY,
-                            min_version: 0,
-                            max_version: 3,
-                            ..Default::default()
-                        },
-                        ApiVersion {
-                            api_key: metadata_request::API_KEY,
-                            min_version: 0,
-                            max_version: 8,
-                            ..Default::default()
-                        },
-                    ],
-                    ..Default::default()
-                },
+                &krabka_client_core::mock_test_support::api_versions_response_ranges([
+                    (api_versions_request::API_KEY, 0, 3),
+                    (metadata_request::API_KEY, 0, 8),
+                ]),
                 0,
             )),
             metadata_request::API_KEY => {
@@ -145,13 +129,13 @@ async fn sasl_client(broker: &MockBroker) -> Client {
 /// A consumer with no assigned partition, so `poll` only refreshes metadata.
 fn consumer(client: Client) -> Consumer {
     Consumer::test_builder(client)
-        .subscription(crate::subscription::shared(vec!["orders".into()], None, true))
+        .subscription(subscription::shared(vec!["orders".into()], None, true))
         .build()
 }
 
 fn coordinator_state(client: Client) -> CoordinatorState {
     CoordinatorState::test_builder(client)
-        .subscription(crate::subscription::shared(vec!["orders".into()], None, true))
+        .subscription(subscription::shared(vec!["orders".into()], None, true))
         .subscription_metadata_refresh_interval(minutes(5))
         .leave_group_timeout(millis(100))
         .retry_policy(CoordinatorRetryPolicy {

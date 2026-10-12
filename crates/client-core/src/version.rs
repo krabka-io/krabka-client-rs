@@ -3,7 +3,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use krabka_protocol::owned::api_versions_response::ApiVersionsResponse;
+use api_versions_response::ApiVersionsResponse;
+use krabka_protocol::owned::api_versions_response;
 
 use crate::{error::ClientError, request::ProtocolRequest};
 
@@ -181,7 +182,7 @@ mod tests {
         const MAX_VERSION: i16 = 6;
         const LATEST_STABLE_VERSION: i16 = 5;
         const FLEXIBLE_MIN: i16 = 2;
-        type Response = krabka_protocol::owned::api_versions_response::ApiVersionsResponse;
+        type Response = api_versions_response::ApiVersionsResponse;
     }
 
     /// Negotiation stops at the latest stable version, as Kafka's

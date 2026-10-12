@@ -15,14 +15,17 @@ use std::{
 };
 
 use bytes::Bytes;
-use krabka_client_core::{Client, FetchMinBytes};
+use krabka_client_core::{
+    Client, ClientError, ClientFrameMax, ConnectionDispatchQueueCapacity, FetchMinBytes, security,
+    telemetry,
+};
 use krabka_protocol::{
     owned::{
-        join_group_response::JoinGroupResponse,
-        sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment},
+        join_group_response::JoinGroupResponse, sync_group_request::SyncGroupRequestAssignment,
         sync_group_response::SyncGroupResponse,
     },
     primitives::uuid::Uuid as WireUuid,
+    records,
 };
 use krabka_units::{
     ByteSize, Time,
@@ -36,15 +39,62 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use crate::TopicPattern;
+#[cfg(test)]
+use crate::builder;
+#[cfg(test)]
+use crate::test_support;
 use crate::{
+    CloseOptions, GroupProtocol, assignor,
     assignor::Assignor,
     builder::{AutoOffsetReset, IsolationLevel, decode_assignment},
+    commit, consumer_group, control, coordinator,
     coordinator::{
-        CoordinatorRetryPolicy, CoordinatorState, find_coordinator, with_coordinator_refind,
+        CoordinatorRefind, CoordinatorRetryPolicy, CoordinatorRetryRequest, CoordinatorState,
+        find_coordinator,
     },
     error::ConsumerError,
+    fetch_buffer,
     group_metadata::ConsumerGroupMetadata,
+    offset_wire, poll, position, rebalance_listener, subscription,
 };
+
+pub(crate) fn validated_positive_i32(value: i32, name: &str) -> Result<i32, String> {
+    GreaterI32::<0>::new(value)
+        .map(|value| value.into_value())
+        .map_err(|error| format!("{name}: {error}"))
+}
+
+pub(crate) fn protocol_bytes(name: &str, value: ByteSize) -> Result<i32, String> {
+    let bytes = value.bytes_f64();
+    if bytes.is_finite() && bytes.fract() == 0.0 && (1.0..=f64::from(i32::MAX)).contains(&bytes) {
+        Ok(value.bytes_i32())
+    } else {
+        Err(format!(
+            "{name} must be a positive whole-byte value that fits i32"
+        ))
+    }
+}
+
+fn validated_millisecond_duration(name: &str, value: Duration) -> Result<u64, String> {
+    let milliseconds = MinMaxU128::<1, { u64::MAX as u128 }>::new(value.as_millis())
+        .map_err(|error| format!("{name}: {error}"))?
+        .into_value();
+    let milliseconds = u64::try_from(milliseconds).map_err(|error| format!("{name}: {error}"))?;
+    if Duration::from_millis(milliseconds) == value {
+        Ok(milliseconds)
+    } else {
+        Err(format!("{name} must be a whole number of milliseconds"))
+    }
+}
+
+pub(crate) async fn client_instance_id(
+    client: &Client,
+    timeout: Time,
+) -> Result<Option<uuid::Uuid>, ConsumerError> {
+    Ok(client.client_instance_id(timeout).await?)
+}
 
 /// Subscribe-style consumer handle. Construct via [`Consumer::builder`].
 #[allow(dead_code)] // `session_timeout` / `heartbeat_interval`
@@ -66,14 +116,14 @@ pub struct Consumer {
     pub(crate) commit_serialization: Arc<Mutex<()>>,
     pub(crate) commit_async_state: Arc<AtomicU8>,
     /// The callbacks of the asynchronous commits that wait for a snapshot.
-    pub(crate) commit_async_callbacks: crate::commit::OffsetCommitCallbacks,
+    pub(crate) commit_async_callbacks: commit::OffsetCommitCallbacks,
     pub(crate) group_instance_id: Option<String>,
     /// The current group generation exposed by [`Consumer::generation`].
     /// Commit RPCs use the generation atomically paired with membership and
     /// partition ownership in `commit_identity`.
     pub(crate) current_generation: Arc<AtomicI32>,
     /// The subscription, shared with the coordinator task.
-    pub(crate) subscription: crate::subscription::SharedSubscription,
+    pub(crate) subscription: subscription::SharedSubscription,
     /// Kafka's `group.protocol`.
     pub(crate) group_protocol: crate::GroupProtocol,
     /// Current assigned partitions: `(topic, partition_index)`.
@@ -85,14 +135,14 @@ pub struct Consumer {
     /// Last broker-reported readable end offset per partition.
     pub(crate) end_offsets: Arc<Mutex<HashMap<(String, i32), i64>>>,
     /// KIP-320 per-partition leader-epoch metadata, keyed like `next_offsets`.
-    pub(crate) positions: Arc<Mutex<HashMap<(String, i32), crate::position::PartitionPosition>>>,
+    pub(crate) positions: Arc<Mutex<HashMap<(String, i32), position::PartitionPosition>>>,
     /// Topic UUIDs resolved at build time. Fetch v ≥ 13 needs them, because it
     /// carries `topic_id` instead of the topic name.
     pub(crate) topic_ids: Arc<Mutex<HashMap<String, WireUuid>>>,
     pub(crate) session_timeout: Time,
     pub(crate) heartbeat_interval: Time,
     /// The newest rebalance protocol that every configured assignor supports.
-    pub(crate) rebalance_protocol: crate::assignor::RebalanceProtocol,
+    pub(crate) rebalance_protocol: assignor::RebalanceProtocol,
     pub(crate) coordinator_shutdown: CancellationToken,
     pub(crate) coordinator_handle: Option<JoinHandle<()>>,
     /// Controls which records `poll` returns.
@@ -103,7 +153,7 @@ pub struct Consumer {
     /// Kafka's `fetch.max.wait.ms`, the `max_wait_ms` of each Fetch.
     pub(crate) fetch_max_wait: Time,
     /// The in-flight Fetch requests and the fetch session of each broker.
-    pub(crate) fetches: crate::poll::Fetches,
+    pub(crate) fetches: poll::Fetches,
     /// Kafka's `client.rack`, the `rack_id` of each Fetch (KIP-392).
     pub(crate) client_rack: Option<String>,
     /// Kafka's `metadata.max.age.ms`. A preferred read replica expires after it.
@@ -111,7 +161,7 @@ pub struct Consumer {
     /// Kafka's `request.timeout.ms`. It bounds the requests of `close`.
     pub(crate) request_timeout: Time,
     /// Wakes a `poll` from another task.
-    pub(crate) wakeup: crate::control::WakeupHandle,
+    pub(crate) wakeup: control::WakeupHandle,
     /// Rebalances that the application asks for, with their reasons.
     pub(crate) enforced_rebalances: tokio::sync::mpsc::UnboundedSender<(String, u64)>,
     /// Kafka's `default.api.timeout.ms`, the timeout of `position` and
@@ -125,31 +175,31 @@ pub struct Consumer {
     pub(crate) auto_offset_reset: AutoOffsetReset,
     /// A fatal error from a coordinator rejoin that the next `poll` returns.
     /// The coordinator task holds the same slot.
-    pub(crate) poll_error: crate::coordinator::PollErrorSlot,
+    pub(crate) poll_error: coordinator::PollErrorSlot,
     /// Kafka's `enable.auto.commit` state. `None` when auto commit is off.
     /// The coordinator task holds a clone.
-    pub(crate) auto_commit: Option<crate::commit::AutoCommit>,
+    pub(crate) auto_commit: Option<commit::AutoCommit>,
     /// Counts the `poll` calls that got no error. The coordinator task waits
     /// for it after a fatal error.
-    pub(crate) poll_signal: crate::coordinator::PollSignal,
+    pub(crate) poll_signal: coordinator::PollSignal,
     /// `true` while the member must join the group. The coordinator task
     /// writes it.
     pub(crate) rebalance_pending: tokio::sync::watch::Receiver<bool>,
     /// Kafka's `max.poll.records`.
     pub(crate) max_poll_records: usize,
     /// Fetched records that `poll` did not return yet.
-    pub(crate) fetch_buffer: crate::fetch_buffer::FetchBuffer,
+    pub(crate) fetch_buffer: fetch_buffer::FetchBuffer,
     /// The membership operation of `close`. The coordinator task reads it
     /// when it stops.
-    pub(crate) close_operation: tokio::sync::watch::Sender<crate::control::CloseRequest>,
+    pub(crate) close_operation: tokio::sync::watch::Sender<control::CloseRequest>,
     /// The rebalance listener, Kafka's `ConsumerRebalanceListener`.
-    pub(crate) rebalance_listener: Option<crate::rebalance_listener::SharedListener>,
+    pub(crate) rebalance_listener: Option<rebalance_listener::SharedListener>,
     /// The listener calls that the coordinator task asks `poll` to run.
     pub(crate) listener_calls:
-        tokio::sync::mpsc::UnboundedReceiver<crate::rebalance_listener::ListenerCall>,
+        tokio::sync::mpsc::UnboundedReceiver<rebalance_listener::ListenerCall>,
     /// The added partitions that wait for `on_partitions_assigned`. The
     /// coordinator task writes it and `poll` does not fetch them.
-    pub(crate) assigned_callback_pending: crate::rebalance_listener::AssignedCallbackPending,
+    pub(crate) assigned_callback_pending: rebalance_listener::AssignedCallbackPending,
 }
 
 /// What a closing consumer does with its group membership. Kafka's
@@ -208,7 +258,7 @@ struct StartConfig {
     isolation_level: IsolationLevel,
     /// Kafka's `partition.assignment.strategy`.
     assignors: Vec<Assignor>,
-    rebalance_protocol: crate::assignor::RebalanceProtocol,
+    rebalance_protocol: assignor::RebalanceProtocol,
     fetch_min: ByteSize,
     fetch_max: ByteSize,
     fetch_partition_max: ByteSize,
@@ -225,7 +275,7 @@ struct StartConfig {
     metadata_recovery_rebootstrap_trigger: Time,
     leave_group_timeout: Time,
     client_rack: Option<String>,
-    security: Option<krabka_client_core::security::ClientSecurity>,
+    security: Option<security::ClientSecurity>,
     /// Kafka's `client.dns.lookup`.
     client_dns_lookup: krabka_client_core::ClientDnsLookup,
     /// Kafka's `reconnect.backoff.ms`.
@@ -248,7 +298,7 @@ struct StartConfig {
     allow_auto_create_topics: bool,
     /// The KIP-714 reporter of the consumer's client, or `None` when Kafka's
     /// `enable.metrics.push` is off.
-    telemetry: Option<krabka_client_core::telemetry::ClientTelemetryConfig>,
+    telemetry: Option<telemetry::ClientTelemetryConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -287,6 +337,7 @@ pub struct ConsumerRetryPolicy {
 /// Kafka's default `retry.backoff.max.ms`.
 pub const DEFAULT_CONSUMER_RETRY_BACKOFF_MAX: Time = millis(1000);
 
+#[bon::bon]
 impl ConsumerRetryPolicy {
     /// Construct a validated retry policy.
     ///
@@ -294,15 +345,15 @@ impl ConsumerRetryPolicy {
     ///
     /// Returns an error for non-positive, non-finite, fractional-millisecond,
     /// or inconsistently ordered values.
-    #[allow(clippy::too_many_arguments)]
+    #[builder(start_fn = builder, finish_fn = build)]
     pub fn new(
-        startup_attempt_timeout: Time,
-        startup_deadline: Time,
-        startup_initial_backoff: Time,
-        startup_max_backoff: Time,
-        coordinator_retry_timeout: Time,
-        coordinator_initial_backoff: Time,
-        coordinator_max_backoff: Time,
+        #[builder(default = secs(90))] startup_attempt_timeout: Time,
+        #[builder(default = minutes(5))] startup_deadline: Time,
+        #[builder(default = millis(500))] startup_initial_backoff: Time,
+        #[builder(default = DEFAULT_CONSUMER_RETRY_BACKOFF_MAX)] startup_max_backoff: Time,
+        #[builder(default = secs(30))] coordinator_retry_timeout: Time,
+        #[builder(default = millis(100))] coordinator_initial_backoff: Time,
+        #[builder(default = DEFAULT_CONSUMER_RETRY_BACKOFF_MAX)] coordinator_max_backoff: Time,
     ) -> Result<Self, String> {
         let policy = Self {
             startup_attempt_timeout: RetryTime::new(
@@ -416,15 +467,12 @@ impl ConsumerRetryPolicy {
         } else {
             retry_backoff_max
         };
-        Self::new(
-            secs(90),
-            minutes(5),
-            startup_initial_backoff,
-            retry_backoff_max,
-            secs(30),
-            coordinator_initial_backoff,
-            retry_backoff_max,
-        )
+        Self::builder()
+            .startup_initial_backoff(startup_initial_backoff)
+            .startup_max_backoff(retry_backoff_max)
+            .coordinator_initial_backoff(coordinator_initial_backoff)
+            .coordinator_max_backoff(retry_backoff_max)
+            .build()
     }
 }
 
@@ -439,7 +487,7 @@ impl Default for ConsumerRetryPolicy {
 pub const DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT: Time = secs(5);
 
 /// Positive, whole-millisecond classic Consumer leave-group deadline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ConsumerLeaveGroupTimeout(Duration);
 
 impl ConsumerLeaveGroupTimeout {
@@ -450,16 +498,7 @@ impl ConsumerLeaveGroupTimeout {
     /// Returns an error for zero, fractional milliseconds, or a value whose
     /// milliseconds cannot be represented as `u64`.
     pub fn new(value: Duration) -> Result<Self, String> {
-        let milliseconds = MinMaxU128::<1, { u64::MAX as u128 }>::new(value.as_millis())
-            .map_err(|error| format!("consumer leave-group timeout: {error}"))?
-            .into_value();
-        let milliseconds = u64::try_from(milliseconds)
-            .map_err(|error| format!("consumer leave-group timeout: {error}"))?;
-        if Duration::from_millis(milliseconds) != value {
-            return Err(
-                "consumer leave-group timeout must be a whole number of milliseconds".to_owned(),
-            );
-        }
+        validated_millisecond_duration("consumer leave-group timeout", value)?;
         Ok(Self(value))
     }
 
@@ -476,7 +515,8 @@ impl ConsumerLeaveGroupTimeout {
     /// Panics only if the invariant established by [`Self::new`] is violated.
     #[must_use]
     pub fn milliseconds(self) -> u64 {
-        u64::try_from(self.0.as_millis()).expect("validated consumer leave-group timeout fits u64")
+        validated_millisecond_duration("consumer leave-group timeout", self.0)
+            .expect("validated consumer leave-group timeout")
     }
 }
 
@@ -491,7 +531,7 @@ impl Default for ConsumerLeaveGroupTimeout {
 pub const DEFAULT_CONSUMER_SUBSCRIPTION_METADATA_REFRESH_INTERVAL: Time = secs(5);
 
 /// Positive total response-byte budget for one classic consumer fetch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ConsumerFetchMaxBytes(i32);
 
 impl ConsumerFetchMaxBytes {
@@ -501,9 +541,7 @@ impl ConsumerFetchMaxBytes {
     ///
     /// Returns an error when `value` is zero or negative.
     pub fn new(value: i32) -> Result<Self, String> {
-        GreaterI32::<0>::new(value)
-            .map(|value| Self(value.into_value()))
-            .map_err(|error| format!("consumer fetch max bytes: {error}"))
+        validated_positive_i32(value, "consumer fetch max bytes").map(Self)
     }
 
     /// Return the validated protocol byte count.
@@ -523,21 +561,12 @@ impl TryFrom<ByteSize> for ConsumerFetchMaxBytes {
     type Error = String;
 
     fn try_from(value: ByteSize) -> Result<Self, Self::Error> {
-        let bytes = value.bytes_f64();
-        if !bytes.is_finite()
-            || bytes.fract() != 0.0
-            || !(1.0..=f64::from(i32::MAX)).contains(&bytes)
-        {
-            return Err(
-                "consumer fetch max must be a positive whole-byte value that fits i32".to_owned(),
-            );
-        }
-        Self::new(value.bytes_i32())
+        Self::new(protocol_bytes("consumer fetch max", value)?)
     }
 }
 
 /// Positive per-partition response-byte budget for one classic consumer fetch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ConsumerFetchPartitionMaxBytes(i32);
 
 impl ConsumerFetchPartitionMaxBytes {
@@ -547,9 +576,7 @@ impl ConsumerFetchPartitionMaxBytes {
     ///
     /// Returns an error when `value` is zero or negative.
     pub fn new(value: i32) -> Result<Self, String> {
-        GreaterI32::<0>::new(value)
-            .map(|value| Self(value.into_value()))
-            .map_err(|error| format!("consumer fetch partition max bytes: {error}"))
+        validated_positive_i32(value, "consumer fetch partition max bytes").map(Self)
     }
 
     /// Return the validated protocol byte count.
@@ -569,22 +596,12 @@ impl TryFrom<ByteSize> for ConsumerFetchPartitionMaxBytes {
     type Error = String;
 
     fn try_from(value: ByteSize) -> Result<Self, Self::Error> {
-        let bytes = value.bytes_f64();
-        if !bytes.is_finite()
-            || bytes.fract() != 0.0
-            || !(1.0..=f64::from(i32::MAX)).contains(&bytes)
-        {
-            return Err(
-                "consumer fetch partition max must be a positive whole-byte value that fits i32"
-                    .to_owned(),
-            );
-        }
-        Self::new(value.bytes_i32())
+        Self::new(protocol_bytes("consumer fetch partition max", value)?)
     }
 }
 
 /// Positive, whole-millisecond subscribed-topic metadata refresh cadence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ConsumerSubscriptionMetadataRefreshInterval(Duration);
 
 impl ConsumerSubscriptionMetadataRefreshInterval {
@@ -595,17 +612,7 @@ impl ConsumerSubscriptionMetadataRefreshInterval {
     /// Returns an error for zero, fractional milliseconds, or a value whose
     /// milliseconds cannot be represented as `u64`.
     pub fn new(value: Duration) -> Result<Self, String> {
-        let milliseconds = MinMaxU128::<1, { u64::MAX as u128 }>::new(value.as_millis())
-            .map_err(|error| format!("consumer subscription metadata refresh interval: {error}"))?
-            .into_value();
-        let milliseconds = u64::try_from(milliseconds)
-            .map_err(|error| format!("consumer subscription metadata refresh interval: {error}"))?;
-        if Duration::from_millis(milliseconds) != value {
-            return Err(
-                "consumer subscription metadata refresh interval must be a whole number of milliseconds"
-                    .to_owned(),
-            );
-        }
+        validated_millisecond_duration("consumer subscription metadata refresh interval", value)?;
         Ok(Self(value))
     }
 
@@ -622,8 +629,8 @@ impl ConsumerSubscriptionMetadataRefreshInterval {
     /// Panics only if the invariant established by [`Self::new`] is violated.
     #[must_use]
     pub fn milliseconds(self) -> u64 {
-        u64::try_from(self.0.as_millis())
-            .expect("validated consumer subscription metadata refresh interval fits u64")
+        validated_millisecond_duration("consumer subscription metadata refresh interval", self.0)
+            .expect("validated consumer subscription metadata refresh interval")
     }
 }
 
@@ -661,11 +668,11 @@ pub enum TimestampType {
     LogAppendTime,
 }
 
-impl From<krabka_protocol::records::TimestampType> for TimestampType {
-    fn from(value: krabka_protocol::records::TimestampType) -> Self {
+impl From<records::TimestampType> for TimestampType {
+    fn from(value: records::TimestampType) -> Self {
         match value {
-            krabka_protocol::records::TimestampType::CreateTime => Self::CreateTime,
-            krabka_protocol::records::TimestampType::LogAppendTime => Self::LogAppendTime,
+            records::TimestampType::CreateTime => Self::CreateTime,
+            records::TimestampType::LogAppendTime => Self::LogAppendTime,
         }
     }
 }
@@ -698,7 +705,7 @@ fn initial_join_protocols(
     subscribe: &[String],
     client_rack: Option<&str>,
 ) -> Vec<(String, bytes::Bytes)> {
-    crate::coordinator::join_protocols(assignors, subscribe, &[], -1, client_rack, None)
+    coordinator::join_protocols(assignors, subscribe, &[], -1, client_rack, None)
 }
 
 /// The `JoinGroup` fields of the startup join. Kafka's first
@@ -708,8 +715,8 @@ fn startup_join_fields(
     group_instance_id: Option<&str>,
     protocols: Vec<(String, bytes::Bytes)>,
     (session_timeout_ms, rebalance_timeout_ms): (i32, i32),
-) -> crate::coordinator::JoinRequestFields {
-    crate::coordinator::JoinRequestFields {
+) -> coordinator::JoinRequestFields {
+    coordinator::JoinRequestFields {
         group_id: group_id.to_owned(),
         group_instance_id: group_instance_id.map(str::to_owned),
         session_timeout_ms,
@@ -733,11 +740,18 @@ fn first_join_member_id(resp: &JoinGroupResponse) -> Result<String, ConsumerErro
     Ok(member_id)
 }
 
-/// The topics that the pattern of `config` matches now. Kafka's consumer
-/// matches a pattern against all topics of the cluster
-/// (`ConsumerMetadata.newMetadataRequestBuilder` asks for all topics).
-async fn pattern_topics(config: &StartConfig) -> Result<Vec<String>, ConsumerError> {
-    let client = Client::builder()
+#[derive(bon::Builder, Default)]
+struct ConsumerClientOptions {
+    #[builder(default)]
+    metadata_scope: krabka_client_core::MetadataScope,
+    telemetry: Option<telemetry::ClientTelemetryConfig>,
+}
+
+async fn build_consumer_client(
+    config: &StartConfig,
+    options: ConsumerClientOptions,
+) -> Result<Client, ConsumerError> {
+    Ok(Client::builder()
         .bootstrap(&config.bootstrap)
         .client_id(config.client_id.clone())
         .request_timeout(config.request_timeout)
@@ -755,15 +769,24 @@ async fn pattern_topics(config: &StartConfig) -> Result<Vec<String>, ConsumerErr
         .connections_max_idle(config.connections_max_idle)
         .socket_connection_setup_timeout(config.socket_connection_setup_timeout)
         .socket_connection_setup_timeout_max(config.socket_connection_setup_timeout_max)
+        .metadata_scope(options.metadata_scope)
+        .maybe_telemetry(options.telemetry)
         .build()
-        .await?;
+        .await?)
+}
+
+/// The topics that the pattern of `config` matches now. Kafka's consumer
+/// matches a pattern against all topics of the cluster
+/// (`ConsumerMetadata.newMetadataRequestBuilder` asks for all topics).
+async fn pattern_topics(config: &StartConfig) -> Result<Vec<String>, ConsumerError> {
+    let client = build_consumer_client(config, ConsumerClientOptions::default()).await?;
     let metadata = client
         .refresh_metadata_with(krabka_client_core::all_topics_request())
         .await;
     client.close();
-    let subscription = crate::subscription::Subscription {
+    let subscription = subscription::Subscription {
         pattern: config.subscribe_pattern.clone(),
-        ..crate::subscription::Subscription::topics(Vec::new(), config.exclude_internal_topics)
+        ..subscription::Subscription::topics(Vec::new(), config.exclude_internal_topics)
     };
     Ok(subscription.matching_topics(&metadata?).unwrap_or_default())
 }
@@ -789,12 +812,12 @@ fn initial_commit_identity(
 /// `poll` completes the first join and calls `on_partitions_assigned`. Here the
 /// build joined, so the first `poll` runs this call.
 fn queue_initial_assign_call(
-    calls: &crate::rebalance_listener::ListenerCalls,
+    calls: &rebalance_listener::ListenerCalls,
     partitions: Vec<(String, i32)>,
 ) {
     let (done, _) = tokio::sync::oneshot::channel();
-    let _ = calls.send(crate::rebalance_listener::ListenerCall {
-        kind: crate::rebalance_listener::ListenerCallKind::Assigned,
+    let _ = calls.send(rebalance_listener::ListenerCall {
+        kind: rebalance_listener::ListenerCallKind::Assigned,
         partitions,
         done,
     });
@@ -819,26 +842,6 @@ fn is_group_leader(leader: &str, member_id: &str) -> bool {
     leader == member_id
 }
 
-fn build_sync_request(
-    group_id: String,
-    generation_id: i32,
-    member_id: String,
-    group_instance_id: Option<String>,
-    protocol_name: String,
-    assignments: Vec<SyncGroupRequestAssignment>,
-) -> SyncGroupRequest {
-    SyncGroupRequest {
-        group_id,
-        generation_id,
-        member_id,
-        group_instance_id,
-        protocol_type: Some("consumer".into()),
-        protocol_name: Some(protocol_name),
-        assignments,
-        ..Default::default()
-    }
-}
-
 async fn leave_startup_member(
     client: &Client,
     coordinator_id: &AtomicI32,
@@ -847,7 +850,7 @@ async fn leave_startup_member(
     group_instance_id: Option<String>,
     leave_group_timeout: Time,
 ) {
-    if !crate::coordinator::should_send_leave_group(
+    if !coordinator::should_send_leave_group(
         member_id,
         group_instance_id.as_deref(),
         GroupMembershipOperation::Default,
@@ -855,7 +858,7 @@ async fn leave_startup_member(
         return;
     }
     let broker = client.broker(coordinator_id.load(Ordering::Relaxed));
-    let send = broker.send(crate::coordinator::build_leave_group_request(
+    let send = broker.send(coordinator::build_leave_group_request(
         group_id.to_string(),
         member_id.to_string(),
         None,
@@ -891,11 +894,11 @@ pub(crate) fn reset_starting_offset(auto_offset_reset: AutoOffsetReset) -> i64 {
     match auto_offset_reset {
         // Resolved by poll() via ListOffsets(-2), the same sentinel as
         // `seek_to_beginning`.
-        AutoOffsetReset::Earliest => crate::poll::BEGINNING_SENTINEL,
+        AutoOffsetReset::Earliest => poll::BEGINNING_SENTINEL,
         // Resolved by poll() via ListOffsets(-1) on first call.
-        AutoOffsetReset::Latest | AutoOffsetReset::ByDuration(_) => crate::poll::LATEST_SENTINEL,
+        AutoOffsetReset::Latest | AutoOffsetReset::ByDuration(_) => poll::LATEST_SENTINEL,
         // Never resolved: poll() and position() raise NoOffsetForPartition.
-        AutoOffsetReset::None => crate::poll::NO_OFFSET_SENTINEL,
+        AutoOffsetReset::None => poll::NO_OFFSET_SENTINEL,
     }
 }
 
@@ -1002,8 +1005,8 @@ fn validated_auto_commit_interval(
     Ok(Some(interval.to_std()))
 }
 
-fn primed_position(committed_epoch: i32) -> crate::position::PartitionPosition {
-    crate::position::PartitionPosition {
+fn primed_position(committed_epoch: i32) -> position::PartitionPosition {
+    position::PartitionPosition {
         // Wrap the committed leader epoch (raw wire `int32` from OffsetFetch) at
         // the decode boundary.
         offset_epoch: krabka_ids::LeaderEpoch(committed_epoch),
@@ -1101,10 +1104,15 @@ impl Consumer {
         #[builder(default = AutoOffsetReset::Latest)] auto_offset_reset: AutoOffsetReset,
         #[builder(default = IsolationLevel::ReadUncommitted)] isolation_level: IsolationLevel,
         #[builder(into, default = Assignor::DEFAULT_LIST.to_vec())] assignors: Vec<Assignor>,
-        #[builder(default = krabka_client_core::DEFAULT_FETCH_MIN)] fetch_min: ByteSize,
-        #[builder(default = crate::poll::DEFAULT_FETCH_MAX)] fetch_max: ByteSize,
-        #[builder(default = crate::poll::DEFAULT_FETCH_PARTITION_MAX)]
-        fetch_partition_max: ByteSize,
+        /// Kafka's `fetch.min.bytes`, as a raw protocol byte count.
+        #[builder(default = krabka_client_core::DEFAULT_FETCH_MIN.bytes_i32())]
+        fetch_min: i32,
+        /// Kafka's `fetch.max.bytes`, as a raw protocol byte count.
+        #[builder(default = poll::DEFAULT_FETCH_MAX.bytes_i32())]
+        fetch_max: i32,
+        /// Kafka's `max.partition.fetch.bytes`, as a raw protocol byte count.
+        #[builder(default = poll::DEFAULT_FETCH_PARTITION_MAX.bytes_i32())]
+        fetch_partition_max: i32,
         #[builder(default = DEFAULT_CONSUMER_FETCH_MAX_WAIT)] fetch_max_wait: Time,
         #[builder(default = DEFAULT_CONSUMER_METADATA_MAX_AGE)] metadata_max_age: Time,
         /// Kafka's `default.api.timeout.ms`: the timeout of
@@ -1132,7 +1140,7 @@ impl Consumer {
         metadata_recovery_rebootstrap_trigger: Time,
         #[builder(default = DEFAULT_CONSUMER_LEAVE_GROUP_TIMEOUT)] leave_group_timeout: Time,
         #[builder(into)] client_rack: Option<String>,
-        security: Option<krabka_client_core::security::ClientSecurity>,
+        security: Option<security::ClientSecurity>,
         /// Kafka's `client.dns.lookup`.
         #[builder(default)]
         client_dns_lookup: krabka_client_core::ClientDnsLookup,
@@ -1191,7 +1199,7 @@ impl Consumer {
         // Kafka's `ConsumerConfig.checkUnsupportedConfigsPostProcess`:
         // `group.remote.assignor` belongs to the consumer group protocol, and
         // `partition.assignment.strategy` to the classic one.
-        if group_protocol == crate::GroupProtocol::Classic && group_remote_assignor.is_some() {
+        if group_protocol == GroupProtocol::Classic && group_remote_assignor.is_some() {
             return Err(ConsumerError::InvalidConfig(
                 "group.remote.assignor cannot be set when group.protocol=classic".to_owned(),
             ));
@@ -1212,9 +1220,9 @@ impl Consumer {
                     "Topic pattern to subscribe to cannot be empty".to_owned(),
                 ));
             }
-            if group_protocol != crate::GroupProtocol::Consumer {
+            if group_protocol != GroupProtocol::Consumer {
                 return Err(ConsumerError::InvalidConfig(
-                    crate::consumer_group::RE2J_NEEDS_CONSUMER_PROTOCOL.to_owned(),
+                    consumer_group::RE2J_NEEDS_CONSUMER_PROTOCOL.to_owned(),
                 ));
             }
             if group_id.is_empty() {
@@ -1233,10 +1241,10 @@ impl Consumer {
         }
         krabka_client_core::ClientDnsTimeout::new(dns_timeout)
             .map_err(ConsumerError::InvalidConfig)?;
-        let fetch_min = FetchMinBytes::try_from(fetch_min)
+        let fetch_min = FetchMinBytes::new(fetch_min)
             .map_err(ConsumerError::InvalidConfig)?
             .size();
-        let fetch_max = ConsumerFetchMaxBytes::try_from(fetch_max)
+        let fetch_max = ConsumerFetchMaxBytes::new(fetch_max)
             .map_err(ConsumerError::InvalidConfig)?
             .size();
         if fetch_min.bytes_i32() > fetch_max.bytes_i32() {
@@ -1244,7 +1252,7 @@ impl Consumer {
                 "consumer fetch min must not exceed consumer fetch max".to_owned(),
             ));
         }
-        let fetch_partition_max = ConsumerFetchPartitionMaxBytes::try_from(fetch_partition_max)
+        let fetch_partition_max = ConsumerFetchPartitionMaxBytes::new(fetch_partition_max)
             .map_err(ConsumerError::InvalidConfig)?
             .size();
         // The two validated newtypes below still speak `Duration`: both derive
@@ -1258,11 +1266,10 @@ impl Consumer {
                 subscription_metadata_refresh_interval.to_std(),
             )
             .map_err(ConsumerError::InvalidConfig)?;
-        let dispatch_queue_capacity =
-            krabka_client_core::ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
-                .map_err(ConsumerError::InvalidConfig)?;
-        let frame_max = krabka_client_core::ClientFrameMax::try_from(frame_max)
+        let dispatch_queue_capacity = ConnectionDispatchQueueCapacity::new(dispatch_queue_capacity)
             .map_err(ConsumerError::InvalidConfig)?;
+        let frame_max =
+            ClientFrameMax::try_from(frame_max).map_err(ConsumerError::InvalidConfig)?;
         let metadata_recovery_rebootstrap_trigger =
             krabka_client_core::MetadataRecoveryRebootstrapTrigger::new(
                 metadata_recovery_rebootstrap_trigger,
@@ -1295,12 +1302,12 @@ impl Consumer {
             None => ConsumerRetryPolicy::with_retry_backoff_max(retry_backoff_max)
                 .map_err(ConsumerError::InvalidConfig)?,
         };
-        let rebalance_protocol = crate::assignor::rebalance_protocol_of(&assignors)
-            .map_err(ConsumerError::InvalidConfig)?;
+        let rebalance_protocol =
+            assignor::rebalance_protocol_of(&assignors).map_err(ConsumerError::InvalidConfig)?;
 
         let client_id = consumer_client_id(client_id, &group_id, group_instance_id.as_deref());
         let telemetry = enable_metrics_push.then(|| {
-            krabka_client_core::telemetry::ClientTelemetryConfig::consumer(
+            telemetry::ClientTelemetryConfig::consumer(
                 Some(group_id.as_str()),
                 group_instance_id.as_deref(),
                 client_rack.as_deref(),
@@ -1374,11 +1381,9 @@ impl Consumer {
         loop {
             let remaining = total.saturating_sub(started.elapsed());
             if remaining.is_zero() {
-                return Err(ConsumerError::Client(
-                    krabka_client_core::ClientError::Timeout(
-                        config.retry_policy.startup_deadline(),
-                    ),
-                ));
+                return Err(ConsumerError::Client(ClientError::Timeout(
+                    config.retry_policy.startup_deadline(),
+                )));
             }
             match tokio::time::timeout(
                 config
@@ -1392,7 +1397,7 @@ impl Consumer {
             {
                 Ok(Ok(mut consumer)) => {
                     consumer.rebalance_listener =
-                        rebalance_listener.map(crate::rebalance_listener::shared);
+                        rebalance_listener.map(rebalance_listener::shared);
                     return Ok(consumer);
                 }
                 Ok(Err(error)) => {
@@ -1410,11 +1415,9 @@ impl Consumer {
                 }
                 Err(_elapsed) => {
                     if started.elapsed().as_time() >= config.retry_policy.startup_deadline() {
-                        return Err(ConsumerError::Client(
-                            krabka_client_core::ClientError::Timeout(
-                                config.retry_policy.startup_deadline(),
-                            ),
-                        ));
+                        return Err(ConsumerError::Client(ClientError::Timeout(
+                            config.retry_policy.startup_deadline(),
+                        )));
                     }
                     tracing::warn!(
                         group = %config.group_id,
@@ -1465,7 +1468,7 @@ impl Consumer {
         if config.subscribe_pattern.is_some() {
             config.subscribe = pattern_topics(&config).await?;
         }
-        if config.group_protocol == crate::GroupProtocol::Consumer {
+        if config.group_protocol == GroupProtocol::Consumer {
             // KIP-848: the member joins with its first
             // `ConsumerGroupHeartbeat`, which the coordinator task sends.
             return start_without_subscription(config).await;
@@ -1562,26 +1565,19 @@ impl Consumer {
             protocols.clone(),
             (session_timeout_ms, rebalance_timeout_ms),
         );
-        let r1 = with_coordinator_refind(
-            &client,
-            &group_id,
-            &coordinator_id,
-            coordinator_retry,
-            |r: &JoinGroupResponse| r.error_code,
-            || {
-                let request = join_fields.request(String::new());
-                let client = &client;
-                let target = coordinator_id.load(Ordering::Relaxed);
-                async move {
-                    client
-                        .broker(target)
-                        .send(request)
-                        .await
-                        .map_err(ConsumerError::from)
-                }
-            },
-        )
-        .await?;
+        let refind = CoordinatorRefind {
+            client: &client,
+            group_id: &group_id,
+            coordinator_id: &coordinator_id,
+        };
+        let r1 = CoordinatorRetryRequest::builder()
+            .retry(coordinator_retry)
+            .code(|r: &JoinGroupResponse| r.error_code)
+            .make(|| refind.send_join_group(join_fields.request(String::new())))
+            .refind(refind)
+            .build()
+            .run_with_refind()
+            .await?;
         let member_id = first_join_member_id(&r1)?;
         tracing::Span::current().record("member_id", member_id.as_str());
 
@@ -1644,26 +1640,16 @@ async fn finish_startup(
     );
     join_fields.reason = format!("need to re-join with the given member-id: {member_id}");
     // 2. Second JoinGroup with the assigned member_id, on the coordinator.
-    let r2 = with_coordinator_refind(
-        &client,
-        &group_id,
-        &coordinator_id,
-        coordinator_retry,
-        |r: &JoinGroupResponse| r.error_code,
-        || {
-            let request = join_fields.request(member_id.clone());
-            let client = &client;
-            let target = coordinator_id.load(Ordering::Relaxed);
-            async move {
-                client
-                    .broker(target)
-                    .send(request)
-                    .await
-                    .map_err(ConsumerError::from)
-            }
-        },
-    )
-    .await?;
+    let r2 = coordinator::JoinGroupRetry::builder()
+        .client(&client)
+        .group_id(&group_id)
+        .coordinator_id(&coordinator_id)
+        .retry(coordinator_retry)
+        .fields(&join_fields)
+        .member_id(member_id.clone())
+        .build()
+        .run()
+        .await?;
     if r2.error_code != 0 {
         return Err(ConsumerError::Server(r2.error_code));
     }
@@ -1678,7 +1664,7 @@ async fn finish_startup(
 
     // 5. Fetch existing committed offsets so poll() resumes correctly.
     let mut next_offsets: HashMap<(String, i32), i64> = HashMap::new();
-    let mut positions: HashMap<(String, i32), crate::position::PartitionPosition> = HashMap::new();
+    let mut positions: HashMap<(String, i32), position::PartitionPosition> = HashMap::new();
     if has_assigned_partitions(&assigned_partitions) {
         let mut by_topic: HashMap<String, Vec<i32>> = HashMap::new();
         for (t, p) in &assigned_partitions {
@@ -1686,16 +1672,16 @@ async fn finish_startup(
         }
         // OffsetFetch is a coordinator RPC — route it to the coordinator
         // broker (its id is fresh from the join/sync above).
-        let of = crate::coordinator::send_offset_fetch(
+        let of = coordinator::send_offset_fetch(
             &client,
             &group_id,
             &coordinator_id,
-            &crate::offset_wire::build_offset_fetch(&group_id, &by_topic),
+            &offset_wire::build_offset_fetch(&group_id, &by_topic),
             coordinator_retry,
         )
         .await?;
         for (name, partition_index, committed, committed_epoch) in
-            crate::offset_wire::parse_offset_fetch(&of)
+            offset_wire::parse_offset_fetch(&of)
         {
             let starting = starting_offset(committed, auto_offset_reset);
             next_offsets.insert((name.clone(), partition_index), starting);
@@ -1708,15 +1694,15 @@ async fn finish_startup(
         client,
         coordinator_id,
         member_id,
-        StartupState {
-            generation_id: r2.generation_id,
-            group_topics,
-            assigned_partitions,
-            next_offsets,
-            positions,
-            topic_ids,
-            topic_partitions,
-        },
+        StartupState::builder()
+            .generation_id(r2.generation_id)
+            .group_topics(group_topics)
+            .assigned_partitions(assigned_partitions)
+            .next_offsets(next_offsets)
+            .positions(positions)
+            .topic_ids(topic_ids)
+            .topic_partitions(topic_partitions)
+            .build(),
     )
     .await
 }
@@ -1752,7 +1738,7 @@ async fn resolve_initial_assignment(
     // Kafka's `ConsumerCoordinator.onLeaderElected`: the leader fetches
     // metadata for the topics of every member.
     let group_topics = if is_leader {
-        crate::coordinator::group_subscription_topics(r2, subscribe)
+        coordinator::group_subscription_topics(r2, subscribe)
     } else {
         subscribe.clone()
     };
@@ -1774,7 +1760,7 @@ async fn resolve_initial_assignment(
     tracing::Span::current().record("generation", r2.generation_id);
     tracing::Span::current().record("is_leader", is_leader);
     let assignments_for_sync: Vec<SyncGroupRequestAssignment> = if is_leader {
-        crate::coordinator::leader_assignments(&config.assignors, r2, &md)?
+        coordinator::leader_assignments(&config.assignors, r2, &md)?
     } else {
         Vec::new()
     };
@@ -1782,13 +1768,10 @@ async fn resolve_initial_assignment(
     // 4. SyncGroup — leader installs assignments; everyone receives their
     //    own assignment in the response. On the coordinator broker, with
     //    re-discovery on a cold/relocating-coordinator code.
-    let r3 = with_coordinator_refind(
-        client,
-        group_id,
-        coordinator_id,
-        config.retry_policy.into(),
-        |r: &SyncGroupResponse| r.error_code,
-        || {
+    let r3 = CoordinatorRetryRequest::builder()
+        .retry(config.retry_policy.into())
+        .code(|r: &SyncGroupResponse| r.error_code)
+        .make(|| {
             let group_id = group_id.clone();
             let protocol_name = protocol_name.to_string();
             let member_id = member_id.to_string();
@@ -1799,20 +1782,28 @@ async fn resolve_initial_assignment(
             async move {
                 client
                     .broker(target)
-                    .send(build_sync_request(
-                        group_id,
-                        generation_id,
-                        member_id,
-                        group_instance_id.clone(),
-                        protocol_name,
-                        assignments_for_sync,
-                    ))
+                    .send(
+                        coordinator::SyncGroupRequestConfig::builder()
+                            .group_id(group_id)
+                            .generation_id(generation_id)
+                            .member_id(member_id)
+                            .maybe_group_instance_id(group_instance_id)
+                            .protocol_name(protocol_name)
+                            .assignments(assignments_for_sync)
+                            .build(),
+                    )
                     .await
                     .map_err(ConsumerError::from)
             }
-        },
-    )
-    .await?;
+        })
+        .refind(CoordinatorRefind {
+            client,
+            group_id,
+            coordinator_id,
+        })
+        .build()
+        .run_with_refind()
+        .await?;
     if r3.error_code != 0 {
         return Err(ConsumerError::Server(r3.error_code));
     }
@@ -1827,15 +1818,50 @@ async fn resolve_initial_assignment(
     })
 }
 
+#[derive(bon::Builder, Default)]
 struct StartupState {
+    #[builder(default)]
     generation_id: i32,
     /// The topics that the coordinator task watches until the next join.
+    #[builder(default)]
     group_topics: Vec<String>,
+    #[builder(default)]
     assigned_partitions: Vec<(String, i32)>,
+    #[builder(default)]
     next_offsets: HashMap<(String, i32), i64>,
-    positions: HashMap<(String, i32), crate::position::PartitionPosition>,
+    #[builder(default)]
+    positions: HashMap<(String, i32), position::PartitionPosition>,
+    #[builder(default)]
     topic_ids: HashMap<String, WireUuid>,
+    #[builder(default)]
     topic_partitions: HashMap<String, i32>,
+}
+
+#[cfg(test)]
+#[derive(bon::Builder)]
+#[builder(start_fn = builder, finish_fn = build)]
+struct TestConsumerStart {
+    bootstrap: String,
+    config: StartConfig,
+    startup: StartupState,
+}
+
+#[cfg(test)]
+async fn start_test_consumer(start: TestConsumerStart) -> Consumer {
+    let client = Client::builder()
+        .bootstrap(start.bootstrap)
+        .build()
+        .await
+        .expect("client");
+    spawn_consumer(
+        start.config,
+        client,
+        Arc::new(AtomicI32::new(0)),
+        "member-a".into(),
+        start.startup,
+    )
+    .await
+    .expect("spawn consumer")
 }
 
 /// Start a consumer without a subscription: Kafka's consumer before
@@ -1843,28 +1869,14 @@ struct StartupState {
 /// group and has no coordinator task. With a group id it finds the
 /// coordinator, so it can commit the offsets of an `assign`.
 async fn start_without_subscription(config: StartConfig) -> Result<Consumer, ConsumerError> {
-    let client = Client::builder()
-        .bootstrap(&config.bootstrap)
-        .client_id(config.client_id.clone())
-        .request_timeout(config.request_timeout)
-        .dns_timeout(config.dns_timeout)
-        .send_buffer(config.send_buffer)
-        .receive_buffer(config.receive_buffer)
-        .dispatch_queue_capacity(config.dispatch_queue_capacity.get())
-        .frame_max(config.frame_max.size())
-        .metadata_recovery_strategy(config.metadata_recovery_strategy)
-        .metadata_recovery_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger)
-        .maybe_security(config.security.clone())
-        .client_dns_lookup(config.client_dns_lookup)
-        .reconnect_backoff(config.reconnect_backoff)
-        .reconnect_backoff_max(config.reconnect_backoff_max)
-        .connections_max_idle(config.connections_max_idle)
-        .socket_connection_setup_timeout(config.socket_connection_setup_timeout)
-        .socket_connection_setup_timeout_max(config.socket_connection_setup_timeout_max)
-        .metadata_scope(subscription_metadata_scope(config.allow_auto_create_topics))
-        .maybe_telemetry(config.telemetry.clone())
-        .build()
-        .await?;
+    let client = build_consumer_client(
+        &config,
+        ConsumerClientOptions::builder()
+            .metadata_scope(subscription_metadata_scope(config.allow_auto_create_topics))
+            .maybe_telemetry(config.telemetry.clone())
+            .build(),
+    )
+    .await?;
     let coordinator_id = if config.group_id.is_empty() {
         -1
     } else {
@@ -1872,7 +1884,7 @@ async fn start_without_subscription(config: StartConfig) -> Result<Consumer, Con
     };
     // KIP-848: the member id comes from the client. Kafka's
     // `AsyncKafkaConsumer` generates a random one at startup.
-    let member_id = if config.group_protocol == crate::GroupProtocol::Consumer {
+    let member_id = if config.group_protocol == GroupProtocol::Consumer {
         uuid::Uuid::new_v4().to_string()
     } else {
         String::new()
@@ -1885,15 +1897,7 @@ async fn start_without_subscription(config: StartConfig) -> Result<Consumer, Con
         client,
         Arc::new(AtomicI32::new(coordinator_id)),
         member_id,
-        StartupState {
-            generation_id: -1,
-            group_topics: Vec::new(),
-            assigned_partitions: Vec::new(),
-            next_offsets: HashMap::new(),
-            positions: HashMap::new(),
-            topic_ids: HashMap::new(),
-            topic_partitions: HashMap::new(),
-        },
+        StartupState::builder().generation_id(-1).build(),
     )
     .await
 }
@@ -1915,27 +1919,13 @@ async fn coordinator_task_client(
     {
         return Ok(None);
     }
-    let client = Client::builder()
-        .bootstrap(&config.bootstrap)
-        .client_id(config.client_id.clone())
-        .request_timeout(config.request_timeout)
-        .dns_timeout(config.dns_timeout)
-        .send_buffer(config.send_buffer)
-        .receive_buffer(config.receive_buffer)
-        .dispatch_queue_capacity(config.dispatch_queue_capacity.get())
-        .frame_max(config.frame_max.size())
-        .metadata_recovery_strategy(config.metadata_recovery_strategy)
-        .metadata_recovery_rebootstrap_trigger(config.metadata_recovery_rebootstrap_trigger)
-        .maybe_security(config.security.clone())
-        .client_dns_lookup(config.client_dns_lookup)
-        .reconnect_backoff(config.reconnect_backoff)
-        .reconnect_backoff_max(config.reconnect_backoff_max)
-        .connections_max_idle(config.connections_max_idle)
-        .socket_connection_setup_timeout(config.socket_connection_setup_timeout)
-        .socket_connection_setup_timeout_max(config.socket_connection_setup_timeout_max)
-        .metadata_scope(subscription_metadata_scope(config.allow_auto_create_topics))
-        .build()
-        .await?;
+    let client = build_consumer_client(
+        config,
+        ConsumerClientOptions::builder()
+            .metadata_scope(subscription_metadata_scope(config.allow_auto_create_topics))
+            .build(),
+    )
+    .await?;
     // A leader of the build watches the topics of the whole group until the
     // next join (Kafka's `SubscriptionState.metadataTopics`).
     let topics = if group_topics.is_empty() {
@@ -1987,7 +1977,7 @@ async fn spawn_consumer(
         auto_commit_interval,
         ..
     } = config;
-    let subscription = crate::subscription::shared(
+    let subscription = subscription::shared(
         subscribe.clone(),
         subscribe_pattern,
         exclude_internal_topics,
@@ -2024,22 +2014,22 @@ async fn spawn_consumer(
     // current generation; the coordinator publishes to it on every (re)join.
     let current_generation = Arc::new(AtomicI32::new(generation_id));
 
-    let poll_error = crate::coordinator::PollErrorSlot::default();
-    let poll_signal = crate::coordinator::PollSignal::default();
+    let poll_error = coordinator::PollErrorSlot::default();
+    let poll_signal = coordinator::PollSignal::default();
     // A member of the consumer group protocol has no assignment before its
     // first heartbeat, so the first `poll` waits for it.
     let rebalance_pending =
-        tokio::sync::watch::Sender::new(group_protocol == crate::GroupProtocol::Consumer);
+        tokio::sync::watch::Sender::new(group_protocol == GroupProtocol::Consumer);
     let rebalance_pending_receiver = rebalance_pending.subscribe();
-    let close_operation = tokio::sync::watch::Sender::new(crate::control::CloseRequest::default());
+    let close_operation = tokio::sync::watch::Sender::new(control::CloseRequest::default());
     let (listener_sender, listener_calls) = tokio::sync::mpsc::unbounded_channel();
     let (enforced_rebalances, enforced_rebalance_reasons) = tokio::sync::mpsc::unbounded_channel();
-    let assigned_callback_pending = crate::rebalance_listener::AssignedCallbackPending::default();
+    let assigned_callback_pending = rebalance_listener::AssignedCallbackPending::default();
     // A consumer that joined no group runs no rebalance callback.
     if has_rebalance_listener && !standalone {
         queue_initial_assign_call(&listener_sender, initial_assignment);
     }
-    let auto_commit = auto_commit_interval.map(crate::commit::AutoCommit::new);
+    let auto_commit = auto_commit_interval.map(commit::AutoCommit::new);
 
     let shutdown = CancellationToken::new();
     let published_member_id = tokio::sync::watch::Sender::new(member_id.clone());
@@ -2063,7 +2053,7 @@ async fn spawn_consumer(
         group_protocol,
         server_assignor,
         member_epoch: 0,
-        sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
+        sent_heartbeat_fields: consumer_group::SentFields::default(),
         assigned: Arc::clone(&assigned),
         assignment_changed: Arc::clone(&assignment_changed),
         next_ownership_id,
@@ -2097,19 +2087,15 @@ async fn spawn_consumer(
         enforced_rebalances: enforced_rebalance_reasons,
         lost_partitions: Vec::new(),
         assigned_callback_pending: Arc::clone(&assigned_callback_pending),
-        poll_timer: crate::coordinator::PollTimer::new(max_poll_interval),
+        poll_timer: coordinator::PollTimer::new(max_poll_interval),
         poll_timeout_in_callback: false,
     };
     // IMPORTANT: `tokio::spawn` is the very last operation — no `.await`
     // follows it.  Dropping a timed-out `start_once` future before this
     // point cancels all in-flight connections without spawning anything.
     let coord_handle = (!standalone).then(|| match group_protocol {
-        crate::GroupProtocol::Classic => {
-            tokio::spawn(crate::coordinator::run(state, shutdown.clone()))
-        }
-        crate::GroupProtocol::Consumer => {
-            tokio::spawn(crate::consumer_group::run(state, shutdown.clone()))
-        }
+        GroupProtocol::Classic => tokio::spawn(coordinator::run(state, shutdown.clone())),
+        GroupProtocol::Consumer => tokio::spawn(consumer_group::run(state, shutdown.clone())),
     });
 
     Ok(Consumer {
@@ -2142,11 +2128,11 @@ async fn spawn_consumer(
         fetch_max,
         fetch_partition_max,
         fetch_max_wait,
-        fetches: crate::poll::Fetches::default(),
+        fetches: poll::Fetches::default(),
         client_rack,
         metadata_max_age,
         request_timeout,
-        wakeup: crate::control::WakeupHandle::default(),
+        wakeup: control::WakeupHandle::default(),
         enforced_rebalances,
         default_api_timeout,
         paused: std::sync::Mutex::default(),
@@ -2156,7 +2142,7 @@ async fn spawn_consumer(
         poll_signal,
         rebalance_pending: rebalance_pending_receiver,
         max_poll_records,
-        fetch_buffer: crate::fetch_buffer::FetchBuffer::default(),
+        fetch_buffer: fetch_buffer::FetchBuffer::default(),
         close_operation,
         rebalance_listener: None,
         listener_calls,
@@ -2185,14 +2171,14 @@ fn is_retriable_consumer_start_error(error: &ConsumerError) -> bool {
         // 16 NOT_COORDINATOR, 22 ILLEGAL_GENERATION, 25 UNKNOWN_MEMBER_ID,
         // 27 REBALANCE_IN_PROGRESS, 79 MEMBER_ID_REQUIRED.
         ConsumerError::Server(14 | 15 | 16 | 22 | 25 | 27 | 79)
-            | ConsumerError::Client(krabka_client_core::ClientError::Disconnected)
+            | ConsumerError::Client(ClientError::Disconnected)
     ) || matches!(
         error,
         ConsumerError::StartupAfterJoin(inner)
             if is_retriable_consumer_start_error(inner)
                 || matches!(
                     inner.as_ref(),
-                    ConsumerError::Client(krabka_client_core::ClientError::Timeout(_))
+                    ConsumerError::Client(ClientError::Timeout(_))
                 )
     )
 }
@@ -2250,7 +2236,7 @@ impl Consumer {
         assigned.iter().all(|partition| {
             positions
                 .get(partition)
-                .filter(|position| !crate::poll::is_reset_sentinel(**position))
+                .filter(|position| !poll::is_reset_sentinel(**position))
                 .zip(ends.get(partition))
                 .is_some_and(|(position, end)| position >= end)
         })
@@ -2264,7 +2250,7 @@ impl Consumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn close(self) -> Result<(), ConsumerError> {
-        self.close_with(crate::CloseOptions::default()).await
+        self.close_with(CloseOptions::default()).await
     }
 
     /// The client instance id that the broker assigned for metrics push
@@ -2281,13 +2267,13 @@ impl Consumer {
     /// `timeout`, as Kafka throws an `IllegalStateException` and an
     /// `IllegalArgumentException`.
     ///
-    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
-    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
+    /// [`ClientError::TelemetryDisabled`]: ClientError::TelemetryDisabled
+    /// [`ClientError::InvalidArgument`]: ClientError::InvalidArgument
     pub async fn client_instance_id(
         &self,
         timeout: Time,
     ) -> Result<Option<uuid::Uuid>, ConsumerError> {
-        Ok(self.client.client_instance_id(timeout).await?)
+        client_instance_id(&self.client, timeout).await
     }
 
     /// Close the consumer, and leave the group or stay in it as
@@ -2306,7 +2292,7 @@ impl Consumer {
     /// commit and without `LeaveGroup`.
     ///
     /// The coordinator itself sends the best-effort `LeaveGroup` as the last
-    /// thing it does on shutdown. See `crate::coordinator::run`. It uses its
+    /// thing it does on shutdown. See `coordinator::run`. It uses its
     /// *live* `member_id`, which can differ from the one captured at build
     /// time, because a from-scratch rejoin (`UNKNOWN_MEMBER_ID`) replaces it.
     /// The cancel and join are prompt, because the coordinator races its
@@ -2321,7 +2307,7 @@ impl Consumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn close_with(mut self, options: crate::CloseOptions) -> Result<(), ConsumerError> {
-        let timeout = crate::control::close_timeout(options)?.to_std();
+        let timeout = control::close_timeout(options)?.to_std();
         let started = tokio::time::Instant::now();
         let request_timeout = self.request_timeout.to_std();
         // Kafka's `createTimerForRequest`: the coordinator close gets at most
@@ -2337,10 +2323,9 @@ impl Consumer {
         // `LeaveGroup`: lost when the member has no generation or a rebalance
         // runs, revoked otherwise.
         let listener_result = self.leave_prepare().await;
-        self.close_operation
-            .send_replace(crate::control::CloseRequest {
-                operation: options.group_membership_operation,
-            });
+        self.close_operation.send_replace(control::CloseRequest {
+            operation: options.group_membership_operation,
+        });
         self.coordinator_shutdown.cancel();
         if let Some(h) = self.coordinator_handle.take() {
             let _ = h.await;
@@ -2369,9 +2354,9 @@ impl Consumer {
             return pending;
         }
         let kind = if self.member_id.borrow().is_empty() || *self.rebalance_pending.borrow() {
-            crate::rebalance_listener::ListenerCallKind::Lost
+            rebalance_listener::ListenerCallKind::Lost
         } else {
-            crate::rebalance_listener::ListenerCallKind::Revoked
+            rebalance_listener::ListenerCallKind::Revoked
         };
         let result = self.run_listener(kind, &owned).await;
         pending.and(result)
@@ -2382,8 +2367,8 @@ impl Consumer {
 impl Consumer {
     pub(crate) fn test_builder(
         client: krabka_client_core::Client,
-    ) -> crate::test_support::ConsumerTestBuilder {
-        crate::test_support::ConsumerTestBuilder::new(client)
+    ) -> test_support::ConsumerTestBuilder {
+        test_support::ConsumerTest::new(client)
     }
 }
 
@@ -2448,16 +2433,16 @@ mod consumer_retry_policy_tests {
         check!(defaults.coordinator_initial_backoff() == millis(100));
         check!(defaults.coordinator_max_backoff() == secs(1));
 
-        let configured = ConsumerRetryPolicy::new(
-            secs(11),
-            secs(12),
-            millis(13),
-            millis(14),
-            secs(15),
-            millis(16),
-            millis(17),
-        )
-        .expect("valid retry policy");
+        let configured = ConsumerRetryPolicy::builder()
+            .startup_attempt_timeout(secs(11))
+            .startup_deadline(secs(12))
+            .startup_initial_backoff(millis(13))
+            .startup_max_backoff(millis(14))
+            .coordinator_retry_timeout(secs(15))
+            .coordinator_initial_backoff(millis(16))
+            .coordinator_max_backoff(millis(17))
+            .build()
+            .expect("valid retry policy");
         check!(configured.startup_attempt_timeout() == secs(11));
         check!(configured.startup_deadline() == secs(12));
         check!(configured.startup_initial_backoff() == millis(13));
@@ -2507,68 +2492,71 @@ mod consumer_retry_policy_tests {
 
     #[test]
     fn consumer_retry_policy_rejects_invalid_values() {
-        let valid = [
-            secs(90),
-            minutes(5),
-            millis(500),
-            secs(5),
-            secs(30),
-            millis(100),
-            secs(1),
-        ];
-        for (index, invalid) in [
+        for invalid in [
             Time::ZERO,
             Time::from_secs_f64(0.0005),
             Time::from_secs_f64(f64::INFINITY),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut values = valid;
-            values[index] = invalid;
+        ] {
             assert!(
-                ConsumerRetryPolicy::new(
-                    values[0], values[1], values[2], values[3], values[4], values[5], values[6],
-                )
-                .is_err()
+                ConsumerRetryPolicy::builder()
+                    .startup_attempt_timeout(invalid)
+                    .build()
+                    .is_err()
+            );
+            assert!(
+                ConsumerRetryPolicy::builder()
+                    .startup_deadline(invalid)
+                    .build()
+                    .is_err()
+            );
+            assert!(
+                ConsumerRetryPolicy::builder()
+                    .startup_initial_backoff(invalid)
+                    .build()
+                    .is_err()
+            );
+            assert!(
+                ConsumerRetryPolicy::builder()
+                    .startup_max_backoff(invalid)
+                    .build()
+                    .is_err()
+            );
+            assert!(
+                ConsumerRetryPolicy::builder()
+                    .coordinator_retry_timeout(invalid)
+                    .build()
+                    .is_err()
+            );
+            assert!(
+                ConsumerRetryPolicy::builder()
+                    .coordinator_initial_backoff(invalid)
+                    .build()
+                    .is_err()
+            );
+            assert!(
+                ConsumerRetryPolicy::builder()
+                    .coordinator_max_backoff(invalid)
+                    .build()
+                    .is_err()
             );
         }
 
-        for values in [
-            [
-                secs(13),
-                secs(12),
-                millis(1),
-                millis(2),
-                secs(3),
-                millis(1),
-                millis(2),
-            ],
-            [
-                secs(1),
-                secs(2),
-                millis(3),
-                millis(2),
-                secs(3),
-                millis(1),
-                millis(2),
-            ],
-            [
-                secs(1),
-                secs(2),
-                millis(1),
-                millis(2),
-                secs(3),
-                millis(3),
-                millis(2),
-            ],
-        ] {
-            assert!(
-                ConsumerRetryPolicy::new(
-                    values[0], values[1], values[2], values[3], values[4], values[5], values[6],
-                )
-                .is_err()
-            );
+        let invalid_orderings = [
+            ConsumerRetryPolicy::builder()
+                .startup_attempt_timeout(secs(13))
+                .startup_deadline(secs(12))
+                .build(),
+            ConsumerRetryPolicy::builder()
+                .startup_initial_backoff(millis(3))
+                .startup_max_backoff(millis(2))
+                .build(),
+            ConsumerRetryPolicy::builder()
+                .coordinator_initial_backoff(millis(3))
+                .coordinator_max_backoff(millis(2))
+                .build(),
+        ];
+        for policy in invalid_orderings {
+            assert!(policy.is_err());
         }
     }
 }
@@ -2581,12 +2569,9 @@ mod security_arg_tests {
         security::{ClientSecurity, SaslCredentials},
     };
     use krabka_protocol::{
-        Encode, UnknownTaggedFields,
+        Encode,
         owned::{
-            api_versions_request,
-            api_versions_response::{ApiVersion, ApiVersionsResponse},
-            join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol},
-            leave_group_request,
+            api_versions_request, leave_group_request,
             leave_group_response::{self, LeaveGroupResponse},
         },
     };
@@ -2594,28 +2579,12 @@ mod security_arg_tests {
 
     use super::*;
 
-    fn api_versions_for_startup_cleanup() -> Vec<u8> {
-        let resp = ApiVersionsResponse {
-            error_code: 0,
-            api_keys: vec![
-                ApiVersion {
-                    api_key: api_versions_request::API_KEY,
-                    min_version: 0,
-                    max_version: 3,
-                    ..Default::default()
-                },
-                ApiVersion {
-                    api_key: leave_group_request::API_KEY,
-                    min_version: 0,
-                    max_version: leave_group_request::MAX_VERSION,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let mut buf = bytes::BytesMut::new();
-        resp.encode(&mut buf, 0).unwrap();
-        buf.to_vec()
+    async fn invalid_consumer_config<F, E>(build: F) -> E
+    where
+        F: std::future::Future<Output = Result<Consumer, E>>,
+        E: std::fmt::Debug,
+    {
+        build.await.err().expect("invalid configuration")
     }
 
     fn leave_group_response_at(version: i16) -> Vec<u8> {
@@ -2685,15 +2654,15 @@ mod security_arg_tests {
 
     #[tokio::test]
     async fn invalid_subscription_metadata_refresh_interval_fails_before_broker_lookup() {
-        let error = Consumer::builder()
-            .bootstrap("invalid.invalid:9092")
-            .group_id("metadata-refresh-validation")
-            .subscribe(["topic".to_owned()])
-            .subscription_metadata_refresh_interval(krabka_units::secs(0))
-            .build()
-            .await
-            .err()
-            .expect("invalid configuration");
+        let error = invalid_consumer_config(
+            Consumer::builder()
+                .bootstrap("invalid.invalid:9092")
+                .group_id("metadata-refresh-validation")
+                .subscribe(["topic".to_owned()])
+                .subscription_metadata_refresh_interval(krabka_units::secs(0))
+                .build(),
+        )
+        .await;
 
         assert2::assert!(
             error
@@ -2810,7 +2779,7 @@ mod security_arg_tests {
             (
                 "both",
                 vec!["orders".to_owned()],
-                Some(crate::TopicPattern::new(|_| true)),
+                Some(TopicPattern::new(|_| true)),
                 "invalid configuration: subscribe and subscribe_pattern are mutually exclusive",
             ),
             (
@@ -2849,7 +2818,7 @@ mod security_arg_tests {
         for (name, protocol, assignor, regex, topics, expected) in [
             (
                 "a remote assignor with the classic protocol",
-                crate::GroupProtocol::Classic,
+                GroupProtocol::Classic,
                 Some("uniform"),
                 None,
                 Vec::new(),
@@ -2857,7 +2826,7 @@ mod security_arg_tests {
             ),
             (
                 "a regular expression with the classic protocol",
-                crate::GroupProtocol::Classic,
+                GroupProtocol::Classic,
                 None,
                 Some("orders-.*"),
                 Vec::new(),
@@ -2865,7 +2834,7 @@ mod security_arg_tests {
             ),
             (
                 "an empty regular expression",
-                crate::GroupProtocol::Consumer,
+                GroupProtocol::Consumer,
                 None,
                 Some(""),
                 Vec::new(),
@@ -2873,7 +2842,7 @@ mod security_arg_tests {
             ),
             (
                 "a regular expression and topics",
-                crate::GroupProtocol::Consumer,
+                GroupProtocol::Consumer,
                 None,
                 Some("orders-.*"),
                 vec!["orders".to_owned()],
@@ -2899,15 +2868,15 @@ mod security_arg_tests {
 
     #[tokio::test]
     async fn invalid_leave_group_timeout_fails_before_broker_lookup() {
-        let error = Consumer::builder()
-            .bootstrap("invalid.invalid:9092")
-            .group_id("leave-validation")
-            .subscribe(["topic".to_owned()])
-            .leave_group_timeout(krabka_units::secs(0))
-            .build()
-            .await
-            .err()
-            .expect("invalid configuration");
+        let error = invalid_consumer_config(
+            Consumer::builder()
+                .bootstrap("invalid.invalid:9092")
+                .group_id("leave-validation")
+                .subscribe(["topic".to_owned()])
+                .leave_group_timeout(krabka_units::secs(0))
+                .build(),
+        )
+        .await;
 
         assert2::assert!(error.to_string().contains("consumer leave-group timeout"));
     }
@@ -2939,7 +2908,7 @@ mod security_arg_tests {
             let saw_leave_in_mock = Arc::clone(&saw_leave);
             let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
                 if api_key == api_versions_request::API_KEY {
-                    Some(api_versions_for_startup_cleanup())
+                    Some(test_support::leave_group_api_versions())
                 } else if api_key == leave_group_request::API_KEY {
                     saw_leave_in_mock.store(true, Ordering::SeqCst);
                     Some(leave_group_response_at(version))
@@ -2976,33 +2945,13 @@ mod security_arg_tests {
 
     #[tokio::test]
     async fn startup_member_cleanup_bounds_stalled_leave_with_configured_timeout() {
-        let saw_leave = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let saw_leave_in_mock = Arc::clone(&saw_leave);
-        let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
-            if api_key == api_versions_request::API_KEY {
-                Some(api_versions_for_startup_cleanup())
-            } else if api_key == leave_group_request::API_KEY {
-                saw_leave_in_mock.store(true, Ordering::SeqCst);
-                None
-            } else {
-                None
-            }
-        })
-        .await;
-
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .request_timeout(krabka_units::secs(5))
-            .build()
-            .await
-            .expect("client");
-        let coordinator_id = AtomicI32::new(0);
+        let fixture = test_support::StalledLeaveGroup::start().await;
 
         tokio::time::timeout(
             Duration::from_secs(1),
             leave_startup_member(
-                &client,
-                &coordinator_id,
+                &fixture.client,
+                &fixture.coordinator_id,
                 "group-a",
                 "member-a",
                 None,
@@ -3012,8 +2961,8 @@ mod security_arg_tests {
         .await
         .expect("configured leave deadline bounds cleanup");
 
-        mock.stop();
-        assert2::assert!(saw_leave.load(Ordering::SeqCst));
+        fixture.broker.stop();
+        assert2::assert!(fixture.saw_leave.load(Ordering::SeqCst));
     }
 
     /// Kafka's `ConsumerCoordinator.metadata` sends one protocol per assignor,
@@ -3022,7 +2971,7 @@ mod security_arg_tests {
     /// and `sticky` carries nothing before its first assignment.
     #[test]
     fn initial_join_protocols_follow_the_assignor_list() {
-        use crate::builder::DecodedSubscription;
+        use builder::DecodedSubscription;
 
         let protocols = initial_join_protocols(
             &[
@@ -3035,7 +2984,7 @@ mod security_arg_tests {
         );
         let decoded: Vec<(String, DecodedSubscription)> = protocols
             .iter()
-            .map(|(name, metadata)| (name.clone(), crate::builder::decode_subscription(metadata)))
+            .map(|(name, metadata)| (name.clone(), builder::decode_subscription(metadata)))
             .collect();
         let subscription = |user_data: Option<Bytes>| DecodedSubscription {
             topics: vec!["topic".into()],
@@ -3058,9 +3007,9 @@ mod security_arg_tests {
     }
 
     #[test]
-    fn startup_join_request_preserves_group_member_timeouts_protocols_and_empty_reason() {
+    fn startup_join_fields_preserve_member_timeouts_protocols_and_empty_reason() {
         let metadata = bytes::Bytes::from_static(b"metadata");
-        let req = startup_join_fields(
+        let fields = startup_join_fields(
             "group-a",
             Some("instance-a"),
             vec![
@@ -3068,33 +3017,20 @@ mod security_arg_tests {
                 ("cooperative-sticky".to_owned(), metadata.clone()),
             ],
             (45_000, 60_000),
-        )
-        .request("member-a".into());
-
-        assert2::assert!(
-            req == JoinGroupRequest {
-                group_id: "group-a".into(),
-                session_timeout_ms: 45_000,
-                rebalance_timeout_ms: 60_000,
-                member_id: "member-a".into(),
-                group_instance_id: Some("instance-a".into()),
-                protocol_type: "consumer".into(),
-                protocols: vec![
-                    JoinGroupRequestProtocol {
-                        name: "range".into(),
-                        metadata: metadata.clone(),
-                        unknown_tagged_fields: UnknownTaggedFields::default(),
-                    },
-                    JoinGroupRequestProtocol {
-                        name: "cooperative-sticky".into(),
-                        metadata,
-                        unknown_tagged_fields: UnknownTaggedFields::default(),
-                    },
-                ],
-                reason: Some(String::new()),
-                unknown_tagged_fields: UnknownTaggedFields::default(),
-            }
         );
+
+        assert2::assert!(fields.group_id == "group-a");
+        assert2::assert!(fields.group_instance_id.as_deref() == Some("instance-a"));
+        assert2::assert!(fields.session_timeout_ms == 45_000);
+        assert2::assert!(fields.rebalance_timeout_ms == 60_000);
+        assert2::assert!(
+            fields.protocols
+                == vec![
+                    ("range".to_owned(), metadata.clone()),
+                    ("cooperative-sticky".to_owned(), metadata),
+                ]
+        );
+        assert2::assert!(fields.reason.is_empty());
     }
 
     #[test]
@@ -3161,43 +3097,12 @@ mod security_arg_tests {
 
     #[test]
     fn build_sync_assignment_preserves_member_and_assignment_payload() {
-        let assignment = crate::coordinator::build_sync_group_assignment(
-            "member-a".into(),
-            &[("orders".into(), 3)],
-        );
+        let assignment =
+            coordinator::build_sync_group_assignment("member-a".into(), &[("orders".into(), 3)]);
         let decoded = decode_assignment(&assignment.assignment);
 
         assert2::assert!(
             (assignment.member_id.as_str(), decoded) == ("member-a", vec![("orders".into(), 3)])
-        );
-    }
-
-    #[test]
-    fn build_sync_request_preserves_group_generation_member_protocol_and_assignments() {
-        let assignment = crate::coordinator::build_sync_group_assignment(
-            "member-a".into(),
-            &[("orders".into(), 3)],
-        );
-        let req = build_sync_request(
-            "group-a".into(),
-            7,
-            "member-a".into(),
-            Some("instance-a".into()),
-            "range".into(),
-            vec![assignment.clone()],
-        );
-
-        assert2::assert!(
-            req == SyncGroupRequest {
-                group_id: "group-a".into(),
-                generation_id: 7,
-                member_id: "member-a".into(),
-                group_instance_id: Some("instance-a".into()),
-                protocol_type: Some("consumer".into()),
-                protocol_name: Some("range".into()),
-                assignments: vec![assignment],
-                unknown_tagged_fields: UnknownTaggedFields::default(),
-            }
         );
     }
 
@@ -3210,34 +3115,12 @@ mod security_arg_tests {
             assert2::assert!(has_assigned_partitions(&partitions) == expected);
         }
 
-        for (_name, committed, reset, expected) in [
-            ("committed offset", 12, AutoOffsetReset::Earliest, 12),
-            (
-                "missing earliest",
-                -1,
-                AutoOffsetReset::Earliest,
-                crate::poll::BEGINNING_SENTINEL,
-            ),
-            (
-                "missing latest",
-                -1,
-                AutoOffsetReset::Latest,
-                crate::poll::LATEST_SENTINEL,
-            ),
-            (
-                "missing none",
-                -1,
-                AutoOffsetReset::None,
-                crate::poll::NO_OFFSET_SENTINEL,
-            ),
-        ] {
-            assert2::assert!(starting_offset(committed, reset) == expected);
-        }
+        test_support::assert_starting_offsets(starting_offset);
 
         let position = primed_position(9);
         assert2::assert!(
             position
-                == crate::position::PartitionPosition {
+                == position::PartitionPosition {
                     offset_epoch: krabka_ids::LeaderEpoch(9),
                     leader_id: -1,
                     leader_epoch: krabka_ids::LeaderEpoch(-1),
@@ -3278,7 +3161,7 @@ mod security_arg_tests {
             .bootstrap("127.0.0.1:1")
             .group_id("timeout-group")
             .subscribe(vec!["orders".to_string()])
-            .fetch_min(krabka_units::bytes(0))
+            .fetch_min(0)
             .build()
             .await;
         assert2::assert!(matches!(min, Err(ConsumerError::InvalidConfig(_))));
@@ -3287,7 +3170,7 @@ mod security_arg_tests {
             .bootstrap("127.0.0.1:1")
             .group_id("timeout-group")
             .subscribe(vec!["orders".to_string()])
-            .fetch_max(krabka_units::bytes(0))
+            .fetch_max(0)
             .build()
             .await;
         assert2::assert!(matches!(max, Err(ConsumerError::InvalidConfig(_))));
@@ -3296,7 +3179,7 @@ mod security_arg_tests {
             .bootstrap("127.0.0.1:1")
             .group_id("timeout-group")
             .subscribe(vec!["orders".to_string()])
-            .fetch_partition_max(krabka_units::bytes(0))
+            .fetch_partition_max(0)
             .build()
             .await;
         assert2::assert!(matches!(
@@ -3308,8 +3191,8 @@ mod security_arg_tests {
             .bootstrap("127.0.0.1:1")
             .group_id("timeout-group")
             .subscribe(vec!["orders".to_string()])
-            .fetch_min(krabka_units::bytes(2))
-            .fetch_max(krabka_units::bytes(1))
+            .fetch_min(2)
+            .fetch_max(1)
             .build()
             .await;
         assert2::assert!(matches!(
@@ -3354,14 +3237,9 @@ mod security_arg_tests {
         Consumer::test_builder(client)
             .coordinator_id(Arc::new(AtomicI32::new(3)))
             .generation_id(7)
-            .commit_identity(Arc::new(Mutex::new(CommitIdentity {
-                generation: 7,
-                member_id: "member-a".into(),
-                ownership_ids: HashMap::from([(("orders".into(), 0), 1)]),
-                rejoin_on_poll: false,
-            })))
-            .group_instance_id(Some("instance-a".into()))
-            .subscription(crate::subscription::shared(
+            .commit_identity(test_support::orders_partition_commit_identity(7))
+            .group_instance_id("instance-a")
+            .subscription(subscription::shared(
                 vec!["orders".into(), "payments".into()],
                 None,
                 true,
@@ -3574,13 +3452,11 @@ mod auto_commit_tests {
     use std::{collections::VecDeque, sync::atomic::AtomicI16};
 
     use bytes::Buf as _;
-    use krabka_client_core::MockBroker;
+    use krabka_client_core::{MockBroker, mock_test_support::offset_commit_response};
     use krabka_protocol::{
         Decode as _, Encode, UnknownTaggedFields,
         owned::{
-            api_versions_request,
-            api_versions_response::{ApiVersion, ApiVersionsResponse},
-            fetch_request,
+            api_versions_request, fetch_request,
             fetch_response::FetchResponse,
             find_coordinator_request,
             find_coordinator_response::FindCoordinatorResponse,
@@ -3589,17 +3465,10 @@ mod auto_commit_tests {
             join_group_request::{self, JoinGroupRequest},
             leave_group_request::{self, LeaveGroupRequest},
             leave_group_response::LeaveGroupResponse,
-            list_offsets_request,
-            list_offsets_response::{
-                ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
-            },
-            metadata_request,
+            list_offsets_request, metadata_request,
             metadata_response::MetadataResponse,
             offset_commit_request::{
                 self, OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
-            },
-            offset_commit_response::{
-                OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
             },
             offset_fetch_request,
             offset_fetch_response::OffsetFetchResponse,
@@ -3666,6 +3535,15 @@ mod auto_commit_tests {
         (list_offsets_request::API_KEY, 1, 5),
     ];
 
+    fn encoded_api_versions() -> Vec<u8> {
+        encode(
+            &krabka_client_core::mock_test_support::api_versions_response_ranges(
+                API_VERSIONS.iter().copied(),
+            ),
+            0,
+        )
+    }
+
     /// A group coordinator that records every group request. It answers each
     /// one with success, except the `OffsetCommit` requests in
     /// `commit_replies`. It does not answer `FindCoordinator`.
@@ -3698,6 +3576,50 @@ mod auto_commit_tests {
         pub(super) drop_leaves: std::sync::atomic::AtomicBool,
     }
 
+    pub(super) async fn mock_coordinator_broker(coordinator: &Arc<MockCoordinator>) -> MockBroker {
+        let in_mock = Arc::clone(coordinator);
+        MockBroker::start(move |api_key, version, _corr_id, body| {
+            in_mock.respond(api_key, version, body)
+        })
+        .await
+    }
+
+    pub(super) fn single_partition_startup(topic_partition_count: i32) -> StartupState {
+        StartupState::builder()
+            .generation_id(1)
+            .assigned_partitions(vec![partition(0)])
+            .next_offsets(HashMap::from([(partition(0), 12)]))
+            .topic_partitions(HashMap::from([(TOPIC.to_owned(), topic_partition_count)]))
+            .build()
+    }
+
+    pub(super) async fn start_consumer_with_startup(
+        config: StartConfig,
+        startup: StartupState,
+    ) -> Consumer {
+        start_test_consumer(
+            TestConsumerStart::builder()
+                .bootstrap(config.bootstrap.clone())
+                .config(config)
+                .startup(startup)
+                .build(),
+        )
+        .await
+    }
+
+    pub(super) async fn start_single_partition_consumer(config: StartConfig) -> Consumer {
+        start_consumer_with_startup(config, single_partition_startup(1)).await
+    }
+
+    pub(super) fn two_partition_startup() -> StartupState {
+        StartupState::builder()
+            .generation_id(1)
+            .assigned_partitions(vec![partition(0), partition(1)])
+            .next_offsets(HashMap::from([(partition(0), 12), (partition(1), 7)]))
+            .topic_partitions(HashMap::from([(TOPIC.to_owned(), 2)]))
+            .build()
+    }
+
     fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
         let mut buf = bytes::BytesMut::new();
         response.encode(&mut buf, version).expect("encode response");
@@ -3705,6 +3627,10 @@ mod auto_commit_tests {
     }
 
     impl MockCoordinator {
+        pub(super) fn range_partition(index: i32) -> Arc<Self> {
+            Self::new(Assignor::Range, vec![vec![partition(index)]])
+        }
+
         /// A coordinator at generation 1 whose `SyncGroup` responses carry
         /// `assignments`.
         pub(super) fn new(assignor: Assignor, assignments: Vec<Vec<(String, i32)>>) -> Arc<Self> {
@@ -3722,6 +3648,10 @@ mod auto_commit_tests {
                 leaves: std::sync::Mutex::new(Vec::new()),
                 drop_leaves: std::sync::atomic::AtomicBool::new(false),
             })
+        }
+
+        pub(super) fn set_heartbeat_error(&self, error_code: i16) {
+            self.heartbeat_error.store(error_code, Ordering::SeqCst);
         }
 
         fn record(&self, request: GroupRequest) {
@@ -3746,21 +3676,7 @@ mod auto_commit_tests {
             mut body: &[u8],
         ) -> Option<Vec<u8>> {
             match api_key {
-                api_versions_request::API_KEY => Some(encode(
-                    &ApiVersionsResponse {
-                        api_keys: API_VERSIONS
-                            .iter()
-                            .map(|(api_key, min_version, max_version)| ApiVersion {
-                                api_key: *api_key,
-                                min_version: *min_version,
-                                max_version: *max_version,
-                                ..Default::default()
-                            })
-                            .collect(),
-                        ..Default::default()
-                    },
-                    0,
-                )),
+                api_versions_request::API_KEY => Some(encoded_api_versions()),
                 metadata_request::API_KEY => Some(encode(&MetadataResponse::default(), version)),
                 heartbeat_request::API_KEY => {
                     *self.last_heartbeat.lock().expect("last heartbeat lock") =
@@ -3822,7 +3738,7 @@ mod auto_commit_tests {
                     drop(assignments);
                     Some(encode(
                         &SyncGroupResponse {
-                            assignment: crate::builder::encode_assignment(&assignment),
+                            assignment: builder::encode_assignment(&assignment),
                             ..Default::default()
                         },
                         version,
@@ -3833,43 +3749,7 @@ mod auto_commit_tests {
                 // Every partition resolves to offset 0, whichever timestamp the
                 // request asked for.
                 list_offsets_request::API_KEY => {
-                    let client_id_len = body.get_i16();
-                    body.advance(usize::try_from(client_id_len.max(0)).expect("client id length"));
-                    let flexible = version >= list_offsets_request::FLEXIBLE_MIN;
-                    if flexible {
-                        // The empty tagged fields of the request header.
-                        body.advance(1);
-                    }
-                    let request =
-                        krabka_protocol::owned::list_offsets_request::ListOffsetsRequest::decode(
-                            &mut body, version,
-                        )
-                        .expect("decode list offsets");
-                    let mut response = if flexible { vec![0] } else { Vec::new() };
-                    response.extend(encode(
-                        &ListOffsetsResponse {
-                            topics: request
-                                .topics
-                                .iter()
-                                .map(|topic| ListOffsetsTopicResponse {
-                                    name: topic.name.clone(),
-                                    partitions: topic
-                                        .partitions
-                                        .iter()
-                                        .map(|p| ListOffsetsPartitionResponse {
-                                            partition_index: p.partition_index,
-                                            offset: 0,
-                                            ..Default::default()
-                                        })
-                                        .collect(),
-                                    ..Default::default()
-                                })
-                                .collect(),
-                            ..Default::default()
-                        },
-                        version,
-                    ));
-                    Some(response)
+                    Some(test_support::list_offsets_mock_response(&mut body, version))
                 }
                 // No partition has a committed offset.
                 offset_fetch_request::API_KEY => {
@@ -3933,26 +3813,7 @@ mod auto_commit_tests {
                     return None;
                 }
             };
-            let response = OffsetCommitResponse {
-                topics: request
-                    .topics
-                    .iter()
-                    .map(|topic| OffsetCommitResponseTopic {
-                        name: topic.name.clone(),
-                        partitions: topic
-                            .partitions
-                            .iter()
-                            .map(|p| OffsetCommitResponsePartition {
-                                partition_index: p.partition_index,
-                                error_code,
-                                ..Default::default()
-                            })
-                            .collect(),
-                        ..Default::default()
-                    })
-                    .collect(),
-                ..Default::default()
-            };
+            let response = offset_commit_response(&request, |_| error_code);
             self.record(GroupRequest::OffsetCommit(request));
             Some(encode(&response, version))
         }
@@ -4018,21 +3879,7 @@ mod auto_commit_tests {
             let handler_requests = Arc::clone(&requests);
             let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
                 match api_key {
-                    api_versions_request::API_KEY => Some(encode(
-                        &ApiVersionsResponse {
-                            api_keys: API_VERSIONS
-                                .iter()
-                                .map(|(api_key, min_version, max_version)| ApiVersion {
-                                    api_key: *api_key,
-                                    min_version: *min_version,
-                                    max_version: *max_version,
-                                    ..Default::default()
-                                })
-                                .collect(),
-                            ..Default::default()
-                        },
-                        0,
-                    )),
+                    api_versions_request::API_KEY => Some(encoded_api_versions()),
                     find_coordinator_request::API_KEY => Some(encode(
                         &FindCoordinatorResponse {
                             node_id: 1,
@@ -4063,16 +3910,14 @@ mod auto_commit_tests {
             config.subscribe = subscribe.into_iter().map(str::to_owned).collect();
             config.allow_auto_create_topics = allow_auto_create_topics;
             let start = tokio::spawn(Consumer::start_once(config));
-            let first = tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if let Some(first) = requests.lock().expect("requests lock").first().cloned() {
-                        break first;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("the consumer sends Metadata");
+            let first = test_support::FirstRecorded::builder()
+                .requests(Arc::clone(&requests))
+                .timeout(Duration::from_secs(10))
+                .poll_interval(Duration::from_millis(5))
+                .build()
+                .wait()
+                .await
+                .expect("the consumer sends Metadata");
             start.abort();
             mock.stop();
             assert2::check!(first == expected, "{name}");
@@ -4087,41 +3932,19 @@ mod auto_commit_tests {
     async fn the_coordinator_task_of_a_leader_build_watches_the_group_topics() {
         use krabka_protocol::owned::{
             find_coordinator_response::FindCoordinatorResponse,
-            heartbeat_response::HeartbeatResponse, metadata_request::MetadataRequest,
+            heartbeat_response::HeartbeatResponse,
         };
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let handler_requests = Arc::clone(&requests);
         let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| match api_key {
-            api_versions_request::API_KEY => Some(encode(
-                &ApiVersionsResponse {
-                    api_keys: API_VERSIONS
-                        .iter()
-                        .map(|(api_key, min_version, max_version)| ApiVersion {
-                            api_key: *api_key,
-                            min_version: *min_version,
-                            max_version: *max_version,
-                            ..Default::default()
-                        })
-                        .collect(),
-                    ..Default::default()
-                },
-                0,
-            )),
+            api_versions_request::API_KEY => Some(encoded_api_versions()),
             find_coordinator_request::API_KEY => {
                 Some(encode(&FindCoordinatorResponse::default(), version))
             }
             heartbeat_request::API_KEY => Some(encode(&HeartbeatResponse::default(), version)),
             metadata_request::API_KEY => {
-                let client_id_len = body.get_i16();
-                body.advance(usize::try_from(client_id_len.max(0)).expect("length"));
-                let request = MetadataRequest::decode(&mut body, version).expect("decode Metadata");
-                let names: Vec<String> = request
-                    .topics
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|topic| topic.name)
-                    .collect();
+                let names = test_support::metadata_topic_names(&mut body, version);
                 handler_requests.lock().expect("requests lock").push(names);
                 Some(encode(&MetadataResponse::default(), version))
             }
@@ -4131,37 +3954,29 @@ mod auto_commit_tests {
         let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, minutes(1));
         config.heartbeat_interval = millis(50);
         config.subscription_metadata_refresh_interval = millis(50);
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .build()
-            .await
-            .expect("client");
-        let consumer = spawn_consumer(
-            config,
-            client,
-            Arc::new(AtomicI32::new(0)),
-            MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: vec![TOPIC.to_owned(), "payments".to_owned()],
-                assigned_partitions: vec![partition(0)],
-                next_offsets: HashMap::from([(partition(0), 12)]),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
-            },
+        let consumer = start_test_consumer(
+            TestConsumerStart::builder()
+                .bootstrap(mock.addr.to_string())
+                .config(config)
+                .startup(
+                    StartupState::builder()
+                        .generation_id(1)
+                        .group_topics(vec![TOPIC.to_owned(), "payments".to_owned()])
+                        .assigned_partitions(vec![partition(0)])
+                        .next_offsets(HashMap::from([(partition(0), 12)]))
+                        .topic_partitions(HashMap::from([(TOPIC.to_owned(), 1)]))
+                        .build(),
+                )
+                .build(),
         )
-        .await
-        .expect("spawn consumer");
-        let first = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(first) = requests.lock().expect("requests lock").first().cloned() {
-                    break first;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
         .await;
+        let first = test_support::FirstRecorded::builder()
+            .requests(Arc::clone(&requests))
+            .timeout(Duration::from_secs(5))
+            .poll_interval(Duration::from_millis(10))
+            .build()
+            .wait()
+            .await;
         drop(consumer);
         mock.stop();
         assert2::assert!(first == Ok(vec![TOPIC.to_owned(), "payments".to_owned()]));
@@ -4186,17 +4001,17 @@ mod auto_commit_tests {
             subscribe_pattern: None,
             subscribe_regex: None,
             exclude_internal_topics: true,
-            group_protocol: crate::GroupProtocol::Classic,
+            group_protocol: GroupProtocol::Classic,
             server_assignor: None,
             group_instance_id: None,
             auto_offset_reset: AutoOffsetReset::Earliest,
             isolation_level: IsolationLevel::ReadUncommitted,
             assignors: vec![assignor],
-            rebalance_protocol: crate::assignor::rebalance_protocol_of(&[assignor])
+            rebalance_protocol: assignor::rebalance_protocol_of(&[assignor])
                 .expect("assignor protocol"),
             fetch_min: krabka_client_core::DEFAULT_FETCH_MIN,
-            fetch_max: crate::poll::DEFAULT_FETCH_MAX,
-            fetch_partition_max: crate::poll::DEFAULT_FETCH_PARTITION_MAX,
+            fetch_max: poll::DEFAULT_FETCH_MAX,
+            fetch_partition_max: poll::DEFAULT_FETCH_PARTITION_MAX,
             fetch_max_wait: DEFAULT_CONSUMER_FETCH_MAX_WAIT,
             metadata_max_age: DEFAULT_CONSUMER_METADATA_MAX_AGE,
             default_api_timeout: DEFAULT_CONSUMER_DEFAULT_API_TIMEOUT,
@@ -4204,14 +4019,12 @@ mod auto_commit_tests {
             dns_timeout: krabka_client_core::DEFAULT_CLIENT_DNS_TIMEOUT,
             send_buffer: Some(krabka_client_core::DEFAULT_SEND_BUFFER),
             receive_buffer: Some(krabka_client_core::DEFAULT_RECEIVE_BUFFER),
-            dispatch_queue_capacity: krabka_client_core::ConnectionDispatchQueueCapacity::new(
+            dispatch_queue_capacity: ConnectionDispatchQueueCapacity::new(
                 krabka_client_core::DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY,
             )
             .expect("dispatch queue capacity"),
-            frame_max: krabka_client_core::ClientFrameMax::try_from(
-                krabka_client_core::DEFAULT_CLIENT_FRAME_MAX,
-            )
-            .expect("frame max"),
+            frame_max: ClientFrameMax::try_from(krabka_client_core::DEFAULT_CLIENT_FRAME_MAX)
+                .expect("frame max"),
             metadata_recovery_strategy: krabka_client_core::MetadataRecoveryStrategy::default(),
             metadata_recovery_rebootstrap_trigger:
                 krabka_client_core::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER,
@@ -4275,13 +4088,13 @@ mod auto_commit_tests {
     /// These polls record no new positions.
     pub(super) async fn wait_for_sync_groups(
         coordinator: &MockCoordinator,
-        polls: &crate::coordinator::PollSignal,
+        polls: &coordinator::PollSignal,
         syncs: usize,
         within: Duration,
     ) {
         let waited = tokio::time::timeout(within, async {
             while coordinator.sync_groups() < syncs {
-                crate::coordinator::note_poll(polls);
+                coordinator::note_poll(polls);
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
@@ -4314,11 +4127,7 @@ mod auto_commit_tests {
         steps: &[Step],
     ) -> Vec<GroupRequest> {
         let coordinator = MockCoordinator::new(assignor, assignments);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let config = start_config(
             mock.addr.to_string(),
             assignor,
@@ -4336,15 +4145,13 @@ mod auto_commit_tests {
                 client,
                 Arc::new(AtomicI32::new(0)),
                 MEMBER.into(),
-                StartupState {
-                    generation_id: 1,
-                    group_topics: Vec::new(),
-                    assigned_partitions: vec![partition(0), partition(1)],
-                    next_offsets: HashMap::from([(partition(0), 12), (partition(1), 7)]),
-                    positions: HashMap::from([(partition(0), primed_position(3))]),
-                    topic_ids: HashMap::new(),
-                    topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
-                },
+                StartupState::builder()
+                    .generation_id(1)
+                    .assigned_partitions(vec![partition(0), partition(1)])
+                    .next_offsets(HashMap::from([(partition(0), 12), (partition(1), 7)]))
+                    .positions(HashMap::from([(partition(0), primed_position(3))]))
+                    .topic_partitions(HashMap::from([(TOPIC.to_owned(), 2)]))
+                    .build(),
             )
             .await
             .expect("spawn consumer"),
@@ -4436,16 +4243,113 @@ mod auto_commit_tests {
         requests
     }
 
-    /// One scenario: name, `enable.auto.commit`, assignor, the `SyncGroup`
-    /// assignments, the steps, and the group requests that Kafka sends.
-    type Case = (
-        &'static str,
-        bool,
-        Assignor,
-        Vec<Vec<(String, i32)>>,
-        Vec<Step>,
-        Vec<GroupRequest>,
-    );
+    /// One auto-commit scenario and the requests it sends to the group.
+    #[derive(bon::Builder)]
+    struct AutoCommitCase {
+        name: &'static str,
+        #[builder(default = true)]
+        auto_commit: bool,
+        #[builder(default = Assignor::Range)]
+        assignor: Assignor,
+        #[builder(default)]
+        assignments: Vec<Vec<(String, i32)>>,
+        steps: Vec<Step>,
+        expected: Vec<GroupRequest>,
+    }
+
+    fn rebalance_steps(syncs: usize) -> Vec<Step> {
+        use Step::{Poll, Rebalance, ReceiveRecords};
+
+        vec![
+            Poll,
+            ReceiveRecords,
+            Rebalance {
+                syncs,
+                within: REBALANCE_WAIT,
+            },
+        ]
+    }
+
+    #[derive(bon::Builder)]
+    struct AutoCommitTimeoutCase {
+        name: &'static str,
+        #[builder(default = minutes(1))]
+        rebalance_timeout: Time,
+        steps: Vec<Step>,
+        expected: Vec<GroupRequest>,
+    }
+
+    trait NamedGroupRequestCase {
+        fn name(&self) -> &'static str;
+        fn expected(&self) -> &[GroupRequest];
+    }
+
+    impl NamedGroupRequestCase for AutoCommitCase {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn expected(&self) -> &[GroupRequest] {
+            &self.expected
+        }
+    }
+
+    impl NamedGroupRequestCase for AutoCommitTimeoutCase {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn expected(&self) -> &[GroupRequest] {
+            &self.expected
+        }
+    }
+
+    #[derive(Debug)]
+    struct GroupRequestObservation {
+        name: &'static str,
+        actual: Vec<GroupRequest>,
+        expected: Vec<GroupRequest>,
+    }
+
+    async fn assert_group_request_cases<C, F, Fut>(cases: Vec<C>, mut run: F)
+    where
+        C: NamedGroupRequestCase,
+        F: FnMut(C) -> Fut,
+        Fut: std::future::Future<Output = Vec<GroupRequest>>,
+    {
+        let mut observations = Vec::with_capacity(cases.len());
+        for case in cases {
+            let name = case.name();
+            let expected = case.expected().to_vec();
+            observations.push(GroupRequestObservation {
+                name,
+                actual: run(case).await,
+                expected,
+            });
+        }
+        let failed_cases: Vec<_> = observations
+            .iter()
+            .filter(|observation| observation.actual != observation.expected)
+            .map(|observation| observation.name)
+            .collect();
+        assert2::assert!(failed_cases.is_empty());
+    }
+
+    fn rebalance_step(within: Duration) -> Step {
+        Step::Rebalance { syncs: 1, within }
+    }
+
+    fn commit_sync_then_rebalance_requests(received: &[(i32, i64, i32)]) -> Vec<GroupRequest> {
+        use GroupRequest::{CommitSyncReturned, JoinGroup, SyncGroup};
+
+        vec![
+            commit(1, received),
+            CommitSyncReturned,
+            commit(1, received),
+            JoinGroup,
+            SyncGroup,
+        ]
+    }
 
     /// Kafka commits the consumed positions from `poll` each
     /// `auto.commit.interval.ms`, before each `JoinGroup`, and in `close`, but
@@ -4454,125 +4358,84 @@ mod auto_commit_tests {
     #[tokio::test(start_paused = true)]
     async fn auto_commit_sends_offset_commit_where_kafka_does() {
         use GroupRequest::{JoinGroup, LeaveGroup, SyncGroup};
-        use Step::{AdvanceInterval, Close, Poll, Rebalance, ReceiveRecords};
+        use Step::{AdvanceInterval, Close, Poll, ReceiveRecords};
 
         let both = [(0, 12, 3), (1, 7, -1)];
-        let cases: Vec<Case> = vec![
-            (
-                "on: a poll after the interval commits the positions",
-                true,
-                Assignor::Range,
-                vec![],
-                vec![Poll, AdvanceInterval, Poll],
-                vec![commit(1, &both)],
-            ),
-            (
-                "on: a poll before the interval commits nothing",
-                true,
-                Assignor::Range,
-                vec![],
-                vec![Poll, Poll],
-                vec![],
-            ),
-            (
-                "off: a poll after the interval commits nothing",
-                false,
-                Assignor::Range,
-                vec![],
-                vec![Poll, AdvanceInterval, Poll],
-                vec![],
-            ),
-            (
-                "on, eager: a rebalance commits the positions of the last poll before JoinGroup",
-                true,
-                Assignor::Range,
-                vec![vec![partition(0), partition(1)]],
-                vec![
-                    Poll,
-                    ReceiveRecords,
-                    Rebalance {
-                        syncs: 1,
-                        within: REBALANCE_WAIT,
-                    },
-                ],
-                vec![commit(1, &both), JoinGroup, SyncGroup],
-            ),
-            (
-                "off, eager: a rebalance commits nothing",
-                false,
-                Assignor::Range,
-                vec![vec![partition(0), partition(1)]],
-                vec![
-                    Poll,
-                    ReceiveRecords,
-                    Rebalance {
-                        syncs: 1,
-                        within: REBALANCE_WAIT,
-                    },
-                ],
-                vec![JoinGroup, SyncGroup],
-            ),
-            (
-                "on, cooperative: a revoke of partition 1 commits before each JoinGroup",
-                true,
-                Assignor::CooperativeSticky,
-                vec![vec![partition(0)]],
-                vec![
-                    Poll,
-                    ReceiveRecords,
-                    Rebalance {
-                        syncs: 2,
-                        within: REBALANCE_WAIT,
-                    },
-                ],
-                vec![
+        let cases = vec![
+            AutoCommitCase::builder()
+                .name("on: a poll after the interval commits the positions")
+                .steps(vec![Poll, AdvanceInterval, Poll])
+                .expected(vec![commit(1, &both)])
+                .build(),
+            AutoCommitCase::builder()
+                .name("on: a poll before the interval commits nothing")
+                .steps(vec![Poll, Poll])
+                .expected(vec![])
+                .build(),
+            AutoCommitCase::builder()
+                .name("off: a poll after the interval commits nothing")
+                .auto_commit(false)
+                .steps(vec![Poll, AdvanceInterval, Poll])
+                .expected(vec![])
+                .build(),
+            AutoCommitCase::builder()
+                .name("on, eager: a rebalance commits the positions of the last poll before JoinGroup")
+                .assignments(vec![vec![partition(0), partition(1)]])
+                .steps(rebalance_steps(1))
+                .expected(vec![commit(1, &both), JoinGroup, SyncGroup])
+                .build(),
+            AutoCommitCase::builder()
+                .name("off, eager: a rebalance commits nothing")
+                .auto_commit(false)
+                .assignments(vec![vec![partition(0), partition(1)]])
+                .steps(rebalance_steps(1))
+                .expected(vec![JoinGroup, SyncGroup])
+                .build(),
+            AutoCommitCase::builder()
+                .name("on, cooperative: a revoke of partition 1 commits before each JoinGroup")
+                .assignor(Assignor::CooperativeSticky)
+                .assignments(vec![vec![partition(0)]])
+                .steps(rebalance_steps(2))
+                .expected(vec![
                     commit(1, &both),
                     JoinGroup,
                     SyncGroup,
                     commit(2, &[(0, 12, 3)]),
                     JoinGroup,
                     SyncGroup,
-                ],
-            ),
-            (
-                "off, cooperative: a revoke of partition 1 commits nothing",
-                false,
-                Assignor::CooperativeSticky,
-                vec![vec![partition(0)]],
-                vec![
-                    Poll,
-                    ReceiveRecords,
-                    Rebalance {
-                        syncs: 2,
-                        within: REBALANCE_WAIT,
-                    },
-                ],
-                vec![JoinGroup, SyncGroup, JoinGroup, SyncGroup],
-            ),
-            (
-                "on: close commits the current positions, then leaves the group",
-                true,
-                Assignor::Range,
-                vec![],
-                vec![Poll, ReceiveRecords, Close],
-                vec![commit(1, &[(0, 20, 3), (1, 7, -1)]), LeaveGroup],
-            ),
-            (
-                "off: close only leaves the group",
-                false,
-                Assignor::CooperativeSticky,
-                vec![],
-                vec![Poll, ReceiveRecords, Close],
-                vec![LeaveGroup],
-            ),
+                ])
+                .build(),
+            AutoCommitCase::builder()
+                .name("off, cooperative: a revoke of partition 1 commits nothing")
+                .auto_commit(false)
+                .assignor(Assignor::CooperativeSticky)
+                .assignments(vec![vec![partition(0)]])
+                .steps(rebalance_steps(2))
+                .expected(vec![JoinGroup, SyncGroup, JoinGroup, SyncGroup])
+                .build(),
+            AutoCommitCase::builder()
+                .name("on: close commits the current positions, then leaves the group")
+                .steps(vec![Poll, ReceiveRecords, Close])
+                .expected(vec![commit(1, &[(0, 20, 3), (1, 7, -1)]), LeaveGroup])
+                .build(),
+            AutoCommitCase::builder()
+                .name("off: close only leaves the group")
+                .auto_commit(false)
+                .assignor(Assignor::CooperativeSticky)
+                .steps(vec![Poll, ReceiveRecords, Close])
+                .expected(vec![LeaveGroup])
+                .build(),
         ];
-        let mut actual = Vec::new();
-        let mut wanted = Vec::new();
-        for (name, auto_commit, assignor, assignments, steps, expected) in cases {
-            actual.push((name, run(auto_commit, assignor, assignments, &steps).await));
-            wanted.push((name, expected));
-        }
-        assert2::assert!(actual == wanted);
+        assert_group_request_cases(cases, |case| async move {
+            run(
+                case.auto_commit,
+                case.assignor,
+                case.assignments,
+                &case.steps,
+            )
+            .await
+        })
+        .await;
     }
 
     /// The commit before a `JoinGroup` and the commit of `close` wait for the
@@ -4586,38 +4449,29 @@ mod auto_commit_tests {
         use GroupRequest::{CommitSyncReturned, JoinGroup, LeaveGroup, SyncGroup};
         use Step::{
             Close, CommitSync, CommitSyncDuringRebalance, DropHeartbeats, HoldCommitLock, Poll,
-            Rebalance, ReceiveRecords, ReplyToNextCommit,
+            ReceiveRecords, ReplyToNextCommit,
         };
 
         let polled = [(0, 12, 3), (1, 7, -1)];
         let received = [(0, 20, 3), (1, 7, -1)];
         let both_partitions = vec![vec![partition(0), partition(1)]];
-        let cases: Vec<(&str, Time, Vec<Step>, Vec<GroupRequest>)> = vec![
-            (
-                "commit_sync, then a rebalance: the commit before JoinGroup does not go back",
-                minutes(1),
-                vec![
+        let cases = vec![
+            AutoCommitTimeoutCase::builder()
+                .name("commit_sync, then a rebalance: the commit before JoinGroup does not go back")
+                .steps(vec![
                     Poll,
                     ReceiveRecords,
                     CommitSync,
-                    Rebalance {
-                        syncs: 1,
-                        within: REBALANCE_WAIT,
-                    },
-                ],
-                vec![
-                    commit(1, &received),
-                    CommitSyncReturned,
-                    commit(1, &received),
-                    JoinGroup,
-                    SyncGroup,
-                ],
-            ),
-            (
-                "a rebalance while commit_sync waits for its response: the commit before \
-                 JoinGroup comes after it",
-                minutes(1),
-                vec![
+                    rebalance_step(REBALANCE_WAIT),
+                ])
+                .expected(commit_sync_then_rebalance_requests(&received))
+                .build(),
+            AutoCommitTimeoutCase::builder()
+                .name(
+                    "a rebalance while commit_sync waits for its response: the commit before \
+                     JoinGroup comes after it",
+                )
+                .steps(vec![
                     Poll,
                     ReceiveRecords,
                     CommitSyncDuringRebalance {
@@ -4625,8 +4479,8 @@ mod auto_commit_tests {
                         syncs: 1,
                         within: Duration::from_mins(1),
                     },
-                ],
-                vec![
+                ])
+                .expected(vec![
                     // `default_api_timeout` (60s), not `coordinator_retry_timeout`
                     // (30s), now bounds `commit_sync`'s retries, so it has time
                     // left to retry the dropped request once more before the
@@ -4637,14 +4491,15 @@ mod auto_commit_tests {
                     commit(1, &received),
                     JoinGroup,
                     SyncGroup,
-                ],
-            ),
-            (
-                "a rebalance while commit_sync waits for its response, with a \
-                 REBALANCE_IN_PROGRESS reply: commit_sync fails immediately instead of \
-                 waiting for the rejoin, so the commit before JoinGroup comes after it",
-                minutes(1),
-                vec![
+                ])
+                .build(),
+            AutoCommitTimeoutCase::builder()
+                .name(
+                    "a rebalance while commit_sync waits for its response, with a \
+                     REBALANCE_IN_PROGRESS reply: commit_sync fails immediately instead of \
+                     waiting for the rejoin, so the commit before JoinGroup comes after it",
+                )
+                .steps(vec![
                     Poll,
                     ReceiveRecords,
                     CommitSyncDuringRebalance {
@@ -4652,97 +4507,76 @@ mod auto_commit_tests {
                         syncs: 1,
                         within: REBALANCE_WAIT,
                     },
-                ],
-                vec![
-                    commit(1, &received),
-                    CommitSyncReturned,
-                    commit(1, &received),
-                    JoinGroup,
-                    SyncGroup,
-                ],
-            ),
-            (
-                "another commit holds the commit lock: JoinGroup at the rebalance timeout, \
-                 without a commit",
-                secs(10),
-                vec![
+                ])
+                .expected(commit_sync_then_rebalance_requests(&received))
+                .build(),
+            AutoCommitTimeoutCase::builder()
+                .name(
+                    "another commit holds the commit lock: JoinGroup at the rebalance timeout, \
+                     without a commit",
+                )
+                .rebalance_timeout(secs(10))
+                .steps(vec![Poll, HoldCommitLock, rebalance_step(REBALANCE_WAIT)])
+                .expected(vec![JoinGroup, SyncGroup])
+                .build(),
+            AutoCommitTimeoutCase::builder()
+                .name(
+                    "another commit holds the commit lock past the session timeout: heartbeats keep \
+                     the member in the group",
+                )
+                .steps(vec![
                     Poll,
                     HoldCommitLock,
-                    Rebalance {
-                        syncs: 1,
-                        within: REBALANCE_WAIT,
-                    },
-                ],
-                vec![JoinGroup, SyncGroup],
-            ),
-            (
-                "another commit holds the commit lock past the session timeout: heartbeats keep \
-                 the member in the group",
-                minutes(1),
-                vec![
-                    Poll,
-                    HoldCommitLock,
-                    Rebalance {
-                        syncs: 1,
-                        within: Duration::from_secs(90),
-                    },
-                ],
-                vec![JoinGroup, SyncGroup],
-            ),
-            (
-                "the coordinator does not answer a heartbeat during the commit before JoinGroup: \
-                 JoinGroup at the rebalance timeout",
-                secs(10),
-                vec![
+                    rebalance_step(Duration::from_secs(90)),
+                ])
+                .expected(vec![JoinGroup, SyncGroup])
+                .build(),
+            AutoCommitTimeoutCase::builder()
+                .name(
+                    "the coordinator does not answer a heartbeat during the commit before JoinGroup: \
+                     JoinGroup at the rebalance timeout",
+                )
+                .rebalance_timeout(secs(10))
+                .steps(vec![
                     Poll,
                     HoldCommitLock,
                     DropHeartbeats,
-                    Rebalance {
-                        syncs: 1,
-                        within: Duration::from_secs(20),
-                    },
-                ],
-                vec![JoinGroup, SyncGroup],
-            ),
-            (
-                "the coordinator does not answer the commit before JoinGroup: JoinGroup at the \
-                 rebalance timeout",
-                secs(10),
-                vec![
-                    Poll,
-                    ReplyToNextCommit(Drop),
-                    Rebalance {
-                        syncs: 1,
-                        within: REBALANCE_WAIT,
-                    },
-                ],
-                vec![commit(1, &polled), JoinGroup, SyncGroup],
-            ),
-            (
-                "another commit holds the commit lock: close leaves the group after the close \
-                 timeout",
-                minutes(1),
-                vec![Poll, ReceiveRecords, HoldCommitLock, Close],
-                vec![LeaveGroup],
-            ),
+                    rebalance_step(Duration::from_secs(20)),
+                ])
+                .expected(vec![JoinGroup, SyncGroup])
+                .build(),
+            AutoCommitTimeoutCase::builder()
+                .name(
+                    "the coordinator does not answer the commit before JoinGroup: JoinGroup at the \
+                     rebalance timeout",
+                )
+                .rebalance_timeout(secs(10))
+                .steps(vec![Poll, ReplyToNextCommit(Drop), rebalance_step(REBALANCE_WAIT)])
+                .expected(vec![commit(1, &polled), JoinGroup, SyncGroup])
+                .build(),
+            AutoCommitTimeoutCase::builder()
+                .name(
+                    "another commit holds the commit lock: close leaves the group after the close \
+                     timeout",
+                )
+                .steps(vec![Poll, ReceiveRecords, HoldCommitLock, Close])
+                .expected(vec![LeaveGroup])
+                .build(),
         ];
-        let mut actual = Vec::new();
-        let mut wanted = Vec::new();
-        for (name, rebalance_timeout, steps, expected) in cases {
-            actual.push((
-                name,
+        assert_group_request_cases(cases, |case| {
+            let assignments = both_partitions.clone();
+            async move {
                 run_with_rebalance_timeout(
                     true,
                     Assignor::Range,
-                    both_partitions.clone(),
-                    rebalance_timeout,
-                    &steps,
+                    assignments,
+                    case.rebalance_timeout,
+                    &case.steps,
                 )
-                .await,
-            ));
-            wanted.push((name, expected));
-        }
-        assert2::assert!(actual == wanted);
+                .await
+            }
+        })
+        .await;
     }
 
     #[test]
@@ -4798,14 +4632,9 @@ mod auto_commit_tests {
 
 #[cfg(test)]
 mod group_rejoin_tests {
-    use std::sync::atomic::Ordering;
-
-    use krabka_client_core::MockBroker;
-
     use super::{
         auto_commit_tests::{
-            GroupRequest, MEMBER, MockCoordinator, TOPIC, partition, start_config,
-            wait_for_sync_groups,
+            GroupRequest, MockCoordinator, partition, start_config, wait_for_sync_groups,
         },
         *,
     };
@@ -4832,42 +4661,22 @@ mod group_rejoin_tests {
     /// failure cause once, and the next `poll` calls `ensureActiveGroup`.
     #[tokio::test(start_paused = true)]
     async fn poll_after_a_fenced_instance_id_joins_the_group_again() {
-        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(1)]]);
-        coordinator
-            .heartbeat_error
-            .store(FENCED_INSTANCE_ID, Ordering::SeqCst);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let coordinator = MockCoordinator::range_partition(1);
+        coordinator.set_heartbeat_error(FENCED_INSTANCE_ID);
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, minutes(1));
         config.group_instance_id = Some("instance-a".into());
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .build()
-            .await
-            .expect("client");
-        let mut consumer = spawn_consumer(
-            config,
-            client,
-            Arc::new(AtomicI32::new(0)),
-            MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: Vec::new(),
-                assigned_partitions: vec![partition(0), partition(1)],
-                next_offsets: HashMap::from([(partition(0), 12), (partition(1), 7)]),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
-            },
+        let mut consumer = start_test_consumer(
+            TestConsumerStart::builder()
+                .bootstrap(mock.addr.to_string())
+                .config(config)
+                .startup(super::auto_commit_tests::two_partition_startup())
+                .build(),
         )
-        .await
-        .expect("spawn consumer");
+        .await;
         // Wait for the heartbeat that gets the fence.
         tokio::time::timeout(Duration::from_secs(30), async {
-            while !crate::coordinator::poll_error_pending(&consumer.poll_error) {
+            while !coordinator::poll_error_pending(&consumer.poll_error) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
@@ -4936,16 +4745,10 @@ mod group_rejoin_tests {
 
 #[cfg(test)]
 mod poll_interval_tests {
-    use std::sync::atomic::Ordering;
-
-    use krabka_client_core::MockBroker;
-    use krabka_protocol::{
-        UnknownTaggedFields,
-        owned::leave_group_request::{LeaveGroupRequest, MemberIdentity},
-    };
+    use krabka_protocol::owned::leave_group_request::LeaveGroupRequest;
 
     use super::{
-        auto_commit_tests::{MEMBER, MockCoordinator, TOPIC, partition, start_config},
+        auto_commit_tests::{MEMBER, MockCoordinator, TOPIC, start_config},
         *,
     };
 
@@ -4981,37 +4784,12 @@ mod poll_interval_tests {
         group_instance_id: Option<&str>,
         polls: Polls,
     ) -> PollTimeoutObservation {
-        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let coordinator = MockCoordinator::range_partition(0);
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, millis(500));
         config.group_instance_id = group_instance_id.map(str::to_owned);
         config.heartbeat_interval = millis(100);
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .build()
-            .await
-            .expect("client");
-        let mut consumer = spawn_consumer(
-            config,
-            client,
-            Arc::new(AtomicI32::new(0)),
-            MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: Vec::new(),
-                assigned_partitions: vec![partition(0)],
-                next_offsets: HashMap::from([(partition(0), 12)]),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
-            },
-        )
-        .await
-        .expect("spawn consumer");
+        let mut consumer = super::auto_commit_tests::start_single_partition_consumer(config).await;
         // The case starts after the first heartbeat, with a `poll`.
         let spawned_at = *coordinator
             .last_heartbeat
@@ -5025,14 +4803,14 @@ mod poll_interval_tests {
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        crate::coordinator::note_poll(&consumer.poll_signal);
+        coordinator::note_poll(&consumer.poll_signal);
 
         let poller = matches!(polls, Polls::EachTenthOfASecond).then(|| {
             let poll_signal = consumer.poll_signal.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    crate::coordinator::note_poll(&poll_signal);
+                    coordinator::note_poll(&poll_signal);
                 }
             })
         });
@@ -5059,7 +4837,7 @@ mod poll_interval_tests {
         // The application keeps polling while the join runs.
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
             while consumer.member_id().is_empty() {
-                crate::coordinator::note_poll(&consumer.poll_signal);
+                coordinator::note_poll(&consumer.poll_signal);
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -5072,7 +4850,7 @@ mod poll_interval_tests {
         if let Some(poller) = poller {
             poller.abort();
         }
-        coordinator.heartbeat_error.store(0, Ordering::SeqCst);
+        coordinator.set_heartbeat_error(0);
         drop(consumer);
         mock.stop();
         PollTimeoutObservation {
@@ -5095,18 +4873,8 @@ mod poll_interval_tests {
     #[tokio::test]
     async fn a_member_leaves_the_group_when_poll_does_not_come_within_max_poll_interval() {
         let commit_failed = Err(ConsumerError::CommitFailed.to_string());
-        let leave = LeaveGroupRequest {
-            group_id: "group-a".into(),
-            // Version 5 has no top-level member id.
-            member_id: String::new(),
-            members: vec![MemberIdentity {
-                member_id: MEMBER.into(),
-                group_instance_id: None,
-                reason: Some("consumer poll timeout has expired.".into()),
-                unknown_tagged_fields: UnknownTaggedFields::default(),
-            }],
-            unknown_tagged_fields: UnknownTaggedFields::default(),
-        };
+        let leave =
+            test_support::dynamic_member_leave_request("consumer poll timeout has expired.");
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for (name, group_instance_id, polls, expected) in [
@@ -5161,40 +4929,15 @@ mod poll_interval_tests {
     /// nothing, and it starts the join after the leave request ends.
     #[tokio::test]
     async fn a_poll_during_the_poll_timeout_leave_fetches_nothing_and_starts_the_join() {
-        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
+        let coordinator = MockCoordinator::range_partition(0);
         coordinator
             .drop_leaves
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, millis(300));
         config.heartbeat_interval = millis(50);
         config.leave_group_timeout = secs(1);
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .build()
-            .await
-            .expect("client");
-        let mut consumer = spawn_consumer(
-            config,
-            client,
-            Arc::new(AtomicI32::new(0)),
-            MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: Vec::new(),
-                assigned_partitions: vec![partition(0)],
-                next_offsets: HashMap::from([(partition(0), 12)]),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
-            },
-        )
-        .await
-        .expect("spawn consumer");
+        let mut consumer = super::auto_commit_tests::start_single_partition_consumer(config).await;
         tokio::time::timeout(Duration::from_secs(10), async {
             while coordinator.leaves.lock().expect("leaves lock").is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5232,11 +4975,7 @@ mod poll_interval_tests {
             ("configured", Some(secs(10)), 10_000),
         ] {
             let coordinator = MockCoordinator::new(Assignor::Range, vec![Vec::new()]);
-            let in_mock = Arc::clone(&coordinator);
-            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-                in_mock.respond(api_key, version, body)
-            })
-            .await;
+            let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
             let consumer = Consumer::builder()
                 .bootstrap(mock.addr.to_string())
                 .group_id("group-a")
@@ -5334,13 +5073,9 @@ mod poll_interval_tests {
 
 #[cfg(test)]
 mod group_membership_tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, atomic::Ordering};
 
     use krabka_client_core::MockBroker;
-    use krabka_protocol::{
-        UnknownTaggedFields,
-        owned::leave_group_request::{LeaveGroupRequest, MemberIdentity},
-    };
 
     use super::{
         auto_commit_tests::{
@@ -5361,7 +5096,7 @@ mod group_membership_tests {
         let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, minutes(1));
         config.assignors = assignors.to_vec();
         config.rebalance_protocol =
-            crate::assignor::rebalance_protocol_of(assignors).expect("assignor protocol");
+            assignor::rebalance_protocol_of(assignors).expect("assignor protocol");
         config.group_instance_id = group_instance_id.map(str::to_owned);
         config.heartbeat_interval = millis(50);
         let client = Client::builder()
@@ -5374,18 +5109,29 @@ mod group_membership_tests {
             client,
             Arc::new(AtomicI32::new(0)),
             MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: Vec::new(),
-                assigned_partitions: vec![partition(0)],
-                next_offsets: HashMap::from([(partition(0), 12)]),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
-            },
+            super::auto_commit_tests::single_partition_startup(1),
         )
         .await
         .expect("spawn consumer")
+    }
+
+    struct StartedRangeConsumer {
+        coordinator: Arc<MockCoordinator>,
+        mock: MockBroker,
+        consumer: Consumer,
+    }
+
+    impl StartedRangeConsumer {
+        async fn start(group_instance_id: Option<&str>) -> Self {
+            let coordinator = MockCoordinator::range_partition(0);
+            let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
+            let consumer = started_consumer(&mock, group_instance_id).await;
+            Self {
+                coordinator,
+                mock,
+                consumer,
+            }
+        }
     }
 
     /// Kafka's `AbstractCoordinator.close` calls `maybeLeaveGroup` with the
@@ -5394,18 +5140,7 @@ mod group_membership_tests {
     /// named by its member id and the reason only.
     #[tokio::test]
     async fn close_leaves_the_group_as_the_membership_operation_says() {
-        let leave = LeaveGroupRequest {
-            group_id: "group-a".into(),
-            // Version 5 has no top-level member id.
-            member_id: String::new(),
-            members: vec![MemberIdentity {
-                member_id: MEMBER.into(),
-                group_instance_id: None,
-                reason: Some("the consumer is being closed".into()),
-                unknown_tagged_fields: UnknownTaggedFields::default(),
-            }],
-            unknown_tagged_fields: UnknownTaggedFields::default(),
-        };
+        let leave = test_support::dynamic_member_leave_request("the consumer is being closed");
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for (name, group_instance_id, operation, expected) in [
@@ -5434,21 +5169,21 @@ mod group_membership_tests {
                 Vec::new(),
             ),
         ] {
-            let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-            let in_mock = Arc::clone(&coordinator);
-            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-                in_mock.respond(api_key, version, body)
-            })
-            .await;
-            let consumer = started_consumer(&mock, group_instance_id).await;
-            consumer
-                .close_with(crate::CloseOptions::group_membership_operation(operation))
+            let fixture = StartedRangeConsumer::start(group_instance_id).await;
+            fixture
+                .consumer
+                .close_with(CloseOptions::group_membership_operation(operation))
                 .await
                 .expect("close");
-            mock.stop();
+            fixture.mock.stop();
             actual.push((
                 name,
-                coordinator.leaves.lock().expect("leaves lock").clone(),
+                fixture
+                    .coordinator
+                    .leaves
+                    .lock()
+                    .expect("leaves lock")
+                    .clone(),
             ));
             wanted.push((name, expected));
         }
@@ -5463,11 +5198,7 @@ mod group_membership_tests {
     async fn a_join_after_the_member_was_reset_during_preparation_owns_nothing() {
         let coordinator =
             MockCoordinator::new(Assignor::CooperativeSticky, vec![vec![partition(0)]]);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut config = start_config(
             mock.addr.to_string(),
             Assignor::CooperativeSticky,
@@ -5475,28 +5206,7 @@ mod group_membership_tests {
             minutes(1),
         );
         config.heartbeat_interval = millis(50);
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .build()
-            .await
-            .expect("client");
-        let mut consumer = spawn_consumer(
-            config,
-            client,
-            Arc::new(AtomicI32::new(0)),
-            MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: Vec::new(),
-                assigned_partitions: vec![partition(0)],
-                next_offsets: HashMap::from([(partition(0), 12)]),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
-            },
-        )
-        .await
-        .expect("spawn consumer");
+        let mut consumer = super::auto_commit_tests::start_single_partition_consumer(config).await;
         consumer.poll(millis(20)).await.expect("first poll");
         // The pre-join auto commit gets no answer, so the task heartbeats while
         // it waits.
@@ -5505,7 +5215,7 @@ mod group_membership_tests {
             .lock()
             .expect("commit replies lock")
             .push_back(super::auto_commit_tests::CommitReply::Drop);
-        coordinator.heartbeat_error.store(27, Ordering::SeqCst);
+        coordinator.set_heartbeat_error(27);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut reset = false;
         while coordinator.joins.lock().expect("joins lock").is_empty()
@@ -5517,7 +5227,7 @@ mod group_membership_tests {
                 .iter()
                 .any(|request| matches!(request, GroupRequest::OffsetCommit(_)));
             if committing && !reset {
-                coordinator.heartbeat_error.store(25, Ordering::SeqCst);
+                coordinator.set_heartbeat_error(25);
                 reset = true;
             }
         }
@@ -5528,7 +5238,7 @@ mod group_membership_tests {
             .iter()
             .flat_map(|join| join.protocols.iter())
             .map(|protocol| {
-                let subscription = crate::builder::decode_subscription(&protocol.metadata);
+                let subscription = builder::decode_subscription(&protocol.metadata);
                 (subscription.owned, subscription.generation_id)
             })
             .collect();
@@ -5545,36 +5255,11 @@ mod group_membership_tests {
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for (name, timeout, expected) in [("300 ms", millis(300), (Ok(()), true, 1))] {
-            let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-            let in_mock = Arc::clone(&coordinator);
-            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-                in_mock.respond(api_key, version, body)
-            })
-            .await;
+            let coordinator = MockCoordinator::range_partition(0);
+            let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
             let mut config = start_config(mock.addr.to_string(), Assignor::Range, true, minutes(1));
             config.heartbeat_interval = millis(50);
-            let client = Client::builder()
-                .bootstrap(mock.addr.to_string())
-                .build()
-                .await
-                .expect("client");
-            let consumer = spawn_consumer(
-                config,
-                client,
-                Arc::new(AtomicI32::new(0)),
-                MEMBER.into(),
-                StartupState {
-                    generation_id: 1,
-                    group_topics: Vec::new(),
-                    assigned_partitions: vec![partition(0)],
-                    next_offsets: HashMap::from([(partition(0), 12)]),
-                    positions: HashMap::new(),
-                    topic_ids: HashMap::new(),
-                    topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
-                },
-            )
-            .await
-            .expect("spawn consumer");
+            let consumer = super::auto_commit_tests::start_single_partition_consumer(config).await;
             // Another commit holds the commit lock, so the auto commit of
             // `close` waits.
             let held = Arc::clone(&consumer.commit_serialization)
@@ -5583,7 +5268,7 @@ mod group_membership_tests {
             let started = tokio::time::Instant::now();
             let closed = tokio::time::timeout(
                 Duration::from_secs(10),
-                consumer.close_with(crate::CloseOptions::timeout(timeout)),
+                consumer.close_with(CloseOptions::timeout(timeout)),
             )
             .await
             .expect("close returns")
@@ -5602,12 +5287,8 @@ mod group_membership_tests {
     /// commits and runs their callbacks before the consumer leaves the group.
     #[tokio::test]
     async fn close_waits_for_a_pending_asynchronous_commit() {
-        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let coordinator = MockCoordinator::range_partition(0);
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let consumer = started_consumer(&mock, None).await;
         // Another commit holds the commit lock for a while, so the
         // asynchronous commit is still pending when `close` starts.
@@ -5705,13 +5386,11 @@ mod group_membership_tests {
                 (vec![(vec![], changed("orders", ""))], vec![], vec![]),
             ),
         ] {
-            let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-            let in_mock = Arc::clone(&coordinator);
-            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-                in_mock.respond(api_key, version, body)
-            })
-            .await;
-            let mut consumer = started_consumer(&mock, None).await;
+            let StartedRangeConsumer {
+                coordinator,
+                mock,
+                mut consumer,
+            } = StartedRangeConsumer::start(None).await;
             let mut errors = Vec::new();
             match change {
                 Change::Subscribe(topic) => consumer.subscribe([topic]).await.expect("subscribe"),
@@ -5725,7 +5404,7 @@ mod group_membership_tests {
                 }
                 Change::PatternWithoutMatch => {
                     consumer
-                        .subscribe_pattern(crate::TopicPattern::new(|_| false))
+                        .subscribe_pattern(TopicPattern::new(|_| false))
                         .expect("subscribe_pattern");
                 }
             }
@@ -5747,8 +5426,7 @@ mod group_membership_tests {
                 .expect("joins lock")
                 .iter()
                 .map(|join| {
-                    let subscription =
-                        crate::builder::decode_subscription(&join.protocols[0].metadata);
+                    let subscription = builder::decode_subscription(&join.protocols[0].metadata);
                     (subscription.topics, join.reason.clone())
                 })
                 .collect();
@@ -5772,12 +5450,8 @@ mod group_membership_tests {
     /// `assignment` and a commit see no partition right after it.
     #[tokio::test]
     async fn unsubscribe_gives_up_the_assignment_before_it_returns() {
-        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let coordinator = MockCoordinator::range_partition(0);
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut consumer = started_consumer(&mock, None).await;
         let before = consumer.assignment().await;
         // A coordinator task that is busy, here a stopped one, handles the
@@ -5799,12 +5473,8 @@ mod group_membership_tests {
     /// subscription.
     #[tokio::test]
     async fn a_manual_assignment_after_unsubscribe_survives_and_blocks_enforce_rebalance() {
-        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let coordinator = MockCoordinator::range_partition(0);
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut consumer = started_consumer(&mock, None).await;
         consumer.unsubscribe().await.expect("unsubscribe");
         consumer
@@ -5844,13 +5514,11 @@ mod group_membership_tests {
             ("empty reason", Some(""), "rebalance enforced by user"),
             ("reason", Some("scale out"), "scale out"),
         ] {
-            let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-            let in_mock = Arc::clone(&coordinator);
-            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-                in_mock.respond(api_key, version, body)
-            })
-            .await;
-            let mut consumer = started_consumer(&mock, None).await;
+            let StartedRangeConsumer {
+                coordinator,
+                mock,
+                mut consumer,
+            } = StartedRangeConsumer::start(None).await;
             consumer
                 .enforce_rebalance(reason)
                 .expect("enforce_rebalance");
@@ -5880,16 +5548,12 @@ mod group_membership_tests {
     /// must still start it, or it waits until its timeout.
     #[tokio::test]
     async fn a_poll_that_waits_for_an_eager_join_starts_a_join_requested_after_it_began() {
-        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let coordinator = MockCoordinator::range_partition(0);
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut consumer = started_consumer(&mock, None).await;
         // The start of `poll` signals the task.
-        crate::coordinator::note_poll(&consumer.poll_signal);
-        coordinator.heartbeat_error.store(27, Ordering::SeqCst);
+        coordinator::note_poll(&consumer.poll_signal);
+        coordinator.set_heartbeat_error(27);
         tokio::time::timeout(Duration::from_secs(5), async {
             while !*consumer.rebalance_pending.borrow() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -5915,12 +5579,8 @@ mod group_membership_tests {
     /// group.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn continuous_polls_do_not_stop_the_heartbeats() {
-        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let coordinator = MockCoordinator::range_partition(0);
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let consumer = started_consumer(&mock, None).await;
         let first_heartbeat = *coordinator
             .last_heartbeat
@@ -5931,7 +5591,7 @@ mod group_membership_tests {
         tokio::task::spawn_blocking(move || {
             let end = std::time::Instant::now() + Duration::from_millis(500);
             while std::time::Instant::now() < end {
-                crate::coordinator::note_poll(&poll_signal);
+                coordinator::note_poll(&poll_signal);
             }
         })
         .await
@@ -5951,36 +5611,11 @@ mod group_membership_tests {
     /// the new member before the old one leaves.
     #[tokio::test]
     async fn the_poll_timeout_leave_goes_out_before_the_join_of_the_next_poll() {
-        let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let coordinator = MockCoordinator::range_partition(0);
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut config = start_config(mock.addr.to_string(), Assignor::Range, false, millis(200));
         config.heartbeat_interval = millis(50);
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .build()
-            .await
-            .expect("client");
-        let consumer = spawn_consumer(
-            config,
-            client,
-            Arc::new(AtomicI32::new(0)),
-            MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: Vec::new(),
-                assigned_partitions: vec![partition(0)],
-                next_offsets: HashMap::from([(partition(0), 12)]),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 1)]),
-            },
-        )
-        .await
-        .expect("spawn consumer");
+        let consumer = super::auto_commit_tests::start_single_partition_consumer(config).await;
         // The application polls again as soon as the member leaves the group.
         tokio::time::timeout(Duration::from_secs(5), async {
             while !*consumer.rebalance_pending.borrow() {
@@ -5989,7 +5624,7 @@ mod group_membership_tests {
         })
         .await
         .expect("the poll timeout expires");
-        crate::coordinator::note_poll(&consumer.poll_signal);
+        coordinator::note_poll(&consumer.poll_signal);
         tokio::time::timeout(Duration::from_secs(5), async {
             while coordinator.sync_groups() == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6014,7 +5649,7 @@ mod group_membership_tests {
     /// user data. A cooperative member sends its owned partitions.
     #[tokio::test]
     async fn rejoin_sends_a_subscription_per_assignor_with_the_owned_partitions_of_the_protocol() {
-        use crate::builder::{DecodedSubscription, decode_subscription};
+        use builder::{DecodedSubscription, decode_subscription};
         let subscription =
             |owned: Vec<(String, i32)>, user_data: Option<Bytes>| DecodedSubscription {
                 topics: vec![TOPIC.to_owned()],
@@ -6053,7 +5688,7 @@ mod group_membership_tests {
                     "sticky".to_owned(),
                     subscription(
                         Vec::new(),
-                        crate::assignor::subscription_user_data(
+                        assignor::subscription_user_data(
                             Assignor::Sticky,
                             Some(&[partition(0)]),
                             1,
@@ -6062,17 +5697,13 @@ mod group_membership_tests {
                 )],
             ),
         ] {
-            let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-            let in_mock = Arc::clone(&coordinator);
-            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-                in_mock.respond(api_key, version, body)
-            })
-            .await;
+            let coordinator = MockCoordinator::range_partition(0);
+            let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
             let consumer = started_consumer_with(&mock, None, &assignors).await;
-            coordinator.heartbeat_error.store(27, Ordering::SeqCst);
+            coordinator.set_heartbeat_error(27);
             let protocols = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
-                    crate::coordinator::note_poll(&consumer.poll_signal);
+                    coordinator::note_poll(&consumer.poll_signal);
                     if let Some(join) = coordinator.joins.lock().expect("joins lock").first() {
                         break join
                             .protocols
@@ -6126,20 +5757,21 @@ mod group_membership_tests {
                 ("", "encountered UNKNOWN_MEMBER_ID from HEARTBEAT response"),
             ),
         ] {
-            let coordinator = MockCoordinator::new(Assignor::Range, vec![vec![partition(0)]]);
-            let in_mock = Arc::clone(&coordinator);
-            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-                in_mock.respond(api_key, version, body)
-            })
-            .await;
-            let consumer = started_consumer(&mock, None).await;
-            coordinator
+            let fixture = StartedRangeConsumer::start(None).await;
+            fixture
+                .coordinator
                 .heartbeat_error
                 .store(heartbeat_error, Ordering::SeqCst);
             let join = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
-                    crate::coordinator::note_poll(&consumer.poll_signal);
-                    if let Some(join) = coordinator.joins.lock().expect("joins lock").first() {
+                    coordinator::note_poll(&fixture.consumer.poll_signal);
+                    if let Some(join) = fixture
+                        .coordinator
+                        .joins
+                        .lock()
+                        .expect("joins lock")
+                        .first()
+                    {
                         break (join.member_id.clone(), join.reason.clone());
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -6147,8 +5779,8 @@ mod group_membership_tests {
             })
             .await
             .expect("the consumer joins again");
-            drop(consumer);
-            mock.stop();
+            drop(fixture.consumer);
+            fixture.mock.stop();
             actual.push((name, join));
             wanted.push((name, (expected.0.to_owned(), Some(expected.1.to_owned()))));
         }
@@ -6160,15 +5792,14 @@ mod group_membership_tests {
 mod rebalance_listener_tests {
     use std::sync::atomic::Ordering;
 
-    use krabka_client_core::MockBroker;
-
     use super::{
-        auto_commit_tests::{
-            GroupRequest, MEMBER, MockCoordinator, TOPIC, partition, start_config,
-        },
+        auto_commit_tests::{GroupRequest, MockCoordinator, TOPIC, partition, start_config},
         *,
     };
-    use crate::{ConsumerRebalanceListener, RebalanceListenerError};
+    use crate::{
+        ConsumerRebalanceListener, RebalanceListenerError,
+        test_support::{ListenerStep as Step, RecordingListener},
+    };
 
     /// One listener callback, or the result of a commit inside a callback.
     #[derive(Clone, Debug, PartialEq)]
@@ -6222,11 +5853,11 @@ mod rebalance_listener_tests {
 
         async fn on_partitions_assigned(
             &mut self,
-            consumer: &Consumer,
-            partitions: &[(String, i32)],
+            consumer_for_assignment: &Consumer,
+            assigned_partitions: &[(String, i32)],
         ) -> Result<(), RebalanceListenerError> {
-            self.record(Call::Assigned(partitions.to_vec()));
-            let mut awaiting: Vec<_> = consumer
+            self.record(Call::Assigned(assigned_partitions.to_vec()));
+            let mut awaiting: Vec<_> = consumer_for_assignment
                 .assigned_callback_pending
                 .lock()
                 .expect("pending lock")
@@ -6234,11 +5865,13 @@ mod rebalance_listener_tests {
                 .cloned()
                 .collect();
             awaiting.sort();
-            if !partitions.is_empty() {
+            if !assigned_partitions.is_empty() {
                 self.record(Call::AwaitingCallback(awaiting));
             }
-            if let (Some(offset), Some(partition)) = (self.seek_on_assign, partitions.first()) {
-                consumer
+            if let (Some(offset), Some(partition)) =
+                (self.seek_on_assign, assigned_partitions.first())
+            {
+                consumer_for_assignment
                     .seek(partition.0.clone(), partition.1, offset)
                     .await
                     .expect("seek");
@@ -6282,42 +5915,38 @@ mod rebalance_listener_tests {
 
     /// The listener calls of a case, and the generation of each
     /// `OffsetCommit`.
-    type CaseResult = (Vec<Call>, Vec<i32>);
+    #[derive(Debug, PartialEq)]
+    struct CaseResult {
+        calls: Vec<Call>,
+        commit_generations: Vec<i32>,
+    }
+
+    #[derive(bon::Builder)]
+    struct ListenerScenario {
+        name: &'static str,
+        case: Case,
+        expected_calls: Vec<Call>,
+        expected_commit_generations: Vec<i32>,
+    }
 
     async fn run_case(case: Case) -> CaseResult {
         let coordinator = MockCoordinator::new(case.assignor, case.assignments);
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut config = start_config(mock.addr.to_string(), case.assignor, false, minutes(1));
         config.heartbeat_interval = millis(50);
         config.has_rebalance_listener = true;
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .build()
-            .await
-            .expect("client");
-        let mut consumer = spawn_consumer(
+        let mut consumer = super::auto_commit_tests::start_consumer_with_startup(
             config,
-            client,
-            Arc::new(AtomicI32::new(0)),
-            MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: Vec::new(),
-                assigned_partitions: case.owned.clone(),
-                next_offsets: case.owned.iter().map(|key| (key.clone(), 12)).collect(),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
-            },
+            StartupState::builder()
+                .generation_id(1)
+                .assigned_partitions(case.owned.clone())
+                .next_offsets(case.owned.iter().map(|key| (key.clone(), 12)).collect())
+                .topic_partitions(HashMap::from([(TOPIC.to_owned(), 2)]))
+                .build(),
         )
-        .await
-        .expect("spawn consumer");
+        .await;
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        consumer.rebalance_listener = Some(crate::rebalance_listener::shared(Box::new(Recorder {
+        consumer.rebalance_listener = Some(rebalance_listener::shared(Box::new(Recorder {
             calls: Arc::clone(&calls),
             commit_on_revoke: case.commit_on_revoke,
             fail_revoke: case.fail_revoke,
@@ -6373,7 +6002,24 @@ mod rebalance_listener_tests {
             .collect();
         mock.stop();
         let calls = calls.lock().expect("calls lock").clone();
-        (calls, generations)
+        CaseResult {
+            calls,
+            commit_generations: generations,
+        }
+    }
+
+    async fn assert_listener_scenarios(scenarios: impl IntoIterator<Item = ListenerScenario>) {
+        for scenario in scenarios {
+            let expected = CaseResult {
+                calls: scenario.expected_calls,
+                commit_generations: scenario.expected_commit_generations,
+            };
+            assert2::assert!(
+                run_case(scenario.case).await == expected,
+                "{}",
+                scenario.name
+            );
+        }
     }
 
     /// Poll once, and record an error of the `poll`.
@@ -6386,57 +6032,6 @@ mod rebalance_listener_tests {
         }
     }
 
-    /// The order and the partitions of Kafka's `ConsumerRebalanceListener`
-    /// calls (`ConsumerCoordinator.onJoinPrepare`, `onJoinComplete` and
-    /// `onLeavePrepare`).
-    /// What the listener of the cancellation test saw.
-    #[derive(Clone, Debug, PartialEq)]
-    enum Step {
-        Started(&'static str, Vec<(String, i32)>),
-        Ended(&'static str, Vec<(String, i32)>),
-    }
-
-    /// A listener whose first assign callback for partition 1 takes long, so a
-    /// timeout cancels the `poll` that runs it.
-    struct SlowOnce {
-        steps: Arc<std::sync::Mutex<Vec<Step>>>,
-        slow: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl ConsumerRebalanceListener for SlowOnce {
-        async fn on_partitions_revoked(
-            &mut self,
-            _consumer: &Consumer,
-            partitions: &[(String, i32)],
-        ) -> Result<(), RebalanceListenerError> {
-            let mut steps = self.steps.lock().expect("steps lock");
-            steps.push(Step::Started("revoked", partitions.to_vec()));
-            steps.push(Step::Ended("revoked", partitions.to_vec()));
-            Ok(())
-        }
-
-        async fn on_partitions_assigned(
-            &mut self,
-            _consumer: &Consumer,
-            partitions: &[(String, i32)],
-        ) -> Result<(), RebalanceListenerError> {
-            self.steps
-                .lock()
-                .expect("steps lock")
-                .push(Step::Started("assigned", partitions.to_vec()));
-            if self.slow && partitions.contains(&partition(1)) {
-                self.slow = false;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            self.steps
-                .lock()
-                .expect("steps lock")
-                .push(Step::Ended("assigned", partitions.to_vec()));
-            Ok(())
-        }
-    }
-
     /// A cancelled `poll` keeps the listener, and the callback that it did not
     /// finish runs again in the next `poll`. Kafka runs each callback to its
     /// end on the application thread.
@@ -6446,11 +6041,7 @@ mod rebalance_listener_tests {
             Assignor::CooperativeSticky,
             vec![vec![partition(0), partition(1)]],
         );
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut config = start_config(
             mock.addr.to_string(),
             Assignor::CooperativeSticky,
@@ -6459,35 +6050,20 @@ mod rebalance_listener_tests {
         );
         config.heartbeat_interval = millis(50);
         config.has_rebalance_listener = true;
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .build()
-            .await
-            .expect("client");
-        let mut consumer = spawn_consumer(
+        let mut consumer = super::auto_commit_tests::start_consumer_with_startup(
             config,
-            client,
-            Arc::new(AtomicI32::new(0)),
-            MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: Vec::new(),
-                assigned_partitions: vec![partition(0)],
-                next_offsets: HashMap::from([(partition(0), 12)]),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
-            },
+            super::auto_commit_tests::single_partition_startup(2),
         )
-        .await
-        .expect("spawn consumer");
+        .await;
         let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
-        consumer.rebalance_listener = Some(crate::rebalance_listener::shared(Box::new(SlowOnce {
-            steps: Arc::clone(&steps),
-            slow: true,
-        })));
+        let listener = RecordingListener::builder()
+            .steps(Arc::clone(&steps))
+            .slow_partition(1)
+            .slow_for(Duration::from_millis(500))
+            .build();
+        consumer.rebalance_listener = Some(rebalance_listener::shared(Box::new(listener)));
         consumer.poll(millis(20)).await.expect("first poll");
-        coordinator.heartbeat_error.store(27, Ordering::SeqCst);
+        coordinator.set_heartbeat_error(27);
         let ended = |steps: &std::sync::Mutex<Vec<Step>>| {
             steps
                 .lock()
@@ -6525,37 +6101,6 @@ mod rebalance_listener_tests {
         );
     }
 
-    /// An assign callback that takes longer than `max_poll_interval` the first
-    /// time that it gets the added partition.
-    struct SlowAssign {
-        slept: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl ConsumerRebalanceListener for SlowAssign {
-        async fn on_partitions_revoked(
-            &mut self,
-            _consumer: &Consumer,
-            _partitions: &[(String, i32)],
-        ) -> Result<(), RebalanceListenerError> {
-            Ok(())
-        }
-
-        async fn on_partitions_assigned(
-            &mut self,
-            _consumer: &Consumer,
-            partitions: &[(String, i32)],
-        ) -> Result<(), RebalanceListenerError> {
-            // The partition that the rebalance adds. The first `poll` runs the
-            // callback of the build quickly.
-            if partitions.contains(&partition(1)) && !self.slept {
-                self.slept = true;
-                tokio::time::sleep(Duration::from_millis(1200)).await;
-            }
-            Ok(())
-        }
-    }
-
     /// Kafka's heartbeat thread leaves the group when the poll timer expires,
     /// also while a callback runs inside `poll` (`AbstractCoordinator.
     /// HeartbeatThread.run`, `handlePollTimeoutExpiry`).
@@ -6565,11 +6110,7 @@ mod rebalance_listener_tests {
             Assignor::CooperativeSticky,
             vec![vec![partition(0), partition(1)]],
         );
-        let in_mock = Arc::clone(&coordinator);
-        let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
-            in_mock.respond(api_key, version, body)
-        })
-        .await;
+        let mock = super::auto_commit_tests::mock_coordinator_broker(&coordinator).await;
         let mut config = start_config(
             mock.addr.to_string(),
             Assignor::CooperativeSticky,
@@ -6578,34 +6119,21 @@ mod rebalance_listener_tests {
         );
         config.heartbeat_interval = millis(50);
         config.has_rebalance_listener = true;
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .build()
-            .await
-            .expect("client");
-        let mut consumer = spawn_consumer(
-            config,
-            client,
-            Arc::new(AtomicI32::new(0)),
-            MEMBER.into(),
-            StartupState {
-                generation_id: 1,
-                group_topics: Vec::new(),
-                assigned_partitions: vec![partition(0)],
-                next_offsets: HashMap::from([(partition(0), 12)]),
-                positions: HashMap::new(),
-                topic_ids: HashMap::new(),
-                topic_partitions: HashMap::from([(TOPIC.to_owned(), 2)]),
-            },
+        let mut consumer = start_test_consumer(
+            TestConsumerStart::builder()
+                .bootstrap(mock.addr.to_string())
+                .config(config)
+                .startup(super::auto_commit_tests::single_partition_startup(2))
+                .build(),
         )
-        .await
-        .expect("spawn consumer");
-        consumer.rebalance_listener =
-            Some(crate::rebalance_listener::shared(Box::new(SlowAssign {
-                slept: false,
-            })));
+        .await;
+        let listener = RecordingListener::builder()
+            .slow_partition(1)
+            .slow_for(Duration::from_millis(1200))
+            .build();
+        consumer.rebalance_listener = Some(rebalance_listener::shared(Box::new(listener)));
         consumer.poll(millis(20)).await.expect("first poll");
-        coordinator.heartbeat_error.store(27, Ordering::SeqCst);
+        coordinator.set_heartbeat_error(27);
         // Poll until the slow assign callback of the join has run.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while coordinator.leaves.lock().expect("leaves lock").is_empty()
@@ -6649,106 +6177,118 @@ mod rebalance_listener_tests {
         Call::AwaitingCallback(partitions)
     }
 
+    fn empty_assignment_call() -> Call {
+        Call::Assigned(Vec::new())
+    }
+
+    fn range_revoke_calls() -> Vec<Call> {
+        vec![
+            Call::Assigned(vec![partition(0)]),
+            awaiting(vec![]),
+            Call::Revoked(vec![partition(0)]),
+        ]
+    }
+
+    fn range_revoke_commit_calls() -> Vec<Call> {
+        let mut calls = range_revoke_calls();
+        calls.extend([
+            Call::CommitInRevoke(Ok(())),
+            Call::Assigned(vec![partition(0)]),
+            awaiting(vec![partition(0)]),
+        ]);
+        calls
+    }
+
     #[tokio::test]
     async fn listener_calls_follow_kafkas_order() {
         let p = partition;
-        let mut actual = Vec::new();
-        let mut wanted = Vec::new();
-        for (name, case, expected) in [
-            (
-                "eager rebalance",
-                case(
+        assert_listener_scenarios([
+            ListenerScenario::builder()
+                .name("eager rebalance")
+                .case(case(
                     Assignor::Range,
                     vec![p(0), p(1)],
                     vec![p(0)],
                     Event::Heartbeat(27),
                     5,
-                ),
-                (
-                    vec![
-                        Call::Assigned(vec![p(0), p(1)]),
-                        awaiting(vec![]),
-                        Call::Revoked(vec![p(0), p(1)]),
-                        Call::Assigned(vec![p(0)]),
-                        awaiting(vec![p(0)]),
-                    ],
-                    vec![],
-                ),
-            ),
-            (
-                "cooperative rebalance that revokes",
-                case(
+                ))
+                .expected_calls(vec![
+                    Call::Assigned(vec![p(0), p(1)]),
+                    awaiting(vec![]),
+                    Call::Revoked(vec![p(0), p(1)]),
+                    Call::Assigned(vec![p(0)]),
+                    awaiting(vec![p(0)]),
+                ])
+                .expected_commit_generations(vec![])
+                .build(),
+            ListenerScenario::builder()
+                .name("cooperative rebalance that revokes")
+                .case(case(
                     Assignor::CooperativeSticky,
                     vec![p(0), p(1)],
                     vec![p(0)],
                     Event::Heartbeat(27),
                     5,
-                ),
-                (
-                    vec![
-                        Call::Assigned(vec![p(0), p(1)]),
-                        awaiting(vec![]),
-                        Call::Revoked(vec![p(1)]),
-                        Call::Assigned(Vec::new()),
-                        Call::Assigned(Vec::new()),
-                    ],
-                    vec![],
-                ),
-            ),
-            (
-                "cooperative rebalance that adds",
-                case(
+                ))
+                .expected_calls(vec![
+                    Call::Assigned(vec![p(0), p(1)]),
+                    awaiting(vec![]),
+                    Call::Revoked(vec![p(1)]),
+                    empty_assignment_call(),
+                    empty_assignment_call(),
+                ])
+                .expected_commit_generations(vec![])
+                .build(),
+            ListenerScenario::builder()
+                .name("cooperative rebalance that adds")
+                .case(case(
                     Assignor::CooperativeSticky,
                     vec![p(0)],
                     vec![p(0), p(1)],
                     Event::Heartbeat(27),
                     4,
-                ),
-                (
-                    vec![
-                        Call::Assigned(vec![p(0)]),
-                        awaiting(vec![]),
-                        Call::Assigned(vec![p(1)]),
-                        awaiting(vec![p(1)]),
-                    ],
-                    vec![],
-                ),
-            ),
-            (
-                "unknown member id",
-                case(
+                ))
+                .expected_calls(vec![
+                    Call::Assigned(vec![p(0)]),
+                    awaiting(vec![]),
+                    Call::Assigned(vec![p(1)]),
+                    awaiting(vec![p(1)]),
+                ])
+                .expected_commit_generations(vec![])
+                .build(),
+            ListenerScenario::builder()
+                .name("unknown member id")
+                .case(case(
                     Assignor::Range,
                     vec![p(0)],
                     vec![p(0)],
                     Event::Heartbeat(25),
                     5,
-                ),
-                (
-                    vec![
-                        Call::Assigned(vec![p(0)]),
-                        awaiting(vec![]),
-                        Call::Lost(vec![p(0)]),
-                        Call::Assigned(vec![p(0)]),
-                        awaiting(vec![p(0)]),
-                    ],
-                    vec![],
-                ),
-            ),
-            (
-                "close",
-                case(Assignor::Range, vec![p(0)], vec![p(0)], Event::Close, 3),
-                (
-                    vec![
-                        Call::Assigned(vec![p(0)]),
-                        awaiting(vec![]),
-                        Call::Revoked(vec![p(0)]),
-                    ],
-                    vec![],
-                ),
-            ),
-            (
-                "a commit in the eager revoke callback",
-                Case {
+                ))
+                .expected_calls(vec![
+                    Call::Assigned(vec![p(0)]),
+                    awaiting(vec![]),
+                    Call::Lost(vec![p(0)]),
+                    Call::Assigned(vec![p(0)]),
+                    awaiting(vec![p(0)]),
+                ])
+                .expected_commit_generations(vec![])
+                .build(),
+            ListenerScenario::builder()
+                .name("close")
+                .case(case(
+                    Assignor::Range,
+                    vec![p(0)],
+                    vec![p(0)],
+                    Event::Close,
+                    3,
+                ))
+                .expected_calls(range_revoke_calls())
+                .expected_commit_generations(vec![])
+                .build(),
+            ListenerScenario::builder()
+                .name("a commit in the eager revoke callback")
+                .case(Case {
                     commit_on_revoke: true,
                     ..case(
                         Assignor::Range,
@@ -6757,24 +6297,12 @@ mod rebalance_listener_tests {
                         Event::Heartbeat(27),
                         6,
                     )
-                },
-                (
-                    vec![
-                        Call::Assigned(vec![p(0)]),
-                        awaiting(vec![]),
-                        Call::Revoked(vec![p(0)]),
-                        Call::CommitInRevoke(Ok(())),
-                        Call::Assigned(vec![p(0)]),
-                        awaiting(vec![p(0)]),
-                    ],
-                    vec![1],
-                ),
-            ),
-        ] {
-            actual.push((name, run_case(case).await));
-            wanted.push((name, expected));
-        }
-        assert2::assert!(actual == wanted);
+                })
+                .expected_calls(range_revoke_commit_calls())
+                .expected_commit_generations(vec![1])
+                .build(),
+        ])
+        .await;
     }
 
     /// Kafka's listener order when a callback commits or fails, when the
@@ -6782,12 +6310,10 @@ mod rebalance_listener_tests {
     #[tokio::test]
     async fn listener_calls_follow_kafka_around_commits_errors_and_seeks() {
         let p = partition;
-        let mut actual = Vec::new();
-        let mut wanted = Vec::new();
-        for (name, case, expected) in [
-            (
-                "a commit in the cooperative revoke callback carries the new generation",
-                Case {
+        assert_listener_scenarios([
+            ListenerScenario::builder()
+                .name("a commit in the cooperative revoke callback carries the new generation")
+                .case(Case {
                     commit_on_revoke: true,
                     ..case(
                         Assignor::CooperativeSticky,
@@ -6796,22 +6322,20 @@ mod rebalance_listener_tests {
                         Event::Heartbeat(27),
                         6,
                     )
-                },
-                (
-                    vec![
-                        Call::Assigned(vec![p(0), p(1)]),
-                        awaiting(vec![]),
-                        Call::Revoked(vec![p(1)]),
-                        Call::CommitInRevoke(Ok(())),
-                        Call::Assigned(Vec::new()),
-                        Call::Assigned(Vec::new()),
-                    ],
-                    vec![2],
-                ),
-            ),
-            (
-                "a failed cooperative revoke callback fails the poll after the rebalance",
-                Case {
+                })
+                .expected_calls(vec![
+                    Call::Assigned(vec![p(0), p(1)]),
+                    awaiting(vec![]),
+                    Call::Revoked(vec![p(1)]),
+                    Call::CommitInRevoke(Ok(())),
+                    empty_assignment_call(),
+                    empty_assignment_call(),
+                ])
+                .expected_commit_generations(vec![2])
+                .build(),
+            ListenerScenario::builder()
+                .name("a failed cooperative revoke callback fails the poll after the rebalance")
+                .case(Case {
                     fail_revoke: true,
                     ..case(
                         Assignor::CooperativeSticky,
@@ -6820,59 +6344,50 @@ mod rebalance_listener_tests {
                         Event::Heartbeat(27),
                         6,
                     )
-                },
-                (
-                    vec![
-                        Call::Assigned(vec![p(0), p(1)]),
-                        awaiting(vec![]),
-                        Call::Revoked(vec![p(1)]),
-                        Call::Assigned(Vec::new()),
-                        Call::Assigned(Vec::new()),
-                        Call::PollError("rebalance listener failed: revoke failed".into()),
-                    ],
-                    vec![],
-                ),
-            ),
-            (
-                "a cooperative join after a subscription change revokes the partitions of the old topic",
-                case(
+                })
+                .expected_calls(vec![
+                    Call::Assigned(vec![p(0), p(1)]),
+                    awaiting(vec![]),
+                    Call::Revoked(vec![p(1)]),
+                    empty_assignment_call(),
+                    empty_assignment_call(),
+                    Call::PollError("rebalance listener failed: revoke failed".into()),
+                ])
+                .expected_commit_generations(vec![])
+                .build(),
+            ListenerScenario::builder()
+                .name("a cooperative join after a subscription change revokes the partitions of the old topic")
+                .case(case(
                     Assignor::CooperativeSticky,
                     vec![p(0), p(1)],
                     vec![],
                     Event::Subscribe("payments"),
                     4,
-                ),
-                (
-                    vec![
-                        Call::Assigned(vec![p(0), p(1)]),
-                        awaiting(vec![]),
-                        Call::Revoked(vec![p(0), p(1)]),
-                        Call::Assigned(Vec::new()),
-                    ],
-                    vec![],
-                ),
-            ),
-            (
-                "a seek in the assign callback moves the position of the same poll",
-                Case {
+                ))
+                .expected_calls(vec![
+                    Call::Assigned(vec![p(0), p(1)]),
+                    awaiting(vec![]),
+                    Call::Revoked(vec![p(0), p(1)]),
+                    empty_assignment_call(),
+                ])
+                .expected_commit_generations(vec![])
+                .build(),
+            ListenerScenario::builder()
+                .name("a seek in the assign callback moves the position of the same poll")
+                .case(Case {
                     seek_on_assign: Some(3),
                     ..case(Assignor::Range, vec![p(0)], vec![p(0)], Event::Close, 4)
-                },
-                (
-                    vec![
-                        Call::Assigned(vec![p(0)]),
-                        awaiting(vec![]),
-                        Call::Position(Some(3)),
-                        Call::Revoked(vec![p(0)]),
-                    ],
-                    vec![],
-                ),
-            ),
-        ] {
-            actual.push((name, run_case(case).await));
-            wanted.push((name, expected));
-        }
-        assert2::assert!(actual == wanted);
+                })
+                .expected_calls(vec![
+                    Call::Assigned(vec![p(0)]),
+                    awaiting(vec![]),
+                    Call::Position(Some(3)),
+                    Call::Revoked(vec![p(0)]),
+                ])
+                .expected_commit_generations(vec![])
+                .build(),
+        ])
+        .await;
     }
 }
 
@@ -6887,7 +6402,7 @@ mod transport_configuration_tests {
     };
     use krabka_units::{kibibytes, millis};
 
-    use super::Consumer;
+    use super::{ClientError, Consumer};
 
     #[tokio::test]
     async fn consumer_retains_dns_and_socket_overrides_in_its_client() {
@@ -6930,16 +6445,16 @@ mod transport_configuration_tests {
         use super::ConsumerRetryPolicy;
         for backoff in [millis(100), secs(1), secs(2)] {
             let mock = MockBroker::start(|_, _, _, _| None).await;
-            let policy = ConsumerRetryPolicy::new(
-                secs(2),
-                secs(3),
-                backoff,
-                backoff,
-                secs(1),
-                millis(100),
-                secs(1),
-            )
-            .expect("policy");
+            let policy = ConsumerRetryPolicy::builder()
+                .startup_attempt_timeout(secs(2))
+                .startup_deadline(secs(3))
+                .startup_initial_backoff(backoff)
+                .startup_max_backoff(backoff)
+                .coordinator_retry_timeout(secs(1))
+                .coordinator_initial_backoff(millis(100))
+                .coordinator_max_backoff(secs(1))
+                .build()
+                .expect("policy");
             let started = tokio::time::Instant::now();
             let result = Consumer::builder()
                 .bootstrap(mock.addr.to_string())
@@ -6950,7 +6465,7 @@ mod transport_configuration_tests {
                 .build()
                 .await;
             assert!(matches!(result, Err(super::ConsumerError::Client(
-                krabka_client_core::ClientError::Timeout(deadline)
+                ClientError::Timeout(deadline)
             )) if deadline == secs(3)));
             assert!(started.elapsed() == secs(3).to_std());
             mock.stop();
