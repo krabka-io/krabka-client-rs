@@ -157,16 +157,19 @@ pub struct TransactionListing {
 /// Narrows a [`AdminClient::list_transactions`] call, as Kafka's
 /// `ListTransactionsOptions` does. The default matches every transaction, as
 /// Kafka's default options do.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, bon::Builder)]
 pub struct ListTransactionsFilter {
     /// Only transactions whose state name is in this list. Empty matches
     /// every state.
+    #[builder(default)]
     pub state_filters: Vec<String>,
     /// Only transactions whose producer ID is in this list. Empty matches
     /// every producer ID.
+    #[builder(default)]
     pub producer_id_filters: Vec<i64>,
     /// Only transactions that have run for at least this long. `None`
     /// matches every duration, as Kafka's `-1` filter does.
+    #[builder(default, with = |millis: Option<i64>| millis.map(Time::from_millis))]
     pub min_duration: Option<Time>,
 }
 
@@ -2494,16 +2497,16 @@ mod tests {
         for (name, filter, expected) in [
             (
                 "default matches everything",
-                ListTransactionsFilter::default(),
+                ListTransactionsFilter::builder().build(),
                 ListTransactionsRequest::default(),
             ),
             (
                 "every filter",
-                ListTransactionsFilter {
-                    state_filters: vec!["Ongoing".to_owned()],
-                    producer_id_filters: vec![4242],
-                    min_duration: Some(krabka_units::secs(90)),
-                },
+                ListTransactionsFilter::builder()
+                    .state_filters(vec!["Ongoing".to_owned()])
+                    .producer_id_filters(vec![4242])
+                    .min_duration(Some(90_000))
+                    .build(),
                 ListTransactionsRequest {
                     state_filters: vec!["Ongoing".to_owned()],
                     producer_id_filters: vec![4242],
@@ -2890,10 +2893,9 @@ mod tests {
                 .expect("cluster lock")
                 .extend([first_broker.addr, second_broker.addr]);
             let admin = fast_admin(first_broker.addr).await;
-            let filter = ListTransactionsFilter {
-                state_filters: vec!["Ongoing".to_owned()],
-                ..ListTransactionsFilter::default()
-            };
+            let filter = ListTransactionsFilter::builder()
+                .state_filters(vec!["Ongoing".to_owned()])
+                .build();
 
             let result = admin
                 .list_transactions(&filter)
@@ -2979,7 +2981,7 @@ mod tests {
             assert_send(admin.fence_producers(&["payments"]));
             assert_send(admin.abort_transaction(&orders_spec()));
             assert_send(admin.describe_producers(&[("orders".to_owned(), 0)]));
-            assert_send(admin.list_transactions(&ListTransactionsFilter::default()));
+            assert_send(admin.list_transactions(&ListTransactionsFilter::builder().build()));
         };
     }
 }

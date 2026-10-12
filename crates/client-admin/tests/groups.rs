@@ -50,7 +50,7 @@ async fn lists_groups_and_committed_offsets() {
     consumer.commit_sync().await.expect("commit_sync");
 
     let groups = admin
-        .list_groups(&ListGroupsOptions::default())
+        .list_groups(&ListGroupsOptions::builder().build())
         .await
         .expect("list_groups")
         .all()

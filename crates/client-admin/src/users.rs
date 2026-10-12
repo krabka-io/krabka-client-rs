@@ -103,14 +103,21 @@ pub struct AclEntry {
 
 /// Filter for `DescribeAcls` / `DeleteAcls`. Each `None` axis matches
 /// anything.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct AclEntryFilter {
+    #[builder(default)]
     pub resource_type: Option<ResourceType>,
+    #[builder(default, into)]
     pub resource_name: Option<String>,
+    #[builder(default)]
     pub pattern_type: Option<PatternType>,
+    #[builder(default, into)]
     pub principal: Option<String>,
+    #[builder(default, into)]
     pub host: Option<String>,
+    #[builder(default)]
     pub operation: Option<AclOperation>,
+    #[builder(default)]
     pub permission_type: Option<PermissionType>,
 }
 
@@ -955,7 +962,7 @@ mod tests {
 
     #[test]
     fn acl_filter_to_wire_uses_any_for_none_axes() {
-        let f = AclEntryFilter::default();
+        let f = AclEntryFilter::builder().build();
         let w = acl_filter_to_wire(&f);
         // 1 == Kafka's `AclBindingFilter.ANY` discriminant (`WIRE_ANY`).
         assert2::assert!(
@@ -974,15 +981,15 @@ mod tests {
 
     #[test]
     fn acl_filter_to_wire_passes_concrete_axes_through() {
-        let f = AclEntryFilter {
-            resource_type: Some(ResourceType::Topic),
-            resource_name: Some("orders".into()),
-            pattern_type: Some(PatternType::Literal),
-            principal: Some("User:alice".into()),
-            host: Some("10.0.0.0".into()),
-            operation: Some(AclOperation::Read),
-            permission_type: Some(PermissionType::Allow),
-        };
+        let f = AclEntryFilter::builder()
+            .resource_type(Some(ResourceType::Topic))
+            .resource_name(Some("orders".into()))
+            .pattern_type(Some(PatternType::Literal))
+            .principal(Some("User:alice".into()))
+            .host(Some("10.0.0.0".into()))
+            .operation(Some(AclOperation::Read))
+            .permission_type(Some(PermissionType::Allow))
+            .build();
         let w = acl_filter_to_wire(&f);
         assert2::assert!(
             w == DeleteAclsFilter {
@@ -1039,11 +1046,10 @@ mod tests {
         let mut admin = AdminClient::connect(&[mock.addr.to_string()])
             .await
             .expect("admin connects to mock broker");
-        let filter = AclEntryFilter {
-            resource_type: Some(ResourceType::Topic),
-            resource_name: Some("orders".into()),
-            ..Default::default()
-        };
+        let filter = AclEntryFilter::builder()
+            .resource_type(Some(ResourceType::Topic))
+            .resource_name(Some("orders".into()))
+            .build();
 
         let outcomes = admin
             .delete_acls(&[filter])
@@ -1168,10 +1174,9 @@ mod tests {
 
     #[test]
     fn describe_request_uses_any_for_unspecified_axes() {
-        let f = AclEntryFilter {
-            principal: Some("User:alice".into()),
-            ..Default::default()
-        };
+        let f = AclEntryFilter::builder()
+            .principal(Some("User:alice".into()))
+            .build();
         let r = filter_to_describe_request(&f);
         // 1 == Kafka's `AclBindingFilter.ANY` discriminant (`WIRE_ANY`).
         assert2::assert!(
@@ -1383,15 +1388,15 @@ mod tests {
 
     #[test]
     fn describe_request_passes_resource_name_and_host_filters_through() {
-        let f = AclEntryFilter {
-            resource_type: Some(ResourceType::Topic),
-            resource_name: Some("orders".into()),
-            pattern_type: Some(PatternType::Literal),
-            principal: Some("User:alice".into()),
-            host: Some("10.0.0.0".into()),
-            operation: Some(AclOperation::Read),
-            permission_type: Some(PermissionType::Allow),
-        };
+        let f = AclEntryFilter::builder()
+            .resource_type(Some(ResourceType::Topic))
+            .resource_name(Some("orders".into()))
+            .pattern_type(Some(PatternType::Literal))
+            .principal(Some("User:alice".into()))
+            .host(Some("10.0.0.0".into()))
+            .operation(Some(AclOperation::Read))
+            .permission_type(Some(PermissionType::Allow))
+            .build();
 
         let r = filter_to_describe_request(&f);
 

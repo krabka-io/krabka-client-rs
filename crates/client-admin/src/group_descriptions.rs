@@ -73,10 +73,11 @@ pub type StreamsGroupDescription = StreamsDescribedGroup;
 
 /// The options of the describe calls, as Apache Kafka's
 /// `Describe*GroupsOptions` hold them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bon::Builder)]
 pub struct DescribeGroupsOptions {
     /// Ask for the operations that the caller may perform on each group.
     /// Kafka's default is `false`.
+    #[builder(default)]
     pub include_authorized_operations: bool,
 }
 
@@ -1175,7 +1176,7 @@ mod tests {
         let result = admin
             .describe_consumer_groups(
                 &["kip848", "classic", "other", "missing", "connect"],
-                DescribeGroupsOptions::default(),
+                DescribeGroupsOptions::builder().build(),
             )
             .await;
 
@@ -1284,7 +1285,7 @@ mod tests {
             .await;
 
         let result = admin
-            .describe_consumer_groups(&["classic"], DescribeGroupsOptions::default())
+            .describe_consumer_groups(&["classic"], DescribeGroupsOptions::builder().build())
             .await;
 
         let b0 = node(cluster.addrs[0], 0);
@@ -1397,9 +1398,9 @@ mod tests {
                     .call()
                     .await;
                 let admin = cluster.admin(krabka_units::secs(5)).await;
-                let options = DescribeGroupsOptions {
-                    include_authorized_operations: true,
-                };
+                let options = DescribeGroupsOptions::builder()
+                    .include_authorized_operations(true)
+                    .build();
                 let result = match call {
                     Call::Classic => admin
                         .describe_classic_groups(&["workers"], options)
@@ -1494,7 +1495,7 @@ mod tests {
             .await;
 
         let result = admin
-            .describe_streams_groups(&["with", "without"], DescribeGroupsOptions::default())
+            .describe_streams_groups(&["with", "without"], DescribeGroupsOptions::builder().build())
             .await;
 
         let seen = cluster.stop();

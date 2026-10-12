@@ -785,13 +785,12 @@ pub fn role_partition(role: &Role, partitions: i32) -> Result<i32, CoordinationE
 /// The topic is compacted, so it keeps the last record of every role and every
 /// member and drops the rest.
 fn coordination_topic_spec(partitions: i32, replication: i32) -> CreateTopicSpec {
-    CreateTopicSpec {
-        name: COORDINATION_STATE_TOPIC.to_owned(),
-        partitions,
-        replicas: replication,
-        configs: BTreeMap::from([("cleanup.policy".to_owned(), "compact".to_owned())]),
-        ..Default::default()
-    }
+    CreateTopicSpec::builder()
+        .name(COORDINATION_STATE_TOPIC)
+        .partitions(partitions)
+        .replicas(replication)
+        .configs(BTreeMap::from([("cleanup.policy".to_owned(), "compact".to_owned())]))
+        .build()
 }
 
 /// Takes `TOPIC_ALREADY_EXISTS` for success and reports every other code.

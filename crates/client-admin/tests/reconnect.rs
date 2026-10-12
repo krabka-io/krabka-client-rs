@@ -164,7 +164,7 @@ async fn describe_acls_reconnects_after_cached_connection_closes() {
         .unwrap();
 
     let acls = admin
-        .describe_acls(&AclEntryFilter::default())
+        .describe_acls(&AclEntryFilter::builder().build())
         .await
         .unwrap();
 

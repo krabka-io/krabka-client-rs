@@ -41,9 +41,10 @@ const INVALID_TOPIC_EXCEPTION: i16 = 17;
 const UNKNOWN_TOPIC_ID: i16 = 100;
 
 /// What [`AdminClient::list_topics`] lists, as Kafka's `ListTopicsOptions`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bon::Builder)]
 pub struct ListTopicsOptions {
     /// List internal topics, such as `__consumer_offsets`, too.
+    #[builder(default)]
     pub list_internal: bool,
 }
 
@@ -60,12 +61,14 @@ pub struct TopicListing {
 
 /// What [`AdminClient::describe_topics`] asks for, as Kafka's
 /// `DescribeTopicsOptions`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
 pub struct DescribeTopicsOptions {
     /// Ask for the operations that the caller may perform on each topic.
+    #[builder(default)]
     pub include_authorized_operations: bool,
     /// The most partitions that one `DescribeTopicPartitions` answer
     /// carries. Kafka's default is 2000.
+    #[builder(default = 2000)]
     pub partition_size_limit_per_response: i32,
 }
 
@@ -594,7 +597,7 @@ impl AdminClient {
             return pages.out;
         }
         let nodes = match self
-            .describe_cluster(DescribeClusterOptions::default())
+            .describe_cluster(DescribeClusterOptions::builder().build())
             .await
         {
             Ok(cluster) => cluster
@@ -1009,7 +1012,7 @@ mod tests {
         .await;
         let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
         let result = admin
-            .describe_topics(&case.names, DescribeTopicsOptions::default())
+            .describe_topics(&case.names, DescribeTopicsOptions::builder().build())
             .await;
         let own = broker.addr;
         broker.stop();
@@ -1145,7 +1148,7 @@ mod tests {
                             12,
                             metadata_by_name_request(
                                 &BTreeSet::from(["alpha".to_owned(), "beta".to_owned()]),
-                                DescribeTopicsOptions::default(),
+                                DescribeTopicsOptions::builder().build(),
                             ),
                         )],
                     )
@@ -1240,7 +1243,7 @@ mod tests {
             .await;
             let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
             let result = admin
-                .list_topics(ListTopicsOptions { list_internal })
+                .list_topics(ListTopicsOptions::builder().list_internal(list_internal).build())
                 .await
                 .expect("list topics");
             broker.stop();
@@ -1267,10 +1270,9 @@ mod tests {
         );
         let unknown_beta = topic_err(100, Some(format!("TopicId {BETA} not found.")));
         let unsupported = topic_err(35, None);
-        let options = DescribeTopicsOptions {
-            include_authorized_operations: true,
-            ..DescribeTopicsOptions::default()
-        };
+        let options = DescribeTopicsOptions::builder()
+            .include_authorized_operations(true)
+            .build();
         let asked = BTreeSet::from([ALPHA, BETA]);
         for (name, max_metadata, topics, expected_requests) in [
             (

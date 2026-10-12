@@ -22,12 +22,14 @@ pub(crate) const ENFORCED_REBALANCE_REASON: &str = "rebalance enforced by user";
 
 /// How [`Consumer::close_with`](Consumer::close_with) closes the
 /// consumer. Kafka's `CloseOptions` (KIP-1092).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bon::Builder)]
 pub struct CloseOptions {
     /// What the consumer does with its group membership.
+    #[builder(default)]
     pub group_membership_operation: GroupMembershipOperation,
     /// The time that the close can take. `None` is
     /// [`DEFAULT_CONSUMER_CLOSE_TIMEOUT`].
+    #[builder(default, with = |millis: Option<i64>| millis.map(Time::from_millis))]
     pub timeout: Option<Time>,
 }
 
@@ -35,20 +37,16 @@ impl CloseOptions {
     /// The options with `timeout`. Kafka's `CloseOptions.timeout`.
     #[must_use]
     pub fn timeout(timeout: Time) -> Self {
-        Self {
-            timeout: Some(timeout),
-            ..Self::default()
-        }
+        Self::builder().timeout(Some(timeout.millis_i64())).build()
     }
 
     /// The options with `operation`. Kafka's
     /// `CloseOptions.groupMembershipOperation`.
     #[must_use]
     pub fn group_membership_operation(operation: GroupMembershipOperation) -> Self {
-        Self {
-            group_membership_operation: operation,
-            ..Self::default()
-        }
+        Self::builder()
+            .group_membership_operation(operation)
+            .build()
     }
 }
 
@@ -176,7 +174,7 @@ mod tests {
     #[test]
     fn close_timeout_follows_kafkas_close() {
         let actual = [
-            CloseOptions::default(),
+            CloseOptions::builder().build(),
             CloseOptions::timeout(millis(250)),
             CloseOptions::timeout(Time::from_secs_f64(-1.0)),
         ]

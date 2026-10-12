@@ -94,13 +94,12 @@ async fn create_topic_with_override(admin: &mut AdminClient, topic: &str) {
     let configs = BTreeMap::from([("retention.ms".to_owned(), "60000".to_owned())]);
     let outcomes = admin
         .create_topics(
-            &[CreateTopicSpec {
-                name: topic.to_owned(),
-                partitions: 3,
-                replicas: 1,
-                configs,
-                ..Default::default()
-            }],
+            &[CreateTopicSpec::builder()
+                .name(topic)
+                .partitions(3)
+                .replicas(1)
+                .configs(configs)
+                .build()],
             TopicMutationOptions::with_timeout(krabka_units::secs(RPC_TIMEOUT_SECS)),
         )
         .await
@@ -187,7 +186,7 @@ async fn set_override(admin: &mut AdminClient, topic: &str) {
                 ConfigResource::topic(topic),
                 vec![AlterConfigOp::set("cleanup.policy", "compact")],
             )]),
-            IncrementalAlterConfigsOptions::default(),
+            IncrementalAlterConfigsOptions::builder().build(),
         )
         .await
         .expect("incremental_alter_configs set");
@@ -212,7 +211,7 @@ async fn delete_override(admin: &mut AdminClient, topic: &str) {
                 ConfigResource::topic(topic),
                 vec![AlterConfigOp::delete("retention.ms")],
             )]),
-            IncrementalAlterConfigsOptions::default(),
+            IncrementalAlterConfigsOptions::builder().build(),
         )
         .await
         .expect("incremental_alter_configs delete");
@@ -294,7 +293,7 @@ async fn await_overrides(
             let mut described = admin
                 .describe_configs(
                     std::slice::from_ref(&resource),
-                    DescribeConfigsOptions::default(),
+                    DescribeConfigsOptions::builder().build(),
                 )
                 .await
                 .expect("describe_configs");
