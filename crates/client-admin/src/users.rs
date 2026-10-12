@@ -1170,9 +1170,7 @@ mod tests {
 
     #[test]
     fn describe_request_uses_any_for_unspecified_axes() {
-        let f = AclEntryFilter::builder()
-            .principal("User:alice")
-            .build();
+        let f = AclEntryFilter::builder().principal("User:alice").build();
         let r = filter_to_describe_request(&f);
         // 1 == Kafka's `AclBindingFilter.ANY` discriminant (`WIRE_ANY`).
         assert2::assert!(
