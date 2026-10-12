@@ -48,6 +48,7 @@ tokio-util = { workspace = true, features = ["codec", "rt"] }
 dashmap = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
+maplit = { workspace = true }
 refined_type = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

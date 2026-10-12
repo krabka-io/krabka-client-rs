@@ -1040,10 +1040,10 @@ mod tests {
                 metadata_topics: Vec::new(),
                 expected: |own| {
                     (
-                        BTreeMap::from([
-                            ("alpha".to_owned(), Ok(paged("alpha", &[0], own))),
-                            ("beta".to_owned(), Ok(paged("beta", &[0, 1], own))),
-                        ]),
+                        maplit::btreemap! {
+                            "alpha".to_owned() => Ok(paged("alpha", &[0], own)),
+                            "beta".to_owned() => Ok(paged("beta", &[0, 1], own)),
+                        },
                         vec![Received::Pages(dtp_request(&["alpha", "beta"], None))],
                     )
                 },
@@ -1063,10 +1063,10 @@ mod tests {
                 metadata_topics: Vec::new(),
                 expected: |own| {
                     (
-                        BTreeMap::from([
-                            ("alpha".to_owned(), Ok(paged("alpha", &[0], own))),
-                            ("beta".to_owned(), Ok(paged("beta", &[0, 1, 2], own))),
-                        ]),
+                        maplit::btreemap! {
+                            "alpha".to_owned() => Ok(paged("alpha", &[0], own)),
+                            "beta".to_owned() => Ok(paged("beta", &[0, 1, 2], own)),
+                        },
                         vec![
                             Received::Pages(dtp_request(&["alpha", "beta"], None)),
                             Received::Pages(dtp_request(&["beta"], Some(("beta", 1)))),
@@ -1086,10 +1086,10 @@ mod tests {
                 metadata_topics: Vec::new(),
                 expected: |own| {
                     (
-                        BTreeMap::from([
-                            ("alpha".to_owned(), topic_err(29, None)),
-                            ("beta".to_owned(), Ok(paged("beta", &[0], own))),
-                        ]),
+                        maplit::btreemap! {
+                            "alpha".to_owned() => topic_err(29, None),
+                            "beta".to_owned() => Ok(paged("beta", &[0], own)),
+                        },
                         vec![Received::Pages(dtp_request(&["alpha", "beta"], None))],
                     )
                 },
@@ -1106,7 +1106,9 @@ mod tests {
                 metadata_topics: Vec::new(),
                 expected: |own| {
                     (
-                        BTreeMap::from([("alpha".to_owned(), Ok(paged("alpha", &[0], own)))]),
+                        maplit::btreemap! {
+                            "alpha".to_owned() => Ok(paged("alpha", &[0], own)),
+                        },
                         vec![
                             Received::Pages(dtp_request(&["alpha"], None)),
                             Received::Pages(dtp_request(&["alpha"], None)),
@@ -1123,31 +1125,25 @@ mod tests {
                 metadata_topics: vec![metadata_topic("alpha", 0, &[1, 0], -1)],
                 expected: |own| {
                     (
-                        BTreeMap::from([
-                            (
-                                String::new(),
-                                topic_err(
-                                    17,
-                                    Some(
-                                        "The given topic name '' cannot be represented in a \
-                                         request."
-                                            .to_owned(),
-                                    ),
-                                ),
+                        maplit::btreemap! {
+                            String::new() => topic_err(
+                            17,
+                            Some(
+                                "The given topic name '' cannot be represented in a \
+                                 request."
+                                    .to_owned(),
                             ),
-                            (
-                                "alpha".to_owned(),
-                                Ok(from_metadata("alpha", &[0, 1], own, false)),
-                            ),
-                            (
-                                "beta".to_owned(),
-                                topic_err(3, Some("Topic beta not found.".to_owned())),
-                            ),
-                        ]),
+                        ),
+                            "alpha".to_owned() => Ok(from_metadata("alpha", &[0, 1], own, false)),
+                            "beta".to_owned() => topic_err(3, Some("Topic beta not found.".to_owned())),
+                        },
                         vec![Received::Metadata(
                             12,
                             metadata_by_name_request(
-                                &BTreeSet::from(["alpha".to_owned(), "beta".to_owned()]),
+                                &maplit::btreeset! {
+                                    "alpha".to_owned(),
+                                    "beta".to_owned(),
+                                },
                                 DescribeTopicsOptions::builder().build(),
                             ),
                         )],
@@ -1163,7 +1159,9 @@ mod tests {
                 metadata_topics: Vec::new(),
                 expected: |_| {
                     (
-                        BTreeMap::from([("alpha".to_owned(), topic_err(31, None))]),
+                        maplit::btreemap! {
+                            "alpha".to_owned() => topic_err(31, None),
+                        },
                         Vec::new(),
                     )
                 },
@@ -1183,29 +1181,32 @@ mod tests {
     /// topics only with `listInternal`, and retries a lost connection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_topics_keeps_internal_topics_on_request() {
-        let listing = |name: &str, is_internal| {
-            (
-                name.to_owned(),
-                TopicListing {
-                    name: name.to_owned(),
-                    topic_id: Some(id_of(name)),
-                    is_internal,
-                },
-            )
+        let listing = |name: &str, is_internal| TopicListing {
+            name: name.to_owned(),
+            topic_id: Some(id_of(name)),
+            is_internal,
         };
         for (name, list_internal, close_first, expected) in [
             (
                 "without internal topics",
                 false,
                 false,
-                (BTreeMap::from([listing("alpha", false)]), 1),
+                (
+                    maplit::btreemap! {
+                        "alpha".to_owned() => listing("alpha", false),
+                    },
+                    1,
+                ),
             ),
             (
                 "with internal topics",
                 true,
                 false,
                 (
-                    BTreeMap::from([listing("__consumer_offsets", true), listing("alpha", false)]),
+                    maplit::btreemap! {
+                        "__consumer_offsets".to_owned() => listing("__consumer_offsets", true),
+                        "alpha".to_owned() => listing("alpha", false),
+                    },
                     1,
                 ),
             ),
@@ -1213,7 +1214,12 @@ mod tests {
                 "a lost connection is retried",
                 false,
                 true,
-                (BTreeMap::from([listing("alpha", false)]), 2),
+                (
+                    maplit::btreemap! {
+                        "alpha".to_owned() => listing("alpha", false),
+                    },
+                    2,
+                ),
             ),
         ] {
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1277,7 +1283,10 @@ mod tests {
         let options = DescribeTopicsOptions::builder()
             .include_authorized_operations(true)
             .build();
-        let asked = BTreeSet::from([ALPHA, BETA]);
+        let asked = maplit::btreeset! {
+            ALPHA,
+            BETA,
+        };
         for (name, max_metadata, topics, expected_requests) in [
             (
                 "found and missing",
@@ -1341,17 +1350,17 @@ mod tests {
             let own = broker.addr;
             broker.stop();
             let expected = if max_metadata < 12 {
-                BTreeMap::from([
-                    (Uuid::nil(), nil.clone()),
-                    (ALPHA, unsupported.clone()),
-                    (BETA, unsupported.clone()),
-                ])
+                maplit::btreemap! {
+                    Uuid::nil() => nil.clone(),
+                    ALPHA => unsupported.clone(),
+                    BETA => unsupported.clone(),
+                }
             } else {
-                BTreeMap::from([
-                    (Uuid::nil(), nil.clone()),
-                    (ALPHA, Ok(from_metadata("alpha", &[0], own, true))),
-                    (BETA, unknown_beta.clone()),
-                ])
+                maplit::btreemap! {
+                    Uuid::nil() => nil.clone(),
+                    ALPHA => Ok(from_metadata("alpha", &[0], own, true)),
+                    BETA => unknown_beta.clone(),
+                }
             };
             assert2::assert!(
                 (result, requests.lock().expect("requests lock").clone())
@@ -1367,7 +1376,12 @@ mod tests {
     fn describe_page_reads_authorized_operations_on_request() {
         for (include, expected) in [
             (false, None),
-            (true, Some(BTreeSet::from([AclOperation::Read]))),
+            (
+                true,
+                Some(maplit::btreeset! {
+                    AclOperation::Read,
+                }),
+            ),
         ] {
             let description = description_from_describe(
                 &page_topic("alpha", 0, &[]),

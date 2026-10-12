@@ -262,12 +262,12 @@ fn describe_results_decode_each_resource() {
     let broker = ConfigResource::broker(1);
     let missing = ConfigResource::topic("missing");
     let skipped = ConfigResource::group("billing");
-    let asked = BTreeSet::from([
+    let asked = maplit::btreeset! {
         orders.clone(),
         broker.clone(),
         missing.clone(),
         skipped.clone(),
-    ]);
+    };
     let response = DescribeConfigsResponse {
         results: vec![
             DescribeConfigsResult {
@@ -316,62 +316,50 @@ fn describe_results_decode_each_resource() {
         ],
         ..Default::default()
     };
-    let expected = BTreeMap::from([
-        (
-            orders,
-            Ok(config(vec![
-                ConfigEntry {
-                    synonyms: vec![
-                        ConfigSynonym {
-                            name: "retention.ms".into(),
-                            value: Some("60000".into()),
-                            source: ConfigSource::DynamicTopicConfig,
-                        },
-                        ConfigSynonym {
-                            name: "log.retention.ms".into(),
-                            value: None,
-                            source: ConfigSource::DefaultConfig,
-                        },
-                    ],
-                    config_type: ConfigType::Long,
-                    documentation: Some("How long to keep a log.".into()),
-                    ..entry(
-                        "retention.ms",
-                        Some("60000"),
-                        ConfigSource::DynamicTopicConfig,
-                    )
+    let expected = maplit::btreemap! {
+        orders => Ok(config(vec![
+        ConfigEntry {
+            synonyms: vec![
+                ConfigSynonym {
+                    name: "retention.ms".into(),
+                    value: Some("60000".into()),
+                    source: ConfigSource::DynamicTopicConfig,
                 },
-                ConfigEntry {
-                    config_type: ConfigType::Unknown,
-                    ..entry("future.type", Some("x"), ConfigSource::Unknown)
+                ConfigSynonym {
+                    name: "log.retention.ms".into(),
+                    value: None,
+                    source: ConfigSource::DefaultConfig,
                 },
-            ])),
-        ),
-        (
-            broker,
-            Ok(config(vec![ConfigEntry {
-                is_sensitive: true,
-                is_read_only: true,
-                config_type: ConfigType::Password,
-                ..entry("ssl.key.password", None, ConfigSource::StaticBrokerConfig)
-            }])),
-        ),
-        (
-            missing,
-            Err(KafkaError {
-                code: 3,
-                name: "UNKNOWN_TOPIC_OR_PARTITION",
-                message: Some("no such topic".into()),
-            }),
-        ),
-        (
-            skipped,
-            Err(unknown_server_error_with(
-                "The node response did not contain a result for config resource \
-                 ConfigResource { resource_type: Group, name: \"billing\" }",
-            )),
-        ),
-    ]);
+            ],
+            config_type: ConfigType::Long,
+            documentation: Some("How long to keep a log.".into()),
+            ..entry(
+                "retention.ms",
+                Some("60000"),
+                ConfigSource::DynamicTopicConfig,
+            )
+        },
+        ConfigEntry {
+            config_type: ConfigType::Unknown,
+            ..entry("future.type", Some("x"), ConfigSource::Unknown)
+        },
+    ])),
+        broker => Ok(config(vec![ConfigEntry {
+        is_sensitive: true,
+        is_read_only: true,
+        config_type: ConfigType::Password,
+        ..entry("ssl.key.password", None, ConfigSource::StaticBrokerConfig)
+    }])),
+        missing => Err(KafkaError {
+        code: 3,
+        name: "UNKNOWN_TOPIC_OR_PARTITION",
+        message: Some("no such topic".into()),
+    }),
+        skipped => Err(unknown_server_error_with(
+        "The node response did not contain a result for config resource \
+         ConfigResource { resource_type: Group, name: \"billing\" }",
+    )),
+    };
     assert2::assert!(describe_results(&asked, Ok(response)) == expected);
 }
 
@@ -382,7 +370,10 @@ fn describe_results_decode_each_resource() {
 fn describe_results_fail_every_resource_of_a_bad_answer() {
     let orders = ConfigResource::topic("orders");
     let broker = ConfigResource::broker(1);
-    let asked = BTreeSet::from([orders.clone(), broker.clone()]);
+    let asked = maplit::btreeset! {
+        orders.clone(),
+        broker.clone(),
+    };
     let with_entry = |entry| DescribeConfigsResponse {
         results: vec![
             DescribeConfigsResult {
@@ -440,10 +431,10 @@ fn describe_results_fail_every_resource_of_a_bad_answer() {
             unknown_server_error_with("id should be positive, id: -3"),
         ),
     ] {
-        let every = BTreeMap::from([
-            (orders.clone(), Err(expected.clone())),
-            (broker.clone(), Err(expected)),
-        ]);
+        let every = maplit::btreemap! {
+            orders.clone() => Err(expected.clone()),
+            broker.clone() => Err(expected),
+        };
         assert2::assert!(describe_results(&asked, answer) == every, "case {name}");
     }
 }
@@ -756,10 +747,10 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
                     describe_wire(std::slice::from_ref(&broker_2), true, true),
                 ),
             ],
-            BTreeMap::from([
-                (orders.clone(), Ok(answered_by(1))),
-                (broker_2.clone(), Ok(answered_by(2))),
-            ]),
+            maplit::btreemap! {
+                orders.clone() => Ok(answered_by(1)),
+                broker_2.clone() => Ok(answered_by(2)),
+            },
         ),
         (
             "synonyms go at v1",
@@ -774,14 +765,13 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
             )],
             // v1 carries no type or documentation: each reads as its schema
             // default, `UNKNOWN` and "", as in Kafka.
-            BTreeMap::from([(
-                orders.clone(),
-                Ok(config(vec![ConfigEntry {
-                    config_type: ConfigType::Unknown,
-                    documentation: Some(String::new()),
-                    ..entry("answered.by", Some("broker-1"), ConfigSource::DefaultConfig)
-                }])),
-            )]),
+            maplit::btreemap! {
+                orders.clone() => Ok(config(vec![ConfigEntry {
+                config_type: ConfigType::Unknown,
+                documentation: Some(String::new()),
+                ..entry("answered.by", Some("broker-1"), ConfigSource::DefaultConfig)
+            }])),
+            },
         ),
         (
             "documentation needs v3",
@@ -790,7 +780,10 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
             both.clone(),
             documentation,
             vec![],
-            BTreeMap::from([(orders.clone(), Err(35)), (broker_2.clone(), Err(35))]),
+            maplit::btreemap! {
+                orders.clone() => Err(35),
+                broker_2.clone() => Err(35),
+            },
         ),
         (
             "an unreachable broker fails its own resources",
@@ -803,10 +796,10 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
                 4,
                 describe_wire(std::slice::from_ref(&orders), false, false),
             )],
-            BTreeMap::from([
-                (orders.clone(), Ok(answered_by(1))),
-                (broker_2.clone(), Err(7)),
-            ]),
+            maplit::btreemap! {
+                orders.clone() => Ok(answered_by(1)),
+                broker_2.clone() => Err(7),
+            },
         ),
     ] {
         let timeout = if broker_2_down { SHORT } else { LONG };
@@ -876,27 +869,24 @@ async fn incremental_alter_configs_routes_each_resource_as_kafka_does() {
     ];
     let broker_ops = vec![AlterConfigOp::set("log.cleaner.threads", "2")];
     let logger_ops = vec![AlterConfigOp::set("kafka.server", "DEBUG")];
-    let configs = BTreeMap::from([
-        (orders.clone(), topic_ops.clone()),
-        (bad.clone(), broker_ops.clone()),
-        (broker_2.clone(), broker_ops.clone()),
-        (default.clone(), broker_ops.clone()),
-        (logger_2.clone(), logger_ops.clone()),
-    ]);
-    let expected = BTreeMap::from([
-        (orders.clone(), Ok(())),
-        (
-            bad.clone(),
-            Err(KafkaError {
-                code: 40,
-                name: "INVALID_CONFIG",
-                message: Some("bad value".into()),
-            }),
-        ),
-        (broker_2.clone(), Ok(())),
-        (default.clone(), Ok(())),
-        (logger_2.clone(), Ok(())),
-    ]);
+    let configs = maplit::btreemap! {
+        orders.clone() => topic_ops.clone(),
+        bad.clone() => broker_ops.clone(),
+        broker_2.clone() => broker_ops.clone(),
+        default.clone() => broker_ops.clone(),
+        logger_2.clone() => logger_ops.clone(),
+    };
+    let expected = maplit::btreemap! {
+        orders.clone() => Ok(()),
+        bad.clone() => Err(KafkaError {
+        code: 40,
+        name: "INVALID_CONFIG",
+        message: Some("bad value".into()),
+    }),
+        broker_2.clone() => Ok(()),
+        default.clone() => Ok(()),
+        logger_2.clone() => Ok(()),
+    };
     for validate_only in [false, true] {
         let mut cluster = Cluster::start(ECHO, false, 4, LONG).await;
         let result = cluster
@@ -944,10 +934,10 @@ async fn incremental_alter_configs_retries_not_controller_and_isolates_failures(
     let orders = ConfigResource::topic("orders");
     let broker_2 = ConfigResource::broker(2);
     let ops = vec![AlterConfigOp::set("retention.ms", "60000")];
-    let configs = BTreeMap::from([
-        (orders.clone(), ops.clone()),
-        (broker_2.clone(), ops.clone()),
-    ]);
+    let configs = maplit::btreemap! {
+        orders.clone() => ops.clone(),
+        broker_2.clone() => ops.clone(),
+    };
     let to_1 = Received::Alter(1, alter_wire(&[(&orders, &ops)], false));
     let to_2 = Received::Alter(2, alter_wire(&[(&broker_2, &ops)], false));
     let not_controller_once = Script {
@@ -966,21 +956,30 @@ async fn incremental_alter_configs_retries_not_controller_and_isolates_failures(
             not_controller_once,
             false,
             vec![to_1.clone(), to_1.clone(), to_2.clone(), to_2.clone()],
-            BTreeMap::from([(orders.clone(), Ok(())), (broker_2.clone(), Ok(()))]),
+            maplit::btreemap! {
+                orders.clone() => Ok(()),
+                broker_2.clone() => Ok(()),
+            },
         ),
         (
             "no result",
             no_results,
             false,
             vec![to_1.clone(), to_2.clone()],
-            BTreeMap::from([(orders.clone(), Err(-1)), (broker_2.clone(), Err(-1))]),
+            maplit::btreemap! {
+                orders.clone() => Err(-1),
+                broker_2.clone() => Err(-1),
+            },
         ),
         (
             "an unreachable broker",
             ECHO,
             true,
             vec![to_1.clone()],
-            BTreeMap::from([(orders.clone(), Ok(())), (broker_2.clone(), Err(7))]),
+            maplit::btreemap! {
+                orders.clone() => Ok(()),
+                broker_2.clone() => Err(7),
+            },
         ),
     ] {
         let timeout = if broker_2_down { SHORT } else { LONG };
@@ -1080,7 +1079,10 @@ async fn incremental_alter_configs_through_controllers_routes_as_kafka_does() {
     let broker = ConfigResource::broker(1);
     let logger = ConfigResource::broker_logger(3000);
     let ops = vec![AlterConfigOp::set("log.cleaner.threads", "2")];
-    let configs = BTreeMap::from([(broker.clone(), ops.clone()), (logger.clone(), ops.clone())]);
+    let configs = maplit::btreemap! {
+        broker.clone() => ops.clone(),
+        logger.clone() => ops.clone(),
+    };
     let result = admin
         .incremental_alter_configs(&configs, IncrementalAlterConfigsOptions::builder().build())
         .await
@@ -1093,7 +1095,10 @@ async fn incremental_alter_configs_through_controllers_routes_as_kafka_does() {
     assert2::assert!(
         (result, requests)
             == (
-                BTreeMap::from([(broker.clone(), Ok(())), (logger.clone(), Ok(()))]),
+                maplit::btreemap! {
+                    broker.clone() => Ok(()),
+                    logger.clone() => Ok(()),
+                },
                 vec![
                     alter_wire(&[(&logger, &ops)], false),
                     alter_wire(&[(&logger, &ops)], false),

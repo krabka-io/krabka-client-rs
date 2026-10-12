@@ -864,7 +864,7 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 Query::Beginning,
                 (Some(found), 0, 5),
-                Answer::Offsets(HashMap::from([(key(0), 3), (key(1), 4)])),
+                Answer::Offsets(maplit::hashmap! {key(0) => 3, key(1) => 4}),
                 vec![request(0, [-2, -2])],
             ),
             (
@@ -872,7 +872,7 @@ mod tests {
                 IsolationLevel::ReadCommitted,
                 Query::End,
                 (Some(found), 0, 5),
-                Answer::Offsets(HashMap::from([(key(0), 3), (key(1), 4)])),
+                Answer::Offsets(maplit::hashmap! {key(0) => 3, key(1) => 4}),
                 vec![request(1, [-1, -1])],
             ),
             (
@@ -880,17 +880,11 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 Query::Times([1000, 2000]),
                 (Some(found), 0, 5),
-                Answer::Times(HashMap::from([
-                    (
-                        key(0),
-                        Some(OffsetAndTimestamp {
+                Answer::Times(maplit::hashmap! {key(0) => Some(OffsetAndTimestamp {
                             offset: 42,
                             timestamp: 1005,
                             leader_epoch: Some(2),
-                        }),
-                    ),
-                    (key(1), None),
-                ])),
+                        }), key(1) => None}),
                 vec![request(0, [1000, 2000])],
             ),
             (
@@ -941,17 +935,11 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 Query::Times([1000, 2000]),
                 (Some(found), 0, 1),
-                Answer::Times(HashMap::from([
-                    (
-                        key(0),
-                        Some(OffsetAndTimestamp {
+                Answer::Times(maplit::hashmap! {key(0) => Some(OffsetAndTimestamp {
                             offset: 42,
                             timestamp: 1005,
                             leader_epoch: None,
-                        }),
-                    ),
-                    (key(1), None),
-                ])),
+                        }), key(1) => None}),
                 vec![ListOffsetsRequest {
                     replica_id: -1,
                     topics: vec![ListOffsetsTopic {
@@ -1045,10 +1033,9 @@ mod tests {
             (
                 "no error",
                 0,
-                Ok(Some(HashMap::from([(
-                    "orders".to_string(),
-                    orders.clone(),
-                )]))),
+                Ok(Some(
+                    maplit::hashmap! {"orders".to_string() => orders.clone()},
+                )),
             ),
             ("unknown topic", 3, Ok(Some(HashMap::new()))),
             ("leader not available", 5, Ok(None)),

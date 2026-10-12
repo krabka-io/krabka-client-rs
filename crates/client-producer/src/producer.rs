@@ -2821,7 +2821,7 @@ mod tests {
     };
 
     use super::{
-        DrainIntent, HashMap, Producer, TxnOffsetCommitCap, TxnOffsetCommitRequest,
+        DrainIntent, Producer, TxnOffsetCommitCap, TxnOffsetCommitRequest,
         TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic, TxnOffsetCommitResponse,
         build_topics_payload, minted_identity, request_may_have_reached_the_broker,
         txn_offset_commit_error_code, wake_sender_after_append,
@@ -3251,11 +3251,9 @@ mod tests {
             partitions,
             ..Default::default()
         };
-        let both_ids = HashMap::from([
-            ("orders".to_owned(), orders),
-            ("payments".to_owned(), payments),
-        ]);
-        let one_id = HashMap::from([("orders".to_owned(), orders)]);
+        let both_ids =
+            maplit::hashmap! {"orders".to_owned() => orders, "payments".to_owned() => payments};
+        let one_id = maplit::hashmap! {"orders".to_owned() => orders};
         for (name, topic_ids, transaction_v2, expected) in [
             (
                 "every topic has an id",
@@ -3621,7 +3619,7 @@ mod tests {
         };
         // Kafka's `ProducerMetadata.newMetadataRequestBuilder` names the
         // producer's topics and allows auto topic creation.
-        let orders_request = || BTreeSet::from([(Some(vec![METADATA_TOPIC.to_owned()]), true)]);
+        let orders_request = || maplit::btreeset! {(Some(vec![METADATA_TOPIC.to_owned()]), true)};
         let delivered = |partition: i32| SendOutcome {
             delivered: Ok(partition),
             produced_partitions: vec![partition],

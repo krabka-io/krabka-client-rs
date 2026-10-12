@@ -37,7 +37,7 @@ use krabka_protocol::{
 
 use crate::{
     AdminClient, AdminError, ClusterNode, KafkaError,
-    cluster::authorized_operations,
+    cluster::{authorized_operations, node_with_host_port},
     group_coordinators::{GroupOutcome, group_error_outcome, kafka_error},
     groups::{GroupState, GroupType, list_groups_kafka_error},
     kafka_error_name,
@@ -217,16 +217,16 @@ macro_rules! impl_group_description_entry {
                 &self.group_id
             }
 
-            fn error_code(&self) -> i16 {
-                self.error_code
-            }
-
             fn error_message(self) -> Option<String> {
                 ($error_message)(self)
             }
 
             fn successful_outcome(self) -> GroupOutcome<Self> {
                 ($successful_outcome)(self)
+            }
+
+            fn error_code(&self) -> i16 {
+                self.error_code
             }
         }
     };
@@ -361,13 +361,11 @@ fn classic_consumer_description_outcome(
 
 /// The node that `FindCoordinator` named, as Kafka's `Node` holds it.
 fn coordinator_node(coordinator: &CoordinatorEndpoint) -> ClusterNode {
-    ClusterNode {
-        id: coordinator.node_id,
-        host: coordinator.host.clone(),
-        port: coordinator.port,
-        rack: None,
-        is_fenced: false,
-    }
+    node_with_host_port(
+        coordinator.node_id,
+        coordinator.host.clone(),
+        coordinator.port,
+    )
 }
 
 /// The outcome of every group of `keys` after a request to their coordinator
@@ -394,17 +392,27 @@ pub(crate) fn request_error_outcomes<V>(
 fn consumer_assignment(
     assignment: krabka_protocol::owned::common::consumer_group_describe_response::assignment::Assignment,
 ) -> BTreeSet<(String, i32)> {
-    assignment
-        .topic_partitions
+    assignment_partitions(
+        assignment
+            .topic_partitions
+            .into_iter()
+            .map(|topic| (topic.topic_name, topic.partitions)),
+    )
+}
+
+fn assignment_partitions(
+    topics: impl IntoIterator<Item = (String, Vec<i32>)>,
+) -> BTreeSet<(String, i32)> {
+    topics
         .into_iter()
-        .flat_map(|topic| {
-            let name = topic.topic_name;
-            topic
-                .partitions
-                .into_iter()
-                .map(move |partition| (name.clone(), partition))
+        .fold(BTreeSet::new(), |mut result, (name, partitions)| {
+            result.extend(
+                partitions
+                    .into_iter()
+                    .map(|partition| (name.clone(), partition)),
+            );
+            result
         })
-        .collect()
 }
 
 /// A member of a `ConsumerGroupDescribe` answer, as Kafka's
@@ -441,17 +449,12 @@ fn classic_assignment(mut bytes: &[u8]) -> Result<BTreeSet<(String, i32)>, Strin
     let version = version.min(consumer_protocol_assignment::MAX_VERSION);
     let assignment = ConsumerProtocolAssignment::decode(&mut bytes, version)
         .map_err(|error| format!("Error reading consumer assignment: {error}"))?;
-    Ok(assignment
-        .assigned_partitions
-        .into_iter()
-        .flat_map(|topic| {
-            let name = topic.topic;
-            topic
-                .partitions
-                .into_iter()
-                .map(move |partition| (name.clone(), partition))
-        })
-        .collect())
+    Ok(assignment_partitions(
+        assignment
+            .assigned_partitions
+            .into_iter()
+            .map(|topic| (topic.topic, topic.partitions)),
+    ))
 }
 
 /// A member of a classic `DescribeGroups` answer, as Kafka's
@@ -797,6 +800,31 @@ mod tests {
         partition_leaders::test_support::{ApiVersionRange, decode_request, encode_response},
     };
 
+    fn api_range(api_key: i16, max_version: i16) -> ApiVersionRange {
+        ApiVersionRange::builder()
+            .api_key(api_key)
+            .max_version(max_version)
+            .build()
+    }
+
+    fn mock_response(bytes: Vec<u8>) -> MockReply {
+        MockReply::Respond(bytes)
+    }
+
+    fn classic_response(groups: Vec<ClassicDescribedGroup>) -> DescribeGroupsResponse {
+        let mut response = DescribeGroupsResponse::default();
+        response.groups = groups;
+        response
+    }
+
+    const FALLBACK_GROUPS: [&str; 5] = ["kip848", "classic", "other", "missing", "connect"];
+    const STREAMS_GROUPS: [&str; 2] = ["with", "without"];
+
+    struct AdminGroupCluster {
+        cluster: GroupCluster,
+        admin: AdminClient,
+    }
+
     macro_rules! described_group {
         ($entry:ident, $error_code:expr, $error_message:expr $(, $field:ident = $value:expr)* $(,)?) => {
             $entry {
@@ -809,9 +837,17 @@ mod tests {
         };
     }
 
-    struct AdminGroupCluster {
-        cluster: GroupCluster,
-        admin: AdminClient,
+    macro_rules! encode_described_group {
+        ($response:ident, $entry:ident, $code:expr, $message:expr, $version:expr, $flexible:expr $(, $field:ident = $value:expr)* $(,)?) => {
+            crate::encode_test_struct_field!(
+                encode_response,
+                $response,
+                groups,
+                vec![described_group!($entry, $code, $message $(, $field = $value)*)],
+                $version,
+                $flexible,
+            )
+        };
     }
 
     #[bon::builder]
@@ -851,49 +887,31 @@ mod tests {
         bytes.freeze()
     }
 
-    #[test]
-    fn classic_assignment_reads_as_kafka_does() {
-        let set = |pairs: &[(&str, i32)]| {
-            pairs
-                .iter()
-                .map(|(topic, partition)| ((*topic).to_owned(), *partition))
-                .collect::<BTreeSet<_>>()
-        };
-        for (name, bytes, expected) in [
-            ("empty", bytes::Bytes::new(), Ok(BTreeSet::new())),
-            (
-                "v0",
-                assignment_bytes(0, &[("orders", &[0, 2])]),
-                Ok(set(&[("orders", 0), ("orders", 2)])),
-            ),
-            (
-                "a newer version reads as v3",
-                assignment_bytes(9, &[("orders", &[1])]),
-                Ok(set(&[("orders", 1)])),
-            ),
-            (
-                "negative version",
-                bytes::Bytes::from_static(&[0xff, 0xff]),
-                Err("Unsupported assignment version: -1".to_owned()),
-            ),
-            (
-                "truncated header",
-                bytes::Bytes::from_static(&[0]),
-                Err("Buffer underflow while parsing consumer protocol's header".to_owned()),
-            ),
-        ] {
-            assert!(classic_assignment(&bytes) == expected, "case {name}");
-        }
+    #[yare::parameterized(
+        empty = { bytes::Bytes::new(), Ok(BTreeSet::new()) },
+        v0 = { assignment_bytes(0, &[("orders", &[0, 2])]), Ok(maplit::btreeset! {
+            ("orders".to_owned(), 0),
+            ("orders".to_owned(), 2),
+        }) },
+        newer_version = { assignment_bytes(9, &[("orders", &[1])]), Ok(maplit::btreeset! {
+            ("orders".to_owned(), 1),
+        }) },
+        negative_version = { bytes::Bytes::from_static(&[0xff, 0xff]), Err("Unsupported assignment version: -1".to_owned()) },
+        truncated_header = { bytes::Bytes::from_static(&[0]), Err("Buffer underflow while parsing consumer protocol's header".to_owned()) },
+    )]
+    fn classic_assignment_reads_as_kafka_does(
+        bytes: bytes::Bytes,
+        expected: Result<BTreeSet<(String, i32)>, String>,
+    ) {
+        assert2::assert!(classic_assignment(&bytes) == expected);
     }
 
     fn node(addr: std::net::SocketAddr, id: i32) -> ClusterNode {
-        ClusterNode {
-            id,
-            host: addr.ip().to_string(),
-            port: i32::from(addr.port()),
-            rack: None,
-            is_fenced: false,
-        }
+        node_with_host_port(id, addr.ip().to_string(), i32::from(addr.port()))
+    }
+
+    fn nodes(addrs: [std::net::SocketAddr; 2]) -> [ClusterNode; 2] {
+        [node(addrs[0], 0), node(addrs[1], 1)]
     }
 
     fn consumer_entry(
@@ -983,6 +1001,12 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum GroupDescriptionKind {
+        Consumer,
+        Classic,
+    }
+
     #[bon::builder]
     fn member_description(
         member_id: String,
@@ -1007,12 +1031,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum GroupDescriptionKind {
-        Consumer,
-        Classic,
-    }
-
     fn group_description_fields(kind: GroupDescriptionKind) -> GroupDescriptionFields {
         match kind {
             GroupDescriptionKind::Consumer => GroupDescriptionFields {
@@ -1021,7 +1039,9 @@ mod tests {
                     .maybe_group_instance_id(None)
                     .client_id("c1".to_owned())
                     .host("/10.0.0.1".to_owned())
-                    .assignment(BTreeSet::from([("orders".to_owned(), 0)]))
+                    .assignment(maplit::btreeset! {
+                        ("orders".to_owned(), 0),
+                    })
                     .maybe_target_assignment(Some(BTreeSet::new()))
                     .maybe_member_epoch(Some(4))
                     .maybe_upgraded(Some(true))
@@ -1038,14 +1058,18 @@ mod tests {
                     .maybe_group_instance_id(Some("static-1".to_owned()))
                     .client_id("c2".to_owned())
                     .host("/10.0.0.2".to_owned())
-                    .assignment(BTreeSet::from([("orders".to_owned(), 1)]))
+                    .assignment(maplit::btreeset! {
+                        ("orders".to_owned(), 1),
+                    })
                     .maybe_target_assignment(None)
                     .maybe_member_epoch(None)
                     .maybe_upgraded(None)
                     .call(),
                 partition_assignor: "range".to_owned(),
                 group_type: GroupType::Classic,
-                authorized_operations: Some(BTreeSet::from([AclOperation::Read])),
+                authorized_operations: Some(maplit::btreeset! {
+                    AclOperation::Read,
+                }),
                 group_epoch: None,
                 target_assignment_epoch: None,
             },
@@ -1063,6 +1087,54 @@ mod tests {
             .coordinator(coordinator)
             .fields(fields)
             .call()
+    }
+
+    fn classic_group_description(coordinator: ClusterNode) -> ConsumerGroupDescription {
+        test_group_description("classic", coordinator, GroupDescriptionKind::Classic)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DescribeApiCall {
+        Classic,
+        Share,
+        Streams,
+    }
+
+    async fn describe_one_group(
+        call: DescribeApiCall,
+        admin: &mut AdminClient,
+        options: DescribeGroupsOptions,
+    ) -> Option<Result<(), KafkaError>> {
+        match call {
+            DescribeApiCall::Classic => admin
+                .describe_classic_groups(&["workers"], options)
+                .await
+                .remove("workers")
+                .map(|result| result.map(drop)),
+            DescribeApiCall::Share => admin
+                .describe_share_groups(&["workers"], options)
+                .await
+                .remove("workers")
+                .map(|result| result.map(drop)),
+            DescribeApiCall::Streams => admin
+                .describe_streams_groups(&["workers"], options)
+                .await
+                .remove("workers")
+                .map(|result| result.map(drop)),
+        }
+    }
+
+    fn default_describe_options() -> DescribeGroupsOptions {
+        DescribeGroupsOptions::builder().build()
+    }
+
+    async fn default_streams_descriptions(
+        admin: &AdminClient,
+        groups: &[&str],
+    ) -> GroupDescriptions<StreamsGroupDescription> {
+        admin
+            .describe_streams_groups(groups, default_describe_options())
+            .await
     }
 
     /// The group ids of each request of `api_key` that `seen` recorded, with
@@ -1110,14 +1182,8 @@ mod tests {
         let cluster: GroupCluster = group_cluster()
             .count(2)
             .apis(vec![
-                ApiVersionRange::builder()
-                    .api_key(consumer_group_describe_request::API_KEY)
-                    .max_version(1)
-                    .build(),
-                ApiVersionRange::builder()
-                    .api_key(describe_groups_request::API_KEY)
-                    .max_version(5)
-                    .build(),
+                api_range(consumer_group_describe_request::API_KEY, 1),
+                api_range(describe_groups_request::API_KEY, 5),
             ])
             .lookup(|group, _| Lookup::At(usize::from(!matches!(group, "kip848" | "classic"))))
             .answer(|_, api_key, version, body, _| {
@@ -1137,13 +1203,13 @@ mod tests {
                                 _ => consumer_entry(id, 35, None),
                             })
                             .collect();
-                        encode_response(
-                            &ConsumerGroupDescribeResponse {
-                                groups,
-                                ..Default::default()
-                            },
+                        crate::encode_test_struct_field!(
+                            encode_response,
+                            ConsumerGroupDescribeResponse,
+                            groups,
+                            groups,
                             version,
-                            true,
+                            true
                         )
                     }
                     describe_groups_request::API_KEY => {
@@ -1156,74 +1222,45 @@ mod tests {
                                 _ => classic_entry(id, 69, ""),
                             })
                             .collect();
-                        encode_response(
-                            &DescribeGroupsResponse {
-                                groups,
-                                ..Default::default()
-                            },
-                            version,
-                            version >= 5,
-                        )
+                        encode_response(&classic_response(groups), version, version >= 5)
                     }
                     _ => return MockReply::Silent,
                 };
-                MockReply::Respond(reply)
+                mock_response(reply)
             })
             .call()
             .await;
         let admin = cluster.admin(krabka_units::secs(5)).await;
 
         let result = admin
-            .describe_consumer_groups(
-                &["kip848", "classic", "other", "missing", "connect"],
-                DescribeGroupsOptions::builder().build(),
-            )
+            .describe_consumer_groups(&FALLBACK_GROUPS, default_describe_options())
             .await;
 
-        let (b0, b1) = (node(cluster.addrs[0], 0), node(cluster.addrs[1], 1));
+        let [b0, b1] = nodes([cluster.addrs[0], cluster.addrs[1]]);
         let seen = cluster.stop();
-        assert!(
+        assert2::assert!(
             result
-                == BTreeMap::from([
-                    (
-                        "kip848".to_owned(),
-                        Ok(test_group_description(
-                            "kip848",
-                            b0.clone(),
-                            GroupDescriptionKind::Consumer,
-                        ))
-                    ),
-                    (
-                        "classic".to_owned(),
-                        Ok(test_group_description(
-                            "classic",
-                            b0,
-                            GroupDescriptionKind::Classic,
-                        )),
-                    ),
-                    (
-                        "other".to_owned(),
-                        Ok(test_group_description(
-                            "other",
-                            b1,
-                            GroupDescriptionKind::Consumer,
-                        )),
-                    ),
-                    (
-                        "missing".to_owned(),
-                        Err(kafka_error(
-                            69,
-                            Some("Group missing does not exist.".to_owned())
-                        ))
-                    ),
-                    (
-                        "connect".to_owned(),
-                        Err(kafka_error(
-                            -1,
-                            Some("GroupId connect is not a consumer group (connect).".to_owned())
-                        ))
-                    ),
-                ])
+                == maplit::btreemap! {
+                    "kip848".to_owned() => Ok(test_group_description(
+                    "kip848",
+                    b0.clone(),
+                    GroupDescriptionKind::Consumer,
+                )),
+                    "classic".to_owned() => Ok(classic_group_description(b0)),
+                    "other".to_owned() => Ok(test_group_description(
+                    "other",
+                    b1,
+                    GroupDescriptionKind::Consumer,
+                )),
+                    "missing".to_owned() => Err(kafka_error(
+                    69,
+                    Some("Group missing does not exist.".to_owned())
+                )),
+                    "connect".to_owned() => Err(kafka_error(
+                    -1,
+                    Some("GroupId connect is not a consumer group (connect).".to_owned())
+                )),
+                }
         );
         let ids = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
         assert!(
@@ -1258,12 +1295,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn describe_consumer_groups_uses_describe_groups_on_an_old_coordinator() {
         let AdminGroupCluster { cluster, admin } = admin_group_cluster()
-            .apis(vec![
-                ApiVersionRange::builder()
-                    .api_key(describe_groups_request::API_KEY)
-                    .max_version(5)
-                    .build(),
-            ])
+            .apis(vec![api_range(describe_groups_request::API_KEY, 5)])
             .answer(|_, api_key, version, body, _| {
                 if api_key != describe_groups_request::API_KEY {
                     return MockReply::Silent;
@@ -1272,34 +1304,23 @@ mod tests {
                     .iter()
                     .map(|id| classic_entry(id, 0, "consumer"))
                     .collect();
-                MockReply::Respond(encode_response(
-                    &DescribeGroupsResponse {
-                        groups,
-                        ..Default::default()
-                    },
-                    version,
-                    true,
-                ))
+                mock_response(encode_response(&classic_response(groups), version, true))
             })
             .call()
             .await;
 
         let result = admin
-            .describe_consumer_groups(&["classic"], DescribeGroupsOptions::builder().build())
+            .describe_consumer_groups(&["classic"], default_describe_options())
             .await;
 
-        let b0 = node(cluster.addrs[0], 0);
-        cluster.stop();
+        let first_broker = cluster.addrs[0];
+        let _seen = cluster.stop();
+        let b0 = node(first_broker, 0);
         assert!(
             result
-                == BTreeMap::from([(
-                    "classic".to_owned(),
-                    Ok(test_group_description(
-                        "classic",
-                        b0,
-                        GroupDescriptionKind::Classic,
-                    )),
-                )])
+                == maplit::btreemap! {
+                    "classic".to_owned() => Ok(classic_group_description(b0)),
+                }
         );
     }
 
@@ -1308,153 +1329,130 @@ mod tests {
     /// `COORDINATOR_NOT_AVAILABLE` and `NOT_COORDINATOR`, and fails every
     /// other code with the message of the answer (none for
     /// `describeClassicGroups`). The call sends the options' flag.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn describe_calls_retry_coordinator_errors_as_kafka_does() {
-        #[derive(Clone, Copy, Debug)]
-        enum Call {
-            Classic,
-            Share,
-            Streams,
-        }
+    #[yare::parameterized(
+        classic_no_error = { DescribeApiCall::Classic, "no error", vec![0], 1, 1, Ok(()) },
+        classic_load = { DescribeApiCall::Classic, "load in progress", vec![14, 0], 1, 2, Ok(()) },
+        classic_not_coordinator = { DescribeApiCall::Classic, "not coordinator", vec![16, 0], 2, 2, Ok(()) },
+        classic_not_available = { DescribeApiCall::Classic, "not available", vec![15, 0], 2, 2, Ok(()) },
+        classic_authorization = { DescribeApiCall::Classic, "group authorization failed", vec![30], 1, 1, Err(30) },
+        classic_not_found = { DescribeApiCall::Classic, "group id not found", vec![69], 1, 1, Err(69) },
+        share_no_error = { DescribeApiCall::Share, "no error", vec![0], 1, 1, Ok(()) },
+        share_load = { DescribeApiCall::Share, "load in progress", vec![14, 0], 1, 2, Ok(()) },
+        share_not_coordinator = { DescribeApiCall::Share, "not coordinator", vec![16, 0], 2, 2, Ok(()) },
+        share_not_available = { DescribeApiCall::Share, "not available", vec![15, 0], 2, 2, Ok(()) },
+        share_authorization = { DescribeApiCall::Share, "group authorization failed", vec![30], 1, 1, Err(30) },
+        share_not_found = { DescribeApiCall::Share, "group id not found", vec![69], 1, 1, Err(69) },
+        streams_no_error = { DescribeApiCall::Streams, "no error", vec![0], 1, 1, Ok(()) },
+        streams_load = { DescribeApiCall::Streams, "load in progress", vec![14, 0], 1, 2, Ok(()) },
+        streams_not_coordinator = { DescribeApiCall::Streams, "not coordinator", vec![16, 0], 2, 2, Ok(()) },
+        streams_not_available = { DescribeApiCall::Streams, "not available", vec![15, 0], 2, 2, Ok(()) },
+        streams_authorization = { DescribeApiCall::Streams, "group authorization failed", vec![30], 1, 1, Err(30) },
+        streams_not_found = { DescribeApiCall::Streams, "group id not found", vec![69], 1, 1, Err(69) },
+    )]
+    #[test_macro(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn describe_calls_retry_coordinator_errors_as_kafka_does(
+        call: DescribeApiCall,
+        name: &'static str,
+        codes: Vec<i16>,
+        expected_lookups: usize,
+        expected_requests: usize,
+        expected: Result<(), i16>,
+    ) {
         let message = Some("from the broker".to_owned());
-        for call in [Call::Classic, Call::Share, Call::Streams] {
-            for (name, codes, expected_lookups, expected_requests, expected) in [
-                ("no error", vec![0], 1, 1, Ok(())),
-                ("load in progress", vec![14, 0], 1, 2, Ok(())),
-                ("not coordinator", vec![16, 0], 2, 2, Ok(())),
-                ("not available", vec![15, 0], 2, 2, Ok(())),
-                ("group authorization failed", vec![30], 1, 1, Err(30)),
-                ("group id not found", vec![69], 1, 1, Err(69)),
-            ] {
-                let api_key = match call {
-                    Call::Classic => describe_groups_request::API_KEY,
-                    Call::Share => share_group_describe_request::API_KEY,
-                    Call::Streams => streams_group_describe_request::API_KEY,
+        let api_key = match call {
+            DescribeApiCall::Classic => describe_groups_request::API_KEY,
+            DescribeApiCall::Share => share_group_describe_request::API_KEY,
+            DescribeApiCall::Streams => streams_group_describe_request::API_KEY,
+        };
+        let script = Arc::new(Mutex::new(codes));
+        let reply_message = message.clone();
+        let cluster = group_cluster()
+            .count(1)
+            .apis(vec![api_range(api_key, 6)])
+            .lookup(|_, _| Lookup::At(0))
+            .answer(move |_, key, version, _, _| {
+                if key != api_key {
+                    return MockReply::Silent;
+                }
+                let code = {
+                    let mut script = script.lock().expect("script lock");
+                    if script.len() > 1 {
+                        script.remove(0)
+                    } else {
+                        script[0]
+                    }
                 };
-                let script = Arc::new(Mutex::new(codes));
-                let reply_message = message.clone();
-                let cluster = group_cluster()
-                    .count(1)
-                    .apis(vec![
-                        ApiVersionRange::builder()
-                            .api_key(api_key)
-                            .max_version(6)
-                            .build(),
-                    ])
-                    .lookup(|_, _| Lookup::At(0))
-                    .answer(move |_, key, version, _, _| {
-                        if key != api_key {
-                            return MockReply::Silent;
-                        }
-                        let code = {
-                            let mut script = script.lock().expect("script lock");
-                            if script.len() > 1 {
-                                script.remove(0)
-                            } else {
-                                script[0]
-                            }
-                        };
-                        let body = match call {
-                            Call::Classic => encode_response(
-                                &DescribeGroupsResponse {
-                                    groups: vec![described_group!(
-                                        ClassicDescribedGroup,
-                                        code,
-                                        reply_message.clone()
-                                    )],
-                                    ..Default::default()
-                                },
-                                version,
-                                version >= 5,
-                            ),
-                            Call::Share => encode_response(
-                                &ShareGroupDescribeResponse {
-                                    groups: vec![described_group!(
-                                        ShareDescribedGroup,
-                                        code,
-                                        reply_message.clone()
-                                    )],
-                                    ..Default::default()
-                                },
-                                version,
-                                true,
-                            ),
-                            Call::Streams => encode_response(
-                                &StreamsGroupDescribeResponse {
-                                    groups: vec![described_group!(
-                                        StreamsDescribedGroup,
-                                        code,
-                                        reply_message.clone(),
-                                        topology = Some(Topology::default())
-                                    )],
-                                    ..Default::default()
-                                },
-                                version,
-                                true,
-                            ),
-                        };
-                        MockReply::Respond(body)
-                    })
-                    .call()
-                    .await;
-                let admin = cluster.admin(krabka_units::secs(5)).await;
-                let options = DescribeGroupsOptions::builder()
-                    .include_authorized_operations(true)
-                    .build();
-                let result = match call {
-                    Call::Classic => admin
-                        .describe_classic_groups(&["workers"], options)
-                        .await
-                        .remove("workers")
-                        .map(|result| result.map(drop)),
-                    Call::Share => admin
-                        .describe_share_groups(&["workers"], options)
-                        .await
-                        .remove("workers")
-                        .map(|result| result.map(drop)),
-                    Call::Streams => admin
-                        .describe_streams_groups(&["workers"], options)
-                        .await
-                        .remove("workers")
-                        .map(|result| result.map(drop)),
+                let body = match call {
+                    DescribeApiCall::Classic => encode_described_group!(
+                        DescribeGroupsResponse,
+                        ClassicDescribedGroup,
+                        code,
+                        reply_message.clone(),
+                        version,
+                        version >= 5,
+                    ),
+                    DescribeApiCall::Share => encode_described_group!(
+                        ShareGroupDescribeResponse,
+                        ShareDescribedGroup,
+                        code,
+                        reply_message.clone(),
+                        version,
+                        true,
+                    ),
+                    DescribeApiCall::Streams => encode_described_group!(
+                        StreamsGroupDescribeResponse,
+                        StreamsDescribedGroup,
+                        code,
+                        reply_message.clone(),
+                        version,
+                        true,
+                        topology = Some(Topology::default()),
+                    ),
                 };
-                let seen = cluster.stop();
-                let expected_message = match call {
-                    Call::Classic => None,
-                    Call::Share | Call::Streams => message.clone(),
-                };
-                let flags = seen
-                    .requests
-                    .iter()
-                    .map(|request| {
-                        let (version, body) = (request.version, &request.body[..]);
-                        match call {
-                            Call::Classic => {
-                                decode_request::<DescribeGroupsRequest>(body, version, version >= 5)
-                                    .include_authorized_operations
-                            }
-                            Call::Share => {
-                                decode_request::<ShareGroupDescribeRequest>(body, version, true)
-                                    .include_authorized_operations
-                            }
-                            Call::Streams => {
-                                decode_request::<StreamsGroupDescribeRequest>(body, version, true)
-                                    .include_authorized_operations
-                            }
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                assert!(
-                    (result, seen.find_coordinator.len(), flags)
-                        == (
-                            Some(expected.map_err(|code| kafka_error(code, expected_message))),
-                            expected_lookups,
-                            vec![true; expected_requests],
-                        ),
-                    "case {call:?} {name}"
-                );
-            }
-        }
+                mock_response(body)
+            })
+            .call()
+            .await;
+        let mut admin = cluster.admin(krabka_units::secs(5)).await;
+        let options = DescribeGroupsOptions::builder()
+            .include_authorized_operations(true)
+            .build();
+        let result = describe_one_group(call, &mut admin, options).await;
+        let seen = cluster.stop();
+        let expected_message = match call {
+            DescribeApiCall::Classic => None,
+            DescribeApiCall::Share | DescribeApiCall::Streams => message.clone(),
+        };
+        let flags = seen
+            .requests
+            .iter()
+            .map(|request| {
+                let (version, body) = (request.version, &request.body[..]);
+                match call {
+                    DescribeApiCall::Classic => {
+                        decode_request::<DescribeGroupsRequest>(body, version, version >= 5)
+                            .include_authorized_operations
+                    }
+                    DescribeApiCall::Share => {
+                        decode_request::<ShareGroupDescribeRequest>(body, version, true)
+                            .include_authorized_operations
+                    }
+                    DescribeApiCall::Streams => {
+                        decode_request::<StreamsGroupDescribeRequest>(body, version, true)
+                            .include_authorized_operations
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        assert2::assert!(
+            (result, seen.find_coordinator.len(), flags)
+                == (
+                    Some(expected.map_err(|code| kafka_error(code, expected_message))),
+                    expected_lookups,
+                    vec![true; expected_requests],
+                ),
+            "case {call:?} {name}"
+        );
     }
 
     /// Kafka 4.3.1 defines `StreamsGroupDescribe` v0 only, and its handler
@@ -1462,31 +1460,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn describe_streams_groups_sends_v0_and_needs_a_topology() {
         let AdminGroupCluster { cluster, admin } = admin_group_cluster()
-            .apis(vec![
-                ApiVersionRange::builder()
-                    .api_key(streams_group_describe_request::API_KEY)
-                    .max_version(1)
-                    .build(),
-            ])
+            .apis(vec![api_range(streams_group_describe_request::API_KEY, 1)])
             .answer(|_, api_key, version, _, _| {
                 if api_key != streams_group_describe_request::API_KEY {
                     return MockReply::Silent;
                 }
-                MockReply::Respond(encode_response(
-                    &StreamsGroupDescribeResponse {
-                        groups: vec![
-                            StreamsDescribedGroup {
-                                group_id: "with".to_owned(),
-                                topology: Some(Topology::default()),
-                                ..Default::default()
-                            },
-                            StreamsDescribedGroup {
-                                group_id: "without".to_owned(),
-                                ..Default::default()
-                            },
-                        ],
-                        ..Default::default()
-                    },
+                mock_response(crate::encode_test_struct_field!(
+                    encode_response,
+                    StreamsGroupDescribeResponse,
+                    groups,
+                    vec![
+                        StreamsDescribedGroup {
+                            group_id: "with".to_owned(),
+                            topology: Some(Topology::default()),
+                            ..Default::default()
+                        },
+                        StreamsDescribedGroup {
+                            group_id: "without".to_owned(),
+                            ..Default::default()
+                        },
+                    ],
                     version,
                     true,
                 ))
@@ -1494,12 +1487,7 @@ mod tests {
             .call()
             .await;
 
-        let result = admin
-            .describe_streams_groups(
-                &["with", "without"],
-                DescribeGroupsOptions::builder().build(),
-            )
-            .await;
+        let result = default_streams_descriptions(&admin, &STREAMS_GROUPS).await;
 
         let seen = cluster.stop();
         let versions = seen
@@ -1510,23 +1498,17 @@ mod tests {
         assert!(
             (result, versions)
                 == (
-                    BTreeMap::from([
-                        (
-                            "with".to_owned(),
-                            Ok(StreamsDescribedGroup {
-                                group_id: "with".to_owned(),
-                                topology: Some(Topology::default()),
-                                ..Default::default()
-                            })
-                        ),
-                        (
-                            "without".to_owned(),
-                            Err(kafka_error(
-                                -1,
-                                Some("Topology information is missing".to_owned())
-                            ))
-                        ),
-                    ]),
+                    maplit::btreemap! {
+                        "with".to_owned() => Ok(StreamsDescribedGroup {
+                        group_id: "with".to_owned(),
+                        topology: Some(Topology::default()),
+                        ..Default::default()
+                    }),
+                        "without".to_owned() => Err(kafka_error(
+                        -1,
+                        Some("Topology information is missing".to_owned())
+                    )),
+                    },
                     vec![0],
                 )
         );

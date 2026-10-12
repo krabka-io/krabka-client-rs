@@ -77,6 +77,16 @@ fn cluster_node(broker: DescribeClusterBroker) -> ClusterNode {
     }
 }
 
+pub(crate) fn node_with_host_port(id: i32, host: String, port: i32) -> ClusterNode {
+    ClusterNode {
+        id,
+        host,
+        port,
+        rack: None,
+        is_fenced: false,
+    }
+}
+
 /// The operations of an authorized-operations bit field, as Kafka's
 /// `KafkaAdminClient.validAclOperations` reads it: `None` for
 /// `Integer.MIN_VALUE`, and without `UNKNOWN`, `ANY` and `ALL`.
@@ -193,10 +203,10 @@ mod tests {
             (
                 "some",
                 bits,
-                Some(BTreeSet::from([
+                Some(maplit::btreeset! {
                     AclOperation::Read,
                     AclOperation::CreateTokens,
-                ])),
+                }),
             ),
         ] {
             assert2::assert!(authorized_operations(bits) == expected, "case {name}");
@@ -263,7 +273,9 @@ mod tests {
                     cluster_id: "lkc-1".to_owned(),
                     controller: None,
                     nodes,
-                    authorized_operations: Some(BTreeSet::from([AclOperation::Describe])),
+                    authorized_operations: Some(maplit::btreeset! {
+                        AclOperation::Describe,
+                    }),
                 }),
             ),
             (

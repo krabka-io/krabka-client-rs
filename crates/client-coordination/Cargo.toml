@@ -28,6 +28,7 @@ krabka-units = { workspace = true }
 async-trait            = { workspace = true }
 bon                    = { workspace = true }
 bytes                  = { workspace = true }
+maplit                 = { workspace = true }
 thiserror              = { workspace = true }
 tokio                  = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tracing                = { workspace = true }

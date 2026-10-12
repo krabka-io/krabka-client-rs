@@ -443,7 +443,7 @@ mod tests {
     /// next round.
     #[test]
     fn sticky_moves_partitions_at_once_and_cooperative_sticky_holds_them_back() {
-        let counts = HashMap::from([("t".to_owned(), 4)]);
+        let counts = maplit::hashmap! {"t".to_owned() => 4};
         let owned = vec![
             ("t".to_owned(), 0),
             ("t".to_owned(), 1),
@@ -495,23 +495,8 @@ mod tests {
         assert2::assert!(
             actual
                 == (
-                    HashMap::from([
-                        (
-                            "a".to_owned(),
-                            vec![("t".to_owned(), 0), ("t".to_owned(), 1)]
-                        ),
-                        (
-                            "b".to_owned(),
-                            vec![("t".to_owned(), 2), ("t".to_owned(), 3)]
-                        ),
-                    ]),
-                    HashMap::from([
-                        (
-                            "a".to_owned(),
-                            vec![("t".to_owned(), 0), ("t".to_owned(), 1)]
-                        ),
-                        ("b".to_owned(), Vec::new()),
-                    ]),
+                    maplit::hashmap! {"a".to_owned() => vec![("t".to_owned(), 0), ("t".to_owned(), 1)], "b".to_owned() => vec![("t".to_owned(), 2), ("t".to_owned(), 3)]},
+                    maplit::hashmap! {"a".to_owned() => vec![("t".to_owned(), 0), ("t".to_owned(), 1)], "b".to_owned() => Vec::new()},
                 )
         );
     }
@@ -519,7 +504,7 @@ mod tests {
     /// Kafka's `MemberInfo.compareTo`: static members first, by instance id.
     #[test]
     fn range_orders_static_members_by_group_instance_id() {
-        let counts = HashMap::from([("t".to_owned(), 3)]);
+        let counts = maplit::hashmap! {"t".to_owned() => 3};
         let member = |id: &str, instance: Option<&str>| GroupMember {
             key: MemberKey {
                 member_id: id.to_owned(),
@@ -536,13 +521,7 @@ mod tests {
         let members = [member("a", None), member("z", Some("i-1"))];
         assert2::assert!(
             assign(Assignor::Range, &members, &counts)
-                == HashMap::from([
-                    (
-                        "z".to_owned(),
-                        vec![("t".to_owned(), 0), ("t".to_owned(), 1)]
-                    ),
-                    ("a".to_owned(), vec![("t".to_owned(), 2)]),
-                ])
+                == maplit::hashmap! {"z".to_owned() => vec![("t".to_owned(), 0), ("t".to_owned(), 1)], "a".to_owned() => vec![("t".to_owned(), 2)]}
         );
     }
 }

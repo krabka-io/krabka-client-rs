@@ -148,12 +148,12 @@ mod tests {
         }
         for call in [Call::Consumer, Call::Share, Call::Streams] {
             // "moved" is on broker 1 first, and then on broker 0.
-            let codes = Arc::new(Mutex::new(BTreeMap::from([
-                ("done", vec![0]),
-                ("loading", vec![14, 0]),
-                ("moved", vec![16, 0]),
-                ("busy", vec![68]),
-            ])));
+            let codes = Arc::new(Mutex::new(maplit::btreemap! {
+                "done" => vec![0],
+                "loading" => vec![14, 0],
+                "moved" => vec![16, 0],
+                "busy" => vec![68],
+            }));
             let cluster = group_cluster()
                 .count(2)
                 .apis(vec![
@@ -228,13 +228,13 @@ mod tests {
             assert!(
                 (result, lookups)
                     == (
-                        BTreeMap::from([
-                            ("busy".to_owned(), Err(kafka_error(68, None))),
-                            ("denied".to_owned(), Err(kafka_error(30, None))),
-                            ("done".to_owned(), Ok(())),
-                            ("loading".to_owned(), Ok(())),
-                            ("moved".to_owned(), Ok(())),
-                        ]),
+                        maplit::btreemap! {
+                            "busy".to_owned() => Err(kafka_error(68, None)),
+                            "denied".to_owned() => Err(kafka_error(30, None)),
+                            "done".to_owned() => Ok(()),
+                            "loading".to_owned() => Ok(()),
+                            "moved".to_owned() => Ok(()),
+                        },
                         vec![
                             names(&["busy", "denied", "done", "loading", "moved"]),
                             names(&["moved"]),
@@ -318,11 +318,11 @@ mod tests {
             assert!(
                 (result, lookups)
                     == (
-                        BTreeMap::from([
-                            ("a".to_owned(), Ok(())),
-                            ("b".to_owned(), Ok(())),
-                            ("c".to_owned(), Ok(())),
-                        ]),
+                        maplit::btreemap! {
+                            "a".to_owned() => Ok(()),
+                            "b".to_owned() => Ok(()),
+                            "c".to_owned() => Ok(()),
+                        },
                         expected,
                     ),
                 "case {name}"
@@ -345,7 +345,10 @@ mod tests {
         assert!(
             (result, seen.find_coordinator, seen.requests.len())
                 == (
-                    BTreeMap::from([("a".to_owned(), Ok(())), ("b".to_owned(), Ok(()))]),
+                    maplit::btreemap! {
+                        "a".to_owned() => Ok(()),
+                        "b".to_owned() => Ok(()),
+                    },
                     vec![(3, names(&["a"])), (3, names(&["b"]))],
                     1,
                 )

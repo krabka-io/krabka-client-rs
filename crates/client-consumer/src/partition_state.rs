@@ -223,7 +223,7 @@ fn no_current_assignment((topic, partition): &(String, i32)) -> ConsumerError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     use krabka_client_core::{Client, MockBroker};
     use krabka_protocol::{
@@ -336,18 +336,13 @@ mod tests {
         mock.stop();
         assert2::assert!(
             committed
-                == Ok(HashMap::from([
-                    (
-                        ("orders".to_string(), 0),
-                        Some(OffsetAndMetadata {
-                            offset: 10,
-                            leader_epoch: Some(3),
-                            metadata: "note".into(),
-                        })
-                    ),
-                    (("orders".to_string(), 1), None),
-                    (("orders".to_string(), 2), None),
-                ]))
+                == Ok(
+                    maplit::hashmap! {("orders".to_string(), 0) => Some(OffsetAndMetadata {
+                        offset: 10,
+                        leader_epoch: Some(3),
+                        metadata: "note".into(),
+                    }), ("orders".to_string(), 1) => None, ("orders".to_string(), 2) => None}
+                )
         );
     }
 

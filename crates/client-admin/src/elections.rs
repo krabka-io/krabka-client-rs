@@ -272,14 +272,21 @@ mod tests {
                 "success",
                 ElectionType::Preferred,
                 vec![(0, 0)],
-                (Ok(BTreeMap::from([(("orders".to_owned(), 0), Ok(()))])), 1),
+                (
+                    Ok(maplit::btreemap! {
+                        ("orders".to_owned(), 0) => Ok(()),
+                    }),
+                    1,
+                ),
             ),
             (
                 "election not needed is a partition result",
                 ElectionType::Unclean,
                 vec![(0, 84)],
                 (
-                    Ok(BTreeMap::from([(("orders".to_owned(), 0), not_needed)])),
+                    Ok(maplit::btreemap! {
+                        ("orders".to_owned(), 0) => not_needed,
+                    }),
                     1,
                 ),
             ),
@@ -287,7 +294,12 @@ mod tests {
                 "not controller finds the controller again",
                 ElectionType::Preferred,
                 vec![(41, 0), (0, NOT_CONTROLLER), (0, 0)],
-                (Ok(BTreeMap::from([(("orders".to_owned(), 0), Ok(()))])), 3),
+                (
+                    Ok(maplit::btreemap! {
+                        ("orders".to_owned(), 0) => Ok(()),
+                    }),
+                    3,
+                ),
             ),
             (
                 "cluster authorization failed is final",

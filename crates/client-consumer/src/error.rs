@@ -224,10 +224,9 @@ mod tests {
             ),
             (
                 "topic authorization failed",
-                ConsumerError::TopicAuthorizationFailed(BTreeSet::from([
-                    "orders".to_string(),
-                    "payments".to_string(),
-                ])),
+                ConsumerError::TopicAuthorizationFailed(
+                    maplit::btreeset! {"orders".to_string(), "payments".to_string()},
+                ),
                 "not authorized to access topics: [orders, payments]",
             ),
             (
@@ -275,10 +274,9 @@ mod tests {
             ),
             (
                 "no offset for partition",
-                ConsumerError::NoOffsetForPartition(BTreeSet::from([
-                    ("orders".to_string(), 0),
-                    ("orders".to_string(), 1),
-                ])),
+                ConsumerError::NoOffsetForPartition(
+                    maplit::btreeset! {("orders".to_string(), 0), ("orders".to_string(), 1)},
+                ),
                 "undefined offset with no reset policy for partitions: [orders-0, orders-1]",
             ),
         ] {

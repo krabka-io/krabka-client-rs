@@ -2142,10 +2142,7 @@ mod connection_policy_tests {
             if version >= 3 {
                 crate::FinalizedFeatures {
                     epoch: 7,
-                    levels: std::collections::BTreeMap::from([(
-                        "transaction.version".to_owned(),
-                        2,
-                    )]),
+                    levels: maplit::btreemap! {"transaction.version".to_owned() => 2},
                 }
             } else {
                 crate::FinalizedFeatures::default()

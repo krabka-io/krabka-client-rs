@@ -103,10 +103,10 @@ impl AdminClient {
                 &ListGroupsOptions::builder()
                     .group_states(options.group_states.clone())
                     .types(options.types.clone())
-                    .protocol_types(BTreeSet::from([
+                    .protocol_types(maplit::btreeset! {
                         String::new(),
                         CONSUMER_PROTOCOL_TYPE.to_owned(),
-                    ]))
+                    })
                     .build(),
             )
             .await?;
@@ -207,7 +207,9 @@ mod tests {
         let result = admin
             .list_consumer_groups(
                 &ListConsumerGroupsOptions::builder()
-                    .group_states(BTreeSet::from([GroupState::Stable]))
+                    .group_states(maplit::btreeset! {
+                        GroupState::Stable,
+                    })
                     .types(BTreeSet::new())
                     .build(),
             )

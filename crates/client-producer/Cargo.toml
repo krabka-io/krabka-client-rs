@@ -35,6 +35,7 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+maplit = { workspace = true }
 refined_type = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = { workspace = true, features = ["rt"] }

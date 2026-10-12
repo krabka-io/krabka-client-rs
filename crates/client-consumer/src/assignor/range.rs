@@ -114,10 +114,7 @@ mod tests {
             &tp,
         );
         assert2::assert!(
-            a == HashMap::from([
-                ("m1".into(), vec![("t".into(), 0), ("t".into(), 1)]),
-                ("m2".into(), vec![("t".into(), 2), ("t".into(), 3)]),
-            ])
+            a == maplit::hashmap! {"m1".into() => vec![("t".into(), 0), ("t".into(), 1)], "m2".into() => vec![("t".into(), 2), ("t".into(), 3)]}
         );
     }
 

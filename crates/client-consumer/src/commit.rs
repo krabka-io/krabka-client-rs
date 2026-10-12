@@ -1657,10 +1657,9 @@ mod tests {
 
     async fn selected_commit(consumer: &Consumer, offset: i64) -> Result<(), ConsumerError> {
         consumer
-            .commit_offsets_sync(HashMap::from([(
-                ("topic".into(), 0),
-                OffsetAndMetadata::new(offset),
-            )]))
+            .commit_offsets_sync(
+                maplit::hashmap! {("topic".into(), 0) => OffsetAndMetadata::new(offset)},
+            )
             .await
     }
 
@@ -1737,7 +1736,7 @@ mod tests {
         Arc::new(Mutex::new(CommitIdentity {
             generation,
             member_id: member_id.into(),
-            ownership_ids: HashMap::from([(("topic".into(), 0), 1)]),
+            ownership_ids: maplit::hashmap! {("topic".into(), 0) => 1},
             rejoin_on_poll: false,
         }))
     }
@@ -1940,7 +1939,7 @@ mod tests {
     /// `commitSync(offsets)` accepts an offset past the consumed position.
     #[test]
     fn selected_offset_validation_follows_kafka() {
-        let assigned = HashMap::from([(("topic".to_string(), 2), 1)]);
+        let assigned = maplit::hashmap! {("topic".to_string(), 2) => 1};
 
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
@@ -1960,10 +1959,7 @@ mod tests {
             ("at the position", ("topic", 2), 11, None),
             ("past the position", ("topic", 2), 100, None),
         ] {
-            let offsets = HashMap::from([(
-                (partition.0.to_string(), partition.1),
-                OffsetAndMetadata::new(offset),
-            )]);
+            let offsets = maplit::hashmap! {(partition.0.to_string(), partition.1) => OffsetAndMetadata::new(offset)};
             let result = validate_selected_offsets(&offsets, &assigned).err();
             actual.push((name, result.map(|error| error.to_string())));
             wanted.push((name, expected.map(str::to_owned)));
@@ -1989,10 +1985,7 @@ mod tests {
         let offsets = commit_offsets(raw, &positions);
         assert2::assert!(
             offsets
-                == HashMap::from([
-                    (("known".into(), 0), (11, 7)),
-                    (("unknown".into(), 1), (22, -1)),
-                ])
+                == maplit::hashmap! {("known".into(), 0) => (11, 7), ("unknown".into(), 1) => (22, -1)}
         );
     }
 
@@ -2001,54 +1994,31 @@ mod tests {
     /// position only while its ownership is still current.
     #[test]
     fn consumed_positions_keep_owned_valid_positions_of_the_current_ownership() {
-        let ownership_ids = HashMap::from([
-            (("orders".into(), 0), 1),
-            (("orders".into(), 1), 2),
-            (("orders".into(), 2), 3),
-            (("orders".into(), 3), 4),
-        ]);
-        let next_offsets = HashMap::from([
-            (("orders".into(), 0), 12),
-            (("orders".into(), 1), 0),
-            (("orders".into(), 2), i64::MAX),
-            (("orders".into(), 3), -1),
-            (("unowned".into(), 0), 5),
-        ]);
-        let positions = HashMap::from([(
-            ("orders".into(), 0),
-            PartitionPosition {
-                offset_epoch: krabka_ids::LeaderEpoch(4),
-                ..Default::default()
-            },
-        )]);
+        let ownership_ids = maplit::hashmap! {("orders".into(), 0) => 1, ("orders".into(), 1) => 2, ("orders".into(), 2) => 3, ("orders".into(), 3) => 4};
+        let next_offsets = maplit::hashmap! {("orders".into(), 0) => 12, ("orders".into(), 1) => 0, ("orders".into(), 2) => i64::MAX, ("orders".into(), 3) => -1, ("unowned".into(), 0) => 5};
+        let positions = maplit::hashmap! {("orders".into(), 0) => PartitionPosition {
+            offset_epoch: krabka_ids::LeaderEpoch(4),
+            ..Default::default()
+        }};
 
         let consumed = all_consumed(&ownership_ids, &next_offsets, &positions);
         assert2::assert!(
             consumed
-                == HashMap::from([
-                    (
-                        ("orders".into(), 0),
-                        ConsumedPosition {
-                            offset: 12,
-                            leader_epoch: 4,
-                            ownership_id: 1,
-                        },
-                    ),
-                    (
-                        ("orders".into(), 1),
-                        ConsumedPosition {
-                            offset: 0,
-                            leader_epoch: -1,
-                            ownership_id: 2,
-                        },
-                    ),
-                ])
+                == maplit::hashmap! {("orders".into(), 0) => ConsumedPosition {
+                    offset: 12,
+                    leader_epoch: 4,
+                    ownership_id: 1,
+                }, ("orders".into(), 1) => ConsumedPosition {
+                    offset: 0,
+                    leader_epoch: -1,
+                    ownership_id: 2,
+                }}
         );
 
-        let reassigned = HashMap::from([(("orders".into(), 0), 9), (("orders".into(), 1), 2)]);
+        let reassigned = maplit::hashmap! {("orders".into(), 0) => 9, ("orders".into(), 1) => 2};
         assert2::assert!(
             owned_offsets(&consumed, &reassigned)
-                == HashMap::from([(("orders".into(), 1), (0, -1))])
+                == maplit::hashmap! {("orders".into(), 1) => (0, -1)}
         );
     }
 
@@ -2282,36 +2252,28 @@ mod tests {
         let identity = Arc::new(Mutex::new(CommitIdentity {
             generation: 7,
             member_id: "member-a".into(),
-            ownership_ids: HashMap::from([(("alpha".into(), 0), 1), (("alpha".into(), 1), 2)]),
+            ownership_ids: maplit::hashmap! {("alpha".into(), 0) => 1, ("alpha".into(), 1) => 2},
             rejoin_on_poll: false,
         }));
-        let offsets = Arc::new(Mutex::new(HashMap::from([
-            (("alpha".to_string(), 0), 10),
-            (("alpha".to_string(), 1), 20),
-        ])));
-        let positions = Arc::new(Mutex::new(HashMap::from([(
-            ("alpha".to_string(), 1),
-            PartitionPosition {
+        let offsets = Arc::new(Mutex::new(
+            maplit::hashmap! {("alpha".to_string(), 0) => 10, ("alpha".to_string(), 1) => 20},
+        ));
+        let positions = Arc::new(Mutex::new(
+            maplit::hashmap! {("alpha".to_string(), 1) => PartitionPosition {
                 offset_epoch: krabka_ids::LeaderEpoch(7),
                 ..Default::default()
-            },
-        )])));
+            }},
+        ));
         let snapshot = snapshot_commit_offsets(&identity, &offsets, &positions, None).await;
 
         assert2::assert!(
             snapshot
                 == (
-                    HashMap::from([
-                        (("alpha".to_string(), 0), OffsetAndMetadata::new(10)),
-                        (
-                            ("alpha".to_string(), 1),
-                            OffsetAndMetadata {
-                                offset: 20,
-                                leader_epoch: Some(7),
-                                metadata: String::new(),
-                            }
-                        ),
-                    ]),
+                    maplit::hashmap! {("alpha".to_string(), 0) => OffsetAndMetadata::new(10), ("alpha".to_string(), 1) => OffsetAndMetadata {
+                        offset: 20,
+                        leader_epoch: Some(7),
+                        metadata: String::new(),
+                    }},
                     (7, "member-a".into())
                 )
         );
@@ -2393,10 +2355,9 @@ mod tests {
                 "success",
                 &[0, 0][..],
                 running,
-                Ok(CommitOutcome::Acked(HashSet::from([
-                    ("topic".into(), 0),
-                    ("topic".into(), 1),
-                ]))),
+                Ok(CommitOutcome::Acked(
+                    maplit::hashset! {("topic".into(), 0), ("topic".into(), 1)},
+                )),
             ),
             (
                 "retriable code keeps the acknowledged partitions",
@@ -2404,7 +2365,7 @@ mod tests {
                 running,
                 Ok(CommitOutcome::Retriable {
                     code: 3,
-                    acknowledged: HashSet::from([("topic".into(), 0)]),
+                    acknowledged: maplit::hashset! {("topic".into(), 0)},
                     find_coordinator: false,
                 }),
             ),
@@ -2690,10 +2651,9 @@ mod tests {
             let consumer = default_commit_consumer(&mock).await;
 
             let result: CommitResult = consumer
-                .commit_offsets_sync(HashMap::from([(
-                    ("topic".into(), 0),
-                    OffsetAndMetadata::new(12),
-                )]))
+                .commit_offsets_sync(
+                    maplit::hashmap! {("topic".into(), 0) => OffsetAndMetadata::new(12)},
+                )
                 .await
                 .map_err(|error| match error {
                     ConsumerError::Client(ClientError::IncompatibleVersion {
@@ -2807,10 +2767,9 @@ mod tests {
         let timed_out = |cause: ConsumerError| (COMMIT_TIMED_OUT.into(), Some(cause.to_string()));
         let disconnected = timed_out(ConsumerError::Client(ClientError::Disconnected));
         let group_denied = described(&ConsumerError::GroupAuthorizationFailed("group-a".into()));
-        let topics_denied = described(&ConsumerError::TopicAuthorizationFailed(BTreeSet::from([
-            "orders".into(),
-            "payments".into(),
-        ])));
+        let topics_denied = described(&ConsumerError::TopicAuthorizationFailed(
+            maplit::btreeset! {"orders".into(), "payments".into()},
+        ));
         vec![
             ("success", vec![Codes(&[])], false, RETRY, (Ok(()), 1, 0)),
             (
@@ -3037,7 +2996,7 @@ mod tests {
         let identity = Arc::new(Mutex::new(CommitIdentity {
             generation: 7,
             member_id: "member-a".into(),
-            ownership_ids: HashMap::from([(("orders".into(), 0), 1), (("payments".into(), 0), 2)]),
+            ownership_ids: maplit::hashmap! {("orders".into(), 0) => 1, ("payments".into(), 0) => 2},
             rejoin_on_poll: false,
         }));
         let assignment_changed = Arc::new(tokio::sync::Notify::new());
@@ -3308,14 +3267,11 @@ mod tests {
             let commit_future = async {
                 match commit {
                     Commit::All => consumer.commit_sync().await,
-                    Commit::Selected => {
-                        consumer
-                            .commit_offsets_sync(HashMap::from([(
-                                ("topic".into(), 0),
-                                OffsetAndMetadata::new(12),
-                            )]))
-                            .await
-                    }
+                    Commit::Selected => consumer
+                        .commit_offsets_sync(
+                            maplit::hashmap! {("topic".into(), 0) => OffsetAndMetadata::new(12)},
+                        )
+                        .await,
                 }
             };
             let result = tokio::time::timeout(Duration::from_secs(5), commit_future)
@@ -3392,10 +3348,9 @@ mod tests {
         changed_identity.generation = 8;
         drop(changed_identity);
         generation.store(8, Ordering::Relaxed);
-        let topics = build_commit_topics(HashMap::from([(
-            ("topic".into(), 0),
-            OffsetAndMetadata::new(12),
-        )]));
+        let topics = build_commit_topics(
+            maplit::hashmap! {("topic".into(), 0) => OffsetAndMetadata::new(12)},
+        );
 
         let error = consumer
             .commit_topics_once(topics, (7, "member-a".into()))
@@ -3431,10 +3386,9 @@ mod tests {
             .start()
             .await;
         let result = consumer
-            .commit_offsets_sync(HashMap::from([(
-                ("topic".into(), 0),
-                OffsetAndMetadata::new(12),
-            )]))
+            .commit_offsets_sync(
+                maplit::hashmap! {("topic".into(), 0) => OffsetAndMetadata::new(12)},
+            )
             .await;
 
         mock.stop();
@@ -3450,7 +3404,7 @@ mod tests {
         let identity = Arc::new(Mutex::new(CommitIdentity {
             generation: 7,
             member_id: "member-a".into(),
-            ownership_ids: HashMap::from([(("topic".into(), 0), 1), (("topic".into(), 1), 2)]),
+            ownership_ids: maplit::hashmap! {("topic".into(), 0) => 1, ("topic".into(), 1) => 2},
             rejoin_on_poll: false,
         }));
         let requests = Arc::new(AtomicUsize::new(0));
@@ -3500,10 +3454,9 @@ mod tests {
             let consumer = Arc::clone(&consumer);
             tokio::spawn(async move {
                 consumer
-                    .commit_offsets_sync(HashMap::from([(
-                        ("topic".into(), 0),
-                        OffsetAndMetadata::new(10),
-                    )]))
+                    .commit_offsets_sync(
+                        maplit::hashmap! {("topic".into(), 0) => OffsetAndMetadata::new(10)},
+                    )
                     .await
             })
         };
@@ -3512,10 +3465,9 @@ mod tests {
             let consumer = Arc::clone(&consumer);
             tokio::spawn(async move {
                 consumer
-                    .commit_offsets_sync(HashMap::from([(
-                        ("topic".into(), 0),
-                        OffsetAndMetadata::new(12),
-                    )]))
+                    .commit_offsets_sync(
+                        maplit::hashmap! {("topic".into(), 0) => OffsetAndMetadata::new(12)},
+                    )
                     .await
             })
         };
@@ -3570,10 +3522,9 @@ mod tests {
 
     #[test]
     fn selected_commit_topics_exclude_unrequested_assignment_positions() {
-        let topics = build_commit_topics(HashMap::from([(
-            ("topic".into(), 0),
-            OffsetAndMetadata::new(12),
-        )]));
+        let topics = build_commit_topics(
+            maplit::hashmap! {("topic".into(), 0) => OffsetAndMetadata::new(12)},
+        );
 
         assert2::assert!(topics.len() == 1);
         assert2::assert!(topics[0].partitions.len() == 1);
@@ -3666,7 +3617,7 @@ mod tests {
             let result = match selected {
                 Some(offset) => {
                     consumer
-                        .commit_offsets_sync(HashMap::from([(("topic".into(), 0), offset)]))
+                        .commit_offsets_sync(maplit::hashmap! {("topic".into(), 0) => offset})
                         .await
                 }
                 None => consumer.commit_sync().await,
@@ -3762,7 +3713,7 @@ mod tests {
             wanted.push((
                 name,
                 (
-                    HashMap::from([(("topic".to_string(), 0), OffsetAndMetadata::new(12))]),
+                    maplit::hashmap! {("topic".to_string(), 0) => OffsetAndMetadata::new(12)},
                     expected.map_err(str::to_owned),
                 ),
             ));
@@ -3806,7 +3757,7 @@ mod tests {
             (
                 "acknowledged",
                 0,
-                HashMap::from([(("topic".to_string(), 0), (100, 4))]),
+                maplit::hashmap! {("topic".to_string(), 0) => (100, 4)},
             ),
             ("metadata too large", 12, HashMap::new()),
         ] {
@@ -3815,14 +3766,11 @@ mod tests {
             let auto_commit = AutoCommit::new(Duration::from_secs(5));
             consumer.auto_commit = Some(auto_commit.clone());
             let _ = consumer
-                .commit_offsets_sync(HashMap::from([(
-                    ("topic".into(), 0),
-                    OffsetAndMetadata {
-                        offset: 100,
-                        leader_epoch: Some(4),
-                        metadata: "note".into(),
-                    },
-                )]))
+                .commit_offsets_sync(maplit::hashmap! {("topic".into(), 0) => OffsetAndMetadata {
+                    offset: 100,
+                    leader_epoch: Some(4),
+                    metadata: "note".into(),
+                }})
                 .await;
             mock.stop();
             let ownership = consumer.commit_identity.lock().await.ownership_ids.clone();

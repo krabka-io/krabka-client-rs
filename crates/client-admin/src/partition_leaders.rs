@@ -688,28 +688,25 @@ mod tests {
     #[test]
     fn complete_results_fills_missing_partitions_and_drops_unasked_ones() {
         let keys = [("orders".to_owned(), 0), ("orders".to_owned(), 1)];
-        let results = BTreeMap::from([
-            (("orders".to_owned(), 0), Ok(7)),
-            (("orders".to_owned(), 9), Ok(8)),
-        ]);
+        let results = maplit::btreemap! {
+            ("orders".to_owned(), 0) => Ok(7),
+            ("orders".to_owned(), 9) => Ok(8),
+        };
 
         assert2::assert!(
             complete_results("ListOffsets", &keys, results)
-                == BTreeMap::from([
-                    (("orders".to_owned(), 0), Ok(7)),
-                    (
-                        ("orders".to_owned(), 1),
-                        Err(KafkaError {
-                            code: UNKNOWN_SERVER_ERROR,
-                            name: "UNKNOWN_SERVER_ERROR",
-                            message: Some(
-                                "the ListOffsets response did not contain a result for \
-                                 partition orders-1"
-                                    .to_owned()
-                            ),
-                        })
+                == maplit::btreemap! {
+                    ("orders".to_owned(), 0) => Ok(7),
+                    ("orders".to_owned(), 1) => Err(KafkaError {
+                    code: UNKNOWN_SERVER_ERROR,
+                    name: "UNKNOWN_SERVER_ERROR",
+                    message: Some(
+                        "the ListOffsets response did not contain a result for \
+                         partition orders-1"
+                            .to_owned()
                     ),
-                ])
+                }),
+                }
         );
     }
 }

@@ -693,12 +693,7 @@ mod tests {
             .collect();
         assert2::assert!(
             loads
-                == BTreeMap::from([
-                    ("a".to_string(), 2),
-                    ("b".to_string(), 3),
-                    ("c".to_string(), 1),
-                    ("d".to_string(), 2),
-                ])
+                == maplit::btreemap! {"a".to_string() => 2, "b".to_string() => 3, "c".to_string() => 1, "d".to_string() => 2}
         );
     }
 
@@ -722,11 +717,8 @@ mod tests {
     fn prepopulate_prefers_higher_generation_and_drops_exact_ties() {
         let topic_parts = topic_parts(&[("t", 3)]);
         let subs = subs(&[("m1", &["t"]), ("m2", &["t"]), ("m3", &["t"])]);
-        let gens = BTreeMap::from([
-            ("m1".to_string(), 5),
-            ("m2".to_string(), 4),
-            ("m3".to_string(), 5),
-        ]);
+        let gens =
+            maplit::btreemap! {"m1".to_string() => 5, "m2".to_string() => 4, "m3".to_string() => 5};
 
         let out = prepopulate_current_assignments(
             &[
@@ -757,10 +749,7 @@ mod tests {
         );
 
         assert2::assert!(
-            out == HashMap::from([
-                ("m1".into(), tp(&[("t", 0)])),
-                ("m2".into(), tp(&[("t", 1)])),
-            ])
+            out == maplit::hashmap! {"m1".into() => tp(&[("t", 0)]), "m2".into() => tp(&[("t", 1)])}
         );
     }
 
@@ -852,7 +841,7 @@ mod tests {
             // Sticky previous owner above the min load: least-loaded wins.
             (
                 "overloaded sticky owner",
-                HashMap::from([(tp.clone(), "m1".to_string())]),
+                maplit::hashmap! {tp.clone() => "m1".to_string()},
                 current(&[
                     ("m1", &[("a", 0)]),
                     ("m2", &[]),
@@ -863,14 +852,14 @@ mod tests {
             // Sticky previous owner at the min load keeps the partition.
             (
                 "balanced sticky owner",
-                HashMap::from([(tp.clone(), "m1".to_string())]),
+                maplit::hashmap! {tp.clone() => "m1".to_string()},
                 current(&[("m1", &[]), ("m2", &[]), ("m3", &[("b", 0), ("b", 1)])]),
                 "m1",
             ),
             // Unsubscribed previous owner: least-loaded wins.
             (
                 "unsubscribed previous owner",
-                HashMap::from([(tp.clone(), "mx".to_string())]),
+                maplit::hashmap! {tp.clone() => "mx".to_string()},
                 current(&[
                     ("m1", &[("a", 0)]),
                     ("m2", &[]),
@@ -899,7 +888,7 @@ mod tests {
     fn balance_assignment_moves_from_heaviest_to_lightest_with_sticky_candidate_order() {
         let ids = member_ids(&["m1", "m2", "m3"]);
         let subs = subs(&[("m1", &["t"]), ("m2", &["t"]), ("m3", &["t"])]);
-        let prev_owner = HashMap::from([(("t".to_string(), 1), "m2".to_string())]);
+        let prev_owner = maplit::hashmap! {("t".to_string(), 1) => "m2".to_string()};
         let mut assignment = current(&[
             ("m1", &[("t", 0), ("t", 1), ("t", 2), ("t", 3)]),
             ("m2", &[]),
@@ -924,7 +913,7 @@ mod tests {
     fn balance_assignment_selects_non_first_heaviest_and_non_sticky_candidate() {
         let ids = member_ids(&["m1", "m2", "m3"]);
         let subs = subs(&[("m1", &["t"]), ("m2", &["t"]), ("m3", &["t"])]);
-        let prev_owner = HashMap::from([(("t".to_string(), 1), "m1".to_string())]);
+        let prev_owner = maplit::hashmap! {("t".to_string(), 1) => "m1".to_string()};
         let mut assignment = current(&[
             ("m1", &[]),
             ("m2", &[("t", 0), ("t", 1), ("t", 2)]),
@@ -969,7 +958,7 @@ mod tests {
     fn balance_assignment_moves_a_partition_back_to_its_previous_owner() {
         let ids = member_ids(&["m1", "m2"]);
         let subs = subs(&[("m1", &["t"]), ("m2", &["t"])]);
-        let prev_owner = HashMap::from([(("t".to_string(), 0), "m1".to_string())]);
+        let prev_owner = maplit::hashmap! {("t".to_string(), 0) => "m1".to_string()};
         let mut assignment = current(&[("m1", &[]), ("m2", &[("t", 0), ("t", 1), ("t", 2)])]);
 
         balance_assignment(&ids, &subs, &prev_owner, &mut assignment, 1);

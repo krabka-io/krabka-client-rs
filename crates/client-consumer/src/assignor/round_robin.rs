@@ -74,7 +74,7 @@ mod tests {
     /// The cases of Kafka's `RoundRobinAssignorTest`.
     #[test]
     fn round_robin_assigns_as_kafka_does() {
-        let counts = HashMap::from([("t1".to_owned(), 3), ("t2".to_owned(), 3)]);
+        let counts = maplit::hashmap! {"t1".to_owned() => 3, "t2".to_owned() => 3};
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for (name, members, expected) in [
@@ -84,16 +84,7 @@ mod tests {
                     member("c1", None, &["t1", "t2"]),
                     member("c2", None, &["t1", "t2"]),
                 ],
-                HashMap::from([
-                    (
-                        "c1".to_owned(),
-                        partitions(&[("t1", 0), ("t1", 2), ("t2", 1)]),
-                    ),
-                    (
-                        "c2".to_owned(),
-                        partitions(&[("t1", 1), ("t2", 0), ("t2", 2)]),
-                    ),
-                ]),
+                maplit::hashmap! {"c1".to_owned() => partitions(&[("t1", 0), ("t1", 2), ("t2", 1)]), "c2".to_owned() => partitions(&[("t1", 1), ("t2", 0), ("t2", 2)])},
             ),
             (
                 "members with different subscriptions",
@@ -102,14 +93,7 @@ mod tests {
                     member("c1", None, &["t1", "t2"]),
                     member("c2", None, &["t1"]),
                 ],
-                HashMap::from([
-                    ("c0".to_owned(), partitions(&[("t1", 0)])),
-                    (
-                        "c1".to_owned(),
-                        partitions(&[("t1", 1), ("t2", 0), ("t2", 1), ("t2", 2)]),
-                    ),
-                    ("c2".to_owned(), partitions(&[("t1", 2)])),
-                ]),
+                maplit::hashmap! {"c0".to_owned() => partitions(&[("t1", 0)]), "c1".to_owned() => partitions(&[("t1", 1), ("t2", 0), ("t2", 1), ("t2", 2)]), "c2".to_owned() => partitions(&[("t1", 2)])},
             ),
             (
                 "static members sort by group instance id",
@@ -117,15 +101,12 @@ mod tests {
                     member("b", Some("i2"), &["t1"]),
                     member("a", Some("i1"), &["t1"]),
                 ],
-                HashMap::from([
-                    ("a".to_owned(), partitions(&[("t1", 0), ("t1", 2)])),
-                    ("b".to_owned(), partitions(&[("t1", 1)])),
-                ]),
+                maplit::hashmap! {"a".to_owned() => partitions(&[("t1", 0), ("t1", 2)]), "b".to_owned() => partitions(&[("t1", 1)])},
             ),
             (
                 "a topic without metadata",
                 vec![member("c1", None, &["t3"])],
-                HashMap::from([("c1".to_owned(), Vec::new())]),
+                maplit::hashmap! {"c1".to_owned() => Vec::new()},
             ),
         ] {
             actual.push((name, assign(members, &counts)));

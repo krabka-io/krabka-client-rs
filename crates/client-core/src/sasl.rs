@@ -1100,7 +1100,7 @@ mod tests {
             (
                 SaslCredentials::OAuthBearer {
                     token: OAuthBearerTokenSource::File(PathBuf::from("/run/token")),
-                    extensions: BTreeMap::from([("logicalCluster".into(), "lkc-1".into())]),
+                    extensions: maplit::btreemap! {"logicalCluster".into() => "lkc-1".into()},
                 },
                 r#"OAuthBearer { token: File("/run/token"), extensions: {"logicalCluster": "lkc-1"} }"#,
             ),
@@ -1475,7 +1475,7 @@ mod tests {
                     "OAUTHBEARER provider with an extension",
                     SaslCredentials::OAuthBearer {
                         token: OAuthBearerTokenSource::Provider(Arc::new(FixedToken)),
-                        extensions: BTreeMap::from([("logicalCluster".into(), "lkc-1".into())]),
+                        extensions: maplit::btreemap! {"logicalCluster".into() => "lkc-1".into()},
                     },
                     None,
                     Box::new(|first: &[u8]| {

@@ -34,7 +34,7 @@
 mod support;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     time::{Duration, Instant},
 };
 
@@ -392,11 +392,8 @@ async fn eager_rebalance_reacquires_and_primes() {
 
     // Each member reads its own partition and commits. Those two commits are
     // the positions the eager rejoin must prime from.
-    let seeded = HashSet::from([
-        consume_one_and_commit(&mut m1, "m1").await,
-        consume_one_and_commit(&mut m2, "m2").await,
-    ]);
-    assert!(seeded == HashSet::from(["a0".to_string(), "a1".to_string()]));
+    let seeded = maplit::hashset! {consume_one_and_commit(&mut m1, "m1").await, consume_one_and_commit(&mut m2, "m2").await};
+    assert!(seeded == maplit::hashset! {"a0".to_string(), "a1".to_string()});
 
     // The rejoin must replay nothing. A re-acquired partition that fetched from
     // 0 instead of from the committed position delivers its seed record here.
@@ -465,7 +462,7 @@ async fn commit_succeeds_after_rebalance_bumps_generation() {
     support::produce_to_partition(&producer, &topic, 0, &["g0"]).await;
     support::produce_to_partition(&producer, &topic, 1, &["g1"]).await;
     let seen = collect_prefixed(&mut m1, 'g', 2).await;
-    assert!(seen == HashSet::from(["g0".to_string(), "g1".to_string()]));
+    assert!(seen == maplit::hashset! {"g0".to_string(), "g1".to_string()});
 
     m1.commit_sync()
         .await
@@ -697,10 +694,9 @@ async fn seed_committed_offset_zero(bootstrap: &str, group: &str, topic: &str) {
         .await
         .expect("build seed consumer");
     wait_for_assignment(&seed, 1, "seed consumer").await;
-    seed.commit_offsets_sync(HashMap::from([(
-        (topic.to_string(), 0),
-        OffsetAndMetadata::new(0),
-    )]))
+    seed.commit_offsets_sync(
+        maplit::hashmap! {(topic.to_string(), 0) => OffsetAndMetadata::new(0)},
+    )
     .await
     .expect("seed commit of offset 0");
     seed.close().await.expect("close seed consumer");
