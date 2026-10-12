@@ -3946,7 +3946,9 @@ mod tests {
         expected: Result<T, i16>,
     }
 
+    #[bon::bon]
     impl<T> CoordinatorRetryCase<T> {
+        #[builder]
         fn success(name: &'static str, codes: Vec<i16>, expected_calls: usize, outcome: T) -> Self {
             Self {
                 name,
@@ -3969,34 +3971,42 @@ mod tests {
     impl<T: Clone> CoordinatorRetryCase<T> {
         fn standard(outcome: &T) -> Vec<Self> {
             vec![
-                Self::success("no error", vec![0], 1, outcome.clone()),
-                Self::success(
-                    "coordinator load in progress retries on the same coordinator",
-                    vec![14, 0],
-                    2,
-                    outcome.clone(),
-                ),
-                Self::success(
-                    "not coordinator finds the coordinator again",
-                    vec![16, 0],
-                    2,
-                    outcome.clone(),
-                ),
+                Self::success()
+                    .name("no error")
+                    .codes(vec![0])
+                    .expected_calls(1)
+                    .outcome(outcome.clone())
+                    .call(),
+                Self::success()
+                    .name("coordinator load in progress retries on the same coordinator")
+                    .codes(vec![14, 0])
+                    .expected_calls(2)
+                    .outcome(outcome.clone())
+                    .call(),
+                Self::success()
+                    .name("not coordinator finds the coordinator again")
+                    .codes(vec![16, 0])
+                    .expected_calls(2)
+                    .outcome(outcome.clone())
+                    .call(),
             ]
         }
 
         fn with_rebalance_in_progress(outcome: &T) -> Vec<Self> {
             let mut cases = Self::standard(outcome);
-            cases.push(Self::success(
-                "rebalance in progress retries on the same coordinator",
-                vec![27, 0],
-                2,
-                outcome.clone(),
-            ));
+            cases.push(
+                Self::success()
+                    .name("rebalance in progress retries on the same coordinator")
+                    .codes(vec![27, 0])
+                    .expected_calls(2)
+                    .outcome(outcome.clone())
+                    .call(),
+            );
             cases
         }
     }
 
+    #[bon::builder]
     async fn run_coordinator_retry_cases<T, F, Fut, Resp>(
         api_key: i16,
         respond: Resp,
@@ -4049,17 +4059,17 @@ mod tests {
         let outcome = successful_group_offset_outcome();
         let mut cases = CoordinatorRetryCase::standard(&outcome);
         cases.push(CoordinatorRetryCase::error("non-empty group is final", 68));
-        run_coordinator_retry_cases(
-            OffsetDeleteRequest::API_KEY,
-            respond,
-            cases,
-            |mut admin| async move {
+        run_coordinator_retry_cases()
+            .api_key(OffsetDeleteRequest::API_KEY)
+            .respond(respond)
+            .cases(cases)
+            .action(|mut admin| async move {
                 admin
                     .delete_consumer_group_offsets("workers", &[("orders".into(), 2)])
                     .await
-            },
-        )
-        .await;
+            })
+            .call()
+            .await;
     }
 
     /// Apache Kafka's `KafkaAdminClient.deleteStreamsGroupOffsets` delegates
@@ -4139,11 +4149,11 @@ mod tests {
             "group authorization failed is final",
             30,
         ));
-        run_coordinator_retry_cases(
-            LeaveGroupRequest::API_KEY,
-            respond,
-            cases,
-            |mut admin| async move {
+        run_coordinator_retry_cases()
+            .api_key(LeaveGroupRequest::API_KEY)
+            .respond(respond)
+            .cases(cases)
+            .action(|mut admin| async move {
                 admin
                     .remove_members_from_consumer_group(
                         "workers",
@@ -4158,9 +4168,9 @@ mod tests {
                         &RemoveMembersOptions::default(),
                     )
                     .await
-            },
-        )
-        .await;
+            })
+            .call()
+            .await;
     }
 
     /// Kafka's `removeMembersFromConsumerGroup` sends each member with
@@ -4262,34 +4272,36 @@ mod tests {
         };
         let outcome = successful_group_offset_outcome();
         let mut cases = CoordinatorRetryCase::with_rebalance_in_progress(&outcome);
-        cases.push(CoordinatorRetryCase::success(
-            "a final group error is the error of each partition",
-            vec![68],
-            1,
-            vec![ConsumerGroupOffsetOutcome {
-                topic: "orders".into(),
-                partition: 2,
-                error: Some(KafkaError {
-                    code: 68,
-                    name: "NON_EMPTY_GROUP",
-                    message: None,
-                }),
-            }],
-        ));
-        run_coordinator_retry_cases(
-            AlterShareGroupOffsetsRequest::API_KEY,
-            respond,
-            cases,
-            |mut admin| async move {
+        cases.push(
+            CoordinatorRetryCase::success()
+                .name("a final group error is the error of each partition")
+                .codes(vec![68])
+                .expected_calls(1)
+                .outcome(vec![ConsumerGroupOffsetOutcome {
+                    topic: "orders".into(),
+                    partition: 2,
+                    error: Some(KafkaError {
+                        code: 68,
+                        name: "NON_EMPTY_GROUP",
+                        message: None,
+                    }),
+                }])
+                .call(),
+        );
+        run_coordinator_retry_cases()
+            .api_key(AlterShareGroupOffsetsRequest::API_KEY)
+            .respond(respond)
+            .cases(cases)
+            .action(|mut admin| async move {
                 admin
                     .alter_share_group_offsets(
                         "workers",
                         &BTreeMap::from([(("orders".into(), 2), 41)]),
                     )
                     .await
-            },
-        )
-        .await;
+            })
+            .call()
+            .await;
     }
 
     /// Apache Kafka's `KafkaAdminClient.alterStreamsGroupOffsets` delegates
@@ -4375,16 +4387,16 @@ mod tests {
             "group authorization failed is final",
             30,
         ));
-        run_coordinator_retry_cases(
-            DeleteShareGroupOffsetsRequest::API_KEY,
-            respond,
-            cases,
-            |mut admin| async move {
+        run_coordinator_retry_cases()
+            .api_key(DeleteShareGroupOffsetsRequest::API_KEY)
+            .respond(respond)
+            .cases(cases)
+            .action(|mut admin| async move {
                 admin
                     .delete_share_group_offsets("workers", &["orders".to_string()])
                     .await
-            },
-        )
-        .await;
+            })
+            .call()
+            .await;
     }
 }

@@ -366,9 +366,16 @@ where
         make,
         refind: _,
     } = request;
-    with_coordinator_retry_loop(retry, code, make, |_| async {}).await
+    with_coordinator_retry_loop()
+        .retry(retry)
+        .code(code)
+        .make(make)
+        .on_retry(|_| async {})
+        .call()
+        .await
 }
 
+#[bon::builder]
 async fn with_coordinator_retry_loop<R, F, Fut, C, H, Hfut>(
     retry: CoordinatorRetryPolicy,
     code: C,
@@ -423,28 +430,33 @@ impl<F, C> CoordinatorRetryRequest<'_, F, C> {
             refind,
         } = self;
         let refind = refind.expect("refind request requires coordinator details");
-        with_coordinator_retry_loop(retry, code, make, |reason| async move {
-            if reason == CoordinatorRetryReason::Transport {
-                // Evict a failed coordinator connection so the next attempt
-                // reconnects to the address from discovery.
-                refind
-                    .client
-                    .evict_broker(refind.coordinator_id.load(Ordering::Relaxed));
-            }
-            // Best-effort re-discovery. A transient failure here just means
-            // the next attempt reuses the last-known id; both retry deadlines
-            // still bound the call.
-            match find_coordinator(refind.client, refind.group_id, retry).await {
-                Ok(id) => refind.coordinator_id.store(id, Ordering::Relaxed),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "coordinator re-discovery failed; retrying with last-known id"
-                    );
+        with_coordinator_retry_loop()
+            .retry(retry)
+            .code(code)
+            .make(make)
+            .on_retry(|reason| async move {
+                if reason == CoordinatorRetryReason::Transport {
+                    // Evict a failed coordinator connection so the next attempt
+                    // reconnects to the address from discovery.
+                    refind
+                        .client
+                        .evict_broker(refind.coordinator_id.load(Ordering::Relaxed));
                 }
-            }
-        })
-        .await
+                // Best-effort re-discovery. A transient failure here just means
+                // the next attempt reuses the last-known id; both retry deadlines
+                // still bound the call.
+                match find_coordinator(refind.client, refind.group_id, retry).await {
+                    Ok(id) => refind.coordinator_id.store(id, Ordering::Relaxed),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "coordinator re-discovery failed; retrying with last-known id"
+                        );
+                    }
+                }
+            })
+            .call()
+            .await
     }
 }
 
@@ -977,6 +989,7 @@ async fn publish_assignment(
 
 /// Prime and publish newly owned cooperative partitions before their assign
 /// callback can let `poll` fetch them.
+#[bon::builder]
 async fn publish_cooperative_additions(
     state: &mut CoordinatorState,
     assignment: &[(String, i32)],
@@ -1315,15 +1328,15 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     }
                     Err(ConsumerError::FencedInstanceId(group_instance_id)) => {
                         fence_member(&mut state, group_instance_id).await;
-                        if !prepare_fenced_rejoin(
-                            &mut state,
-                            &mut rejoin,
-                            &shutdown,
-                            rebalance_failure_reason(&ConsumerError::FencedInstanceId(
+                        if !prepare_fenced_rejoin()
+                            .state(&mut state)
+                            .rejoin(&mut rejoin)
+                            .shutdown(&shutdown)
+                            .reason(rebalance_failure_reason(&ConsumerError::FencedInstanceId(
                                 String::new(),
-                            )),
-                        )
-                        .await
+                            )))
+                            .call()
+                            .await
                         {
                             break;
                         }
@@ -1360,13 +1373,13 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     HeartbeatOutcome::Fenced => {
                         let group_instance_id = state.group_instance_id.clone().unwrap_or_default();
                         fence_member(&mut state, group_instance_id).await;
-                        if !prepare_fenced_rejoin(
-                            &mut state,
-                            &mut rejoin,
-                            &shutdown,
-                            heartbeat_rejoin_reason(FENCED_INSTANCE_ID),
-                        )
-                        .await
+                        if !prepare_fenced_rejoin()
+                            .state(&mut state)
+                            .rejoin(&mut rejoin)
+                            .shutdown(&shutdown)
+                            .reason(heartbeat_rejoin_reason(FENCED_INSTANCE_ID))
+                            .call()
+                            .await
                         {
                             break;
                         }
@@ -1494,6 +1507,7 @@ impl RejoinRequest {
     }
 }
 
+#[bon::builder]
 async fn prepare_fenced_rejoin(
     state: &mut CoordinatorState,
     rejoin: &mut RejoinRequest,
@@ -1964,7 +1978,12 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                 // partition and fetch it from offset 0 (poll.rs's
                 // `unwrap_or(0)`), re-delivering records the previous owner
                 // already committed past at revoke time.
-                publish_cooperative_additions(state, &new_assignment, &added, new_generation)
+                publish_cooperative_additions()
+                    .state(state)
+                    .assignment(&new_assignment)
+                    .added(&added)
+                    .generation_id(new_generation)
+                    .call()
                     .await?;
                 topic_partitions
             } else {
@@ -1985,7 +2004,12 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                     revoked.clone(),
                 )
                 .await?;
-                publish_cooperative_additions(state, &new_assignment, &added, new_generation)
+                publish_cooperative_additions()
+                    .state(state)
+                    .assignment(&new_assignment)
+                    .added(&added)
+                    .generation_id(new_generation)
+                    .call()
                     .await?;
                 // With auto commit on, `commit_before_join` committed the
                 // positions of the revoked partitions before round 1. With
