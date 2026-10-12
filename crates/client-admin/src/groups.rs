@@ -440,48 +440,91 @@ impl ListGroupsResult {
     }
 }
 
-impl AdminClient {
-    /// Commits explicit offsets for an inactive consumer group.
-    ///
-    /// The request names each topic, so the client negotiates `OffsetCommit`
-    /// v9 or lower, as Apache Kafka's `AlterConsumerGroupOffsetsHandler` does.
-    ///
-    /// The call retries the partition error codes as Apache Kafka's
-    /// `AlterConsumerGroupOffsetsHandler.handleError` does. One retriable code
-    /// in the response makes the call send all the offsets again:
-    ///
-    /// - `COORDINATOR_LOAD_IN_PROGRESS` (14) and `REBALANCE_IN_PROGRESS` (27):
-    ///   send the request again to the same coordinator.
-    /// - `COORDINATOR_NOT_AVAILABLE` (15) and `NOT_COORDINATOR` (16): find the
-    ///   coordinator again, then send the request again.
-    ///
-    /// A `FindCoordinator` answer of 14 or 15 also makes the call find the
-    /// coordinator again. A failed or lost connection to the coordinator,
-    /// including a TLS or SASL handshake that stops before the broker gives a
-    /// verdict, makes the call find the coordinator again, as Kafka's
-    /// `AdminApiDriver.onFailure` does. The call waits between attempts with
-    /// Kafka's backoff, and it stops when Kafka's default
-    /// `default.api.timeout.ms` (60 s) elapses. A call whose retries are
-    /// unresolved at the deadline, or whose attempt is still running, fails
-    /// with [`ClientError::Timeout`], as Kafka gives a `TimeoutException`.
-    ///
-    /// # Errors
-    /// Returns an error when encoding, transport, or response handling fails.
-    /// Returns [`ClientError::Server`] when `FindCoordinator` answers with an
-    /// error code that Kafka does not retry. Returns
-    /// [`ClientError::Timeout`] at the deadline. Returns [`ClientError::IncompatibleVersion`] when the
-    /// coordinator does not support `OffsetCommit` v9 or lower.
-    ///
-    /// [`ClientError::IncompatibleVersion`]: ClientError::IncompatibleVersion
-    /// [`ClientError::Server`]: ClientError::Server
-    /// [`ClientError::Timeout`]: ClientError::Timeout
-    pub async fn alter_consumer_group_offsets(
-        &mut self,
-        group: &str,
-        offsets: &GroupOffsets,
-    ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        self.alter_group_offsets(GroupOffsetUpdate::consumer(group, offsets))
+macro_rules! group_offsets_method_body {
+    (delete_consumer, $admin:ident, $group:ident, $input:ident) => {
+        $admin
+            .delete_consumer_group_offsets_with_retry($group, $input, $admin.retry)
             .await
+    };
+    (delete_streams, $admin:ident, $group:ident, $input:ident) => {
+        $admin.delete_consumer_group_offsets($group, $input).await
+    };
+    (alter_consumer, $admin:ident, $group:ident, $input:ident) => {
+        $admin
+            .alter_group_offsets(GroupOffsetUpdate::consumer($group, $input))
+            .await
+    };
+    (alter_share, $admin:ident, $group:ident, $input:ident) => {
+        $admin
+            .alter_group_offsets(GroupOffsetUpdate::share($group, $input))
+            .await
+    };
+}
+
+macro_rules! group_offsets_method {
+    ($(#[$meta:meta])* $name:ident($input:ident: $input_type:ty) => $kind:ident) => {
+        $(#[$meta])*
+        pub async fn $name(
+            &mut self,
+            group: &str,
+            $input: &$input_type,
+        ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
+            group_offsets_method_body!($kind, self, group, $input)
+        }
+    };
+}
+
+macro_rules! retry_group_call {
+    ($admin:ident, $retry_policy:ident, $attempt:ident, $group:ident, $request:ident) => {{
+        let mut retry = CoordinatorRetry::new($retry_policy);
+        loop {
+            let action = retry
+                .run($admin.$attempt($group, $request, retry.find_coordinator()))
+                .await;
+            if let Some(result) = retry.next(action).await {
+                return result;
+            }
+        }
+    }};
+}
+
+impl AdminClient {
+    group_offsets_method! {
+        /// Commits explicit offsets for an inactive consumer group.
+        ///
+        /// The request names each topic, so the client negotiates `OffsetCommit`
+        /// v9 or lower, as Apache Kafka's `AlterConsumerGroupOffsetsHandler` does.
+        ///
+        /// The call retries the partition error codes as Apache Kafka's
+        /// `AlterConsumerGroupOffsetsHandler.handleError` does. One retriable code
+        /// in the response makes the call send all the offsets again:
+        ///
+        /// - `COORDINATOR_LOAD_IN_PROGRESS` (14) and `REBALANCE_IN_PROGRESS` (27):
+        ///   send the request again to the same coordinator.
+        /// - `COORDINATOR_NOT_AVAILABLE` (15) and `NOT_COORDINATOR` (16): find the
+        ///   coordinator again, then send the request again.
+        ///
+        /// A `FindCoordinator` answer of 14 or 15 also makes the call find the
+        /// coordinator again. A failed or lost connection to the coordinator,
+        /// including a TLS or SASL handshake that stops before the broker gives a
+        /// verdict, makes the call find the coordinator again, as Kafka's
+        /// `AdminApiDriver.onFailure` does. The call waits between attempts with
+        /// Kafka's backoff, and it stops when Kafka's default
+        /// `default.api.timeout.ms` (60 s) elapses. A call whose retries are
+        /// unresolved at the deadline, or whose attempt is still running, fails
+        /// with [`ClientError::Timeout`], as Kafka gives a `TimeoutException`.
+        ///
+        /// # Errors
+        /// Returns an error when encoding, transport, or response handling fails.
+        /// Returns [`ClientError::Server`] when `FindCoordinator` answers with an
+        /// error code that Kafka does not retry. Returns
+        /// [`ClientError::Timeout`] at the deadline. Returns [`ClientError::IncompatibleVersion`] when the
+        /// coordinator does not support `OffsetCommit` v9 or lower.
+        ///
+        /// [`ClientError::IncompatibleVersion`]: ClientError::IncompatibleVersion
+        /// [`ClientError::Server`]: ClientError::Server
+        /// [`ClientError::Timeout`]: ClientError::Timeout
+        alter_consumer_group_offsets(offsets: GroupOffsets) => alter_consumer
     }
 
     async fn alter_group_offsets(
@@ -791,38 +834,29 @@ impl AdminClient {
             .await
     }
 
-    /// Deletes committed offsets of an inactive consumer group for the named
-    /// partitions with `OffsetDelete`, as Apache Kafka's
-    /// `deleteConsumerGroupOffsets` does. Routes to the group's coordinator
-    /// with the same retry policy as
-    /// [`AdminClient::alter_consumer_group_offsets`].
-    ///
-    /// # Errors
-    /// Returns an error when encoding, transport, or response handling fails.
-    /// Returns [`AdminError::Broker`] when the coordinator's top-level answer
-    /// carries a group error code that Kafka does not retry, such as
-    /// `GROUP_ID_NOT_FOUND` or `NON_EMPTY_GROUP`.
-    pub async fn delete_consumer_group_offsets(
-        &mut self,
-        group: &str,
-        partitions: &[(String, i32)],
-    ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        self.delete_consumer_group_offsets_with_retry(group, partitions, self.retry)
-            .await
+    group_offsets_method! {
+        /// Deletes committed offsets of an inactive consumer group for the named
+        /// partitions with `OffsetDelete`, as Apache Kafka's
+        /// `deleteConsumerGroupOffsets` does. Routes to the group's coordinator
+        /// with the same retry policy as
+        /// [`AdminClient::alter_consumer_group_offsets`].
+        ///
+        /// # Errors
+        /// Returns an error when encoding, transport, or response handling fails.
+        /// Returns [`AdminError::Broker`] when the coordinator's top-level answer
+        /// carries a group error code that Kafka does not retry, such as
+        /// `GROUP_ID_NOT_FOUND` or `NON_EMPTY_GROUP`.
+        delete_consumer_group_offsets(partitions: [(String, i32)]) => delete_consumer
     }
 
-    /// Deletes committed offsets of an inactive streams group. Apache Kafka's
-    /// `KafkaAdminClient.deleteStreamsGroupOffsets` delegates to
-    /// `deleteConsumerGroupOffsets` verbatim, so this does too.
-    ///
-    /// # Errors
-    /// See [`AdminClient::delete_consumer_group_offsets`].
-    pub async fn delete_streams_group_offsets(
-        &mut self,
-        group: &str,
-        partitions: &[(String, i32)],
-    ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        self.delete_consumer_group_offsets(group, partitions).await
+    group_offsets_method! {
+        /// Deletes committed offsets of an inactive streams group. Apache Kafka's
+        /// `KafkaAdminClient.deleteStreamsGroupOffsets` delegates to
+        /// `deleteConsumerGroupOffsets` verbatim, so this does too.
+        ///
+        /// # Errors
+        /// See [`AdminClient::delete_consumer_group_offsets`].
+        delete_streams_group_offsets(partitions: [(String, i32)]) => delete_streams
     }
 
     async fn delete_consumer_group_offsets_with_retry(
@@ -831,15 +865,7 @@ impl AdminClient {
         partitions: &[(String, i32)],
         retry: RetryPolicy,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.offset_delete_attempt(group, partitions, retry.find_coordinator()))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
+        retry_group_call!(self, retry, offset_delete_attempt, group, partitions)
     }
 
     async fn offset_delete_attempt(
@@ -970,15 +996,7 @@ impl AdminClient {
         members: &[MemberIdentity],
         retry: RetryPolicy,
     ) -> Result<RemovedMembers, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.leave_group_attempt(group, members, retry.find_coordinator()))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
+        retry_group_call!(self, retry, leave_group_attempt, group, members)
     }
 
     async fn leave_group_attempt(
@@ -1001,29 +1019,24 @@ impl AdminClient {
         }
     }
 
-    /// Commits explicit start offsets for a share group's partitions with
-    /// `AlterShareGroupOffsets`, as Apache Kafka's `alterShareGroupOffsets`
-    /// does. Routes to the group's coordinator with the same retry policy as
-    /// [`AdminClient::alter_consumer_group_offsets`].
-    ///
-    /// A top-level `COORDINATOR_LOAD_IN_PROGRESS` (14) or
-    /// `REBALANCE_IN_PROGRESS` (27) sends the request again to the same
-    /// coordinator, and `COORDINATOR_NOT_AVAILABLE` (15) or `NOT_COORDINATOR`
-    /// (16) finds the coordinator again. Every other top-level code, such as
-    /// `NON_EMPTY_GROUP` (68), is the error of each requested partition, as
-    /// Kafka's `AlterShareGroupOffsetsHandler.handleError` puts it in the
-    /// partition results.
-    ///
-    /// # Errors
-    /// Returns an error when the coordinator lookup, the connection, or the
-    /// request fails, or at the deadline.
-    pub async fn alter_share_group_offsets(
-        &mut self,
-        group: &str,
-        offsets: &GroupOffsets,
-    ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        self.alter_group_offsets(GroupOffsetUpdate::share(group, offsets))
-            .await
+    group_offsets_method! {
+        /// Commits explicit start offsets for a share group's partitions with
+        /// `AlterShareGroupOffsets`, as Apache Kafka's `alterShareGroupOffsets`
+        /// does. Routes to the group's coordinator with the same retry policy as
+        /// [`AdminClient::alter_consumer_group_offsets`].
+        ///
+        /// A top-level `COORDINATOR_LOAD_IN_PROGRESS` (14) or
+        /// `REBALANCE_IN_PROGRESS` (27) sends the request again to the same
+        /// coordinator, and `COORDINATOR_NOT_AVAILABLE` (15) or `NOT_COORDINATOR`
+        /// (16) finds the coordinator again. Every other top-level code, such as
+        /// `NON_EMPTY_GROUP` (68), is the error of each requested partition, as
+        /// Kafka's `AlterShareGroupOffsetsHandler.handleError` puts it in the
+        /// partition results.
+        ///
+        /// # Errors
+        /// Returns an error when the coordinator lookup, the connection, or the
+        /// request fails, or at the deadline.
+        alter_share_group_offsets(offsets: GroupOffsets) => alter_share
     }
 
     /// Commits explicit start offsets for a streams group's partitions.
@@ -1391,6 +1404,20 @@ fn alter_share_group_offsets_request(
     }
 }
 
+fn share_group_coordinator_error_action<T>(
+    code: i16,
+    error: AdminError,
+    otherwise: impl FnOnce(AdminError) -> Result<T, AdminError>,
+) -> RetryAction<T> {
+    match code {
+        COORDINATOR_LOAD_IN_PROGRESS | REBALANCE_IN_PROGRESS => {
+            RetryAction::SameCoordinator(Err(error))
+        }
+        COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => RetryAction::FindCoordinator(Err(error)),
+        _ => RetryAction::Done(otherwise(error)),
+    }
+}
+
 /// Maps one `AlterShareGroupOffsets` answer to a retry action, as Kafka's
 /// `AlterShareGroupOffsetsHandler.handleResponse` does. A top-level
 /// `COORDINATOR_LOAD_IN_PROGRESS` or `REBALANCE_IN_PROGRESS` retries on the
@@ -1403,26 +1430,22 @@ fn alter_share_group_offsets_retry_action(
     response: AlterShareGroupOffsetsResponse,
 ) -> RetryAction<Vec<ConsumerGroupOffsetOutcome>> {
     if response.error_code != 0 {
-        let result = Err(AdminError::Broker {
+        let error = AdminError::Broker {
             api: "AlterShareGroupOffsets",
             code: response.error_code,
             name: kafka_error_name(response.error_code),
             message: response.error_message.clone(),
-        });
-        return match response.error_code {
-            COORDINATOR_LOAD_IN_PROGRESS | REBALANCE_IN_PROGRESS => {
-                RetryAction::SameCoordinator(result)
-            }
-            COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => RetryAction::FindCoordinator(result),
-            code => RetryAction::Done(Ok(offsets
+        };
+        return share_group_coordinator_error_action(response.error_code, error, |_| {
+            Ok(offsets
                 .keys()
                 .map(|(topic, partition)| ConsumerGroupOffsetOutcome {
                     topic: topic.clone(),
                     partition: *partition,
-                    error: kafka_error_if(code, response.error_message.clone()),
+                    error: kafka_error_if(response.error_code, response.error_message.clone()),
                 })
-                .collect())),
-        };
+                .collect())
+        });
     }
     let outcomes = response
         .responses
@@ -1452,19 +1475,13 @@ fn delete_share_group_offsets_retry_action(
     response: DeleteShareGroupOffsetsResponse,
 ) -> RetryAction<Vec<(String, Option<KafkaError>)>> {
     if response.error_code != 0 {
-        let result = Err(AdminError::Broker {
+        let error = AdminError::Broker {
             api: "DeleteShareGroupOffsets",
             code: response.error_code,
             name: kafka_error_name(response.error_code),
             message: response.error_message,
-        });
-        return match response.error_code {
-            COORDINATOR_LOAD_IN_PROGRESS | REBALANCE_IN_PROGRESS => {
-                RetryAction::SameCoordinator(result)
-            }
-            COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR => RetryAction::FindCoordinator(result),
-            _ => RetryAction::Done(result),
         };
+        return share_group_coordinator_error_action(response.error_code, error, Err);
     }
     let outcomes = response
         .responses
@@ -1849,7 +1866,9 @@ mod tests {
             metadata_request,
             metadata_response::MetadataResponse,
             offset_commit_request,
-            offset_commit_response::{OffsetCommitResponsePartition, OffsetCommitResponseTopic},
+            offset_commit_response::{
+                OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+            },
             offset_delete_response::{OffsetDeleteResponsePartition, OffsetDeleteResponseTopic},
             offset_fetch_request,
             offset_fetch_response::{
@@ -1891,15 +1910,30 @@ mod tests {
         bytes.to_vec()
     }
 
+    struct MockBrokerAddress {
+        node_id: i32,
+        host: String,
+        port: i32,
+    }
+
+    fn mock_broker_address(addr: std::net::SocketAddr, node_id: i32) -> MockBrokerAddress {
+        MockBrokerAddress {
+            node_id,
+            host: addr.ip().to_string(),
+            port: i32::from(addr.port()),
+        }
+    }
+
     fn mock_coordinator_response(
         addr: std::net::SocketAddr,
         error_code: i16,
     ) -> FindCoordinatorResponse {
+        let broker = mock_broker_address(addr, 2);
         FindCoordinatorResponse {
             error_code,
-            node_id: 2,
-            host: addr.ip().to_string(),
-            port: i32::from(addr.port()),
+            node_id: broker.node_id,
+            host: broker.host,
+            port: broker.port,
             ..Default::default()
         }
     }
@@ -2912,14 +2946,7 @@ mod tests {
                 seen.fetch_add(1, Ordering::SeqCst);
                 Some(encode(
                     &OffsetCommitResponse {
-                        topics: vec![OffsetCommitResponseTopic {
-                            name: "orders".into(),
-                            partitions: vec![OffsetCommitResponsePartition {
-                                partition_index: 2,
-                                ..Default::default()
-                            }],
-                            ..Default::default()
-                        }],
+                        topics: vec![successful_offset_commit_topic()],
                         ..Default::default()
                     },
                     version,
@@ -3078,11 +3105,14 @@ mod tests {
                         .expect("cluster lock")
                         .iter()
                         .zip(1..)
-                        .map(|(addr, node_id)| MetadataResponseBroker {
-                            node_id,
-                            host: addr.ip().to_string(),
-                            port: i32::from(addr.port()),
-                            ..Default::default()
+                        .map(|(addr, node_id)| {
+                            let broker = mock_broker_address(*addr, node_id);
+                            MetadataResponseBroker {
+                                node_id: broker.node_id,
+                                host: broker.host,
+                                port: broker.port,
+                                ..Default::default()
+                            }
                         })
                         .collect(),
                     ..Default::default()
@@ -3932,6 +3962,18 @@ mod tests {
         }
     }
 
+    fn successful_offset_commit_topic() -> OffsetCommitResponseTopic {
+        OffsetCommitResponseTopic {
+            name: "orders".into(),
+            partitions: vec![OffsetCommitResponsePartition {
+                partition_index: 2,
+                error_code: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
     fn assert_single_group_offset_success(
         result: Result<Vec<ConsumerGroupOffsetOutcome>, String>,
         calls: usize,
@@ -4072,29 +4114,82 @@ mod tests {
             .await;
     }
 
-    /// Apache Kafka's `KafkaAdminClient.deleteStreamsGroupOffsets` delegates
-    /// to `deleteConsumerGroupOffsets` verbatim.
+    #[derive(Clone, Copy)]
+    enum StreamsGroupOffsetCall {
+        Delete,
+        Alter,
+    }
+
+    impl StreamsGroupOffsetCall {
+        fn api_key(self) -> i16 {
+            match self {
+                Self::Delete => OffsetDeleteRequest::API_KEY,
+                Self::Alter => offset_commit_request::API_KEY,
+            }
+        }
+
+        fn response(self, version: i16) -> Vec<u8> {
+            match self {
+                Self::Delete => encode(
+                    &OffsetDeleteResponse {
+                        error_code: 0,
+                        topics: vec![successful_offset_delete_topic()],
+                        ..Default::default()
+                    },
+                    version,
+                    false,
+                ),
+                Self::Alter => encode(
+                    &OffsetCommitResponse {
+                        topics: vec![successful_offset_commit_topic()],
+                        ..Default::default()
+                    },
+                    version,
+                    true,
+                ),
+            }
+        }
+
+        async fn call(
+            self,
+            admin: &mut AdminClient,
+        ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
+            match self {
+                Self::Delete => {
+                    admin
+                        .delete_streams_group_offsets("workers", &[("orders".into(), 2)])
+                        .await
+                }
+                Self::Alter => {
+                    admin
+                        .alter_streams_group_offsets(
+                            "workers",
+                            &BTreeMap::from([(("orders".into(), 2), 41)]),
+                        )
+                        .await
+                }
+            }
+        }
+    }
+
+    /// Kafka's Streams group offset APIs delegate to their Consumer group
+    /// counterparts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delete_streams_group_offsets_delegates_to_offset_delete() {
-        let respond = |_code: i16, version: i16| {
-            encode(
-                &OffsetDeleteResponse {
-                    error_code: 0,
-                    topics: vec![successful_offset_delete_topic()],
-                    ..Default::default()
-                },
-                version,
-                false,
-            )
-        };
-        let (mut admin, broker, calls) =
-            connect_self_coordinating(OffsetDeleteRequest::API_KEY, vec![0], respond).await;
-        let result = admin
-            .delete_streams_group_offsets("workers", &[("orders".into(), 2)])
-            .await
-            .map_err(|error| error.to_string());
-        broker.stop();
-        assert_single_group_offset_success(result, calls.load(Ordering::SeqCst));
+    async fn streams_group_offset_calls_delegate_to_consumer_calls() {
+        for call in [
+            StreamsGroupOffsetCall::Delete,
+            StreamsGroupOffsetCall::Alter,
+        ] {
+            let respond = move |_code: i16, version: i16| call.response(version);
+            let (mut admin, broker, calls) =
+                connect_self_coordinating(call.api_key(), vec![0], respond).await;
+            let result = call
+                .call(&mut admin)
+                .await
+                .map_err(|error| error.to_string());
+            broker.stop();
+            assert_single_group_offset_success(result, calls.load(Ordering::SeqCst));
+        }
     }
 
     /// Apache Kafka's `RemoveMembersFromConsumerGroupHandler.handleResponse`
@@ -4302,38 +4397,6 @@ mod tests {
             })
             .call()
             .await;
-    }
-
-    /// Apache Kafka's `KafkaAdminClient.alterStreamsGroupOffsets` delegates
-    /// to `alterConsumerGroupOffsets` verbatim.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn alter_streams_group_offsets_delegates_to_offset_commit() {
-        let respond = |_code: i16, version: i16| {
-            encode(
-                &OffsetCommitResponse {
-                    topics: vec![OffsetCommitResponseTopic {
-                        name: "orders".into(),
-                        partitions: vec![OffsetCommitResponsePartition {
-                            partition_index: 2,
-                            error_code: 0,
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
-        };
-        let (mut admin, broker, calls) =
-            connect_self_coordinating(offset_commit_request::API_KEY, vec![0], respond).await;
-        let result = admin
-            .alter_streams_group_offsets("workers", &BTreeMap::from([(("orders".into(), 2), 41)]))
-            .await
-            .map_err(|error| error.to_string());
-        broker.stop();
-        assert_single_group_offset_success(result, calls.load(Ordering::SeqCst));
     }
 
     /// Apache Kafka's `KafkaAdminClient.listStreamsGroupOffsets` delegates to
