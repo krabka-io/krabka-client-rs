@@ -671,10 +671,10 @@ fn describe_wire(
 ) -> DescribeConfigsRequest {
     describe_request(
         &resources.iter().cloned().collect(),
-        DescribeConfigsOptions {
-            include_synonyms,
-            include_documentation,
-        },
+        DescribeConfigsOptions::builder()
+            .include_synonyms(include_synonyms)
+            .include_documentation(include_documentation)
+            .build(),
     )
 }
 
@@ -715,25 +715,23 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
     let orders = ConfigResource::topic("orders");
     let broker_2 = ConfigResource::broker(2);
     let both = vec![orders.clone(), broker_2.clone()];
-    let synonyms = DescribeConfigsOptions {
-        include_synonyms: true,
-        include_documentation: false,
-    };
-    let documentation = DescribeConfigsOptions {
-        include_synonyms: false,
-        include_documentation: true,
-    };
-    let both_options = DescribeConfigsOptions {
-        include_synonyms: true,
-        include_documentation: true,
-    };
+    let synonyms = DescribeConfigsOptions::builder()
+        .include_synonyms(true)
+        .build();
+    let documentation = DescribeConfigsOptions::builder()
+        .include_documentation(true)
+        .build();
+    let both_options = DescribeConfigsOptions::builder()
+        .include_synonyms(true)
+        .include_documentation(true)
+        .build();
     for (name, broker_2_down, describe_max, resources, options, expected_requests, expected) in [
         (
             "every type",
             false,
             4,
             every_type(),
-            DescribeConfigsOptions::default(),
+            DescribeConfigsOptions::builder().build(),
             vec![
                 Received::Describe(1, 4, describe_wire(&unified, false, false)),
                 Received::Describe(2, 4, describe_wire(&on_broker_2, false, false)),
@@ -799,7 +797,7 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
             true,
             4,
             both.clone(),
-            DescribeConfigsOptions::default(),
+            DescribeConfigsOptions::builder().build(),
             vec![Received::Describe(
                 1,
                 4,
@@ -836,7 +834,7 @@ async fn describe_configs_refuses_a_broker_name_that_is_not_an_id() {
                 ConfigResource::topic("orders"),
                 ConfigResource::new(ConfigResourceType::Broker, "one"),
             ],
-            DescribeConfigsOptions::default(),
+            DescribeConfigsOptions::builder().build(),
         )
         .await;
     let received = cluster.stop();
@@ -853,7 +851,9 @@ fn alter_wire(
             .iter()
             .map(|(resource, ops)| ((*resource).clone(), *ops))
             .collect(),
-        IncrementalAlterConfigsOptions { validate_only },
+        IncrementalAlterConfigsOptions::builder()
+            .validate_only(validate_only)
+            .build(),
     )
 }
 
@@ -901,7 +901,12 @@ async fn incremental_alter_configs_routes_each_resource_as_kafka_does() {
         let mut cluster = Cluster::start(ECHO, false, 4, LONG).await;
         let result = cluster
             .admin
-            .incremental_alter_configs(&configs, IncrementalAlterConfigsOptions { validate_only })
+            .incremental_alter_configs(
+                &configs,
+                IncrementalAlterConfigsOptions::builder()
+                    .validate_only(validate_only)
+                    .build(),
+            )
             .await
             .expect("incremental_alter_configs");
         let mut received = cluster.stop();
@@ -982,7 +987,7 @@ async fn incremental_alter_configs_retries_not_controller_and_isolates_failures(
         let mut cluster = Cluster::start(script, broker_2_down, 4, timeout).await;
         let result = cluster
             .admin
-            .incremental_alter_configs(&configs, IncrementalAlterConfigsOptions::default())
+            .incremental_alter_configs(&configs, IncrementalAlterConfigsOptions::builder().build())
             .await
             .expect("incremental_alter_configs");
         let received = cluster.stop();
@@ -1077,7 +1082,7 @@ async fn incremental_alter_configs_through_controllers_routes_as_kafka_does() {
     let ops = vec![AlterConfigOp::set("log.cleaner.threads", "2")];
     let configs = BTreeMap::from([(broker.clone(), ops.clone()), (logger.clone(), ops.clone())]);
     let result = admin
-        .incremental_alter_configs(&configs, IncrementalAlterConfigsOptions::default())
+        .incremental_alter_configs(&configs, IncrementalAlterConfigsOptions::builder().build())
         .await
         .expect("incremental_alter_configs");
     controller.stop();

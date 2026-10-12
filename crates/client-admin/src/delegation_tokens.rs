@@ -24,7 +24,10 @@ use krabka_protocol::owned::{
     renew_delegation_token_request::RenewDelegationTokenRequest,
 };
 use krabka_security::KafkaPrincipal;
-use krabka_units::{Time, convert::wire::opt_time_to_millis_i64};
+use krabka_units::{
+    Time,
+    convert::{TimeExt as _, wire::opt_time_to_millis_i64},
+};
 
 use crate::{AdminClient, AdminError, kafka_error_name};
 
@@ -35,48 +38,52 @@ const CREATE_WITH_OWNER_MIN_VERSION: i16 = 3;
 /// What [`AdminClient::create_delegation_token`] asks for, as Kafka's
 /// `CreateDelegationTokenOptions`. The default mints a token that the caller
 /// owns, with no renewers and the broker's maximum lifetime.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, bon::Builder)]
 pub struct CreateDelegationTokenOptions {
     /// The owner of the token, of any principal type. `None` makes the
     /// caller the owner. Another owner needs the `CreateTokens` operation on
     /// the owner's `User` resource, and `CreateDelegationToken` v3 (KIP-373).
     pub owner: Option<KafkaPrincipal>,
     /// The principals that may renew the token.
+    #[builder(default)]
     pub renewers: Vec<KafkaPrincipal>,
     /// The maximum lifetime of the token. `None` sends Kafka's `-1`, and the
     /// broker then uses `delegation.token.max.lifetime.ms`. The broker also
     /// uses that ceiling for a lifetime of zero or less, and caps a longer
     /// one at it.
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub max_lifetime: Option<Time>,
 }
 
 /// What [`AdminClient::renew_delegation_token`] asks for, as Kafka's
 /// `RenewDelegationTokenOptions`.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, bon::Builder)]
 pub struct RenewDelegationTokenOptions {
     /// How far past now to move the expiry. `None` sends Kafka's `-1`, and
     /// the broker then uses `delegation.token.expiry.time.ms`. The broker
     /// also uses that default for a period of zero or less, caps a longer
     /// one at it, and never moves the expiry past the token's maximum
     /// timestamp.
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub renew_time_period: Option<Time>,
 }
 
 /// What [`AdminClient::expire_delegation_token`] asks for, as Kafka's
 /// `ExpireDelegationTokenOptions`.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, bon::Builder)]
 pub struct ExpireDelegationTokenOptions {
     /// How far past now the token expires. `None` sends Kafka's `-1`, which
     /// expires the token now, as does any negative period. A period of zero
     /// or more sets the expiry to that time, capped at the token's maximum
     /// timestamp.
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub expiry_time_period: Option<Time>,
 }
 
 /// What [`AdminClient::describe_delegation_token`] asks for, as Kafka's
 /// `DescribeDelegationTokenOptions`. The default describes every token that
 /// the caller may describe.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct DescribeDelegationTokenOptions {
     /// The owners whose tokens to describe. `None` sends a null owner list,
     /// and the broker returns every token that the caller owns or may
@@ -496,7 +503,7 @@ mod tests {
         for (name, options, request, error_code, expected) in [
             (
                 "defaults",
-                CreateDelegationTokenOptions::default(),
+                CreateDelegationTokenOptions::builder().build(),
                 CreateDelegationTokenRequest {
                     owner_principal_type: Some(String::new()),
                     owner_principal_name: Some(String::new()),
@@ -509,11 +516,11 @@ mod tests {
             ),
             (
                 "owner of another principal type, renewers, lifetime",
-                CreateDelegationTokenOptions {
-                    owner: Some(group("ops")),
-                    renewers: renewers.clone(),
-                    max_lifetime: Some(krabka_units::secs(60)),
-                },
+                CreateDelegationTokenOptions::builder()
+                    .owner(group("ops"))
+                    .renewers(renewers.clone())
+                    .max_lifetime(60_000)
+                    .build(),
                 CreateDelegationTokenRequest {
                     owner_principal_type: Some("Group".to_owned()),
                     owner_principal_name: Some("ops".to_owned()),
@@ -526,10 +533,9 @@ mod tests {
             ),
             (
                 "zero lifetime reaches the broker as zero",
-                CreateDelegationTokenOptions {
-                    max_lifetime: Some(krabka_units::millis(0)),
-                    ..CreateDelegationTokenOptions::default()
-                },
+                CreateDelegationTokenOptions::builder()
+                    .max_lifetime(0)
+                    .build(),
                 CreateDelegationTokenRequest {
                     max_lifetime_ms: 0,
                     ..Default::default()
@@ -539,10 +545,9 @@ mod tests {
             ),
             (
                 "not authorized to create for the owner",
-                CreateDelegationTokenOptions {
-                    owner: Some(user("alice")),
-                    ..CreateDelegationTokenOptions::default()
-                },
+                CreateDelegationTokenOptions::builder()
+                    .owner(user("alice"))
+                    .build(),
                 CreateDelegationTokenRequest {
                     owner_principal_type: Some("User".to_owned()),
                     owner_principal_name: Some("alice".to_owned()),
@@ -558,10 +563,9 @@ mod tests {
             ),
             (
                 "renewer of an invalid principal type",
-                CreateDelegationTokenOptions {
-                    renewers: renewers.clone(),
-                    ..CreateDelegationTokenOptions::default()
-                },
+                CreateDelegationTokenOptions::builder()
+                    .renewers(renewers.clone())
+                    .build(),
                 CreateDelegationTokenRequest {
                     renewers: wire_renewers.clone(),
                     max_lifetime_ms: -1,
@@ -605,7 +609,7 @@ mod tests {
         let mut admin = fast_admin(create.addr, krabka_units::secs(5)).await;
         let created = AdminClientLike::create_delegation_token(
             &mut admin,
-            &CreateDelegationTokenOptions::default(),
+            &CreateDelegationTokenOptions::builder().build(),
         )
         .await
         .map(|token| token.token_id);
@@ -624,7 +628,7 @@ mod tests {
         let renewed = AdminClientLike::renew_delegation_token(
             &mut admin,
             b"hmac",
-            RenewDelegationTokenOptions::default(),
+            RenewDelegationTokenOptions::builder().build(),
         )
         .await;
         renew.stop();
@@ -642,7 +646,7 @@ mod tests {
         let expired = AdminClientLike::expire_delegation_token(
             &mut admin,
             b"hmac",
-            ExpireDelegationTokenOptions::default(),
+            ExpireDelegationTokenOptions::builder().build(),
         )
         .await;
         expire.stop();
@@ -656,7 +660,7 @@ mod tests {
         let mut admin = fast_admin(describe.addr, krabka_units::secs(5)).await;
         let described = AdminClientLike::describe_delegation_token(
             &mut admin,
-            &DescribeDelegationTokenOptions::default(),
+            &DescribeDelegationTokenOptions::builder().build(),
         )
         .await
         .map(|tokens| tokens.len());
@@ -735,10 +739,11 @@ mod tests {
             let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
             let result = admin
-                .create_delegation_token(&CreateDelegationTokenOptions {
-                    owner,
-                    ..CreateDelegationTokenOptions::default()
-                })
+                .create_delegation_token(
+                    &CreateDelegationTokenOptions::builder()
+                        .maybe_owner(owner)
+                        .build(),
+                )
                 .await
                 .map(|_| requests.lock().expect("requests lock").len())
                 .map_err(|error| match error {
@@ -801,7 +806,11 @@ mod tests {
                 admin
                     .renew_delegation_token(
                         b"\x01\x02",
-                        RenewDelegationTokenOptions { renew_time_period },
+                        RenewDelegationTokenOptions::builder()
+                            .maybe_renew_time_period(
+                                renew_time_period.map(krabka_units::convert::TimeExt::millis_i64),
+                            )
+                            .build(),
                     )
                     .await,
             );
@@ -866,7 +875,11 @@ mod tests {
                 admin
                     .expire_delegation_token(
                         b"\xaa",
-                        ExpireDelegationTokenOptions { expiry_time_period },
+                        ExpireDelegationTokenOptions::builder()
+                            .maybe_expiry_time_period(
+                                expiry_time_period.map(krabka_units::convert::TimeExt::millis_i64),
+                            )
+                            .build(),
                     )
                     .await,
             );
@@ -974,7 +987,11 @@ mod tests {
 
             let result = outcome(
                 admin
-                    .describe_delegation_token(&DescribeDelegationTokenOptions { owners })
+                    .describe_delegation_token(
+                        &DescribeDelegationTokenOptions::builder()
+                            .maybe_owners(owners)
+                            .build(),
+                    )
                     .await,
             );
 

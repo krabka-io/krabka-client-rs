@@ -21,11 +21,13 @@ const CONSUMER_PROTOCOL_TYPE: &str = "consumer";
 
 /// The options of [`AdminClient::list_consumer_groups`], as Apache Kafka's
 /// `ListConsumerGroupsOptions` holds them. An empty set does not filter.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct ListConsumerGroupsOptions {
     /// The broker lists only groups in these states (`states_filter`).
+    #[builder(default)]
     pub group_states: BTreeSet<GroupState>,
     /// The broker lists only groups of these types (`types_filter`).
+    #[builder(default)]
     pub types: BTreeSet<GroupType>,
 }
 
@@ -97,11 +99,16 @@ impl AdminClient {
         options: &ListConsumerGroupsOptions,
     ) -> Result<ListConsumerGroupsResult, AdminError> {
         let result = self
-            .list_groups(&ListGroupsOptions {
-                group_states: options.group_states.clone(),
-                types: options.types.clone(),
-                protocol_types: BTreeSet::from([String::new(), CONSUMER_PROTOCOL_TYPE.to_owned()]),
-            })
+            .list_groups(
+                &ListGroupsOptions::builder()
+                    .group_states(options.group_states.clone())
+                    .types(options.types.clone())
+                    .protocol_types(BTreeSet::from([
+                        String::new(),
+                        CONSUMER_PROTOCOL_TYPE.to_owned(),
+                    ]))
+                    .build(),
+            )
             .await?;
         Ok(ListConsumerGroupsResult {
             valid: result
@@ -198,10 +205,12 @@ mod tests {
         let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
         let result = admin
-            .list_consumer_groups(&ListConsumerGroupsOptions {
-                group_states: BTreeSet::from([GroupState::Stable]),
-                types: BTreeSet::new(),
-            })
+            .list_consumer_groups(
+                &ListConsumerGroupsOptions::builder()
+                    .group_states(BTreeSet::from([GroupState::Stable]))
+                    .types(BTreeSet::new())
+                    .build(),
+            )
             .await
             .expect("list_consumer_groups succeeds");
 

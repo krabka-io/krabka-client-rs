@@ -26,7 +26,7 @@ use crate::{
 
 /// The partitions to list for one share group, as Apache Kafka's
 /// `ListShareGroupOffsetsSpec` holds them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct ListShareGroupOffsetsSpec {
     /// The partitions to list, or `None` for every partition that the group
     /// has an offset for.
@@ -228,16 +228,19 @@ mod tests {
     #[test]
     fn request_names_the_partitions_of_each_spec() {
         let specs = BTreeMap::from([
-            ("all".to_owned(), ListShareGroupOffsetsSpec::default()),
+            (
+                "all".to_owned(),
+                ListShareGroupOffsetsSpec::builder().build(),
+            ),
             (
                 "some".to_owned(),
-                ListShareGroupOffsetsSpec {
-                    topic_partitions: Some(vec![
+                ListShareGroupOffsetsSpec::builder()
+                    .topic_partitions(vec![
                         ("orders".to_owned(), 2),
                         ("audit".to_owned(), 0),
                         ("orders".to_owned(), 0),
-                    ]),
-                },
+                    ])
+                    .build(),
             ),
         ]);
         let keys = ["all".to_owned(), "some".to_owned()];
@@ -408,8 +411,14 @@ mod tests {
             .await;
         let admin = cluster.admin(krabka_units::secs(5)).await;
         let specs = BTreeMap::from([
-            ("ready".to_owned(), ListShareGroupOffsetsSpec::default()),
-            ("loading".to_owned(), ListShareGroupOffsetsSpec::default()),
+            (
+                "ready".to_owned(),
+                ListShareGroupOffsetsSpec::builder().build(),
+            ),
+            (
+                "loading".to_owned(),
+                ListShareGroupOffsetsSpec::builder().build(),
+            ),
         ]);
 
         let result = admin.list_share_group_offsets(&specs).await;

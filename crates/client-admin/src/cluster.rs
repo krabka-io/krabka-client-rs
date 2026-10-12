@@ -25,11 +25,13 @@ const AUTHORIZED_OPERATIONS_OMITTED: i32 = i32::MIN;
 
 /// What [`AdminClient::describe_cluster`] asks for, as Kafka's
 /// `DescribeClusterOptions`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bon::Builder)]
 pub struct DescribeClusterOptions {
     /// Ask for the operations that the caller may perform on the cluster.
+    #[builder(default)]
     pub include_authorized_operations: bool,
     /// List fenced brokers too (KIP-1073). Needs `DescribeCluster` v2.
+    #[builder(default)]
     pub include_fenced_brokers: bool,
 }
 
@@ -241,7 +243,7 @@ mod tests {
         for (name, options, response, expected) in [
             (
                 "plain",
-                DescribeClusterOptions::default(),
+                DescribeClusterOptions::builder().build(),
                 answer(0, 2, i32::MIN),
                 Ok(ClusterDescription {
                     cluster_id: "lkc-1".to_owned(),
@@ -252,10 +254,10 @@ mod tests {
             ),
             (
                 "fenced brokers and authorized operations",
-                DescribeClusterOptions {
-                    include_authorized_operations: true,
-                    include_fenced_brokers: true,
-                },
+                DescribeClusterOptions::builder()
+                    .include_authorized_operations(true)
+                    .include_fenced_brokers(true)
+                    .build(),
                 answer(0, 7, 1 << 8),
                 Ok(ClusterDescription {
                     cluster_id: "lkc-1".to_owned(),
@@ -266,7 +268,7 @@ mod tests {
             ),
             (
                 "cluster authorization failed is final",
-                DescribeClusterOptions::default(),
+                DescribeClusterOptions::builder().build(),
                 answer(31, 1, i32::MIN),
                 Err(("DescribeCluster", 31, Some("denied".to_owned()))),
             ),
@@ -345,10 +347,11 @@ mod tests {
         let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
         let result = admin
-            .describe_cluster(DescribeClusterOptions {
-                include_fenced_brokers: true,
-                ..DescribeClusterOptions::default()
-            })
+            .describe_cluster(
+                DescribeClusterOptions::builder()
+                    .include_fenced_brokers(true)
+                    .build(),
+            )
             .await;
 
         broker.stop();

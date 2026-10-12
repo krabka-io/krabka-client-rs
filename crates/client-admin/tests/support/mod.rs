@@ -186,13 +186,11 @@ async fn warm_up_pause(attempt: u32) {
 pub async fn create_topic(admin: &mut AdminClient, name: &str, partitions: i32) {
     let outcomes = admin
         .create_topics(
-            &[CreateTopicSpec {
-                name: name.to_owned(),
-                partitions,
-                replicas: 1,
-                configs: std::collections::BTreeMap::new(),
-                ..Default::default()
-            }],
+            &[CreateTopicSpec::builder()
+                .name(name)
+                .partitions(partitions)
+                .replicas(1)
+                .build()],
             krabka_client_admin::TopicMutationOptions::with_timeout(krabka_units::secs(30)),
         )
         .await

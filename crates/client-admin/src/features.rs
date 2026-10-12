@@ -123,23 +123,26 @@ impl FeatureUpdate {
 
 /// Options of [`AdminClient::update_features`], as Kafka's
 /// `UpdateFeaturesOptions`.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, bon::Builder)]
 pub struct UpdateFeaturesOptions {
     /// The deadline of the call, including retries. Each request carries the
     /// time that remains as its `timeout_ms`. `None` uses the client's
     /// `default.api.timeout.ms`.
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub timeout: Option<Time>,
     /// Ask the controller to validate the updates and apply none. Needs
     /// `UpdateFeatures` v1.
+    #[builder(default)]
     pub validate_only: bool,
 }
 
 /// Options of [`AdminClient::describe_features`], as Kafka's
 /// `DescribeFeaturesOptions`.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, bon::Builder)]
 pub struct DescribeFeaturesOptions {
     /// The deadline of the call, including retries. `None` uses the client's
     /// `default.api.timeout.ms`.
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub timeout: Option<Time>,
     /// The node to ask. `None` asks the node of the client's connection, as
     /// Kafka's `LeastLoadedBrokerOrActiveKController` picks one. A node id
@@ -321,10 +324,10 @@ impl AdminClient {
         let results = self
             .update_features(
                 &updates,
-                UpdateFeaturesOptions {
-                    timeout: Some(timeout),
-                    validate_only: false,
-                },
+                UpdateFeaturesOptions::builder()
+                    .timeout(timeout.millis_i64())
+                    .validate_only(false)
+                    .build(),
             )
             .await?;
         if let Some(Err(error)) = results.into_values().next() {
@@ -665,10 +668,9 @@ mod tests {
                     let result = admin
                         .update_features(
                             &updates,
-                            UpdateFeaturesOptions {
-                                timeout: None,
-                                validate_only,
-                            },
+                            UpdateFeaturesOptions::builder()
+                                .validate_only(validate_only)
+                                .build(),
                         )
                         .await;
                     broker.stop();
@@ -752,7 +754,7 @@ mod tests {
             ),
         ] {
             let result = admin
-                .update_features(&updates, UpdateFeaturesOptions::default())
+                .update_features(&updates, UpdateFeaturesOptions::builder().build())
                 .await;
             assert2::assert!(
                 matches!(result, Err(AdminError::InvalidArgument(_))),
@@ -839,10 +841,11 @@ mod tests {
             ("node 2", Some(2), "on.node.2"),
         ] {
             let metadata = admin
-                .describe_features(DescribeFeaturesOptions {
-                    timeout: None,
-                    node_id,
-                })
+                .describe_features(
+                    DescribeFeaturesOptions::builder()
+                        .maybe_node_id(node_id)
+                        .build(),
+                )
                 .await
                 .expect("describe succeeds");
             assert2::assert!(
@@ -861,10 +864,12 @@ mod tests {
         }
 
         let unknown = admin
-            .describe_features(DescribeFeaturesOptions {
-                timeout: Some(krabka_units::millis(50)),
-                node_id: Some(9),
-            })
+            .describe_features(
+                DescribeFeaturesOptions::builder()
+                    .timeout(50)
+                    .node_id(9)
+                    .build(),
+            )
             .await;
         assert2::assert!(
             matches!(

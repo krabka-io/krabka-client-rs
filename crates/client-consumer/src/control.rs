@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use krabka_units::{Time, convert::TimeExt as _, secs};
+use krabka_units::{Time, convert::TimeExt, secs};
 
 use crate::{
     consumer::{Consumer, GroupMembershipOperation},
@@ -22,12 +22,14 @@ pub(crate) const ENFORCED_REBALANCE_REASON: &str = "rebalance enforced by user";
 
 /// How [`Consumer::close_with`](Consumer::close_with) closes the
 /// consumer. Kafka's `CloseOptions` (KIP-1092).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bon::Builder)]
 pub struct CloseOptions {
     /// What the consumer does with its group membership.
+    #[builder(default)]
     pub group_membership_operation: GroupMembershipOperation,
     /// The time that the close can take. `None` is
     /// [`DEFAULT_CONSUMER_CLOSE_TIMEOUT`].
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub timeout: Option<Time>,
 }
 
@@ -45,10 +47,9 @@ impl CloseOptions {
     /// `CloseOptions.groupMembershipOperation`.
     #[must_use]
     pub fn group_membership_operation(operation: GroupMembershipOperation) -> Self {
-        Self {
-            group_membership_operation: operation,
-            ..Self::default()
-        }
+        Self::builder()
+            .group_membership_operation(operation)
+            .build()
     }
 }
 
@@ -175,20 +176,38 @@ mod tests {
 
     #[test]
     fn close_timeout_follows_kafkas_close() {
-        let actual = [
-            CloseOptions::default(),
-            CloseOptions::timeout(millis(250)),
-            CloseOptions::timeout(Time::from_secs_f64(-1.0)),
-        ]
-        .map(|options| close_timeout(options).map_err(|error| error.to_string()));
-        assert2::assert!(
-            actual
-                == [
-                    Ok(DEFAULT_CONSUMER_CLOSE_TIMEOUT),
-                    Ok(millis(250)),
-                    Err("invalid argument: The timeout cannot be negative.".to_owned()),
-                ]
-        );
+        let cases = [
+            (
+                "default timeout",
+                CloseOptions::builder().build(),
+                Ok(DEFAULT_CONSUMER_CLOSE_TIMEOUT),
+            ),
+            (
+                "finite timeout",
+                CloseOptions::timeout(millis(250)),
+                Ok(millis(250)),
+            ),
+            (
+                "negative timeout",
+                CloseOptions::timeout(Time::from_secs_f64(-1.0)),
+                Err("invalid argument: The timeout cannot be negative.".to_owned()),
+            ),
+            (
+                "NaN timeout",
+                CloseOptions::timeout(Time::from_secs_f64(f64::NAN)),
+                Err("invalid argument: The timeout cannot be negative.".to_owned()),
+            ),
+            (
+                "infinite timeout",
+                CloseOptions::timeout(Time::from_secs_f64(f64::INFINITY)),
+                Err("invalid argument: The timeout cannot be negative.".to_owned()),
+            ),
+        ];
+
+        for (name, options, expected) in cases {
+            let actual = close_timeout(options).map_err(|error| error.to_string());
+            assert2::assert!(actual == expected, "case: {name}");
+        }
     }
 
     #[tokio::test]

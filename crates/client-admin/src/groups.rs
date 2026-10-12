@@ -318,13 +318,16 @@ impl std::fmt::Display for GroupType {
 
 /// The options of [`AdminClient::list_groups`], as Apache Kafka's
 /// `ListGroupsOptions` holds them. An empty set does not filter.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct ListGroupsOptions {
     /// The broker lists only groups in these states (`states_filter`).
+    #[builder(default)]
     pub group_states: BTreeSet<GroupState>,
     /// The broker lists only groups of these types (`types_filter`).
+    #[builder(default)]
     pub types: BTreeSet<GroupType>,
     /// The client keeps only groups with these protocol types.
+    #[builder(default)]
     pub protocol_types: BTreeSet<String>,
 }
 
@@ -333,30 +336,27 @@ impl ListGroupsOptions {
     /// protocol type, as Kafka's `ListGroupsOptions.forConsumerGroups` selects.
     #[must_use]
     pub fn for_consumer_groups() -> Self {
-        Self {
-            group_states: BTreeSet::new(),
-            types: BTreeSet::from([GroupType::Classic, GroupType::Consumer]),
-            protocol_types: BTreeSet::from([String::new(), "consumer".to_owned()]),
-        }
+        Self::builder()
+            .types(BTreeSet::from([GroupType::Classic, GroupType::Consumer]))
+            .protocol_types(BTreeSet::from([String::new(), "consumer".to_owned()]))
+            .build()
     }
 
     /// Share groups, as Kafka's `ListGroupsOptions.forShareGroups` selects.
     #[must_use]
     pub fn for_share_groups() -> Self {
-        Self {
-            types: BTreeSet::from([GroupType::Share]),
-            ..Self::default()
-        }
+        Self::builder()
+            .types(BTreeSet::from([GroupType::Share]))
+            .build()
     }
 
     /// Streams groups, as Kafka's `ListGroupsOptions.forStreamsGroups`
     /// selects.
     #[must_use]
     pub fn for_streams_groups() -> Self {
-        Self {
-            types: BTreeSet::from([GroupType::Streams]),
-            ..Self::default()
-        }
+        Self::builder()
+            .types(BTreeSet::from([GroupType::Streams]))
+            .build()
     }
 }
 
@@ -950,7 +950,7 @@ impl AdminClient {
         reason: &str,
     ) -> Result<Vec<MemberIdentity>, AdminError> {
         let description = self
-            .describe_consumer_groups(&[group], DescribeGroupsOptions::default())
+            .describe_consumer_groups(&[group], DescribeGroupsOptions::builder().build())
             .await
             .remove(group)
             .unwrap_or_else(|| {
@@ -1321,10 +1321,11 @@ pub struct MemberToRemove {
 
 /// The options of [`AdminClient::remove_members_from_consumer_group`], as
 /// Apache Kafka's `RemoveMembersFromConsumerGroupOptions` holds them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct RemoveMembersOptions {
     /// The reason that the coordinator logs for each member. `None` or empty
     /// sends Kafka's default reason.
+    #[builder(into)]
     pub reason: Option<String>,
 }
 
@@ -3298,17 +3299,15 @@ mod tests {
     }
 
     fn states(states: &[GroupState]) -> ListGroupsOptions {
-        ListGroupsOptions {
-            group_states: states.iter().copied().collect(),
-            ..ListGroupsOptions::default()
-        }
+        ListGroupsOptions::builder()
+            .group_states(states.iter().copied().collect())
+            .build()
     }
 
     fn types(types: &[GroupType]) -> ListGroupsOptions {
-        ListGroupsOptions {
-            types: types.iter().copied().collect(),
-            ..ListGroupsOptions::default()
-        }
+        ListGroupsOptions::builder()
+            .types(types.iter().copied().collect())
+            .build()
     }
 
     fn broker_error(code: i16) -> ListGroupsBroker {
@@ -3333,7 +3332,7 @@ mod tests {
 
         let result = admin
             .list_groups_with_retry(
-                &ListGroupsOptions::default(),
+                &ListGroupsOptions::builder().build(),
                 RetryPolicy {
                     timeout: Duration::from_secs(10),
                     initial_backoff: Duration::from_millis(1),
@@ -3757,7 +3756,7 @@ mod tests {
 
             let outcome = tokio::time::timeout(
                 RETRY.timeout * 5,
-                admin.list_groups_with_retry(&ListGroupsOptions::default(), RETRY),
+                admin.list_groups_with_retry(&ListGroupsOptions::builder().build(), RETRY),
             )
             .await
             .map(|result| result.expect("list_groups succeeds"));
@@ -4260,7 +4259,7 @@ mod tests {
                                 group_instance_id: "b".into(),
                             },
                         ],
-                        &RemoveMembersOptions::default(),
+                        &RemoveMembersOptions::builder().build(),
                     )
                     .await
             })

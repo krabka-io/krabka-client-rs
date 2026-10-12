@@ -210,7 +210,7 @@ async fn describe_topic(admin: &AdminClient) -> DescribeConfigsResults {
     admin
         .describe_configs(
             &[ConfigResource::topic(TOPIC)],
-            DescribeConfigsOptions::default(),
+            DescribeConfigsOptions::builder().build(),
         )
         .await
         .unwrap()
@@ -267,13 +267,11 @@ async fn controller_bootstrap_rejects_unadvertised_api_locally() {
 
     let result = admin
         .create_topics(
-            &[CreateTopicSpec {
-                name: "not-supported-through-controller".into(),
-                partitions: 1,
-                replicas: 1,
-                configs: BTreeMap::new(),
-                ..Default::default()
-            }],
+            &[CreateTopicSpec::builder()
+                .name("not-supported-through-controller")
+                .partitions(1)
+                .replicas(1)
+                .build()],
             TopicMutationOptions::with_timeout(krabka_units::secs(5)),
         )
         .await;
@@ -325,13 +323,11 @@ async fn controller_connection_stays_usable_after_rejection() {
     unsupported_endpoint_message(
         admin
             .create_topics(
-                &[CreateTopicSpec {
-                    name: "not-supported-through-controller".into(),
-                    partitions: 1,
-                    replicas: 1,
-                    configs: BTreeMap::new(),
-                    ..Default::default()
-                }],
+                &[CreateTopicSpec::builder()
+                    .name("not-supported-through-controller")
+                    .partitions(1)
+                    .replicas(1)
+                    .build()],
                 TopicMutationOptions::with_timeout(krabka_units::secs(5)),
             )
             .await,

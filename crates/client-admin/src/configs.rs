@@ -357,12 +357,14 @@ impl Config {
 
 /// What [`AdminClient::describe_configs`] asks for, as Kafka's
 /// `DescribeConfigsOptions`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bon::Builder)]
 pub struct DescribeConfigsOptions {
     /// Ask for the value of each config at each source
     /// ([`ConfigEntry::synonyms`]).
+    #[builder(default)]
     pub include_synonyms: bool,
     /// Ask for the documentation of each config. Needs `DescribeConfigs` v3.
+    #[builder(default)]
     pub include_documentation: bool,
 }
 
@@ -447,9 +449,10 @@ impl AlterConfigOp {
 
 /// What [`AdminClient::incremental_alter_configs`] asks for, as Kafka's
 /// `AlterConfigsOptions`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bon::Builder)]
 pub struct IncrementalAlterConfigsOptions {
     /// Validate the changes and apply none.
+    #[builder(default)]
     pub validate_only: bool,
 }
 

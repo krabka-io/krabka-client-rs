@@ -2253,7 +2253,7 @@ impl Consumer {
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn close(self) -> Result<(), ConsumerError> {
-        self.close_with(CloseOptions::default()).await
+        self.close_with(CloseOptions::builder().build()).await
     }
 
     /// The client instance id that the broker assigned for metrics push

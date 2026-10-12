@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use krabka_client_admin::{AdminClient, CreateTopicSpec, TopicMutationOptions};
 
 #[tokio::main]
@@ -10,13 +8,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     admin
         .create_topics(
-            &[CreateTopicSpec {
-                name: "test-topic".into(),
-                partitions: 1,
-                replicas: 1,
-                configs: BTreeMap::new(),
-                ..Default::default()
-            }],
+            &[CreateTopicSpec::builder()
+                .name("test-topic")
+                .partitions(1)
+                .replicas(1)
+                .build()],
             TopicMutationOptions::with_timeout(krabka_units::secs(30)),
         )
         .await?;

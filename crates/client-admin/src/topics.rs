@@ -43,18 +43,23 @@ use crate::{
 };
 
 /// One topic to create, as Kafka's `NewTopic`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, bon::Builder)]
 pub struct CreateTopicSpec {
+    #[builder(into)]
     pub name: String,
     /// `-1` asks for the broker's `num.partitions`.
+    #[builder(default = -1)]
     pub partitions: i32,
     /// `-1` asks for the broker's `default.replication.factor`.
+    #[builder(default = -1)]
     pub replicas: i32,
+    #[builder(default)]
     pub configs: BTreeMap<String, String>,
     /// The broker ids of each partition, by partition index, as
     /// `NewTopic(name, replicasAssignments)` takes them. Kafka requires
     /// `partitions` and `replicas` to be `-1` when this is set; an empty map
     /// leaves placement to the broker.
+    #[builder(default)]
     pub replica_assignments: BTreeMap<i32, Vec<i32>>,
 }
 
@@ -1675,13 +1680,15 @@ mod tests {
     #[test]
     fn build_create_topics_one_spec() {
         let req = build_create_topics(
-            &[CreateTopicSpec {
-                name: "foo".into(),
-                partitions: 3,
-                replicas: 1,
-                configs: BTreeMap::from([("retention.ms".to_string(), "60000".to_string())]),
-                ..Default::default()
-            }],
+            &[CreateTopicSpec::builder()
+                .name("foo")
+                .partitions(3)
+                .replicas(1)
+                .configs(BTreeMap::from([(
+                    "retention.ms".to_string(),
+                    "60000".to_string(),
+                )]))
+                .build()],
             5_000,
         );
         assert2::assert!(
@@ -1711,13 +1718,12 @@ mod tests {
     #[test]
     fn replica_assignments_reach_the_wire_as_kafka_sends_them() {
         let topics = build_create_topics(
-            &[CreateTopicSpec {
-                name: "placed".into(),
-                partitions: -1,
-                replicas: -1,
-                replica_assignments: BTreeMap::from([(1, vec![3, 1]), (0, vec![1, 2])]),
-                ..Default::default()
-            }],
+            &[CreateTopicSpec::builder()
+                .name("placed")
+                .partitions(-1)
+                .replicas(-1)
+                .replica_assignments(BTreeMap::from([(1, vec![3, 1]), (0, vec![1, 2])]))
+                .build()],
             5_000,
         );
         assert2::assert!(
@@ -2548,12 +2554,12 @@ mod tests {
             Mutation::CreateTopics => {
                 let specs = topics
                     .iter()
-                    .map(|name| CreateTopicSpec {
-                        name: (*name).to_owned(),
-                        partitions: 1,
-                        replicas: 1,
-                        configs: BTreeMap::new(),
-                        ..Default::default()
+                    .map(|name| {
+                        CreateTopicSpec::builder()
+                            .name(*name)
+                            .partitions(1)
+                            .replicas(1)
+                            .build()
                     })
                     .collect::<Vec<_>>();
                 observe(
@@ -2799,9 +2805,10 @@ mod tests {
             assert_send(admin.delete_topics(names, TopicMutationOptions::default()));
             assert_send(admin.create_partitions(&[], TopicMutationOptions::default()));
             assert_send(admin.unregister_broker(1));
-            assert_send(
-                admin.update_features(&BTreeMap::new(), crate::UpdateFeaturesOptions::default()),
-            );
+            assert_send(admin.update_features(
+                &BTreeMap::new(),
+                crate::UpdateFeaturesOptions::builder().build(),
+            ));
             assert_send(admin.alter_partition_assignments(&BTreeMap::new(), krabka_units::secs(1)));
             assert_send(admin.reconcile_topic_replication_factor("t", 1, krabka_units::secs(1)));
         };

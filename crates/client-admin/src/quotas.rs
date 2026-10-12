@@ -116,12 +116,14 @@ impl ClientQuotaFilterComponent {
 }
 
 /// Which entities a describe returns, as Kafka's `ClientQuotaFilter`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct ClientQuotaFilter {
     /// Each component that a matched entity must satisfy.
+    #[builder(default)]
     pub components: Vec<ClientQuotaFilterComponent>,
     /// Whether a matched entity may have only the component types
     /// (`containsOnly`), not others as well (`contains`).
+    #[builder(default)]
     pub strict: bool,
 }
 

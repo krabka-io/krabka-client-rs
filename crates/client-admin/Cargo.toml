@@ -21,6 +21,7 @@ workspace = true
 
 [dependencies]
 assert2            = { workspace = true }
+bon                = { workspace = true }
 krabka-units = { workspace = true }
 krabka-client-core = { version = "0.6.0", path = "../client-core" }
 krabka-ids = { version = "0.6.0" }
@@ -36,7 +37,6 @@ tracing            = { workspace = true }
 uuid               = { workspace = true }
 
 [dev-dependencies]
-bon = { workspace = true }
 krabka-client-consumer = { path = "../client-consumer" }
 krabka-client-core = { path = "../client-core", features = ["mock"] }
 krabka-client-producer = { path = "../client-producer" }

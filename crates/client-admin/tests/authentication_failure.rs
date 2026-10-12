@@ -127,13 +127,11 @@ fn plain_security() -> ClientSecurity {
 }
 
 fn topic() -> CreateTopicSpec {
-    CreateTopicSpec {
-        name: "orders".into(),
-        partitions: 1,
-        replicas: 1,
-        configs: std::collections::BTreeMap::new(),
-        ..Default::default()
-    }
+    CreateTopicSpec::builder()
+        .name("orders")
+        .partitions(1)
+        .replicas(1)
+        .build()
 }
 
 #[tokio::test]
