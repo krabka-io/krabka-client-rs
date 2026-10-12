@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use krabka_units::{Time, secs};
+use krabka_units::{Time, convert::TimeExt, secs};
 
 use crate::{
     consumer::{Consumer, GroupMembershipOperation},
