@@ -435,11 +435,11 @@ mod tests {
         update_features_request,
         update_features_response::UpdatableFeatureResult,
     };
+
+    use super::*;
     use crate::partition_leaders::test_support::{
         ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
     };
-
-    use super::*;
 
     fn update(level: i16, upgrade_type: UpgradeType) -> FeatureUpdate {
         FeatureUpdate::new(level, upgrade_type).expect("valid update")
