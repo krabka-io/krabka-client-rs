@@ -276,11 +276,12 @@ mod tests {
             let broker = MockBroker::start(move |api_key, version, _, body| match api_key {
                 api_versions_request::API_KEY => Some(
                     api_versions()
-                        .apis(vec![ApiVersionRange {
-                            api_key: describe_cluster_request::API_KEY,
-                            max_version: 2,
-                            ..Default::default()
-                        }])
+                        .apis(vec![
+                            ApiVersionRange::builder()
+                                .api_key(describe_cluster_request::API_KEY)
+                                .max_version(2)
+                                .build(),
+                        ])
                         .call(),
                 ),
                 describe_cluster_request::API_KEY => {
@@ -330,11 +331,12 @@ mod tests {
         let broker = MockBroker::start(move |api_key, _, _, _| match api_key {
             api_versions_request::API_KEY => Some(
                 api_versions()
-                    .apis(vec![ApiVersionRange {
-                        api_key: describe_cluster_request::API_KEY,
-                        max_version: 1,
-                        ..Default::default()
-                    }])
+                    .apis(vec![
+                        ApiVersionRange::builder()
+                            .api_key(describe_cluster_request::API_KEY)
+                            .max_version(1)
+                            .build(),
+                    ])
                     .call(),
             ),
             _ => None,

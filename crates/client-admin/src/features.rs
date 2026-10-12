@@ -605,11 +605,12 @@ mod tests {
         MockBroker::start(move |api_key, version, _, body| match api_key {
             api_versions_request::API_KEY => Some(
                 api_versions()
-                    .apis(vec![ApiVersionRange {
-                        api_key: update_features_request::API_KEY,
-                        max_version,
-                        ..Default::default()
-                    }])
+                    .apis(vec![
+                        ApiVersionRange::builder()
+                            .api_key(update_features_request::API_KEY)
+                            .max_version(max_version)
+                            .build(),
+                    ])
                     .call(),
             ),
             update_features_request::API_KEY => {
@@ -730,11 +731,12 @@ mod tests {
         let broker = MockBroker::start(|api_key, _, _, _| {
             (api_key == api_versions_request::API_KEY).then(|| {
                 api_versions()
-                    .apis(vec![ApiVersionRange {
-                        api_key: update_features_request::API_KEY,
-                        max_version: 2,
-                        ..Default::default()
-                    }])
+                    .apis(vec![
+                        ApiVersionRange::builder()
+                            .api_key(update_features_request::API_KEY)
+                            .max_version(2)
+                            .build(),
+                    ])
                     .call()
             })
         })
@@ -883,11 +885,12 @@ mod tests {
         let broker = MockBroker::start(|api_key, version, _, _| match api_key {
             api_versions_request::API_KEY => Some(
                 api_versions()
-                    .apis(vec![ApiVersionRange {
-                        api_key: update_features_request::API_KEY,
-                        max_version: 1,
-                        ..Default::default()
-                    }])
+                    .apis(vec![
+                        ApiVersionRange::builder()
+                            .api_key(update_features_request::API_KEY)
+                            .max_version(1)
+                            .build(),
+                    ])
                     .call(),
             ),
             update_features_request::API_KEY => Some(encode_response(

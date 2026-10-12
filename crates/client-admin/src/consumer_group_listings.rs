@@ -149,16 +149,15 @@ mod tests {
         let seen = std::sync::Arc::clone(&requests);
         let broker = scripted_broker(
             vec![
-                ApiVersionRange {
-                    api_key: list_groups_request::API_KEY,
-                    max_version: 5,
-                    ..Default::default()
-                },
-                ApiVersionRange {
-                    api_key: metadata_request::API_KEY,
-                    min_version: 12,
-                    max_version: 12,
-                },
+                ApiVersionRange::builder()
+                    .api_key(list_groups_request::API_KEY)
+                    .max_version(5)
+                    .build(),
+                ApiVersionRange::builder()
+                    .api_key(metadata_request::API_KEY)
+                    .min_version(12)
+                    .max_version(12)
+                    .build(),
             ],
             move |api_key, version, body, own| match api_key {
                 metadata_request::API_KEY => MockReply::Respond(encode_response(

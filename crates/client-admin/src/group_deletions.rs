@@ -119,16 +119,14 @@ mod tests {
         group_cluster()
             .count(1)
             .apis(vec![
-                ApiVersionRange {
-                    api_key: delete_groups_request::API_KEY,
-                    max_version: 2,
-                    ..Default::default()
-                },
-                ApiVersionRange {
-                    api_key: find_coordinator_request::API_KEY,
-                    max_version: find_coordinator_max,
-                    ..Default::default()
-                },
+                ApiVersionRange::builder()
+                    .api_key(delete_groups_request::API_KEY)
+                    .max_version(2)
+                    .build(),
+                ApiVersionRange::builder()
+                    .api_key(find_coordinator_request::API_KEY)
+                    .max_version(find_coordinator_max)
+                    .build(),
             ])
             .lookup(|_, _| Lookup::At(0))
             .answer(mock_delete_groups)
@@ -158,11 +156,12 @@ mod tests {
             ])));
             let cluster = group_cluster()
                 .count(2)
-                .apis(vec![ApiVersionRange {
-                    api_key: delete_groups_request::API_KEY,
-                    max_version: 2,
-                    ..Default::default()
-                }])
+                .apis(vec![
+                    ApiVersionRange::builder()
+                        .api_key(delete_groups_request::API_KEY)
+                        .max_version(2)
+                        .build(),
+                ])
                 .lookup(|group, lookups| match (group, lookups) {
                     ("denied", _) => Lookup::Error(30),
                     ("moved", 0) => Lookup::At(1),

@@ -356,11 +356,12 @@ mod tests {
         let loading_answers = Arc::new(Mutex::new(0_usize));
         let cluster = group_cluster()
             .count(1)
-            .apis(vec![ApiVersionRange {
-                api_key: describe_share_group_offsets_request::API_KEY,
-                max_version: 1,
-                ..Default::default()
-            }])
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(describe_share_group_offsets_request::API_KEY)
+                    .max_version(1)
+                    .build(),
+            ])
             .lookup(|_, _| Lookup::At(0))
             .answer(move |_, api_key, version, body, _| {
                 if api_key != describe_share_group_offsets_request::API_KEY {

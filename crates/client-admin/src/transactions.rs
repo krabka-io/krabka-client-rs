@@ -2782,10 +2782,11 @@ mod tests {
         ] {
             let seen = Arc::new(Mutex::new(Seen::default()));
             let broker = partition_leader_broker(
-                vec![ApiVersionRange {
-                    api_key: describe_producers_request::API_KEY,
-                    ..Default::default()
-                }],
+                vec![
+                    ApiVersionRange::builder()
+                        .api_key(describe_producers_request::API_KEY)
+                        .build(),
+                ],
                 describe_producers_request::API_KEY,
                 leaders,
                 Arc::clone(&seen),

@@ -900,16 +900,14 @@ mod tests {
         let cluster: GroupCluster = group_cluster()
             .count(2)
             .apis(vec![
-                ApiVersionRange {
-                    api_key: consumer_group_describe_request::API_KEY,
-                    max_version: 1,
-                    ..Default::default()
-                },
-                ApiVersionRange {
-                    api_key: describe_groups_request::API_KEY,
-                    max_version: 5,
-                    ..Default::default()
-                },
+                ApiVersionRange::builder()
+                    .api_key(consumer_group_describe_request::API_KEY)
+                    .max_version(1)
+                    .build(),
+                ApiVersionRange::builder()
+                    .api_key(describe_groups_request::API_KEY)
+                    .max_version(5)
+                    .build(),
             ])
             .lookup(|group, _| Lookup::At(usize::from(!matches!(group, "kip848" | "classic"))))
             .answer(|_, api_key, version, body, _| {
@@ -1033,11 +1031,12 @@ mod tests {
     async fn describe_consumer_groups_uses_describe_groups_on_an_old_coordinator() {
         let cluster = group_cluster()
             .count(1)
-            .apis(vec![ApiVersionRange {
-                api_key: describe_groups_request::API_KEY,
-                max_version: 5,
-                ..Default::default()
-            }])
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(describe_groups_request::API_KEY)
+                    .max_version(5)
+                    .build(),
+            ])
             .lookup(|_, _| Lookup::At(0))
             .answer(|_, api_key, version, body, _| {
                 if api_key != describe_groups_request::API_KEY {
@@ -1104,11 +1103,12 @@ mod tests {
                 let reply_message = message.clone();
                 let cluster = group_cluster()
                     .count(1)
-                    .apis(vec![ApiVersionRange {
-                        api_key,
-                        max_version: 6,
-                        ..Default::default()
-                    }])
+                    .apis(vec![
+                        ApiVersionRange::builder()
+                            .api_key(api_key)
+                            .max_version(6)
+                            .build(),
+                    ])
                     .lookup(|_, _| Lookup::At(0))
                     .answer(move |_, key, version, _, _| {
                         if key != api_key {
@@ -1234,11 +1234,12 @@ mod tests {
     async fn describe_streams_groups_sends_v0_and_needs_a_topology() {
         let cluster = group_cluster()
             .count(1)
-            .apis(vec![ApiVersionRange {
-                api_key: streams_group_describe_request::API_KEY,
-                max_version: 1,
-                ..Default::default()
-            }])
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(streams_group_describe_request::API_KEY)
+                    .max_version(1)
+                    .build(),
+            ])
             .lookup(|_, _| Lookup::At(0))
             .answer(|_, api_key, version, _, _| {
                 if api_key != streams_group_describe_request::API_KEY {

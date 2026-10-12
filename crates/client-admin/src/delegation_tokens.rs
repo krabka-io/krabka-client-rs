@@ -721,11 +721,13 @@ mod tests {
             ),
         ] {
             let (broker, requests) = token_broker::<CreateDelegationTokenRequest, _>(
-                vec![ApiVersionRange {
-                    api_key: create_delegation_token_request::API_KEY,
-                    min_version: 1,
-                    max_version: 2,
-                }],
+                vec![
+                    ApiVersionRange::builder()
+                        .api_key(create_delegation_token_request::API_KEY)
+                        .min_version(1)
+                        .max_version(2)
+                        .build(),
+                ],
                 create_delegation_token_request::API_KEY,
                 created_response(0),
             )

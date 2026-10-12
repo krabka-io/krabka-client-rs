@@ -212,11 +212,12 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let handler_requests = Arc::clone(&requests);
         let broker = scripted_broker(
-            vec![ApiVersionRange {
-                api_key: list_config_resources_request::API_KEY,
-                max_version,
-                ..Default::default()
-            }],
+            vec![
+                ApiVersionRange::builder()
+                    .api_key(list_config_resources_request::API_KEY)
+                    .max_version(max_version)
+                    .build(),
+            ],
             move |api_key, version, body, _| {
                 if api_key != list_config_resources_request::API_KEY {
                     return MockReply::Silent;

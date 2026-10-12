@@ -635,11 +635,13 @@ mod tests {
             let seen = Arc::new(Mutex::new(Seen::default()));
             let codes = case.orders_1_codes.clone();
             let broker = leader_broker(
-                vec![ApiVersionRange {
-                    api_key: list_offsets_request::API_KEY,
-                    min_version: 1,
-                    max_version: case.max_version,
-                }],
+                vec![
+                    ApiVersionRange::builder()
+                        .api_key(list_offsets_request::API_KEY)
+                        .min_version(1)
+                        .max_version(case.max_version)
+                        .build(),
+                ],
                 list_offsets_request::API_KEY,
                 case.leaders.clone(),
                 Arc::clone(&seen),
@@ -707,11 +709,13 @@ mod tests {
     async fn list_offsets_times_out_a_partition_that_never_gets_a_leader() {
         let seen = Arc::new(Mutex::new(Seen::default()));
         let broker = leader_broker(
-            vec![ApiVersionRange {
-                api_key: list_offsets_request::API_KEY,
-                min_version: 1,
-                max_version: 11,
-            }],
+            vec![
+                ApiVersionRange::builder()
+                    .api_key(list_offsets_request::API_KEY)
+                    .min_version(1)
+                    .max_version(11)
+                    .build(),
+            ],
             list_offsets_request::API_KEY,
             vec![None],
             Arc::clone(&seen),

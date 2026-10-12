@@ -952,16 +952,18 @@ mod tests {
     ) -> (TopicDescriptions<String>, Vec<Received>, SocketAddr) {
         let received = Arc::new(Mutex::new(Vec::new()));
         let handler_received = Arc::clone(&received);
-        let mut apis = vec![ApiVersionRange {
-            api_key: describe_cluster_request::API_KEY,
-            max_version: 2,
-            ..Default::default()
-        }];
+        let mut apis = vec![
+            ApiVersionRange::builder()
+                .api_key(describe_cluster_request::API_KEY)
+                .max_version(2)
+                .build(),
+        ];
         if case.dtp {
-            apis.push(ApiVersionRange {
-                api_key: describe_topic_partitions_request::API_KEY,
-                ..Default::default()
-            });
+            apis.push(
+                ApiVersionRange::builder()
+                    .api_key(describe_topic_partitions_request::API_KEY)
+                    .build(),
+            );
         }
         let cluster_error = case.cluster_error;
         let metadata_topics = case.metadata_topics.clone();
@@ -1291,11 +1293,13 @@ mod tests {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let handler_requests = Arc::clone(&requests);
             let broker = scripted_broker(
-                vec![ApiVersionRange {
-                    api_key: metadata_request::API_KEY,
-                    min_version: 1,
-                    max_version: max_metadata,
-                }],
+                vec![
+                    ApiVersionRange::builder()
+                        .api_key(metadata_request::API_KEY)
+                        .min_version(1)
+                        .max_version(max_metadata)
+                        .build(),
+                ],
                 move |api_key, version, body, own| {
                     if api_key != metadata_request::API_KEY {
                         return MockReply::Silent;

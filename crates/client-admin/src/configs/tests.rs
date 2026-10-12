@@ -604,16 +604,15 @@ async fn cluster_broker(
         let reply = match api_key {
             api_versions_request::API_KEY => api_versions()
                 .apis(vec![
-                    ApiVersionRange {
-                        api_key: describe_configs_request::API_KEY,
-                        min_version: 1,
-                        max_version: describe_max,
-                    },
-                    ApiVersionRange {
-                        api_key: incremental_alter_configs_request::API_KEY,
-                        max_version: 1,
-                        ..Default::default()
-                    },
+                    ApiVersionRange::builder()
+                        .api_key(describe_configs_request::API_KEY)
+                        .min_version(1)
+                        .max_version(describe_max)
+                        .build(),
+                    ApiVersionRange::builder()
+                        .api_key(incremental_alter_configs_request::API_KEY)
+                        .max_version(1)
+                        .build(),
                 ])
                 .call(),
             metadata_request::API_KEY => encode_response(
@@ -1015,16 +1014,14 @@ async fn incremental_alter_configs_through_controllers_routes_as_kafka_does() {
         let reply = match api_key {
             api_versions_request::API_KEY => api_versions()
                 .apis(vec![
-                    ApiVersionRange {
-                        api_key: describe_cluster_request::API_KEY,
-                        max_version: 2,
-                        ..Default::default()
-                    },
-                    ApiVersionRange {
-                        api_key: incremental_alter_configs_request::API_KEY,
-                        max_version: 1,
-                        ..Default::default()
-                    },
+                    ApiVersionRange::builder()
+                        .api_key(describe_cluster_request::API_KEY)
+                        .max_version(2)
+                        .build(),
+                    ApiVersionRange::builder()
+                        .api_key(incremental_alter_configs_request::API_KEY)
+                        .max_version(1)
+                        .build(),
                 ])
                 .call(),
             describe_cluster_request::API_KEY => encode_response(

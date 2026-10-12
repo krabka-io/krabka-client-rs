@@ -678,11 +678,12 @@ pub(crate) mod test_support {
             .iter()
             .any(|api| api.api_key == find_coordinator_request::API_KEY)
         {
-            apis.push(ApiVersionRange {
-                api_key: find_coordinator_request::API_KEY,
-                max_version: 6,
-                ..Default::default()
-            });
+            apis.push(
+                ApiVersionRange::builder()
+                    .api_key(find_coordinator_request::API_KEY)
+                    .max_version(6)
+                    .build(),
+            );
         }
         let addrs = Arc::new(Mutex::new(Vec::<SocketAddr>::new()));
         let seen = Arc::new(Mutex::new(Seen::default()));

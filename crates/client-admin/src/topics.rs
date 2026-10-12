@@ -1497,11 +1497,12 @@ mod tests {
             let broker = MockBroker::start(move |api_key, version, _, body| match api_key {
                 api_versions_request::API_KEY => Some(
                     api_versions()
-                        .apis(vec![ApiVersionRange {
-                            api_key: alter_partition_reassignments_request::API_KEY,
-                            max_version,
-                            ..Default::default()
-                        }])
+                        .apis(vec![
+                            ApiVersionRange::builder()
+                                .api_key(alter_partition_reassignments_request::API_KEY)
+                                .max_version(max_version)
+                                .build(),
+                        ])
                         .call(),
                 ),
                 alter_partition_reassignments_request::API_KEY => {

@@ -803,11 +803,12 @@ mod tests {
             let handler_requests = Arc::clone(&requests);
             let entries = entries.clone();
             let broker = scripted_broker(
-                vec![ApiVersionRange {
-                    api_key: describe_client_quotas_request::API_KEY,
-                    max_version: 1,
-                    ..Default::default()
-                }],
+                vec![
+                    ApiVersionRange::builder()
+                        .api_key(describe_client_quotas_request::API_KEY)
+                        .max_version(1)
+                        .build(),
+                ],
                 move |api_key, version, _, _| {
                     if api_key != describe_client_quotas_request::API_KEY {
                         return MockReply::Silent;

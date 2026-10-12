@@ -308,11 +308,12 @@ mod tests {
                 match api_key {
                     api_versions_request::API_KEY => Some(
                         api_versions()
-                            .apis(vec![ApiVersionRange {
-                                api_key: elect_leaders_request::API_KEY,
-                                max_version: 2,
-                                ..Default::default()
-                            }])
+                            .apis(vec![
+                                ApiVersionRange::builder()
+                                    .api_key(elect_leaders_request::API_KEY)
+                                    .max_version(2)
+                                    .build(),
+                            ])
                             .call(),
                     ),
                     metadata_request::API_KEY => {
@@ -385,10 +386,11 @@ mod tests {
         let broker = MockBroker::start(move |api_key, version, _, _| match api_key {
             api_versions_request::API_KEY => Some(
                 api_versions()
-                    .apis(vec![ApiVersionRange {
-                        api_key: elect_leaders_request::API_KEY,
-                        ..Default::default()
-                    }])
+                    .apis(vec![
+                        ApiVersionRange::builder()
+                            .api_key(elect_leaders_request::API_KEY)
+                            .build(),
+                    ])
                     .call(),
             ),
             elect_leaders_request::API_KEY => {

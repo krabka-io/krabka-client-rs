@@ -355,6 +355,7 @@ pub(crate) mod test_support {
         },
     };
 
+    use bon::Builder;
     use bytes::{Buf, BytesMut};
     use krabka_client_core::{MockBroker, MockReply};
     use krabka_protocol::{
@@ -374,10 +375,12 @@ pub(crate) mod test_support {
 
     /// The supported version interval for one API in a mock broker's
     /// `ApiVersions` answer.
-    #[derive(Clone, Copy, Debug, Default)]
+    #[derive(Builder, Clone, Copy, Debug, Default)]
     pub(crate) struct ApiVersionRange {
         pub(crate) api_key: i16,
+        #[builder(default)]
         pub(crate) min_version: i16,
+        #[builder(default)]
         pub(crate) max_version: i16,
     }
 
@@ -428,7 +431,7 @@ pub(crate) mod test_support {
             api_keys.push(api_version(metadata_request::API_KEY, 12, 12));
         }
         api_keys.extend(
-            apis.iter()
+            apis.into_iter()
                 .map(|api| api_version(api.api_key, api.min_version, api.max_version)),
         );
         encode_response(
