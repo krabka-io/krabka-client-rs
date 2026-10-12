@@ -1935,7 +1935,7 @@ mod tests {
     fn offset_reset_builds_admin_commit() {
         let offsets = test_group_offsets();
         let request = offset_commit_request("worker", &offsets);
-        let expected = TopicNameOffsetCommit::new(commit_request_for_test("worker", 0, 0));
+        let expected = TopicNameOffsetCommit::new(commit_request_for_test("worker", -1, -1));
         assert!(request == expected);
     }
 
@@ -2055,9 +2055,9 @@ mod tests {
     }
 
     impl GroupRanges {
-        fn offset_commit() -> Self {
+        fn offset_commit(offset_commit: (i16, i16)) -> Self {
             Self {
-                offset_commit: (2, 10),
+                offset_commit,
                 offset_fetch: (2, 10),
             }
         }
@@ -2298,24 +2298,37 @@ mod tests {
     fn commit_group_version_cases()
     -> Vec<ExpectedGroupVersionCase<OffsetCommitRequest, CommitResult>> {
         let committed = Ok(successful_group_offset_outcome());
-        let commit_case = |name, requests, result| {
-            expected_group_version_case(name, GroupRanges::offset_commit(), requests, result)
+        let commit_case = |name, version_range, requests, result| {
+            expected_group_version_case(
+                name,
+                GroupRanges::offset_commit(version_range),
+                requests,
+                result,
+            )
         };
         let sent_request = |version| vec![(version, commit_request_for_test("workers", -1, -1))];
         vec![
             commit_case(
                 "coordinator stops at v7",
+                (2, 7),
                 sent_request(7),
                 committed.clone(),
             ),
             commit_case(
                 "coordinator stops at v9",
+                (2, 9),
                 sent_request(9),
                 committed.clone(),
             ),
-            commit_case("coordinator supports v10", sent_request(9), committed),
+            commit_case(
+                "coordinator supports v10",
+                (2, 10),
+                sent_request(9),
+                committed,
+            ),
             commit_case(
                 "coordinator supports only v10",
+                (10, 10),
                 Vec::new(),
                 incompatible_group_version(offset_commit_request::API_KEY, 10, 10),
             ),
