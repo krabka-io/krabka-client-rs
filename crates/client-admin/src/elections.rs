@@ -179,7 +179,7 @@ mod tests {
 
     use super::*;
     use crate::partition_leaders::test_support::{
-        api_versions, decode_request, encode_response, fast_admin, orders_metadata,
+        ApiVersionRange, api_versions, decode_request, encode_response, fast_admin, orders_metadata,
     };
 
     fn orders(partitions: &[i32]) -> Vec<(String, i32)> {
@@ -306,9 +306,15 @@ mod tests {
                     handler_port.load(Ordering::SeqCst),
                 ));
                 match api_key {
-                    api_versions_request::API_KEY => {
-                        Some(api_versions(&[(elect_leaders_request::API_KEY, 0, 2)]))
-                    }
+                    api_versions_request::API_KEY => Some(
+                        api_versions()
+                            .apis(vec![ApiVersionRange {
+                                api_key: elect_leaders_request::API_KEY,
+                                max_version: 2,
+                                ..Default::default()
+                            }])
+                            .call(),
+                    ),
                     metadata_request::API_KEY => {
                         Some(encode_response(&orders_metadata(own), version, true))
                     }
@@ -377,9 +383,14 @@ mod tests {
         let requests = Arc::new(Mutex::new(0_usize));
         let handler_requests = Arc::clone(&requests);
         let broker = MockBroker::start(move |api_key, version, _, _| match api_key {
-            api_versions_request::API_KEY => {
-                Some(api_versions(&[(elect_leaders_request::API_KEY, 0, 0)]))
-            }
+            api_versions_request::API_KEY => Some(
+                api_versions()
+                    .apis(vec![ApiVersionRange {
+                        api_key: elect_leaders_request::API_KEY,
+                        ..Default::default()
+                    }])
+                    .call(),
+            ),
             elect_leaders_request::API_KEY => {
                 *handler_requests.lock().expect("requests lock") += 1;
                 Some(encode_response(&election_answer(0, 0), version, false))

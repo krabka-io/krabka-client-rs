@@ -15,7 +15,7 @@ use krabka_protocol::owned::{
 
 use super::*;
 use crate::partition_leaders::test_support::{
-    api_versions, decode_request, encode_response, fast_admin, refused_address,
+    ApiVersionRange, api_versions, decode_request, encode_response, fast_admin, refused_address,
 };
 
 const LONG: krabka_units::Time = krabka_units::secs(5);
@@ -602,10 +602,20 @@ async fn cluster_broker(
 ) -> MockBroker {
     MockBroker::start_with_replies(move |api_key, version, _, body| {
         let reply = match api_key {
-            api_versions_request::API_KEY => api_versions(&[
-                (describe_configs_request::API_KEY, 1, describe_max),
-                (incremental_alter_configs_request::API_KEY, 0, 1),
-            ]),
+            api_versions_request::API_KEY => api_versions()
+                .apis(vec![
+                    ApiVersionRange {
+                        api_key: describe_configs_request::API_KEY,
+                        min_version: 1,
+                        max_version: describe_max,
+                    },
+                    ApiVersionRange {
+                        api_key: incremental_alter_configs_request::API_KEY,
+                        max_version: 1,
+                        ..Default::default()
+                    },
+                ])
+                .call(),
             metadata_request::API_KEY => encode_response(
                 &MetadataResponse {
                     controller_id: 1,
@@ -1003,10 +1013,20 @@ async fn incremental_alter_configs_through_controllers_routes_as_kafka_does() {
     let controller = MockBroker::start_with_replies(move |api_key, version, _, body| {
         let own_port = i32::from(handler_port.load(std::sync::atomic::Ordering::SeqCst));
         let reply = match api_key {
-            api_versions_request::API_KEY => api_versions(&[
-                (describe_cluster_request::API_KEY, 0, 2),
-                (incremental_alter_configs_request::API_KEY, 0, 1),
-            ]),
+            api_versions_request::API_KEY => api_versions()
+                .apis(vec![
+                    ApiVersionRange {
+                        api_key: describe_cluster_request::API_KEY,
+                        max_version: 2,
+                        ..Default::default()
+                    },
+                    ApiVersionRange {
+                        api_key: incremental_alter_configs_request::API_KEY,
+                        max_version: 1,
+                        ..Default::default()
+                    },
+                ])
+                .call(),
             describe_cluster_request::API_KEY => encode_response(
                 &DescribeClusterResponse {
                     endpoint_type: 2,

@@ -735,7 +735,9 @@ mod tests {
     async fn describe_client_quotas_maps_every_entity_type() {
         use krabka_client_core::MockReply;
 
-        use crate::partition_leaders::test_support::{encode_response, scripted_broker};
+        use crate::partition_leaders::test_support::{
+            ApiVersionRange, encode_response, scripted_broker,
+        };
 
         let entries = vec![
             DescribeEntryData {
@@ -801,7 +803,11 @@ mod tests {
             let handler_requests = Arc::clone(&requests);
             let entries = entries.clone();
             let broker = scripted_broker(
-                vec![(describe_client_quotas_request::API_KEY, 0, 1)],
+                vec![ApiVersionRange {
+                    api_key: describe_client_quotas_request::API_KEY,
+                    max_version: 1,
+                    ..Default::default()
+                }],
                 move |api_key, version, _, _| {
                     if api_key != describe_client_quotas_request::API_KEY {
                         return MockReply::Silent;

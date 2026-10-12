@@ -11,8 +11,6 @@ use krabka_protocol::owned::{
 };
 use krabka_units::{Time, convert::TimeExt as _};
 
-#[cfg(test)]
-use crate::partition_leaders;
 use crate::{
     AdminClient, AdminError, KafkaError, MetadataVersionUpdate, NOT_CONTROLLER, kafka_error_if,
     kafka_error_name,
@@ -428,6 +426,9 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use crate::partition_leaders::test_support::{
+        ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
+    };
     use krabka_client_core::{ClientError, MockBroker, MockReply};
     use krabka_protocol::owned::{
         api_versions_request,
@@ -437,7 +438,6 @@ mod tests {
         update_features_request,
         update_features_response::UpdatableFeatureResult,
     };
-    use partition_leaders::test_support::{decode_request, encode_response, fast_admin};
 
     use super::*;
 
@@ -603,9 +603,15 @@ mod tests {
         seen: Arc<Mutex<Vec<(i16, UpdateFeaturesRequest)>>>,
     ) -> MockBroker {
         MockBroker::start(move |api_key, version, _, body| match api_key {
-            api_versions_request::API_KEY => Some(partition_leaders::test_support::api_versions(
-                &[(update_features_request::API_KEY, 0, max_version)],
-            )),
+            api_versions_request::API_KEY => Some(
+                api_versions()
+                    .apis(vec![ApiVersionRange {
+                        api_key: update_features_request::API_KEY,
+                        max_version,
+                        ..Default::default()
+                    }])
+                    .call(),
+            ),
             update_features_request::API_KEY => {
                 let mut request: UpdateFeaturesRequest = decode_request(body, version, true);
                 // The deadline that remains differs between runs.
@@ -723,11 +729,13 @@ mod tests {
     async fn update_features_refuses_empty_or_blank_features_before_sending() {
         let broker = MockBroker::start(|api_key, _, _, _| {
             (api_key == api_versions_request::API_KEY).then(|| {
-                partition_leaders::test_support::api_versions(&[(
-                    update_features_request::API_KEY,
-                    0,
-                    2,
-                )])
+                api_versions()
+                    .apis(vec![ApiVersionRange {
+                        api_key: update_features_request::API_KEY,
+                        max_version: 2,
+                        ..Default::default()
+                    }])
+                    .call()
             })
         })
         .await;
@@ -873,9 +881,15 @@ mod tests {
     #[tokio::test]
     async fn update_metadata_version_surfaces_the_feature_error() {
         let broker = MockBroker::start(|api_key, version, _, _| match api_key {
-            api_versions_request::API_KEY => Some(partition_leaders::test_support::api_versions(
-                &[(update_features_request::API_KEY, 0, 1)],
-            )),
+            api_versions_request::API_KEY => Some(
+                api_versions()
+                    .apis(vec![ApiVersionRange {
+                        api_key: update_features_request::API_KEY,
+                        max_version: 1,
+                        ..Default::default()
+                    }])
+                    .call(),
+            ),
             update_features_request::API_KEY => Some(encode_response(
                 &UpdateFeaturesResponse {
                     results: vec![UpdatableFeatureResult {

@@ -127,7 +127,7 @@ mod tests {
 
     use super::*;
     use crate::partition_leaders::test_support::{
-        decode_request, encode_response, fast_admin, scripted_broker,
+        ApiVersionRange, decode_request, encode_response, fast_admin, scripted_broker,
     };
 
     fn listed(group_id: &str, protocol_type: &str, group_type: &str) -> ListedGroup {
@@ -149,8 +149,16 @@ mod tests {
         let seen = std::sync::Arc::clone(&requests);
         let broker = scripted_broker(
             vec![
-                (list_groups_request::API_KEY, 0, 5),
-                (metadata_request::API_KEY, 12, 12),
+                ApiVersionRange {
+                    api_key: list_groups_request::API_KEY,
+                    max_version: 5,
+                    ..Default::default()
+                },
+                ApiVersionRange {
+                    api_key: metadata_request::API_KEY,
+                    min_version: 12,
+                    max_version: 12,
+                },
             ],
             move |api_key, version, body, own| match api_key {
                 metadata_request::API_KEY => MockReply::Respond(encode_response(

@@ -1212,7 +1212,8 @@ mod tests {
 
     use super::*;
     use crate::partition_leaders::test_support::{
-        Seen, fast_admin as leader_fast_admin, leader_broker as partition_leader_broker,
+        ApiVersionRange, Seen, fast_admin as leader_fast_admin,
+        leader_broker as partition_leader_broker,
     };
 
     fn state_row(transactional_id: &str, error_code: i16) -> TransactionState {
@@ -2781,7 +2782,10 @@ mod tests {
         ] {
             let seen = Arc::new(Mutex::new(Seen::default()));
             let broker = partition_leader_broker(
-                vec![(describe_producers_request::API_KEY, 0, 0)],
+                vec![ApiVersionRange {
+                    api_key: describe_producers_request::API_KEY,
+                    ..Default::default()
+                }],
                 describe_producers_request::API_KEY,
                 leaders,
                 Arc::clone(&seen),

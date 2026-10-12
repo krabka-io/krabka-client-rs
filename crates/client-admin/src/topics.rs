@@ -1475,7 +1475,7 @@ mod tests {
         };
 
         use crate::partition_leaders::test_support::{
-            api_versions, decode_request, encode_response,
+            ApiVersionRange, api_versions, decode_request, encode_response,
         };
 
         // `None` calls `alter_partition_assignments`, which takes Kafka's
@@ -1495,11 +1495,15 @@ mod tests {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let requests = Arc::clone(&seen);
             let broker = MockBroker::start(move |api_key, version, _, body| match api_key {
-                api_versions_request::API_KEY => Some(api_versions(&[(
-                    alter_partition_reassignments_request::API_KEY,
-                    0,
-                    max_version,
-                )])),
+                api_versions_request::API_KEY => Some(
+                    api_versions()
+                        .apis(vec![ApiVersionRange {
+                            api_key: alter_partition_reassignments_request::API_KEY,
+                            max_version,
+                            ..Default::default()
+                        }])
+                        .call(),
+                ),
                 alter_partition_reassignments_request::API_KEY => {
                     let request: AlterPartitionReassignmentsRequest =
                         decode_request(body, version, true);

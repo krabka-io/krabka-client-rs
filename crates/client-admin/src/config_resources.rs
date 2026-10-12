@@ -165,7 +165,7 @@ mod tests {
 
     use super::*;
     use crate::partition_leaders::test_support::{
-        decode_request, encode_response, fast_admin, scripted_broker,
+        ApiVersionRange, decode_request, encode_response, fast_admin, scripted_broker,
     };
 
     #[test]
@@ -212,7 +212,11 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let handler_requests = Arc::clone(&requests);
         let broker = scripted_broker(
-            vec![(list_config_resources_request::API_KEY, 0, max_version)],
+            vec![ApiVersionRange {
+                api_key: list_config_resources_request::API_KEY,
+                max_version,
+                ..Default::default()
+            }],
             move |api_key, version, body, _| {
                 if api_key != list_config_resources_request::API_KEY {
                     return MockReply::Silent;

@@ -543,6 +543,7 @@ pub(crate) mod test_support {
 
     use krabka_client_core::{MockBroker, MockReply};
     use krabka_protocol::owned::{
+        api_versions_request,
         find_coordinator_request::{self, FindCoordinatorRequest},
         find_coordinator_response::{Coordinator, FindCoordinatorResponse},
     };
@@ -550,7 +551,7 @@ pub(crate) mod test_support {
     use crate::{
         AdminClient,
         partition_leaders::test_support::{
-            api_versions, decode_request, encode_response, fast_admin,
+            ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
         },
     };
 
@@ -661,22 +662,27 @@ pub(crate) mod test_support {
     }
 
     /// Starts `count` mock brokers that advertise `FindCoordinator` v0 to v6
-    /// (unless `apis` names it) and each `(api_key, min, max)` of `apis`.
+    /// (unless `apis` names it) and each API version range in `apis`.
     ///
     /// Any broker answers `FindCoordinator` from `lookup`. Every other
     /// request goes to `answer(broker, api_key, version, body, own_address)`
     /// and is recorded in [`Seen::requests`].
+    #[bon::builder]
     pub(crate) async fn group_cluster(
         count: usize,
-        mut apis: Vec<(i16, i16, i16)>,
+        mut apis: Vec<ApiVersionRange>,
         lookup: impl Fn(&str, usize) -> Lookup + Send + Sync + 'static,
         answer: impl FnMut(usize, i16, i16, &[u8], SocketAddr) -> MockReply + Send + 'static,
     ) -> GroupCluster {
         if !apis
             .iter()
-            .any(|(api_key, _, _)| *api_key == find_coordinator_request::API_KEY)
+            .any(|api| api.api_key == find_coordinator_request::API_KEY)
         {
-            apis.push((find_coordinator_request::API_KEY, 0, 6));
+            apis.push(ApiVersionRange {
+                api_key: find_coordinator_request::API_KEY,
+                max_version: 6,
+                ..Default::default()
+            });
         }
         let addrs = Arc::new(Mutex::new(Vec::<SocketAddr>::new()));
         let seen = Arc::new(Mutex::new(Seen::default()));
@@ -696,8 +702,8 @@ pub(crate) mod test_support {
             brokers.push(
                 MockBroker::start_with_replies(move |api_key, version, _, body| {
                     let addrs = addrs.lock().expect("addrs lock").clone();
-                    if api_key == krabka_protocol::owned::api_versions_request::API_KEY {
-                        return MockReply::Respond(api_versions(&apis));
+                    if api_key == api_versions_request::API_KEY {
+                        return MockReply::Respond(api_versions().apis(apis.clone()).call());
                     }
                     if api_key == find_coordinator_request::API_KEY {
                         let flexible = version >= find_coordinator_request::FLEXIBLE_MIN;
