@@ -24,7 +24,7 @@ use krabka_protocol::owned::{
     renew_delegation_token_request::RenewDelegationTokenRequest,
 };
 use krabka_security::KafkaPrincipal;
-use krabka_units::{Time, convert::wire::opt_time_to_millis_i64};
+use krabka_units::{Time, convert::{TimeExt as _, wire::opt_time_to_millis_i64}};
 
 use crate::{AdminClient, AdminError, kafka_error_name};
 
@@ -48,7 +48,7 @@ pub struct CreateDelegationTokenOptions {
     /// broker then uses `delegation.token.max.lifetime.ms`. The broker also
     /// uses that ceiling for a lifetime of zero or less, and caps a longer
     /// one at it.
-    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub max_lifetime: Option<Time>,
 }
 
@@ -61,7 +61,7 @@ pub struct RenewDelegationTokenOptions {
     /// also uses that default for a period of zero or less, caps a longer
     /// one at it, and never moves the expiry past the token's maximum
     /// timestamp.
-    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub renew_time_period: Option<Time>,
 }
 
@@ -73,7 +73,7 @@ pub struct ExpireDelegationTokenOptions {
     /// expires the token now, as does any negative period. A period of zero
     /// or more sets the expiry to that time, capped at the token's maximum
     /// timestamp.
-    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub expiry_time_period: Option<Time>,
 }
 
@@ -516,7 +516,7 @@ mod tests {
                 CreateDelegationTokenOptions::builder()
                     .owner(Some(group("ops")))
                     .renewers(renewers.clone())
-                    .max_lifetime(Some(60_000))
+                    .max_lifetime(60_000)
                     .build(),
                 CreateDelegationTokenRequest {
                     owner_principal_type: Some("Group".to_owned()),
@@ -531,7 +531,7 @@ mod tests {
             (
                 "zero lifetime reaches the broker as zero",
                 CreateDelegationTokenOptions::builder()
-                    .max_lifetime(Some(0))
+                    .max_lifetime(0)
                     .build(),
                 CreateDelegationTokenRequest {
                     max_lifetime_ms: 0,
@@ -736,7 +736,9 @@ mod tests {
             let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
             let result = admin
-                .create_delegation_token(&CreateDelegationTokenOptions::builder().owner(owner).build())
+                .create_delegation_token(
+                    &CreateDelegationTokenOptions::builder().owner(owner).build(),
+                )
                 .await
                 .map(|_| requests.lock().expect("requests lock").len())
                 .map_err(|error| match error {
@@ -800,7 +802,7 @@ mod tests {
                     .renew_delegation_token(
                         b"\x01\x02",
                         RenewDelegationTokenOptions::builder()
-                            .renew_time_period(
+                            .maybe_renew_time_period(
                                 renew_time_period.map(krabka_units::convert::TimeExt::millis_i64),
                             )
                             .build(),
@@ -869,7 +871,7 @@ mod tests {
                     .expire_delegation_token(
                         b"\xaa",
                         ExpireDelegationTokenOptions::builder()
-                            .expiry_time_period(
+                            .maybe_expiry_time_period(
                                 expiry_time_period.map(krabka_units::convert::TimeExt::millis_i64),
                             )
                             .build(),

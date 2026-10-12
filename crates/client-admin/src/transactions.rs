@@ -169,7 +169,7 @@ pub struct ListTransactionsFilter {
     pub producer_id_filters: Vec<i64>,
     /// Only transactions that have run for at least this long. `None`
     /// matches every duration, as Kafka's `-1` filter does.
-    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub min_duration: Option<Time>,
 }
 
@@ -2505,7 +2505,7 @@ mod tests {
                 ListTransactionsFilter::builder()
                     .state_filters(vec!["Ongoing".to_owned()])
                     .producer_id_filters(vec![4242])
-                    .min_duration(Some(90_000))
+                    .min_duration(90_000)
                     .build(),
                 ListTransactionsRequest {
                     state_filters: vec!["Ongoing".to_owned()],

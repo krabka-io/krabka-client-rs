@@ -29,7 +29,7 @@ pub struct CloseOptions {
     pub group_membership_operation: GroupMembershipOperation,
     /// The time that the close can take. `None` is
     /// [`DEFAULT_CONSUMER_CLOSE_TIMEOUT`].
-    #[builder(with = |millis: Option<i64>| millis.map(Time::from_millis))]
+    #[builder(with = |millis: i64| Time::from_millis(millis))]
     pub timeout: Option<Time>,
 }
 
