@@ -371,7 +371,7 @@ mod tests {
 
     use super::*;
     use crate::partition_leaders::test_support::{
-        api_versions, decode_request, encode_response, fast_admin,
+        ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
     };
 
     fn user(name: &str) -> KafkaPrincipal {
@@ -383,18 +383,34 @@ mod tests {
     }
 
     /// Every delegation-token API up to its latest version.
-    const TOKEN_APIS: [(i16, i16, i16); 4] = [
-        (create_delegation_token_request::API_KEY, 1, 3),
-        (renew_delegation_token_request::API_KEY, 1, 2),
-        (expire_delegation_token_request::API_KEY, 1, 2),
-        (describe_delegation_token_request::API_KEY, 1, 3),
+    const TOKEN_APIS: [ApiVersionRange; 4] = [
+        ApiVersionRange {
+            api_key: create_delegation_token_request::API_KEY,
+            min_version: 1,
+            max_version: 3,
+        },
+        ApiVersionRange {
+            api_key: renew_delegation_token_request::API_KEY,
+            min_version: 1,
+            max_version: 2,
+        },
+        ApiVersionRange {
+            api_key: expire_delegation_token_request::API_KEY,
+            min_version: 1,
+            max_version: 2,
+        },
+        ApiVersionRange {
+            api_key: describe_delegation_token_request::API_KEY,
+            min_version: 1,
+            max_version: 3,
+        },
     ];
 
     /// A mock broker that advertises `apis`, answers each `api_key` request
     /// with `answer` encoded at the negotiated version, and records the
     /// requests it decodes. Every token API is flexible from v2.
     async fn token_broker<Req, Resp>(
-        apis: Vec<(i16, i16, i16)>,
+        apis: Vec<ApiVersionRange>,
         api_key: i16,
         answer: Resp,
     ) -> (MockBroker, Arc<Mutex<Vec<Req>>>)
@@ -405,7 +421,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let broker = MockBroker::start(move |key, version, _, body| match key {
-            api_versions_request::API_KEY => Some(api_versions(&apis)),
+            api_versions_request::API_KEY => Some(api_versions().apis(apis.clone()).call()),
             key if key == api_key => {
                 let flexible = version >= 2;
                 seen.lock()
@@ -705,7 +721,13 @@ mod tests {
             ),
         ] {
             let (broker, requests) = token_broker::<CreateDelegationTokenRequest, _>(
-                vec![(create_delegation_token_request::API_KEY, 1, 2)],
+                vec![
+                    ApiVersionRange::builder()
+                        .api_key(create_delegation_token_request::API_KEY)
+                        .min_version(1)
+                        .max_version(2)
+                        .build(),
+                ],
                 create_delegation_token_request::API_KEY,
                 created_response(0),
             )

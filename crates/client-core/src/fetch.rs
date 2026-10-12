@@ -31,7 +31,7 @@ pub const DEFAULT_FETCH_RESPONSE_MAX: ByteSize = mebibytes(50);
 pub const DEFAULT_FETCH_MIN: ByteSize = bytes(1);
 
 /// Positive whole-byte minimum response size for a single-partition fetch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct FetchMinBytes(i32);
 
 impl FetchMinBytes {

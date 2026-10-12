@@ -21,7 +21,7 @@ use krabka_protocol::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use super::*;
-use crate::{Connection, ConnectionOptions};
+use crate::{Connection, ConnectionOptions, sasl};
 
 /// What the scripted broker saw.
 #[derive(Debug, Default)]
@@ -153,7 +153,7 @@ async fn run(
         connections_max_idle: krabka_units::hours(24),
         ..ConnectionOptions::default()
     };
-    let session = crate::sasl::outbound_sasl(
+    let session = sasl::outbound_sasl(
         &mut client,
         &creds,
         "localhost",
@@ -292,7 +292,7 @@ async fn oauthbearer_reauthentication_sends_the_refreshed_token() {
     let refreshed = token_path.clone();
     let observed = run(
         SaslCredentials::OAuthBearer {
-            token: crate::sasl::OAuthBearerTokenSource::File(token_path),
+            token: sasl::OAuthBearerTokenSource::File(token_path),
             extensions: std::collections::BTreeMap::new(),
         },
         10_000,

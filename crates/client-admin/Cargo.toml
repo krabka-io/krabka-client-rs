@@ -36,6 +36,7 @@ tracing            = { workspace = true }
 uuid               = { workspace = true }
 
 [dev-dependencies]
+bon = { workspace = true }
 krabka-client-consumer = { path = "../client-consumer" }
 krabka-client-core = { path = "../client-core", features = ["mock"] }
 krabka-client-producer = { path = "../client-producer" }

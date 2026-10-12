@@ -1,5 +1,5 @@
 //! Background coordinator task. It owns the join/sync/heartbeat/rebalance
-//! lifecycle for a [`Consumer`](crate::consumer::Consumer).
+//! lifecycle for a [`Consumer`](consumer::Consumer).
 //!
 //! On each tick the task either sends a steady-state `Heartbeat` or runs a
 //! full `JoinGroup` + `SyncGroup` round when `needs_rejoin` is set. The broker
@@ -26,15 +26,17 @@ use std::{
 };
 
 use bytes::Bytes;
-use krabka_client_core::Client;
+use krabka_client_core::{Client, ClientError};
 use krabka_protocol::{
     owned::{
         find_coordinator_request::FindCoordinatorRequest,
         find_coordinator_response::FindCoordinatorResponse,
         heartbeat_request::HeartbeatRequest,
+        heartbeat_response,
         join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol},
         join_group_response::JoinGroupResponse,
         leave_group_request::{LeaveGroupRequest, MemberIdentity},
+        metadata_response,
         offset_fetch_response::OffsetFetchResponse,
         sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment},
         sync_group_response::SyncGroupResponse,
@@ -48,22 +50,32 @@ use krabka_units::{
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use crate::builder;
+#[cfg(test)]
+use crate::poll;
+#[cfg(test)]
+use crate::test_support;
 use crate::{
-    GroupMembershipOperation,
+    GroupMembershipOperation, assignor,
     assignor::{Assignor, RebalanceProtocol},
     builder::{
         AutoOffsetReset, decode_assignment, decode_subscription, encode_assignment,
         encode_subscription,
     },
+    commit,
     commit::{
         AutoCommitOutcome, auto_commit_outcome, build_commit_request, names_moved_coordinator,
     },
+    consumer,
     consumer::{CommitIdentity, ConsumerRetryPolicy, reset_starting_offset, starting_offset},
+    consumer_group,
     error::ConsumerError,
     offset_wire::{
         OffsetFetchAction, TopicNameOffsetFetch, build_commit_topics, build_offset_fetch,
         classify_offset_fetch, parse_offset_fetch,
     },
+    rebalance_listener, subscription,
 };
 
 /// Retriable group-coordinator error codes. The coordinator is loading its
@@ -118,7 +130,7 @@ fn rebalance_failure_reason(error: &ConsumerError) -> String {
         ConsumerError::Server(81) => "GroupMaxSizeReachedException",
         ConsumerError::FencedInstanceId(_) => "FencedInstanceIdException",
         ConsumerError::TopicAuthorizationFailed(_) => "TopicAuthorizationException",
-        ConsumerError::Client(krabka_client_core::ClientError::Timeout(_)) => "TimeoutException",
+        ConsumerError::Client(ClientError::Timeout(_)) => "TimeoutException",
         ConsumerError::Client(_) => "DisconnectException",
         _ => "KafkaException",
     };
@@ -130,6 +142,35 @@ pub(crate) struct CoordinatorRetryPolicy {
     pub timeout: Duration,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CoordinatorRefind<'a> {
+    pub client: &'a Client,
+    pub group_id: &'a str,
+    pub coordinator_id: &'a AtomicI32,
+}
+
+impl CoordinatorRefind<'_> {
+    pub(crate) async fn send_join_group(
+        &self,
+        request: JoinGroupRequest,
+    ) -> Result<JoinGroupResponse, ConsumerError> {
+        self.client
+            .broker(self.coordinator_id.load(Ordering::Relaxed))
+            .send(request)
+            .await
+            .map_err(ConsumerError::from)
+    }
+}
+
+#[derive(bon::Builder)]
+#[builder(start_fn = builder, finish_fn = build)]
+pub(crate) struct CoordinatorRetryRequest<'a, F, C> {
+    pub retry: CoordinatorRetryPolicy,
+    pub code: C,
+    pub make: F,
+    pub refind: Option<CoordinatorRefind<'a>>,
 }
 
 impl From<ConsumerRetryPolicy> for CoordinatorRetryPolicy {
@@ -150,14 +191,14 @@ pub(crate) fn is_retriable_coordinator_code(code: i16) -> bool {
 }
 
 pub(crate) fn is_retriable_transport_error(e: &krabka_client_core::ClientError) -> bool {
-    matches!(
-        e,
-        krabka_client_core::ClientError::Connect { .. }
-            | krabka_client_core::ClientError::Tls { .. }
-            | krabka_client_core::ClientError::Sasl { .. }
-            | krabka_client_core::ClientError::Disconnected
-            | krabka_client_core::ClientError::Io(_)
-    )
+    crate::error::is_transport_error(e, false)
+}
+
+pub(crate) fn heartbeat_ticker(interval: Time) -> tokio::time::Interval {
+    let interval = interval.to_std();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
 }
 
 /// Read the effective `error_code` from a `FindCoordinatorResponse` across wire
@@ -207,20 +248,26 @@ pub(crate) async fn find_coordinator(
     group_id: &str,
     retry: CoordinatorRetryPolicy,
 ) -> Result<i32, ConsumerError> {
-    let resp = with_coordinator_retry(retry, coordinator_error_code, || {
-        let group_id = group_id.to_string();
-        async move {
-            match client.send(build_find_coordinator_request(group_id)).await {
-                Ok(resp) => Ok(resp),
-                Err(e) => {
-                    if is_retriable_transport_error(&e) {
-                        client.reconnect_bootstrap().await;
+    let resp = with_coordinator_retry(
+        CoordinatorRetryRequest::builder()
+            .retry(retry)
+            .code(coordinator_error_code)
+            .make(|| {
+                let group_id = group_id.to_string();
+                async move {
+                    match client.send(build_find_coordinator_request(group_id)).await {
+                        Ok(resp) => Ok(resp),
+                        Err(e) => {
+                            if is_retriable_transport_error(&e) {
+                                client.reconnect_bootstrap().await;
+                            }
+                            Err(ConsumerError::from(e))
+                        }
                     }
-                    Err(ConsumerError::from(e))
                 }
-            }
-        }
-    })
+            })
+            .build(),
+    )
     .await?;
 
     let code = coordinator_error_code(&resp);
@@ -298,112 +345,118 @@ fn build_heartbeat_request(
     }
 }
 
-/// Send a group-coordinator RPC to the *current* coordinator broker, and
-/// re-discover the coordinator before a retry on a cold or relocating
-/// coordinator code (14/15/16).
-///
-/// This chases a moved coordinator to its new home instead of looping forever
-/// on the stale id. Real Kafka returns `NOT_COORDINATOR` when an RPC reaches
-/// the wrong broker. The plain `with_coordinator_retry` re-sends the identical
-/// request to the same broker.
-///
-/// `coordinator_id` is the shared cell that `make` reads, so each retry targets
-/// the latest id. Re-discovery updates that cell in place on success. `make`
-/// does the `client.broker(id).send(...)` routing itself. This function mirrors
-/// the deadline and backoff of `with_coordinator_retry`. The only addition is
-/// the re-find between retriable attempts.
-pub(crate) async fn with_coordinator_refind<R, F, Fut>(
-    client: &Client,
-    group_id: &str,
-    coordinator_id: &AtomicI32,
-    retry: CoordinatorRetryPolicy,
-    code: impl Fn(&R) -> i16,
-    make: F,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoordinatorRetryReason {
+    Response,
+    Transport,
+}
+
+/// Retries a coordinator request without re-discovering the coordinator.
+pub(crate) async fn with_coordinator_retry<R, F, Fut, C>(
+    request: CoordinatorRetryRequest<'_, F, C>,
 ) -> Result<R, ConsumerError>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<R, ConsumerError>>,
+    C: Fn(&R) -> i16,
+{
+    let CoordinatorRetryRequest {
+        retry,
+        code,
+        make,
+        refind: _,
+    } = request;
+    with_coordinator_retry_loop()
+        .retry(retry)
+        .code(code)
+        .make(make)
+        .on_retry(|_| async {})
+        .call()
+        .await
+}
+
+#[bon::builder]
+async fn with_coordinator_retry_loop<R, F, Fut, C, H, Hfut>(
+    retry: CoordinatorRetryPolicy,
+    code: C,
+    make: F,
+    mut on_retry: H,
+) -> Result<R, ConsumerError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<R, ConsumerError>>,
+    C: Fn(&R) -> i16,
+    H: FnMut(CoordinatorRetryReason) -> Hfut,
+    Hfut: std::future::Future<Output = ()>,
 {
     let start = tokio::time::Instant::now();
     let mut backoff = retry.initial_backoff;
     loop {
-        let needs_refind = match make().await {
-            Ok(r) if !is_retriable_coordinator_code(code(&r)) => return Ok(r),
-            Ok(r) => {
+        let reason = match make().await {
+            Ok(response) if !is_retriable_coordinator_code(code(&response)) => {
+                return Ok(response);
+            }
+            Ok(response) => {
                 if retry_deadline_elapsed(start, retry.timeout) {
-                    return Ok(r);
+                    return Ok(response);
                 }
-                // Retriable broker code: the coordinator likely moved.
-                true
+                CoordinatorRetryReason::Response
             }
             Err(ConsumerError::Client(e)) if is_retriable_transport_error(&e) => {
                 if retry_deadline_elapsed(start, retry.timeout) {
                     return Err(ConsumerError::CoordinatorUnavailable);
                 }
-                // The socket to the coordinator is gone (bounced / failed
-                // over); evict it so re-discovery + the next attempt reconnect
-                // to the current coordinator's address.
-                client.evict_broker(coordinator_id.load(Ordering::Relaxed));
-                true
+                CoordinatorRetryReason::Transport
             }
             Err(e) => return Err(e),
         };
-        if needs_refind {
-            // Best-effort re-discovery. A transient failure here just means the
-            // next attempt reuses the last-known id; the outer deadline (and
-            // find_coordinator's own retry) still bound us.
-            match find_coordinator(client, group_id, retry).await {
-                Ok(id) => coordinator_id.store(id, Ordering::Relaxed),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "coordinator re-discovery failed; retrying with last-known id"
-                    );
-                }
-            }
-        }
+        on_retry(reason).await;
         tokio::time::sleep(backoff).await;
         backoff = next_backoff(backoff, retry.max_backoff);
     }
 }
 
-/// Send a group-coordinator RPC and retry on the cold-coordinator codes
-/// (14/15/16) and on transient transport errors.
-///
-/// The retry uses capped exponential backoff until `timeout` elapses. `make`
-/// rebuilds the request on each attempt, so the function can re-send it. `code`
-/// reads the response's `error_code`. On the deadline this function returns the
-/// last response, so the caller's `error_code` handling runs. It returns
-/// `CoordinatorUnavailable` instead if the last attempt was a transport
-/// failure.
-pub(crate) async fn with_coordinator_retry<R, F, Fut>(
-    retry: CoordinatorRetryPolicy,
-    code: impl Fn(&R) -> i16,
-    make: F,
-) -> Result<R, ConsumerError>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<R, ConsumerError>>,
-{
-    let start = tokio::time::Instant::now();
-    let mut backoff = retry.initial_backoff;
-    loop {
-        match make().await {
-            Ok(r) if !is_retriable_coordinator_code(code(&r)) => return Ok(r),
-            Ok(r) => {
-                if retry_deadline_elapsed(start, retry.timeout) {
-                    return Ok(r);
+impl<F, C> CoordinatorRetryRequest<'_, F, C> {
+    pub(crate) async fn run_with_refind<R, Fut>(self) -> Result<R, ConsumerError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<R, ConsumerError>>,
+        C: Fn(&R) -> i16,
+    {
+        let CoordinatorRetryRequest {
+            retry,
+            code,
+            make,
+            refind,
+        } = self;
+        let refind = refind.expect("refind request requires coordinator details");
+        with_coordinator_retry_loop()
+            .retry(retry)
+            .code(code)
+            .make(make)
+            .on_retry(|reason| async move {
+                if reason == CoordinatorRetryReason::Transport {
+                    // Evict a failed coordinator connection so the next attempt
+                    // reconnects to the address from discovery.
+                    refind
+                        .client
+                        .evict_broker(refind.coordinator_id.load(Ordering::Relaxed));
                 }
-            }
-            Err(ConsumerError::Client(e)) if is_retriable_transport_error(&e) => {
-                if retry_deadline_elapsed(start, retry.timeout) {
-                    return Err(ConsumerError::CoordinatorUnavailable);
+                // Best-effort re-discovery. A transient failure here just means
+                // the next attempt reuses the last-known id; both retry deadlines
+                // still bound the call.
+                match find_coordinator(refind.client, refind.group_id, retry).await {
+                    Ok(id) => refind.coordinator_id.store(id, Ordering::Relaxed),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "coordinator re-discovery failed; retrying with last-known id"
+                        );
+                    }
                 }
-            }
-            Err(e) => return Err(e),
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = next_backoff(backoff, retry.max_backoff);
+            })
+            .call()
+            .await
     }
 }
 
@@ -444,9 +497,9 @@ pub(crate) struct CoordinatorState {
     /// The newest rebalance protocol that every assignor supports.
     pub rebalance_protocol: RebalanceProtocol,
     /// The subscription, shared with the `Consumer`.
-    pub subscription: crate::subscription::SharedSubscription,
+    pub subscription: subscription::SharedSubscription,
     /// Changes of the subscription that the task did not handle yet.
-    pub subscription_changes: tokio::sync::watch::Receiver<crate::subscription::Subscription>,
+    pub subscription_changes: tokio::sync::watch::Receiver<subscription::Subscription>,
     /// The topics of the last `JoinGroup`. Kafka's
     /// `ConsumerCoordinator.joinedSubscription`.
     pub joined_topics: Vec<String>,
@@ -459,7 +512,7 @@ pub(crate) struct CoordinatorState {
     /// The member epoch of the consumer group protocol.
     pub member_epoch: i32,
     /// The fields of the last `ConsumerGroupHeartbeat`.
-    pub sent_heartbeat_fields: crate::consumer_group::SentFields,
+    pub sent_heartbeat_fields: consumer_group::SentFields,
     pub assigned: Arc<Mutex<Vec<(String, i32)>>>,
     pub assignment_changed: Arc<Notify>,
     pub next_ownership_id: u64,
@@ -490,7 +543,7 @@ pub(crate) struct CoordinatorState {
     pub poll_error: PollErrorSlot,
     /// Kafka's `enable.auto.commit` state, shared with the parent `Consumer`.
     /// `None` when auto commit is off.
-    pub auto_commit: Option<crate::commit::AutoCommit>,
+    pub auto_commit: Option<commit::AutoCommit>,
     /// The commit lock of the parent `Consumer`. The commit before a
     /// `JoinGroup` takes it, so the commits of the consumer reach the
     /// coordinator in order.
@@ -513,7 +566,7 @@ pub(crate) struct CoordinatorState {
     /// each request to join again, and cleared after a completed sync.
     pub rejoin_reason: String,
     /// The calls of the rebalance listener, or `None` without a listener.
-    pub listener_calls: Option<crate::rebalance_listener::ListenerCalls>,
+    pub listener_calls: Option<rebalance_listener::ListenerCalls>,
     /// The reasons of the rebalances that `Consumer::enforce_rebalance` asks
     /// for.
     pub enforced_rebalances: tokio::sync::mpsc::UnboundedReceiver<(String, u64)>,
@@ -522,12 +575,21 @@ pub(crate) struct CoordinatorState {
     pub lost_partitions: Vec<(String, i32)>,
     /// The added partitions that wait for `on_partitions_assigned`. `poll`
     /// does not fetch them.
-    pub assigned_callback_pending: crate::rebalance_listener::AssignedCallbackPending,
+    pub assigned_callback_pending: rebalance_listener::AssignedCallbackPending,
     /// Kafka's `Heartbeat.pollTimer`: `poll` and each completed join reset it.
     pub poll_timer: PollTimer,
     /// `true` when the poll timer expired while the task waited for a listener
     /// callback. The task then leaves the group, as after a poll timeout.
     pub poll_timeout_in_callback: bool,
+}
+
+#[cfg(test)]
+impl CoordinatorState {
+    pub(crate) fn test_builder(
+        client: krabka_client_core::Client,
+    ) -> test_support::CoordinatorStateTestBuilder {
+        test_support::CoordinatorStateTest::new(client)
+    }
 }
 
 /// Remember the owned partitions as lost before a reset clears them.
@@ -543,7 +605,7 @@ async fn remember_lost_partitions(state: &mut CoordinatorState) {
 /// Ask `poll` to run a listener callback, for the consumer group protocol.
 pub(crate) async fn call_listener_kind(
     state: &mut CoordinatorState,
-    kind: crate::rebalance_listener::ListenerCallKind,
+    kind: rebalance_listener::ListenerCallKind,
     partitions: Vec<(String, i32)>,
 ) -> Result<(), ConsumerError> {
     call_listener(state, kind, partitions).await
@@ -605,12 +667,7 @@ pub(crate) async fn call_lost_listener(state: &mut CoordinatorState) -> Result<(
     if lost.is_empty() {
         return Ok(());
     }
-    call_listener(
-        state,
-        crate::rebalance_listener::ListenerCallKind::Lost,
-        lost,
-    )
-    .await
+    call_listener(state, rebalance_listener::ListenerCallKind::Lost, lost).await
 }
 
 /// Give up every partition after the poll timer expired, and make the next
@@ -655,7 +712,7 @@ pub(crate) async fn find_coordinator_again(state: &CoordinatorState) {
 /// joined with the same `group.instance.id`.
 async fn call_listener(
     state: &mut CoordinatorState,
-    kind: crate::rebalance_listener::ListenerCallKind,
+    kind: rebalance_listener::ListenerCallKind,
     partitions: Vec<(String, i32)>,
 ) -> Result<(), ConsumerError> {
     loop {
@@ -664,7 +721,7 @@ async fn call_listener(
         };
         let (done, ran) = tokio::sync::oneshot::channel();
         if calls
-            .send(crate::rebalance_listener::ListenerCall {
+            .send(rebalance_listener::ListenerCall {
                 kind,
                 partitions: partitions.clone(),
                 done,
@@ -783,21 +840,11 @@ async fn join_prepare(state: &mut CoordinatorState) -> Result<(), ConsumerError>
     if state.member_id.is_empty() || state.generation_id < 0 {
         let lost = std::mem::take(&mut state.lost_partitions);
         if !lost.is_empty() {
-            call_listener(
-                state,
-                crate::rebalance_listener::ListenerCallKind::Lost,
-                lost,
-            )
-            .await?;
+            call_listener(state, rebalance_listener::ListenerCallKind::Lost, lost).await?;
         }
     } else if state.rebalance_protocol == RebalanceProtocol::Eager {
         let owned = state.assigned.lock().await.clone();
-        call_listener(
-            state,
-            crate::rebalance_listener::ListenerCallKind::Revoked,
-            owned,
-        )
-        .await?;
+        call_listener(state, rebalance_listener::ListenerCallKind::Revoked, owned).await?;
     } else {
         // Kafka's cooperative `onJoinPrepare` revokes only the partitions of
         // topics that the consumer no longer subscribes to.
@@ -811,7 +858,7 @@ async fn join_prepare(state: &mut CoordinatorState) -> Result<(), ConsumerError>
         if !revoked.is_empty() {
             call_listener(
                 state,
-                crate::rebalance_listener::ListenerCallKind::Revoked,
+                rebalance_listener::ListenerCallKind::Revoked,
                 revoked,
             )
             .await?;
@@ -925,12 +972,9 @@ async fn install_generation(state: &mut CoordinatorState, generation_id: i32) {
 pub(crate) fn assigned_callback_gate(
     state: &CoordinatorState,
     partitions: &[(String, i32)],
-) -> Option<crate::rebalance_listener::AssignedCallbackGate> {
+) -> Option<rebalance_listener::AssignedCallbackGate> {
     state.listener_calls.as_ref().map(|_| {
-        crate::rebalance_listener::AssignedCallbackGate::new(
-            &state.assigned_callback_pending,
-            partitions,
-        )
+        rebalance_listener::AssignedCallbackGate::new(&state.assigned_callback_pending, partitions)
     })
 }
 
@@ -941,6 +985,28 @@ async fn publish_assignment(
     generation_id: i32,
 ) {
     install_assignment(state, assignment, preserve_retained, generation_id, false).await;
+}
+
+/// Prime and publish newly owned cooperative partitions before their assign
+/// callback can let `poll` fetch them.
+#[bon::builder]
+async fn publish_cooperative_additions(
+    state: &mut CoordinatorState,
+    assignment: &[(String, i32)],
+    added: &[(String, i32)],
+    generation_id: i32,
+) -> Result<(), ConsumerError> {
+    prime_offsets(state, added).await?;
+    let gate = assigned_callback_gate(state, added);
+    publish_assignment(state, assignment, true, generation_id).await;
+    call_listener(
+        state,
+        rebalance_listener::ListenerCallKind::Assigned,
+        added.to_vec(),
+    )
+    .await?;
+    drop(gate);
+    Ok(())
 }
 
 /// Publish `assignment` at `generation_id` to the shared state of the
@@ -1218,7 +1284,7 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
             {
                 let topics = state.subscription.borrow().topics.clone();
                 state.rejoin_reason =
-                    crate::subscription::subscription_changed_reason(&state.joined_topics, &topics);
+                    subscription::subscription_changed_reason(&state.joined_topics, &topics);
                 rejoin.request_after_next_poll(&state);
             } else if let Ok(current) = subscribed_partition_counts(&state).await
                 && subscribed_topics_grew(&known_counts, &current)
@@ -1262,12 +1328,18 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     }
                     Err(ConsumerError::FencedInstanceId(group_instance_id)) => {
                         fence_member(&mut state, group_instance_id).await;
-                        if !wait_for_poll_after_error(&mut state.polls, &state.poll_error, &shutdown).await {
+                        if !prepare_fenced_rejoin()
+                            .state(&mut state)
+                            .rejoin(&mut rejoin)
+                            .shutdown(&shutdown)
+                            .reason(rebalance_failure_reason(&ConsumerError::FencedInstanceId(
+                                String::new(),
+                            )))
+                            .call()
+                            .await
+                        {
                             break;
                         }
-                        state.poll_timer.reset();
-                        state.rejoin_reason = rebalance_failure_reason(&ConsumerError::FencedInstanceId(String::new()));
-                        rejoin.request_now(&state);
                     }
                     Err(_) if std::mem::take(&mut state.poll_timeout_in_callback) => {
                         state.rejoin_reason = "consumer pro-actively leaving the group".into();
@@ -1301,12 +1373,16 @@ pub(crate) async fn run(mut state: CoordinatorState, shutdown: CancellationToken
                     HeartbeatOutcome::Fenced => {
                         let group_instance_id = state.group_instance_id.clone().unwrap_or_default();
                         fence_member(&mut state, group_instance_id).await;
-                        if !wait_for_poll_after_error(&mut state.polls, &state.poll_error, &shutdown).await {
+                        if !prepare_fenced_rejoin()
+                            .state(&mut state)
+                            .rejoin(&mut rejoin)
+                            .shutdown(&shutdown)
+                            .reason(heartbeat_rejoin_reason(FENCED_INSTANCE_ID))
+                            .call()
+                            .await
+                        {
                             break;
                         }
-                        state.poll_timer.reset();
-                        state.rejoin_reason = heartbeat_rejoin_reason(FENCED_INSTANCE_ID);
-                        rejoin.request_now(&state);
                     }
                 },
             }
@@ -1431,6 +1507,22 @@ impl RejoinRequest {
     }
 }
 
+#[bon::builder]
+async fn prepare_fenced_rejoin(
+    state: &mut CoordinatorState,
+    rejoin: &mut RejoinRequest,
+    shutdown: &CancellationToken,
+    reason: String,
+) -> bool {
+    if !wait_for_poll_after_error(&mut state.polls, &state.poll_error, shutdown).await {
+        return false;
+    }
+    state.poll_timer.reset();
+    state.rejoin_reason = reason;
+    rejoin.request_now(state);
+    true
+}
+
 /// The `LeaveGroup` reason of `close`. Kafka's `AbstractCoordinator.close`.
 const CLOSE_LEAVE_REASON: &str = "the consumer is being closed";
 
@@ -1453,12 +1545,7 @@ const POLL_TIMEOUT_LEAVE_REASON: &str = "consumer poll timeout has expired.";
 /// sends the join that such a `poll` requests after the `LeaveGroup`, so the
 /// coordinator never sees the new member before the old one leaves.
 async fn leave_on_poll_timeout(state: &mut CoordinatorState) {
-    tracing::warn!(
-        group = %state.group_id,
-        max_poll_interval = ?state.max_poll_interval,
-        "consumer poll timeout has expired: the time between two poll calls was longer than \
-         max_poll_interval; the member leaves the group and joins again on the next poll"
-    );
+    warn_poll_timeout(state);
     let member_id = std::mem::take(&mut state.member_id);
     state.rebalance_pending.send_replace(true);
     remember_lost_partitions(state).await;
@@ -1476,6 +1563,15 @@ async fn leave_on_poll_timeout(state: &mut CoordinatorState) {
         )
         .await;
     }
+}
+
+pub(crate) fn warn_poll_timeout(state: &CoordinatorState) {
+    tracing::warn!(
+        group = %state.group_id,
+        max_poll_interval = ?state.max_poll_interval,
+        "consumer poll timeout has expired: the time between two poll calls was longer than \
+         max_poll_interval; the member leaves the group and joins again on the next poll"
+    );
 }
 
 /// Act on a change of the subscription.
@@ -1524,7 +1620,7 @@ async fn handle_subscription_change(
     state.client.metadata_topics().set(topics.iter().cloned());
     if topics != state.joined_topics {
         state.rejoin_reason =
-            crate::subscription::subscription_changed_reason(&state.joined_topics, &topics);
+            subscription::subscription_changed_reason(&state.joined_topics, &topics);
         rejoin.request_after_next_poll(state);
         // The partition counts of the new topics are the baseline of the next
         // growth check. Without this, each check sees them as growth and asks
@@ -1558,9 +1654,9 @@ pub(crate) async fn refresh_pattern_topics(state: &mut CoordinatorState) -> bool
     else {
         return false;
     };
-    let matched = crate::subscription::Subscription {
+    let matched = subscription::Subscription {
         pattern: Some(pattern),
-        ..crate::subscription::Subscription::topics(
+        ..subscription::Subscription::topics(
             Vec::new(),
             state.subscription.borrow().exclude_internal_topics,
         )
@@ -1733,10 +1829,7 @@ pub(crate) async fn heartbeat_once(state: &CoordinatorState) -> HeartbeatOutcome
 fn send_heartbeat(
     state: &CoordinatorState,
 ) -> impl std::future::Future<
-    Output = Result<
-        krabka_protocol::owned::heartbeat_response::HeartbeatResponse,
-        krabka_client_core::ClientError,
-    >,
+    Output = Result<heartbeat_response::HeartbeatResponse, krabka_client_core::ClientError>,
 > + Send
 + 'static {
     let client = state.client.clone();
@@ -1754,10 +1847,7 @@ fn send_heartbeat(
 /// coordinator or transport error.
 async fn heartbeat_result_outcome(
     state: &CoordinatorState,
-    result: Result<
-        krabka_protocol::owned::heartbeat_response::HeartbeatResponse,
-        krabka_client_core::ClientError,
-    >,
+    result: Result<heartbeat_response::HeartbeatResponse, krabka_client_core::ClientError>,
 ) -> HeartbeatOutcome {
     match result {
         Ok(r) => {
@@ -1871,7 +1961,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
             // the new assignment is added.
             call_listener(
                 state,
-                crate::rebalance_listener::ListenerCallKind::Assigned,
+                rebalance_listener::ListenerCallKind::Assigned,
                 new_assignment.clone(),
             )
             .await?;
@@ -1888,15 +1978,13 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                 // partition and fetch it from offset 0 (poll.rs's
                 // `unwrap_or(0)`), re-delivering records the previous owner
                 // already committed past at revoke time.
-                prime_offsets(state, &added).await?;
-                let _gate = assigned_callback_gate(state, &added);
-                publish_assignment(state, &new_assignment, true, new_generation).await;
-                call_listener(
-                    state,
-                    crate::rebalance_listener::ListenerCallKind::Assigned,
-                    added.clone(),
-                )
-                .await?;
+                publish_cooperative_additions()
+                    .state(state)
+                    .assignment(&new_assignment)
+                    .added(&added)
+                    .generation_id(new_generation)
+                    .call()
+                    .await?;
                 topic_partitions
             } else {
                 // Phase 1: drop the partitions we're losing, then
@@ -1912,20 +2000,17 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                 install_generation(state, new_generation).await;
                 call_listener(
                     state,
-                    crate::rebalance_listener::ListenerCallKind::Revoked,
+                    rebalance_listener::ListenerCallKind::Revoked,
                     revoked.clone(),
                 )
                 .await?;
-                prime_offsets(state, &added).await?;
-                let gate = assigned_callback_gate(state, &added);
-                publish_assignment(state, &new_assignment, true, new_generation).await;
-                call_listener(
-                    state,
-                    crate::rebalance_listener::ListenerCallKind::Assigned,
-                    added.clone(),
-                )
-                .await?;
-                drop(gate);
+                publish_cooperative_additions()
+                    .state(state)
+                    .assignment(&new_assignment)
+                    .added(&added)
+                    .generation_id(new_generation)
+                    .call()
+                    .await?;
                 // With auto commit on, `commit_before_join` committed the
                 // positions of the revoked partitions before round 1. With
                 // auto commit off, the application commits. The consumer does
@@ -1973,7 +2058,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                     install_generation(state, gen2).await;
                     call_listener(
                         state,
-                        crate::rebalance_listener::ListenerCallKind::Revoked,
+                        rebalance_listener::ListenerCallKind::Revoked,
                         revoked2,
                     )
                     .await?;
@@ -1983,7 +2068,7 @@ async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i3
                 publish_assignment(state, &assignment2, true, gen2).await;
                 call_listener(
                     state,
-                    crate::rebalance_listener::ListenerCallKind::Assigned,
+                    rebalance_listener::ListenerCallKind::Assigned,
                     added2,
                 )
                 .await?;
@@ -2019,11 +2104,7 @@ pub(crate) fn join_protocols(
                     owned,
                     generation_id,
                     rack_id,
-                    crate::assignor::subscription_user_data(
-                        *assignor,
-                        last_assignment,
-                        generation_id,
-                    ),
+                    assignor::subscription_user_data(*assignor, last_assignment, generation_id),
                 ),
             )
         })
@@ -2069,6 +2150,69 @@ impl JoinRequestFields {
     }
 }
 
+#[derive(bon::Builder)]
+#[builder(start_fn = builder, finish_fn = build)]
+pub(crate) struct JoinGroupRetry<'a> {
+    client: &'a Client,
+    group_id: &'a str,
+    coordinator_id: &'a AtomicI32,
+    retry: CoordinatorRetryPolicy,
+    fields: &'a JoinRequestFields,
+    member_id: String,
+}
+
+#[derive(bon::Builder)]
+#[builder(start_fn = builder, finish_fn = build)]
+struct JoinGroupRetryContext<'a> {
+    client: &'a Client,
+    group_id: &'a str,
+    coordinator_id: &'a AtomicI32,
+    retry: CoordinatorRetryPolicy,
+}
+
+impl JoinGroupRetryContext<'_> {
+    fn request<'a>(
+        &'a self,
+        fields: &'a JoinRequestFields,
+        member_id: String,
+    ) -> JoinGroupRetry<'a> {
+        JoinGroupRetry::builder()
+            .client(self.client)
+            .group_id(self.group_id)
+            .coordinator_id(self.coordinator_id)
+            .retry(self.retry)
+            .fields(fields)
+            .member_id(member_id)
+            .build()
+    }
+}
+
+impl JoinGroupRetry<'_> {
+    pub(crate) async fn run(self) -> Result<JoinGroupResponse, ConsumerError> {
+        let Self {
+            client,
+            group_id,
+            coordinator_id,
+            retry,
+            fields,
+            member_id,
+        } = self;
+        let refind = CoordinatorRefind {
+            client,
+            group_id,
+            coordinator_id,
+        };
+        CoordinatorRetryRequest::builder()
+            .retry(retry)
+            .code(|response: &JoinGroupResponse| response.error_code)
+            .make(|| refind.send_join_group(fields.request(member_id.clone())))
+            .refind(refind)
+            .build()
+            .run_with_refind()
+            .await
+    }
+}
+
 pub(crate) fn build_sync_group_assignment(
     member_id: String,
     partitions: &[(String, i32)],
@@ -2080,23 +2224,29 @@ pub(crate) fn build_sync_group_assignment(
     }
 }
 
-fn build_sync_group_request(
-    group_id: String,
-    generation_id: i32,
-    member_id: String,
-    group_instance_id: Option<String>,
-    chosen_protocol: String,
-    assignments: Vec<SyncGroupRequestAssignment>,
-) -> SyncGroupRequest {
-    SyncGroupRequest {
-        group_id,
-        generation_id,
-        member_id,
-        group_instance_id,
-        protocol_type: Some("consumer".into()),
-        protocol_name: Some(chosen_protocol),
-        assignments,
-        ..Default::default()
+pub(crate) struct SyncGroupRequestConfig;
+
+#[bon::bon]
+impl SyncGroupRequestConfig {
+    #[builder(start_fn = builder, finish_fn = build)]
+    pub(crate) fn request(
+        #[builder(into)] group_id: String,
+        generation_id: i32,
+        #[builder(into)] member_id: String,
+        #[builder(into)] group_instance_id: Option<String>,
+        #[builder(into)] protocol_name: String,
+        assignments: Vec<SyncGroupRequestAssignment>,
+    ) -> SyncGroupRequest {
+        SyncGroupRequest {
+            group_id,
+            generation_id,
+            member_id,
+            group_instance_id,
+            protocol_type: Some("consumer".into()),
+            protocol_name: Some(protocol_name),
+            assignments,
+            ..Default::default()
+        }
     }
 }
 
@@ -2108,7 +2258,7 @@ fn build_sync_group_request(
 /// retriable failure until the rebalance timeout expires. After a non-retriable
 /// failure or at the timeout, it writes an error to the log and joins the
 /// group. This function commits the positions of the latest `poll`; see
-/// [`crate::commit::AutoCommit`]. It runs once per join: a retry of a failed
+/// [`commit::AutoCommit`]. It runs once per join: a retry of a failed
 /// `JoinGroup` does not commit again.
 ///
 /// Kafka's heartbeat thread keeps the session alive while `onJoinPrepare`
@@ -2182,12 +2332,10 @@ async fn heartbeat_during_join_prepare(
         // A member of the consumer group protocol keeps its membership with
         // `ConsumerGroupHeartbeat`, not with the classic `Heartbeat`. The
         // heartbeat after the callback acts on the member state.
-        crate::consumer_group::heartbeat_during_callback(state, commit_done).await;
+        consumer_group::heartbeat_during_callback(state, commit_done).await;
         return None;
     }
-    let interval = state.heartbeat_interval.to_std();
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticker = heartbeat_ticker(state.heartbeat_interval);
     loop {
         tokio::select! {
             biased;
@@ -2226,10 +2374,7 @@ async fn heartbeat_during_join_prepare(
 /// it cannot reach the coordinator after a newer commit of the consumer. The
 /// rebalance timeout bounds the wait for that lock, each `OffsetCommit` and
 /// each coordinator lookup.
-async fn commit_consumed_before_join(
-    state: &CoordinatorState,
-    auto_commit: &crate::commit::AutoCommit,
-) {
+async fn commit_consumed_before_join(state: &CoordinatorState, auto_commit: &commit::AutoCommit) {
     let deadline = tokio::time::Instant::now() + state.max_poll_interval.to_std();
     let Some(_turn) = commit_turn(&state.commit_serialization, deadline).await else {
         tracing::error!(
@@ -2250,7 +2395,7 @@ async fn commit_consumed_before_join(
             identity.generation,
             identity.member_id,
             state.group_instance_id.clone(),
-            build_commit_topics(crate::commit::position_commits(offsets)),
+            build_commit_topics(commit::position_commits(offsets)),
         ));
         let Ok(result) = tokio::time::timeout_at(deadline, send).await else {
             tracing::error!("auto commit before the rebalance timed out; joining the group");
@@ -2332,8 +2477,8 @@ async fn perform_join(
     let mut fields = JoinRequestFields {
         group_id: state.group_id.clone(),
         group_instance_id: state.group_instance_id.clone(),
-        session_timeout_ms: crate::consumer::protocol_millis_i32(state.session_timeout),
-        rebalance_timeout_ms: crate::consumer::protocol_millis_i32(state.max_poll_interval),
+        session_timeout_ms: consumer::protocol_millis_i32(state.session_timeout),
+        rebalance_timeout_ms: consumer::protocol_millis_i32(state.max_poll_interval),
         // Kafka's eager `onJoinPrepare` revokes every partition before the
         // join, so an eager subscription owns nothing. The `sticky` user data
         // still carries the last assignment.
@@ -2352,7 +2497,7 @@ async fn perform_join(
     };
 
     // Pull the pieces every retry closure needs out of `&mut state` into locals
-    // so `with_coordinator_refind` can borrow the shared coordinator cell
+    // so the retry request can borrow the shared coordinator cell
     // alongside the closures' borrows without aliasing `state`. `Client` and
     // the `Arc<AtomicI32>` are both cheap to clone; the atomic is the same cell
     // `state.coordinator_id` points at, so re-discovery updates are visible to
@@ -2361,32 +2506,23 @@ async fn perform_join(
     let group_id = state.group_id.clone();
     let group_instance_id = state.group_instance_id.clone();
     let coordinator_id = Arc::clone(&state.coordinator_id);
+    let retry = state.retry_policy;
 
     // First join: if we have no member_id, expect MEMBER_ID_REQUIRED (79) and
     // capture the broker-assigned id, then issue a second join. Retry a cold or
     // relocating coordinator (14/15/16) with backoff, re-discovering the
     // coordinator before each retry so a moved coordinator is chased rather
     // than re-hit on the stale broker.
-    let r1 = with_coordinator_refind(
-        &client,
-        &group_id,
-        &coordinator_id,
-        state.retry_policy,
-        |r: &JoinGroupResponse| r.error_code,
-        || {
-            let request = fields.request(state.member_id.clone());
-            let client = &client;
-            let target = coordinator_id.load(Ordering::Relaxed);
-            async move {
-                client
-                    .broker(target)
-                    .send(request)
-                    .await
-                    .map_err(ConsumerError::from)
-            }
-        },
-    )
-    .await?;
+    let join_group_retry = JoinGroupRetryContext::builder()
+        .client(&client)
+        .group_id(&group_id)
+        .coordinator_id(&coordinator_id)
+        .retry(retry)
+        .build();
+    let r1 = join_group_retry
+        .request(&fields, state.member_id.clone())
+        .run()
+        .await?;
     let join_resp = if r1.error_code == 0 {
         r1
     } else if r1.error_code == 79 {
@@ -2401,26 +2537,10 @@ async fn perform_join(
         // reason.
         state.rejoin_reason = format!("need to re-join with the given member-id: {assigned_id}");
         fields.reason.clone_from(&state.rejoin_reason);
-        let r2 = with_coordinator_refind(
-            &client,
-            &group_id,
-            &coordinator_id,
-            state.retry_policy,
-            |r: &JoinGroupResponse| r.error_code,
-            || {
-                let request = fields.request(assigned_id.clone());
-                let client = &client;
-                let target = coordinator_id.load(Ordering::Relaxed);
-                async move {
-                    client
-                        .broker(target)
-                        .send(request)
-                        .await
-                        .map_err(ConsumerError::from)
-                }
-            },
-        )
-        .await?;
+        let r2 = join_group_retry
+            .request(&fields, assigned_id.clone())
+            .run()
+            .await?;
         if r2.error_code != 0 {
             return Err(group_response_error(
                 r2.error_code,
@@ -2520,7 +2640,7 @@ async fn join_and_sync(state: &mut CoordinatorState) -> Result<JoinOutcome, Cons
 pub(crate) fn leader_assignments(
     assignors: &[Assignor],
     response: &JoinGroupResponse,
-    metadata: &krabka_protocol::owned::metadata_response::MetadataResponse,
+    metadata: &metadata_response::MetadataResponse,
 ) -> Result<Vec<SyncGroupRequestAssignment>, ConsumerError> {
     let name = response.protocol_name.as_deref().unwrap_or_default();
     let assignor = Assignor::by_protocol_name(assignors, name).ok_or_else(|| {
@@ -2528,11 +2648,11 @@ pub(crate) fn leader_assignments(
             "Coordinator selected invalid assignment protocol: {name}"
         ))
     })?;
-    let members: Vec<crate::assignor::GroupMember> = response
+    let members: Vec<assignor::GroupMember> = response
         .members
         .iter()
-        .map(|member| crate::assignor::GroupMember {
-            key: crate::assignor::MemberKey {
+        .map(|member| assignor::GroupMember {
+            key: assignor::MemberKey {
                 member_id: member.member_id.clone(),
                 group_instance_id: member.group_instance_id.clone(),
             },
@@ -2556,7 +2676,7 @@ pub(crate) fn leader_assignments(
             })
         })
         .collect();
-    let mut assignments: Vec<_> = crate::assignor::assign(assignor, &members, &topic_partitions)
+    let mut assignments: Vec<_> = assignor::assign(assignor, &members, &topic_partitions)
         .into_iter()
         .collect();
     assignments.sort();
@@ -2633,21 +2753,18 @@ async fn sync_assignment(
     protocol: &str,
     assignments: Vec<SyncGroupRequestAssignment>,
 ) -> Result<Vec<(String, i32)>, ConsumerError> {
-    let response = with_coordinator_refind(
-        &state.client,
-        &state.group_id,
-        &state.coordinator_id,
-        state.retry_policy,
-        |response: &SyncGroupResponse| response.error_code,
-        || {
-            let request = build_sync_group_request(
-                state.group_id.clone(),
-                generation_id,
-                state.member_id.clone(),
-                state.group_instance_id.clone(),
-                protocol.to_string(),
-                assignments.clone(),
-            );
+    let response = CoordinatorRetryRequest::builder()
+        .retry(state.retry_policy)
+        .code(|response: &SyncGroupResponse| response.error_code)
+        .make(|| {
+            let request = SyncGroupRequestConfig::builder()
+                .group_id(state.group_id.clone())
+                .generation_id(generation_id)
+                .member_id(state.member_id.clone())
+                .maybe_group_instance_id(state.group_instance_id.clone())
+                .protocol_name(protocol)
+                .assignments(assignments.clone())
+                .build();
             let target = state.coordinator_id.load(Ordering::Relaxed);
             async move {
                 state
@@ -2657,9 +2774,15 @@ async fn sync_assignment(
                     .await
                     .map_err(ConsumerError::from)
             }
-        },
-    )
-    .await?;
+        })
+        .refind(CoordinatorRefind {
+            client: &state.client,
+            group_id: &state.group_id,
+            coordinator_id: &state.coordinator_id,
+        })
+        .build()
+        .run_with_refind()
+        .await?;
     if response.error_code != 0 {
         return Err(group_response_error(
             response.error_code,
@@ -2822,6 +2945,17 @@ fn should_prime_missing_partition(seen: bool) -> bool {
 }
 
 #[cfg(test)]
+fn assert_retried_until_deadline<T>(
+    result: Result<T, ConsumerError>,
+    calls: &std::sync::atomic::AtomicUsize,
+) {
+    assert2::assert!(
+        matches!(result, Err(ConsumerError::CoordinatorUnavailable))
+            && calls.load(std::sync::atomic::Ordering::SeqCst) > 1
+    );
+}
+
+#[cfg(test)]
 mod retry_tests {
     use std::{
         collections::BTreeSet,
@@ -2832,7 +2966,7 @@ mod retry_tests {
 
     use assert2::check;
     use bytes::Buf;
-    use krabka_client_core::MockBroker;
+    use krabka_client_core::{MockBroker, mock_test_support::group_api_versions};
     use krabka_protocol::{
         Decode, Encode, UnknownTaggedFields,
         owned::{
@@ -2854,52 +2988,13 @@ mod retry_tests {
         },
     };
     use krabka_units::{millis, minutes, secs};
+    use test_support::coordinator_retry_policy as retry;
 
     use super::*;
 
     const ORDERS: &str = "orders";
 
     const PAYMENTS: &str = "payments";
-
-    /// An `ApiVersions` response that advertises `OffsetFetch` in
-    /// `offset_fetch_range`.
-    fn api_versions_for_offset_fetch(offset_fetch_range: (i16, i16)) -> Vec<u8> {
-        let response = ApiVersionsResponse {
-            error_code: 0,
-            api_keys: vec![
-                ApiVersion {
-                    api_key: api_versions_request::API_KEY,
-                    min_version: 0,
-                    max_version: 3,
-                    ..Default::default()
-                },
-                ApiVersion {
-                    api_key: offset_fetch_request::API_KEY,
-                    min_version: offset_fetch_range.0,
-                    max_version: offset_fetch_range.1,
-                    ..Default::default()
-                },
-                ApiVersion {
-                    api_key: find_coordinator_request::API_KEY,
-                    min_version: 0,
-                    max_version: 0,
-                    ..Default::default()
-                },
-                ApiVersion {
-                    api_key: metadata_request::API_KEY,
-                    min_version: 0,
-                    max_version: 8,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let mut buffer = bytes::BytesMut::new();
-        response
-            .encode(&mut buffer, 0)
-            .expect("encode API versions");
-        buffer.to_vec()
-    }
 
     /// One scripted `OffsetFetch` answer: the group error code and, for
     /// partition 0 of each topic, the partition error code and the committed
@@ -3005,7 +3100,7 @@ mod retry_tests {
                 Outcome::TopicAuthorizationFailed(topics)
             }
             Err(ConsumerError::OffsetFetchFailed(code)) => Outcome::OffsetFetchFailed(code),
-            Err(ConsumerError::Client(krabka_client_core::ClientError::IncompatibleVersion {
+            Err(ConsumerError::Client(ClientError::IncompatibleVersion {
                 api_key: offset_fetch_request::API_KEY,
                 broker_min,
                 broker_max,
@@ -3305,9 +3400,10 @@ mod retry_tests {
         let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
             let mut buffer = bytes::BytesMut::new();
             match api_key {
-                api_versions_request::API_KEY => {
-                    Some(api_versions_for_offset_fetch(offset_fetch_range))
-                }
+                api_versions_request::API_KEY => Some(group_api_versions(
+                    offset_fetch_request::API_KEY,
+                    offset_fetch_range,
+                )),
                 offset_fetch_request::API_KEY => {
                     let client_id_len = body.get_i16();
                     body.advance(usize::try_from(client_id_len).expect("client id length"));
@@ -3434,49 +3530,31 @@ mod retry_tests {
         }
     }
 
-    fn retry(timeout: Duration) -> CoordinatorRetryPolicy {
-        CoordinatorRetryPolicy {
-            timeout,
-            initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(1),
-        }
-    }
-
     struct Resp {
         error_code: i16,
     }
 
     fn refused_connect_error() -> ConsumerError {
-        ConsumerError::Client(krabka_client_core::ClientError::Connect {
+        ConsumerError::Client(ClientError::Connect {
             addr: SocketAddr::from(([127, 0, 0, 1], 9092)),
             source: io::Error::new(io::ErrorKind::ConnectionRefused, "refused"),
         })
     }
 
-    fn api_versions_for_leave_group() -> Vec<u8> {
-        let response = ApiVersionsResponse {
-            error_code: 0,
-            api_keys: vec![
-                ApiVersion {
-                    api_key: api_versions_request::API_KEY,
-                    min_version: 0,
-                    max_version: 3,
-                    ..Default::default()
-                },
-                ApiVersion {
-                    api_key: leave_group_request::API_KEY,
-                    min_version: 0,
-                    max_version: leave_group_request::MAX_VERSION,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let mut buffer = bytes::BytesMut::new();
-        response
-            .encode(&mut buffer, 0)
-            .expect("encode API versions");
-        buffer.to_vec()
+    async fn run_retry<F, Fut>(
+        retry: CoordinatorRetryPolicy,
+        make: F,
+    ) -> Result<Resp, ConsumerError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<Resp, ConsumerError>>,
+    {
+        let request = CoordinatorRetryRequest::builder()
+            .retry(retry)
+            .code(|response: &Resp| response.error_code)
+            .make(make)
+            .build();
+        with_coordinator_retry(request).await
     }
 
     #[tokio::test(start_paused = true)]
@@ -3493,62 +3571,7 @@ mod retry_tests {
 
     /// A coordinator task state of `group-a` on `client`.
     fn test_state(client: Client) -> CoordinatorState {
-        CoordinatorState {
-            client,
-            group_id: "group-a".into(),
-            coordinator_id: Arc::new(AtomicI32::new(0)),
-            member_id: "member-a".into(),
-            published_member_id: tokio::sync::watch::Sender::new("member-a".to_owned()),
-            commit_identity: Arc::new(Mutex::new(CommitIdentity {
-                generation: 1,
-                member_id: "member-a".into(),
-                ownership_ids: HashMap::new(),
-                rejoin_on_poll: false,
-            })),
-            group_instance_id: None,
-            generation_id: 1,
-            current_generation: Arc::new(AtomicI32::new(1)),
-            assignors: vec![Assignor::Range],
-            rebalance_protocol: RebalanceProtocol::Eager,
-            subscription: crate::subscription::shared(vec!["topic".into()], None, true),
-            subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
-            joined_topics: Vec::new(),
-            seen_unsubscribes: 0,
-            group_protocol: crate::GroupProtocol::Classic,
-            server_assignor: None,
-            member_epoch: 0,
-            sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
-            assigned: Arc::new(Mutex::new(Vec::new())),
-            assignment_changed: Arc::new(Notify::new()),
-            next_ownership_id: 1,
-            next_offsets: Arc::new(Mutex::new(HashMap::new())),
-            end_offsets: Arc::new(Mutex::new(HashMap::new())),
-            positions: Arc::new(Mutex::new(HashMap::new())),
-            topic_ids: Arc::new(Mutex::new(HashMap::new())),
-            session_timeout: secs(45),
-            max_poll_interval: minutes(1),
-            heartbeat_interval: secs(3),
-            subscription_metadata_refresh_interval: millis(37),
-            leave_group_timeout: millis(37),
-            auto_offset_reset: AutoOffsetReset::Latest,
-            client_rack: None,
-            initial_subscribed_counts: HashMap::new(),
-            retry_policy: retry(Duration::from_secs(30)),
-            poll_error: PollErrorSlot::default(),
-            auto_commit: None,
-            commit_serialization: Arc::new(Mutex::new(())),
-            join_prepared: false,
-            polls: PollSignal::default().subscribe(),
-            rebalance_pending: tokio::sync::watch::Sender::new(false),
-            close_operation: tokio::sync::watch::channel(crate::control::CloseRequest::default()).1,
-            rejoin_reason: String::new(),
-            listener_calls: None,
-            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().1,
-            lost_partitions: Vec::new(),
-            assigned_callback_pending: Arc::default(),
-            poll_timer: PollTimer::new(secs(300)),
-            poll_timeout_in_callback: false,
-        }
+        CoordinatorState::test_builder(client).build()
     }
 
     /// A subscription change makes the partition counts of the new topics the
@@ -3556,13 +3579,11 @@ mod retry_tests {
     /// again at each metadata refresh.
     #[tokio::test]
     async fn a_subscription_change_rebaselines_the_partition_counts() {
-        use krabka_protocol::owned::metadata_response::{
-            MetadataResponsePartition, MetadataResponseTopic,
-        };
+        use metadata_response::MetadataResponseTopic;
 
         let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
             if api_key == api_versions_request::API_KEY {
-                return Some(api_versions_for_leave_group());
+                return Some(test_support::leave_group_api_versions());
             }
             if api_key != metadata_request::API_KEY {
                 return None;
@@ -3570,33 +3591,19 @@ mod retry_tests {
             let response = MetadataResponse {
                 topics: vec![MetadataResponseTopic {
                     name: Some(PAYMENTS.into()),
-                    partitions: (0..2)
-                        .map(|partition_index| MetadataResponsePartition {
-                            partition_index,
-                            ..Default::default()
-                        })
-                        .collect(),
+                    partitions: test_support::metadata_partitions(2),
                     ..Default::default()
                 }],
                 ..Default::default()
             };
-            let mut buffer = bytes::BytesMut::new();
-            response.encode(&mut buffer, version).expect("encode");
-            Some(buffer.to_vec())
+            Some(test_support::encode_protocol_response(&response, version))
         })
         .await;
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .metadata_scope(krabka_client_core::MetadataScope::Topics {
-                allow_auto_topic_creation: false,
-            })
-            .build()
-            .await
-            .expect("client");
+        let client = test_support::topic_metadata_client(&mock).await;
         let mut state = test_state(client);
         state.member_id = "member-a".into();
         state.joined_topics = vec![ORDERS.to_owned()];
-        state.subscription = crate::subscription::shared(vec![PAYMENTS.to_owned()], None, true);
+        state.subscription = subscription::shared(vec![PAYMENTS.to_owned()], None, true);
         state.subscription_changes = state.subscription.subscribe();
         state
             .subscription
@@ -3617,7 +3624,6 @@ mod retry_tests {
     async fn the_leader_assigns_with_metadata_for_the_whole_group_subscription() {
         use krabka_protocol::owned::{
             join_group_response::JoinGroupResponseMember,
-            metadata_request::MetadataRequest,
             metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
         };
 
@@ -3625,20 +3631,12 @@ mod retry_tests {
         let requested_in_mock = Arc::clone(&requested);
         let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
             if api_key == api_versions_request::API_KEY {
-                return Some(api_versions_for_leave_group());
+                return Some(test_support::leave_group_api_versions());
             }
             if api_key != metadata_request::API_KEY {
                 return None;
             }
-            let client_id_len = body.get_i16();
-            body.advance(usize::try_from(client_id_len.max(0)).expect("length"));
-            let request = MetadataRequest::decode(&mut body, version).expect("decode Metadata");
-            let names: Vec<String> = request
-                .topics
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|topic| topic.name)
-                .collect();
+            let names = test_support::metadata_topic_names(&mut body, version);
             let response = MetadataResponse {
                 topics: names
                     .iter()
@@ -3657,26 +3655,15 @@ mod retry_tests {
                 .lock()
                 .expect("requested lock")
                 .push(names);
-            let mut buffer = bytes::BytesMut::new();
-            response
-                .encode(&mut buffer, version)
-                .expect("encode Metadata");
-            Some(buffer.to_vec())
+            Some(test_support::encode_protocol_response(&response, version))
         })
         .await;
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .metadata_scope(krabka_client_core::MetadataScope::Topics {
-                allow_auto_topic_creation: false,
-            })
-            .build()
-            .await
-            .expect("client");
+        let client = test_support::topic_metadata_client(&mock).await;
         let mut state = test_state(client);
-        state.subscription = crate::subscription::shared(vec![ORDERS.into()], None, true);
+        state.subscription = subscription::shared(vec![ORDERS.into()], None, true);
         let member = |member_id: &str, topic: &str| JoinGroupResponseMember {
             member_id: member_id.into(),
-            metadata: crate::builder::encode_subscription(&[topic.to_owned()], &[], -1, None, None),
+            metadata: builder::encode_subscription(&[topic.to_owned()], &[], -1, None, None),
             ..Default::default()
         };
         let response = JoinGroupResponse {
@@ -3696,7 +3683,7 @@ mod retry_tests {
             .map(|assignment| {
                 (
                     assignment.member_id.clone(),
-                    crate::builder::decode_assignment(&assignment.assignment),
+                    builder::decode_assignment(&assignment.assignment),
                 )
             })
             .collect();
@@ -3716,26 +3703,8 @@ mod retry_tests {
 
     #[tokio::test]
     async fn coordinator_leave_group_uses_configured_timeout() {
-        let saw_leave = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let saw_leave_in_mock = Arc::clone(&saw_leave);
-        let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
-            if api_key == api_versions_request::API_KEY {
-                Some(api_versions_for_leave_group())
-            } else if api_key == leave_group_request::API_KEY {
-                saw_leave_in_mock.store(true, Ordering::SeqCst);
-                None
-            } else {
-                None
-            }
-        })
-        .await;
-        let client = Client::builder()
-            .bootstrap(mock.addr.to_string())
-            .request_timeout(krabka_units::secs(5))
-            .build()
-            .await
-            .expect("client");
-        let state = test_state(client);
+        let fixture = test_support::StalledLeaveGroup::start().await;
+        let state = test_state(fixture.client.clone());
 
         tokio::time::timeout(
             Duration::from_secs(1),
@@ -3748,8 +3717,8 @@ mod retry_tests {
         )
         .await
         .expect("configured leave deadline bounds coordinator shutdown");
-        mock.stop();
-        assert2::assert!(saw_leave.load(Ordering::SeqCst));
+        fixture.broker.stop();
+        assert2::assert!(fixture.saw_leave.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -4021,14 +3990,14 @@ mod retry_tests {
             )
         );
 
-        let req = build_sync_group_request(
-            "group-a".into(),
-            7,
-            "member-a".into(),
-            Some("instance-a".into()),
-            "range".into(),
-            vec![assignment.clone()],
-        );
+        let req = SyncGroupRequestConfig::builder()
+            .group_id("group-a")
+            .generation_id(7)
+            .member_id("member-a")
+            .group_instance_id("instance-a")
+            .protocol_name("range")
+            .assignments(vec![assignment.clone()])
+            .build();
 
         assert2::assert!(
             req == SyncGroupRequest {
@@ -4066,47 +4035,17 @@ mod retry_tests {
 
     #[test]
     fn prime_offset_helpers_preserve_committed_and_reset_boundaries() {
-        for (_name, committed, reset, expected) in [
-            ("committed positive", 12, AutoOffsetReset::Earliest, 12),
-            ("committed zero", 0, AutoOffsetReset::Latest, 0),
-            (
-                "missing earliest",
-                -1,
-                AutoOffsetReset::Earliest,
-                crate::poll::BEGINNING_SENTINEL,
-            ),
-            (
-                "missing latest",
-                -1,
-                AutoOffsetReset::Latest,
-                crate::poll::LATEST_SENTINEL,
-            ),
-            (
-                "missing none",
-                -1,
-                AutoOffsetReset::None,
-                crate::poll::NO_OFFSET_SENTINEL,
-            ),
-        ] {
-            assert2::assert!(starting_offset(committed, reset) == expected);
-        }
+        test_support::assert_starting_offsets(starting_offset);
+        assert2::assert!(starting_offset(0, AutoOffsetReset::Latest) == 0);
 
         for (_name, reset, expected) in [
             (
                 "earliest",
                 AutoOffsetReset::Earliest,
-                crate::poll::BEGINNING_SENTINEL,
+                poll::BEGINNING_SENTINEL,
             ),
-            (
-                "latest",
-                AutoOffsetReset::Latest,
-                crate::poll::LATEST_SENTINEL,
-            ),
-            (
-                "none",
-                AutoOffsetReset::None,
-                crate::poll::NO_OFFSET_SENTINEL,
-            ),
+            ("latest", AutoOffsetReset::Latest, poll::LATEST_SENTINEL),
+            ("none", AutoOffsetReset::None, poll::NO_OFFSET_SENTINEL),
         ] {
             assert2::assert!(reset_starting_offset(reset) == expected);
         }
@@ -4193,7 +4132,7 @@ mod retry_tests {
 
     /// The broker answers for one coordinator task case. `None` leaves the
     /// request without a response.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     struct GroupAnswers {
         /// Whether the application polls each 10 ms during the case.
         polls: bool,
@@ -4203,7 +4142,7 @@ mod retry_tests {
     }
 
     /// What the coordinator task did after the heartbeat answer.
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Debug, Default, PartialEq, Eq)]
     struct TaskObservation {
         task_exited: bool,
         shutdown_cancelled: bool,
@@ -4213,6 +4152,38 @@ mod retry_tests {
         commit_member_id: String,
         rejoin_on_poll: bool,
         group_requests: BTreeSet<&'static str>,
+    }
+
+    impl TaskObservation {
+        fn member(assigned: Vec<(String, i32)>, group_requests: BTreeSet<&'static str>) -> Self {
+            Self {
+                assigned,
+                generation: 1,
+                commit_member_id: "member-a".into(),
+                group_requests,
+                ..Default::default()
+            }
+        }
+
+        fn fenced(poll_error: String, group_requests: BTreeSet<&'static str>) -> Self {
+            Self {
+                poll_error: Some(poll_error),
+                assigned: Vec::new(),
+                generation: -1,
+                rejoin_on_poll: true,
+                group_requests,
+                ..Default::default()
+            }
+        }
+
+        fn unknown_member(group_requests: BTreeSet<&'static str>) -> Self {
+            Self {
+                assigned: Vec::new(),
+                generation: -1,
+                group_requests,
+                ..Default::default()
+            }
+        }
     }
 
     fn group_request_name(api_key: i16) -> Option<&'static str> {
@@ -4317,66 +4288,28 @@ mod retry_tests {
         let orders_0 = (ORDERS.to_string(), 0);
         // The application does not poll during the case.
         let poll_signal = PollSignal::default();
-        let state = CoordinatorState {
-            client,
-            group_id: "group-a".into(),
-            coordinator_id: Arc::new(AtomicI32::new(0)),
-            member_id: "member-a".into(),
-            published_member_id: tokio::sync::watch::Sender::new("member-a".to_owned()),
-            commit_identity: Arc::new(Mutex::new(CommitIdentity {
+        let state = CoordinatorState::test_builder(client)
+            .commit_identity(Arc::new(Mutex::new(CommitIdentity {
                 generation: 1,
                 member_id: "member-a".into(),
                 ownership_ids: HashMap::from([(orders_0.clone(), 1)]),
                 rejoin_on_poll: false,
-            })),
-            group_instance_id: Some("instance-a".into()),
-            generation_id: 1,
-            current_generation: Arc::new(AtomicI32::new(1)),
-            assignors: vec![Assignor::Range],
-            rebalance_protocol: RebalanceProtocol::Eager,
-            subscription: crate::subscription::shared(vec![ORDERS.into()], None, true),
-            subscription_changes: crate::subscription::shared(Vec::new(), None, true).subscribe(),
-            joined_topics: Vec::new(),
-            seen_unsubscribes: 0,
-            group_protocol: crate::GroupProtocol::Classic,
-            server_assignor: None,
-            member_epoch: 0,
-            sent_heartbeat_fields: crate::consumer_group::SentFields::default(),
-            assigned: Arc::new(Mutex::new(vec![orders_0.clone()])),
-            assignment_changed: Arc::new(Notify::new()),
-            next_ownership_id: 2,
-            next_offsets: Arc::new(Mutex::new(HashMap::from([(orders_0, 5)]))),
-            end_offsets: Arc::new(Mutex::new(HashMap::new())),
-            positions: Arc::new(Mutex::new(HashMap::new())),
-            topic_ids: Arc::new(Mutex::new(HashMap::new())),
-            session_timeout: secs(45),
-            max_poll_interval: minutes(1),
-            heartbeat_interval: millis(20),
-            subscription_metadata_refresh_interval: minutes(10),
-            leave_group_timeout: millis(200),
-            auto_offset_reset: AutoOffsetReset::Latest,
-            client_rack: None,
-            initial_subscribed_counts: HashMap::new(),
-            retry_policy: CoordinatorRetryPolicy {
+            })))
+            .group_instance_id("instance-a")
+            .subscription(subscription::shared(vec![ORDERS.into()], None, true))
+            .assigned(vec![orders_0.clone()])
+            .next_ownership_id(2_u64)
+            .next_offsets(HashMap::from([(orders_0, 5)]))
+            .heartbeat_interval(millis(20))
+            .subscription_metadata_refresh_interval(minutes(10))
+            .leave_group_timeout(millis(200))
+            .retry_policy(CoordinatorRetryPolicy {
                 timeout: Duration::from_secs(1),
                 initial_backoff: Duration::from_millis(1),
                 max_backoff: Duration::from_millis(1),
-            },
-            poll_error: PollErrorSlot::default(),
-            auto_commit: None,
-            commit_serialization: Arc::new(Mutex::new(())),
-            join_prepared: false,
-            polls: poll_signal.subscribe(),
-            rebalance_pending: tokio::sync::watch::Sender::new(false),
-            close_operation: tokio::sync::watch::channel(crate::control::CloseRequest::default()).1,
-            rejoin_reason: String::new(),
-            listener_calls: None,
-            enforced_rebalances: tokio::sync::mpsc::unbounded_channel().1,
-            lost_partitions: Vec::new(),
-            assigned_callback_pending: Arc::default(),
-            poll_timer: PollTimer::new(secs(300)),
-            poll_timeout_in_callback: false,
-        };
+            })
+            .polls(poll_signal.subscribe())
+            .build();
         let poll_error = Arc::clone(&state.poll_error);
         let assigned = Arc::clone(&state.assigned);
         let generation = Arc::clone(&state.current_generation);
@@ -4456,117 +4389,50 @@ mod retry_tests {
         for (name, answers, expected) in [
             (
                 "success",
-                GroupAnswers {
-                    polls: false,
-                    heartbeat: 0,
-                    join_group: None,
-                    sync_group: None,
-                },
-                TaskObservation {
-                    task_exited: false,
-                    shutdown_cancelled: false,
-                    poll_error: None,
-                    assigned: owned.clone(),
-                    generation: 1,
-                    commit_member_id: "member-a".into(),
-                    rejoin_on_poll: false,
-                    group_requests: requests(&["Heartbeat"]),
-                },
+                GroupAnswers::default(),
+                TaskObservation::member(owned.clone(), requests(&["Heartbeat"])),
             ),
             (
                 "heartbeat fenced instance id",
                 GroupAnswers {
                     polls: true,
                     heartbeat: 82,
-                    join_group: None,
-                    sync_group: None,
+                    ..Default::default()
                 },
-                TaskObservation {
-                    task_exited: false,
-                    shutdown_cancelled: false,
-                    poll_error: Some(fenced.into()),
-                    assigned: Vec::new(),
-                    generation: -1,
-                    commit_member_id: String::new(),
-                    rejoin_on_poll: true,
-                    group_requests: requests(&["Heartbeat"]),
-                },
+                TaskObservation::fenced(fenced.into(), requests(&["Heartbeat"])),
             ),
             (
                 "rebalance in progress",
                 GroupAnswers {
-                    polls: false,
                     heartbeat: 27,
-                    join_group: None,
-                    sync_group: None,
+                    ..Default::default()
                 },
-                TaskObservation {
-                    task_exited: false,
-                    shutdown_cancelled: false,
-                    poll_error: None,
-                    assigned: owned.clone(),
-                    generation: 1,
-                    commit_member_id: "member-a".into(),
-                    rejoin_on_poll: false,
-                    group_requests: requests(&["Heartbeat"]),
-                },
+                TaskObservation::member(owned.clone(), requests(&["Heartbeat"])),
             ),
             (
                 "rebalance in progress and the application polls",
                 GroupAnswers {
                     polls: true,
                     heartbeat: 27,
-                    join_group: None,
-                    sync_group: None,
+                    ..Default::default()
                 },
-                TaskObservation {
-                    task_exited: false,
-                    shutdown_cancelled: false,
-                    poll_error: None,
-                    assigned: owned.clone(),
-                    generation: 1,
-                    commit_member_id: "member-a".into(),
-                    rejoin_on_poll: false,
-                    group_requests: requests(&["Heartbeat", "JoinGroup"]),
-                },
+                TaskObservation::member(owned.clone(), requests(&["Heartbeat", "JoinGroup"])),
             ),
             (
                 "unknown member id",
                 GroupAnswers {
-                    polls: false,
                     heartbeat: 25,
-                    join_group: None,
-                    sync_group: None,
+                    ..Default::default()
                 },
-                TaskObservation {
-                    task_exited: false,
-                    shutdown_cancelled: false,
-                    poll_error: None,
-                    assigned: Vec::new(),
-                    generation: -1,
-                    commit_member_id: String::new(),
-                    rejoin_on_poll: false,
-                    group_requests: requests(&["Heartbeat"]),
-                },
+                TaskObservation::unknown_member(requests(&["Heartbeat"])),
             ),
             (
                 "coordinator not available",
                 GroupAnswers {
-                    polls: false,
                     heartbeat: 15,
-                    join_group: None,
-                    sync_group: None,
+                    ..Default::default()
                 },
-                TaskObservation {
-                    task_exited: false,
-                    shutdown_cancelled: false,
-                    poll_error: None,
-                    assigned: owned.clone(),
-                    generation: 1,
-                    commit_member_id: "member-a".into(),
-                    rejoin_on_poll: false,
-                    group_requests: requests(&["FindCoordinator", "Heartbeat"]),
-                },
+                TaskObservation::member(owned.clone(), requests(&["FindCoordinator", "Heartbeat"])),
             ),
             (
                 "join group fenced instance id",
@@ -4574,18 +4440,9 @@ mod retry_tests {
                     polls: true,
                     heartbeat: 27,
                     join_group: Some(82),
-                    sync_group: None,
+                    ..Default::default()
                 },
-                TaskObservation {
-                    task_exited: false,
-                    shutdown_cancelled: false,
-                    poll_error: Some(fenced.into()),
-                    assigned: Vec::new(),
-                    generation: -1,
-                    commit_member_id: String::new(),
-                    rejoin_on_poll: true,
-                    group_requests: requests(&["Heartbeat", "JoinGroup"]),
-                },
+                TaskObservation::fenced(fenced.into(), requests(&["Heartbeat", "JoinGroup"])),
             ),
             (
                 "sync group fenced instance id",
@@ -4595,16 +4452,10 @@ mod retry_tests {
                     join_group: Some(0),
                     sync_group: Some(82),
                 },
-                TaskObservation {
-                    task_exited: false,
-                    shutdown_cancelled: false,
-                    poll_error: Some(fenced.into()),
-                    assigned: Vec::new(),
-                    generation: -1,
-                    commit_member_id: String::new(),
-                    rejoin_on_poll: true,
-                    group_requests: requests(&["Heartbeat", "JoinGroup", "SyncGroup"]),
-                },
+                TaskObservation::fenced(
+                    fenced.into(),
+                    requests(&["Heartbeat", "JoinGroup", "SyncGroup"]),
+                ),
             ),
         ] {
             let observation = run_coordinator_task(answers, &expected).await;
@@ -4615,19 +4466,15 @@ mod retry_tests {
     #[tokio::test(start_paused = true)]
     async fn retries_until_coordinator_finishes_loading() {
         let calls = AtomicUsize::new(0);
-        let r = with_coordinator_retry(
-            retry(Duration::from_secs(30)),
-            |r: &Resp| r.error_code,
-            || {
-                let n = calls.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    // COORDINATOR_LOAD_IN_PROGRESS (14) thrice, then success.
-                    Ok::<_, ConsumerError>(Resp {
-                        error_code: if n < 3 { 14 } else { 0 },
-                    })
-                }
-            },
-        )
+        let r = run_retry(retry(Duration::from_secs(30)), || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                // COORDINATOR_LOAD_IN_PROGRESS (14) thrice, then success.
+                Ok::<_, ConsumerError>(Resp {
+                    error_code: if n < 3 { 14 } else { 0 },
+                })
+            }
+        })
         .await
         .unwrap();
         assert2::assert!(r.error_code == 0);
@@ -4642,14 +4489,10 @@ mod retry_tests {
             initial_backoff: Duration::from_millis(5),
             max_backoff: Duration::from_millis(10),
         };
-        let r = with_coordinator_retry(
-            retry,
-            |r: &Resp| r.error_code,
-            || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async { Ok::<_, ConsumerError>(Resp { error_code: 15 }) }
-            },
-        )
+        let r = run_retry(retry, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, ConsumerError>(Resp { error_code: 15 }) }
+        })
         .await
         .unwrap();
         assert2::assert!(r.error_code == 15);
@@ -4658,11 +4501,9 @@ mod retry_tests {
 
     #[tokio::test(start_paused = true)]
     async fn surfaces_last_response_after_deadline() {
-        let r = with_coordinator_retry(
-            retry(Duration::from_secs(1)),
-            |r: &Resp| r.error_code,
-            || async { Ok::<_, ConsumerError>(Resp { error_code: 15 }) },
-        )
+        let r = run_retry(retry(Duration::from_secs(1)), || async {
+            Ok::<_, ConsumerError>(Resp { error_code: 15 })
+        })
         .await
         .unwrap();
         // Deadline hit while still retriable: return the last response so the
@@ -4673,14 +4514,10 @@ mod retry_tests {
     #[tokio::test(start_paused = true)]
     async fn non_retriable_code_returns_immediately() {
         let calls = AtomicUsize::new(0);
-        let r = with_coordinator_retry(
-            retry(Duration::from_secs(30)),
-            |r: &Resp| r.error_code,
-            || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async move { Ok::<_, ConsumerError>(Resp { error_code: 25 }) } // UNKNOWN_MEMBER_ID
-            },
-        )
+        let r = run_retry(retry(Duration::from_secs(30)), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, ConsumerError>(Resp { error_code: 25 }) } // UNKNOWN_MEMBER_ID
+        })
         .await
         .unwrap();
         assert2::assert!(r.error_code == 25);
@@ -4689,15 +4526,9 @@ mod retry_tests {
 
     #[tokio::test(start_paused = true)]
     async fn disconnect_past_deadline_surfaces_coordinator_unavailable() {
-        let r = with_coordinator_retry(
-            retry(Duration::from_secs(1)),
-            |r: &Resp| r.error_code,
-            || async {
-                Err::<Resp, _>(ConsumerError::Client(
-                    krabka_client_core::ClientError::Disconnected,
-                ))
-            },
-        )
+        let r = run_retry(retry(Duration::from_secs(1)), || async {
+            Err::<Resp, _>(ConsumerError::Client(ClientError::Disconnected))
+        })
         .await;
         assert2::assert!(matches!(r, Err(ConsumerError::CoordinatorUnavailable)));
     }
@@ -4705,18 +4536,13 @@ mod retry_tests {
     #[tokio::test(start_paused = true)]
     async fn connect_past_deadline_surfaces_coordinator_unavailable() {
         let calls = AtomicUsize::new(0);
-        let r = with_coordinator_retry(
-            retry(Duration::from_millis(1)),
-            |r: &Resp| r.error_code,
-            || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async { Err::<Resp, _>(refused_connect_error()) }
-            },
-        )
+        let r = run_retry(retry(Duration::from_millis(1)), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err::<Resp, _>(refused_connect_error()) }
+        })
         .await;
 
-        assert2::assert!(matches!(r, Err(ConsumerError::CoordinatorUnavailable)));
-        assert2::assert!(calls.load(Ordering::SeqCst) > 1);
+        assert_retried_until_deadline(r, &calls);
     }
 }
 
@@ -4790,19 +4616,69 @@ mod refind_tests {
     use std::sync::atomic::AtomicUsize;
 
     use assert2::check;
+    use test_support::coordinator_retry_policy as retry;
 
     use super::*;
 
-    fn retry(timeout: Duration) -> CoordinatorRetryPolicy {
-        CoordinatorRetryPolicy {
-            timeout,
-            initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(1),
+    struct Resp {
+        error_code: i16,
+    }
+
+    #[derive(bon::Builder)]
+    struct ImmediateRefindRetry<'a> {
+        client: &'a Client,
+        coordinator_id: &'a AtomicI32,
+        response_code: i16,
+    }
+
+    struct RetryObservation {
+        response_code: i16,
+        calls: usize,
+        coordinator_id: i32,
+    }
+
+    impl ImmediateRefindRetry<'_> {
+        async fn run(self) -> RetryObservation {
+            let Self {
+                client,
+                coordinator_id,
+                response_code,
+            } = self;
+            let calls = AtomicUsize::new(0);
+            let response = CoordinatorRetryRequest::builder()
+                .retry(retry(Duration::from_secs(30)))
+                .code(|response: &Resp| response.error_code)
+                .make(|| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        Ok::<_, ConsumerError>(Resp {
+                            error_code: response_code,
+                        })
+                    }
+                })
+                .refind(CoordinatorRefind {
+                    client,
+                    group_id: "g",
+                    coordinator_id,
+                })
+                .build()
+                .run_with_refind()
+                .await
+                .expect("immediate response");
+            RetryObservation {
+                response_code: response.error_code,
+                calls: calls.load(Ordering::SeqCst),
+                coordinator_id: coordinator_id.load(Ordering::Relaxed),
+            }
         }
     }
 
-    struct Resp {
-        error_code: i16,
+    async fn unreachable_client() -> Client {
+        Client::builder()
+            .bootstrap("127.0.0.1:1")
+            .build()
+            .await
+            .unwrap()
     }
 
     // Without a live broker we can't exercise the real re-find (it sends RPCs),
@@ -4814,59 +4690,37 @@ mod refind_tests {
     async fn returns_immediately_on_success_without_refind() {
         // 127.0.0.1:1 is unroutable, so any re-find attempt would fail — but a
         // success on the first attempt must never re-find.
-        let client = Client::builder()
-            .bootstrap("127.0.0.1:1")
-            .build()
-            .await
-            .unwrap();
+        let client = unreachable_client().await;
         let coord = AtomicI32::new(5);
-        let calls = AtomicUsize::new(0);
-        let r = with_coordinator_refind(
-            &client,
-            "g",
-            &coord,
-            retry(Duration::from_secs(30)),
-            |r: &Resp| r.error_code,
-            || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async { Ok::<_, ConsumerError>(Resp { error_code: 0 }) }
-            },
-        )
-        .await
-        .unwrap();
-        check!(r.error_code == 0);
-        check!(calls.load(Ordering::SeqCst) == 1);
+        let observation = ImmediateRefindRetry::builder()
+            .client(&client)
+            .coordinator_id(&coord)
+            .response_code(0)
+            .build()
+            .run()
+            .await;
+        check!(observation.response_code == 0);
+        check!(observation.calls == 1);
         // Coordinator cell untouched — no re-find on success.
-        check!(coord.load(Ordering::Relaxed) == 5);
+        check!(observation.coordinator_id == 5);
     }
 
     // A non-retriable broker code (e.g. UNKNOWN_MEMBER_ID 25) is returned to the
     // caller on the first attempt, no re-find.
     #[tokio::test(start_paused = true)]
     async fn non_retriable_code_returns_without_refind() {
-        let client = Client::builder()
-            .bootstrap("127.0.0.1:1")
-            .build()
-            .await
-            .unwrap();
+        let client = unreachable_client().await;
         let coord = AtomicI32::new(2);
-        let calls = AtomicUsize::new(0);
-        let r = with_coordinator_refind(
-            &client,
-            "g",
-            &coord,
-            retry(Duration::from_secs(30)),
-            |r: &Resp| r.error_code,
-            || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async { Ok::<_, ConsumerError>(Resp { error_code: 25 }) }
-            },
-        )
-        .await
-        .unwrap();
-        check!(r.error_code == 25);
-        check!(calls.load(Ordering::SeqCst) == 1);
-        check!(coord.load(Ordering::Relaxed) == 2);
+        let observation = ImmediateRefindRetry::builder()
+            .client(&client)
+            .coordinator_id(&coord)
+            .response_code(25)
+            .build()
+            .run()
+            .await;
+        check!(observation.response_code == 25);
+        check!(observation.calls == 1);
+        check!(observation.coordinator_id == 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -4880,31 +4734,31 @@ mod refind_tests {
             .unwrap();
         let coord = AtomicI32::new(5);
         let calls = AtomicUsize::new(0);
-        let r = with_coordinator_refind(
-            &client,
-            "g",
-            &coord,
-            retry(Duration::from_millis(1)),
-            |r: &Resp| r.error_code,
-            || {
+        let r = CoordinatorRetryRequest::builder()
+            .retry(retry(Duration::from_millis(1)))
+            .code(|r: &Resp| r.error_code)
+            .make(|| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async {
-                    Err::<Resp, _>(ConsumerError::Client(
-                        krabka_client_core::ClientError::Connect {
-                            addr: "127.0.0.1:9092".parse().unwrap(),
-                            source: std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                "refused",
-                            ),
-                        },
-                    ))
+                    Err::<Resp, _>(ConsumerError::Client(ClientError::Connect {
+                        addr: "127.0.0.1:9092".parse().unwrap(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "refused",
+                        ),
+                    }))
                 }
-            },
-        )
-        .await;
+            })
+            .refind(CoordinatorRefind {
+                client: &client,
+                group_id: "g",
+                coordinator_id: &coord,
+            })
+            .build()
+            .run_with_refind()
+            .await;
 
-        assert2::assert!(matches!(r, Err(ConsumerError::CoordinatorUnavailable)));
-        assert2::assert!(calls.load(Ordering::SeqCst) > 1);
+        assert_retried_until_deadline(r, &calls);
     }
 
     #[test]

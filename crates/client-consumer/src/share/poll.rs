@@ -51,7 +51,7 @@ use super::{
     consumer::ShareConsumer,
     types::{ShareAckMode, ShareAckType, ShareAcquireMode, ShareConsumerRecord},
 };
-use crate::{error::ConsumerError, poll::record_timestamp};
+use crate::{coordinator, error::ConsumerError, poll::record_timestamp};
 
 fn build_share_fetch_topics(
     assignment: &[(WireUuid, String, i32)],
@@ -232,7 +232,7 @@ impl ShareConsumer {
         let assignment = loop {
             // A heartbeat can assign partitions or report a fatal error while
             // this poll waits for the initial assignment or a rejoin.
-            if let Some(error) = crate::coordinator::take_poll_error(&self.poll_error) {
+            if let Some(error) = coordinator::take_poll_error(&self.poll_error) {
                 return Err(error);
             }
             let assignment = self.assignment.lock().await.clone();
@@ -599,7 +599,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::consumer::TimestampType;
+    use crate::{consumer::TimestampType, share};
 
     fn id(n: u8) -> WireUuid {
         let mut b = [0u8; 16];
@@ -641,16 +641,16 @@ mod tests {
             assignment: Arc::new(Mutex::new(vec![(id(7), "topic-a".into(), 2)])),
             topic_names: Arc::new(Mutex::new(HashMap::new())),
             share_session_epoch: 4,
-            fetch_min: crate::share::DEFAULT_SHARE_CONSUMER_FETCH_MIN,
-            fetch_max: crate::share::DEFAULT_SHARE_CONSUMER_FETCH_MAX,
-            fetch_max_records: crate::share::DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS,
+            fetch_min: share::DEFAULT_SHARE_CONSUMER_FETCH_MIN,
+            fetch_max: share::DEFAULT_SHARE_CONSUMER_FETCH_MAX,
+            fetch_max_records: share::DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS,
             acquire_mode: ShareAcquireMode::BatchOptimized,
             ack_mode,
             pending_acks: Vec::new(),
             prev_delivered: Vec::new(),
             shutdown: CancellationToken::new(),
             hb_handle: None,
-            poll_error: crate::coordinator::PollErrorSlot::default(),
+            poll_error: coordinator::PollErrorSlot::default(),
         }
     }
 
@@ -785,7 +785,7 @@ mod tests {
         let poll_error = Arc::clone(&consumer.poll_error);
         let rejected = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            crate::coordinator::report_rejoin_error(
+            coordinator::report_rejoin_error(
                 &poll_error,
                 ConsumerError::GroupAuthorizationFailed("group-a".into()),
             );

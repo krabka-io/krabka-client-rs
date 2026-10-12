@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use krabka_client_core::MetadataScope;
 use krabka_protocol::owned::{
+    list_offsets_request,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
     list_offsets_response::ListOffsetsResponse,
     metadata_request::MetadataRequest,
@@ -18,7 +19,7 @@ use krabka_protocol::owned::{
 use krabka_units::convert::TimeExt as _;
 
 use crate::{
-    IsolationLevel, consumer::Consumer, coordinator::next_backoff, error::ConsumerError,
+    IsolationLevel, consumer::Consumer, coordinator::next_backoff, error::ConsumerError, poll,
     poll::is_reset_sentinel,
 };
 
@@ -86,12 +87,11 @@ impl krabka_protocol::Encode for TimestampListOffsets {
 }
 
 impl krabka_protocol::ProtocolRequest for TimestampListOffsets {
-    const API_KEY: i16 = krabka_protocol::owned::list_offsets_request::API_KEY;
+    const API_KEY: i16 = list_offsets_request::API_KEY;
     const MIN_VERSION: i16 = 1;
-    const MAX_VERSION: i16 = krabka_protocol::owned::list_offsets_request::MAX_VERSION;
-    const LATEST_STABLE_VERSION: i16 =
-        krabka_protocol::owned::list_offsets_request::LATEST_STABLE_VERSION;
-    const FLEXIBLE_MIN: i16 = krabka_protocol::owned::list_offsets_request::FLEXIBLE_MIN;
+    const MAX_VERSION: i16 = list_offsets_request::MAX_VERSION;
+    const LATEST_STABLE_VERSION: i16 = list_offsets_request::LATEST_STABLE_VERSION;
+    const FLEXIBLE_MIN: i16 = list_offsets_request::FLEXIBLE_MIN;
     type Response = ListOffsetsResponse;
 }
 
@@ -308,7 +308,7 @@ impl Consumer {
         &self,
         partitions: &[(String, i32)],
     ) -> Result<HashMap<(String, i32), i64>, ConsumerError> {
-        self.boundary_offsets(partitions, crate::poll::EARLIEST_TIMESTAMP)
+        self.boundary_offsets(partitions, poll::EARLIEST_TIMESTAMP)
             .await
     }
 
@@ -326,7 +326,7 @@ impl Consumer {
         &self,
         partitions: &[(String, i32)],
     ) -> Result<HashMap<(String, i32), i64>, ConsumerError> {
-        self.boundary_offsets(partitions, crate::poll::LATEST_TIMESTAMP)
+        self.boundary_offsets(partitions, poll::LATEST_TIMESTAMP)
             .await
     }
 
@@ -487,7 +487,7 @@ impl Consumer {
                         // timestamp search.
                         let answer = if self.isolation_level == IsolationLevel::ReadCommitted {
                             broker
-                                .send(crate::poll::ReadCommittedListOffsets(request))
+                                .send(poll::ReadCommittedListOffsets::new(request))
                                 .await
                         } else if require_timestamps {
                             broker.send(TimestampListOffsets(request)).await
@@ -503,7 +503,7 @@ impl Consumer {
                                     &mut unauthorized,
                                 );
                             }
-                            Err(error) if crate::poll::is_transient_transport_error(&error) => {
+                            Err(error) if poll::is_transient_transport_error(&error) => {
                                 self.client.evict_broker(leader);
                             }
                             Err(error) => return Err(error.into()),
@@ -513,7 +513,7 @@ impl Consumer {
                         return Err(ConsumerError::TopicAuthorizationFailed(unauthorized));
                     }
                 }
-                Err(error) if crate::poll::is_transient_transport_error(&error) => {}
+                Err(error) if poll::is_transient_transport_error(&error) => {}
                 Err(error) => return Err(error.into()),
             }
             if search.is_empty() {
@@ -605,7 +605,7 @@ impl Consumer {
                         return Ok(topics);
                     }
                 }
-                Err(error) if crate::poll::is_transient_transport_error(&error) => {}
+                Err(error) if poll::is_transient_transport_error(&error) => {}
                 Err(error) => return Err(error.into()),
             }
             if tokio::time::Instant::now() >= deadline {
@@ -679,9 +679,9 @@ mod tests {
         },
     };
     use krabka_units::{millis, secs};
+    use poll::partition_error_tests::consumer_with_client;
 
     use super::*;
-    use crate::poll::partition_error_tests::consumer_with_client;
 
     /// A `ListOffsets` row of the mock: `(error code, offset, timestamp,
     /// leader epoch)` for a partition and a searched timestamp.
@@ -1157,7 +1157,7 @@ mod tests {
             (
                 "awaiting reset",
                 0,
-                crate::poll::END_SENTINEL,
+                poll::END_SENTINEL,
                 Some(12),
                 None,
                 false,

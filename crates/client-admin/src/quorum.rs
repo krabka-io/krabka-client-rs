@@ -352,7 +352,7 @@ mod tests {
 
     use super::*;
     use crate::partition_leaders::test_support::{
-        decode_request, encode_response, fast_admin, scripted_broker,
+        ApiVersionRange, decode_request, encode_response, fast_admin, scripted_broker,
     };
 
     const DIRECTORY: uuid::Uuid = uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
@@ -528,7 +528,12 @@ mod tests {
         ] {
             let answer = response.clone();
             let broker = scripted_broker(
-                vec![(describe_quorum_request::API_KEY, 0, max_version)],
+                vec![
+                    ApiVersionRange::builder()
+                        .api_key(describe_quorum_request::API_KEY)
+                        .max_version(max_version)
+                        .build(),
+                ],
                 move |key, version, _, _| {
                     if key == describe_quorum_request::API_KEY {
                         MockReply::Respond(encode_response(&answer, version, true))
@@ -583,8 +588,13 @@ mod tests {
             let handler_requests = Arc::clone(&requests);
             let broker = scripted_broker(
                 vec![
-                    (add_raft_voter_request::API_KEY, 0, 1),
-                    (remove_raft_voter_request::API_KEY, 0, 0),
+                    ApiVersionRange::builder()
+                        .api_key(add_raft_voter_request::API_KEY)
+                        .max_version(1)
+                        .build(),
+                    ApiVersionRange::builder()
+                        .api_key(remove_raft_voter_request::API_KEY)
+                        .build(),
                 ],
                 move |api_key, version, body, _| {
                     let mut requests = handler_requests.lock().expect("requests lock");

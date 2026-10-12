@@ -2650,8 +2650,8 @@ impl Producer {
     /// `timeout`, as Kafka throws an `IllegalStateException` and an
     /// `IllegalArgumentException`.
     ///
-    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
-    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
+    /// [`ClientError::TelemetryDisabled`]: ClientError::TelemetryDisabled
+    /// [`ClientError::InvalidArgument`]: ClientError::InvalidArgument
     pub async fn client_instance_id(
         &self,
         timeout: Time,

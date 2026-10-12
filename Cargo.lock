@@ -1896,6 +1896,7 @@ version = "0.6.0"
 dependencies = [
  "assert2",
  "async-trait",
+ "bon",
  "bytes",
  "futures-util",
  "krabka-client-consumer",
@@ -1925,6 +1926,7 @@ dependencies = [
  "async-trait",
  "bon",
  "bytes",
+ "derive_more",
  "futures-util",
  "krabka-client-core",
  "krabka-client-producer",
@@ -1979,6 +1981,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "dashmap",
+ "derive_more",
  "dns-lookup",
  "futures-util",
  "hex",

@@ -30,11 +30,13 @@ use std::{
 
 use bytes::{Buf, BufMut, BytesMut};
 use krabka_ids::{ApiKey, ApiVersion};
+#[cfg(test)]
+use krabka_protocol::owned::api_versions_response;
 use krabka_protocol::{
     Decode, Encode,
     owned::{
         api_versions_request::ApiVersionsRequest, api_versions_response::ApiVersionsResponse,
-        sasl_authenticate_request::SaslAuthenticateRequest,
+        sasl_authenticate_request, sasl_authenticate_request::SaslAuthenticateRequest,
         sasl_authenticate_response::SaslAuthenticateResponse,
         sasl_handshake_request::SaslHandshakeRequest,
         sasl_handshake_response::SaslHandshakeResponse,
@@ -44,7 +46,7 @@ use krabka_security::SaslMechanism;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::ClientFrameMax;
+use crate::{ClientFrameMax, oauth};
 
 const API_KEY_SASL_HANDSHAKE: i16 = 17;
 const API_KEY_SASL_AUTHENTICATE: i16 = 36;
@@ -167,7 +169,7 @@ fn sasl_versions(response: &ApiVersionsResponse) -> (i16, Option<i16>) {
         version.min(krabka_protocol::owned::sasl_handshake_request::MAX_VERSION)
     });
     let authenticate = max(API_KEY_SASL_AUTHENTICATE)
-        .map(|version| version.min(krabka_protocol::owned::sasl_authenticate_request::MAX_VERSION));
+        .map(|version| version.min(sasl_authenticate_request::MAX_VERSION));
     (handshake, authenticate)
 }
 
@@ -230,9 +232,9 @@ pub enum OAuthBearerTokenSource {
     /// again, so token rotation needs no restart.
     File(PathBuf),
     /// A token provider, such as
-    /// [`ClientCredentialsTokenProvider`](crate::oauth::ClientCredentialsTokenProvider)
+    /// [`ClientCredentialsTokenProvider`](oauth::ClientCredentialsTokenProvider)
     /// for an OIDC token endpoint (KIP-768).
-    Provider(Arc<dyn crate::oauth::OAuthBearerTokenProvider>),
+    Provider(Arc<dyn oauth::OAuthBearerTokenProvider>),
 }
 
 impl fmt::Debug for SaslCredentials {
@@ -900,7 +902,7 @@ where
                 ApiVersion(version),
                 next_correlation_id(corr_id),
             ),
-            version >= krabka_protocol::owned::sasl_authenticate_request::FLEXIBLE_MIN,
+            version >= sasl_authenticate_request::FLEXIBLE_MIN,
             &body,
             policy,
         )
@@ -1144,7 +1146,7 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        use krabka_protocol::owned::api_versions_response::ApiVersion as Advertised;
+        use api_versions_response::ApiVersion as Advertised;
 
         let mut body = BytesMut::new();
         ApiVersionsResponse {
@@ -1208,7 +1210,7 @@ mod tests {
     /// maxima that the broker lists.
     #[tokio::test]
     async fn plain_exchange_uses_the_sasl_versions_that_api_versions_lists() {
-        use krabka_protocol::owned::api_versions_response::ApiVersion as Advertised;
+        use api_versions_response::ApiVersion as Advertised;
 
         const C: i32 = MIN_RESERVED_CORRELATION_ID;
         for (name, listed, expected) in [
@@ -1433,8 +1435,8 @@ mod tests {
     #[derive(Debug)]
     struct FixedToken;
 
-    impl crate::oauth::OAuthBearerTokenProvider for FixedToken {
-        fn token(&self) -> crate::oauth::TokenFuture<'_> {
+    impl oauth::OAuthBearerTokenProvider for FixedToken {
+        fn token(&self) -> oauth::TokenFuture<'_> {
             Box::pin(async { Ok("provided.token".to_owned()) })
         }
     }
@@ -2014,7 +2016,7 @@ mod tests {
             &[],
             SaslPolicy {
                 client_id: TEST_CLIENT_ID,
-                frame_max: crate::ClientFrameMax::default(),
+                frame_max: ClientFrameMax::default(),
                 authenticate_version: Some(2),
                 session_lifetime_ms: &AtomicI64::new(0),
             },
@@ -2036,7 +2038,7 @@ mod tests {
             &[0],
             SaslPolicy {
                 client_id: "",
-                frame_max: crate::ClientFrameMax::try_from(krabka_units::bytes(10)).unwrap(),
+                frame_max: ClientFrameMax::try_from(krabka_units::bytes(10)).unwrap(),
                 authenticate_version: Some(2),
                 session_lifetime_ms: &AtomicI64::new(0),
             },
@@ -2068,7 +2070,7 @@ mod tests {
             &[],
             SaslPolicy {
                 client_id: "",
-                frame_max: crate::ClientFrameMax::try_from(krabka_units::bytes(16)).unwrap(),
+                frame_max: ClientFrameMax::try_from(krabka_units::bytes(16)).unwrap(),
                 authenticate_version: Some(2),
                 session_lifetime_ms: &AtomicI64::new(0),
             },

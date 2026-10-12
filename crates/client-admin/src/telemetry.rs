@@ -42,8 +42,8 @@ impl AdminClient {
     /// [`AdminClientConfig::enable_metrics_push`] is `false`, as Kafka throws
     /// an `IllegalArgumentException` and an `IllegalStateException`.
     ///
-    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
-    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
+    /// [`ClientError::InvalidArgument`]: ClientError::InvalidArgument
+    /// [`ClientError::TelemetryDisabled`]: ClientError::TelemetryDisabled
     /// [`AdminClientConfig::enable_metrics_push`]: crate::AdminClientConfig::enable_metrics_push
     pub async fn client_instance_id(
         &self,

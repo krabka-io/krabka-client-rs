@@ -27,6 +27,7 @@ use base64::{
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::{
+    backoff,
     security::{Password, TlsConnectorConfig},
     transport::{SocketOptions, dial},
 };
@@ -275,7 +276,7 @@ impl ClientCredentialsTokenProvider {
             now,
             claims.0.unwrap_or(now),
             claims.1,
-            crate::backoff::random_unit(),
+            backoff::random_unit(),
         );
         *cached = Some(Cached {
             token: token.clone(),
@@ -638,7 +639,7 @@ impl JwtBearerTokenProvider {
             now,
             claims.0.unwrap_or(now),
             claims.1,
-            crate::backoff::random_unit(),
+            backoff::random_unit(),
         );
         *cached = Some(Cached {
             token: token.clone(),

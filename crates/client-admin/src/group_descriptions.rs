@@ -678,7 +678,7 @@ mod tests {
     use super::*;
     use crate::{
         group_coordinators::test_support::{GroupCluster, Lookup, Seen, group_cluster},
-        partition_leaders::test_support::{decode_request, encode_response},
+        partition_leaders::test_support::{ApiVersionRange, decode_request, encode_response},
     };
 
     const OMITTED: i32 = i32::MIN;
@@ -897,14 +897,20 @@ mod tests {
     async fn describe_consumer_groups_batches_and_falls_back_to_describe_groups() {
         // "kip848" and "classic" live on broker 0, "other" and "missing" and
         // "connect" on broker 1.
-        let cluster: GroupCluster = group_cluster(
-            2,
-            vec![
-                (consumer_group_describe_request::API_KEY, 0, 1),
-                (describe_groups_request::API_KEY, 0, 5),
-            ],
-            |group, _| Lookup::At(usize::from(!matches!(group, "kip848" | "classic"))),
-            |_, api_key, version, body, _| {
+        let cluster: GroupCluster = group_cluster()
+            .count(2)
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(consumer_group_describe_request::API_KEY)
+                    .max_version(1)
+                    .build(),
+                ApiVersionRange::builder()
+                    .api_key(describe_groups_request::API_KEY)
+                    .max_version(5)
+                    .build(),
+            ])
+            .lookup(|group, _| Lookup::At(usize::from(!matches!(group, "kip848" | "classic"))))
+            .answer(|_, api_key, version, body, _| {
                 let reply = match api_key {
                     consumer_group_describe_request::API_KEY => {
                         let ids = consumer_describe_ids(body, version);
@@ -952,9 +958,9 @@ mod tests {
                     _ => return MockReply::Silent,
                 };
                 MockReply::Respond(reply)
-            },
-        )
-        .await;
+            })
+            .call()
+            .await;
         let admin = cluster.admin(krabka_units::secs(5)).await;
 
         let result = admin
@@ -1023,11 +1029,16 @@ mod tests {
     /// `handleUnsupportedVersionException` moves them to the classic API.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn describe_consumer_groups_uses_describe_groups_on_an_old_coordinator() {
-        let cluster = group_cluster(
-            1,
-            vec![(describe_groups_request::API_KEY, 0, 5)],
-            |_, _| Lookup::At(0),
-            |_, api_key, version, body, _| {
+        let cluster = group_cluster()
+            .count(1)
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(describe_groups_request::API_KEY)
+                    .max_version(5)
+                    .build(),
+            ])
+            .lookup(|_, _| Lookup::At(0))
+            .answer(|_, api_key, version, body, _| {
                 if api_key != describe_groups_request::API_KEY {
                     return MockReply::Silent;
                 }
@@ -1043,9 +1054,9 @@ mod tests {
                     version,
                     true,
                 ))
-            },
-        )
-        .await;
+            })
+            .call()
+            .await;
         let admin = cluster.admin(krabka_units::secs(5)).await;
 
         let result = admin
@@ -1090,11 +1101,16 @@ mod tests {
                 };
                 let script = Arc::new(Mutex::new(codes));
                 let reply_message = message.clone();
-                let cluster = group_cluster(
-                    1,
-                    vec![(api_key, 0, 6)],
-                    |_, _| Lookup::At(0),
-                    move |_, key, version, _, _| {
+                let cluster = group_cluster()
+                    .count(1)
+                    .apis(vec![
+                        ApiVersionRange::builder()
+                            .api_key(api_key)
+                            .max_version(6)
+                            .build(),
+                    ])
+                    .lookup(|_, _| Lookup::At(0))
+                    .answer(move |_, key, version, _, _| {
                         if key != api_key {
                             return MockReply::Silent;
                         }
@@ -1149,9 +1165,9 @@ mod tests {
                             ),
                         };
                         MockReply::Respond(body)
-                    },
-                )
-                .await;
+                    })
+                    .call()
+                    .await;
                 let admin = cluster.admin(krabka_units::secs(5)).await;
                 let options = DescribeGroupsOptions {
                     include_authorized_operations: true,
@@ -1216,11 +1232,16 @@ mod tests {
     /// fails a group whose answer has no topology.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn describe_streams_groups_sends_v0_and_needs_a_topology() {
-        let cluster = group_cluster(
-            1,
-            vec![(streams_group_describe_request::API_KEY, 0, 1)],
-            |_, _| Lookup::At(0),
-            |_, api_key, version, _, _| {
+        let cluster = group_cluster()
+            .count(1)
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(streams_group_describe_request::API_KEY)
+                    .max_version(1)
+                    .build(),
+            ])
+            .lookup(|_, _| Lookup::At(0))
+            .answer(|_, api_key, version, _, _| {
                 if api_key != streams_group_describe_request::API_KEY {
                     return MockReply::Silent;
                 }
@@ -1242,9 +1263,9 @@ mod tests {
                     version,
                     true,
                 ))
-            },
-        )
-        .await;
+            })
+            .call()
+            .await;
         let admin = cluster.admin(krabka_units::secs(5)).await;
 
         let result = admin

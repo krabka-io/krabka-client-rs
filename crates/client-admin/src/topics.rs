@@ -5,6 +5,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use krabka_protocol::owned::metadata_response;
 use krabka_protocol::{
     owned::{
         alter_partition_reassignments_request::{
@@ -1473,7 +1475,7 @@ mod tests {
         };
 
         use crate::partition_leaders::test_support::{
-            api_versions, decode_request, encode_response,
+            ApiVersionRange, api_versions, decode_request, encode_response,
         };
 
         // `None` calls `alter_partition_assignments`, which takes Kafka's
@@ -1493,11 +1495,16 @@ mod tests {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let requests = Arc::clone(&seen);
             let broker = MockBroker::start(move |api_key, version, _, body| match api_key {
-                api_versions_request::API_KEY => Some(api_versions(&[(
-                    alter_partition_reassignments_request::API_KEY,
-                    0,
-                    max_version,
-                )])),
+                api_versions_request::API_KEY => Some(
+                    api_versions()
+                        .apis(vec![
+                            ApiVersionRange::builder()
+                                .api_key(alter_partition_reassignments_request::API_KEY)
+                                .max_version(max_version)
+                                .build(),
+                        ])
+                        .call(),
+                ),
                 alter_partition_reassignments_request::API_KEY => {
                     let request: AlterPartitionReassignmentsRequest =
                         decode_request(body, version, true);
@@ -1916,7 +1923,7 @@ mod tests {
     /// reconnects to.
     #[test]
     fn controller_endpoint_picks_broker_with_matching_node_id() {
-        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseBroker};
+        use metadata_response::{MetadataResponse, MetadataResponseBroker};
         let resp = MetadataResponse {
             controller_id: 2,
             brokers: vec![
@@ -1946,7 +1953,7 @@ mod tests {
     /// The retry path maps that to `AdminError::NotControllerExhausted`.
     #[test]
     fn controller_endpoint_returns_none_when_no_match() {
-        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseBroker};
+        use metadata_response::{MetadataResponse, MetadataResponseBroker};
         let resp = MetadataResponse {
             controller_id: 99,
             brokers: vec![MetadataResponseBroker {
@@ -1963,7 +1970,7 @@ mod tests {
 
     #[test]
     fn controller_endpoint_rejects_non_dialable_ephemeral_port() {
-        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseBroker};
+        use metadata_response::{MetadataResponse, MetadataResponseBroker};
         let resp = MetadataResponse {
             controller_id: 1,
             brokers: vec![MetadataResponseBroker {
@@ -1989,7 +1996,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_carries_through_per_topic_errors() {
-        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseTopic};
+        use metadata_response::{MetadataResponse, MetadataResponseTopic};
         let resp = MetadataResponse {
             topics: vec![
                 MetadataResponseTopic {
@@ -2035,7 +2042,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_zero_uuid_becomes_none() {
-        use krabka_protocol::owned::metadata_response::{MetadataResponse, MetadataResponseTopic};
+        use metadata_response::{MetadataResponse, MetadataResponseTopic};
         let resp = MetadataResponse {
             topics: vec![MetadataResponseTopic {
                 name: Some("foo".into()),
@@ -2050,7 +2057,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_computes_partition_count_and_replication_factor() {
-        use krabka_protocol::owned::metadata_response::{
+        use metadata_response::{
             MetadataResponse, MetadataResponsePartition, MetadataResponseTopic,
         };
         let part = MetadataResponsePartition {

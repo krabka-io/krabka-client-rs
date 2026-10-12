@@ -1,6 +1,6 @@
 //! Background `ShareGroupHeartbeat` loop for a [`ShareConsumer`].
 //!
-//! This loop mirrors the classic [`coordinator::run`](crate::coordinator::run)
+//! This loop mirrors the classic [`coordinator::run`](coordinator::run)
 //! shape: an interval ticker plus a `tokio::select!` that races each heartbeat
 //! RPC against a shutdown token, so `close()` returns promptly. Each tick sends
 //! a `ShareGroupHeartbeat` (API key 76) with the live member epoch. On success
@@ -26,7 +26,7 @@ use krabka_units::{Time, convert::TimeExt as _};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::ConsumerError;
+use crate::{coordinator, error::ConsumerError};
 
 /// `FENCED_MEMBER_EPOCH`. The member epoch is behind the broker's. Rejoin.
 const FENCED_MEMBER_EPOCH: i16 = 110;
@@ -54,7 +54,7 @@ pub(crate) struct ShareCoordinatorState {
     pub leave_heartbeat_timeout: Time,
     /// A fatal heartbeat error that the next `poll()` returns. This slot is
     /// shared with the parent [`ShareConsumer`].
-    pub poll_error: crate::coordinator::PollErrorSlot,
+    pub poll_error: coordinator::PollErrorSlot,
 }
 
 /// Outcome of a single `ShareGroupHeartbeat` RPC.
@@ -218,7 +218,7 @@ pub(crate) async fn heartbeat_once(
             // Kafka's `AbstractHeartbeatRequestManager.onFailure` gives a
             // non-retriable error, such as an `AuthenticationException`, to
             // the application `poll` as an `ErrorEvent`.
-            crate::coordinator::report_rejoin_error(&state.poll_error, ConsumerError::Client(e));
+            coordinator::report_rejoin_error(&state.poll_error, ConsumerError::Client(e));
             HeartbeatOutcome::Transient
         }
     }
@@ -346,7 +346,7 @@ mod tests {
             subscribe: vec!["topic-a".into()],
             heartbeat_interval: krabka_units::secs(1),
             leave_heartbeat_timeout: krabka_units::millis(37),
-            poll_error: crate::coordinator::PollErrorSlot::default(),
+            poll_error: coordinator::PollErrorSlot::default(),
         };
 
         tokio::time::timeout(Duration::from_secs(1), leave_group(&state))
@@ -375,7 +375,7 @@ mod tests {
             subscribe: vec!["topic-a".into()],
             heartbeat_interval: krabka_units::secs(1),
             leave_heartbeat_timeout: krabka_units::secs(5),
-            poll_error: crate::coordinator::PollErrorSlot::default(),
+            poll_error: coordinator::PollErrorSlot::default(),
         }
     }
 
@@ -522,7 +522,7 @@ mod tests {
                 .await
                 .unwrap()
         };
-        let poll_error = crate::coordinator::PollErrorSlot::default();
+        let poll_error = coordinator::PollErrorSlot::default();
         let mut state = state().await;
         state.client = client(mock.addr.to_string()).await;
         state.poll_error = Arc::clone(&poll_error);

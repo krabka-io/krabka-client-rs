@@ -14,7 +14,7 @@ use krabka_ids::{ApiKey, ApiVersion};
 use tokio::{sync::RwLock, time::Instant};
 
 use crate::{
-    ClientFrameMax,
+    ClientFrameMax, backoff, connection,
     error::ClientError,
     sasl::{OutboundSaslError, SaslChannel, SaslCredentials, SaslPolicy, SaslSession},
 };
@@ -55,7 +55,7 @@ impl Reauth {
                 session_lifetime_ms: None,
                 ..session
             },
-            next: RwLock::new(due_time(&session, crate::backoff::random_unit())),
+            next: RwLock::new(due_time(&session, backoff::random_unit())),
         }
     }
 
@@ -78,8 +78,8 @@ impl Reauth {
             (&mut corr_id, client_id, frame_max),
         )
         .await
-        .map_err(|source| crate::connection::sasl_error(self.addr, source))?;
-        Ok(due_time(&session, crate::backoff::random_unit()))
+        .map_err(|source| connection::sasl_error(self.addr, source))?;
+        Ok(due_time(&session, backoff::random_unit()))
     }
 }
 
@@ -121,7 +121,7 @@ impl SaslChannel for ConnectionChannel<'_> {
         // A flexible response has tagged fields after the correlation id,
         // which the reader already removed.
         let body = if flexible {
-            crate::connection::skip_tagged_fields(&response).map_err(channel_error)?
+            connection::skip_tagged_fields(&response).map_err(channel_error)?
         } else {
             &response[..]
         };

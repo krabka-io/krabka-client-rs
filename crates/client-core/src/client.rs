@@ -4,8 +4,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use krabka_protocol::owned::metadata_request::MetadataRequest;
+use krabka_protocol::owned::{metadata_request, metadata_response};
 use krabka_units::{Time, convert::TimeExt as _, minutes};
+use metadata_request::MetadataRequest;
 use refined_type::rule::GreaterEqualI64;
 
 use crate::{
@@ -14,7 +15,9 @@ use crate::{
         ClientDnsTimeout, ClientFrameMax, ConnectionDispatchQueueCapacity, ConnectionOptions,
     },
     error::ClientError,
+    fetch,
     metadata_topics::{MetadataScope, MetadataTopics},
+    offset_for_leader_epoch,
     pool::{BrokerInfo, BrokerPool},
     request::ProtocolRequest,
     telemetry::{
@@ -61,7 +64,7 @@ pub enum MetadataRecoveryStrategy {
 pub const DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER: Time = minutes(5);
 
 /// Non-negative, whole-millisecond KIP-1102 rebootstrap trigger.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct MetadataRecoveryRebootstrapTrigger(i64);
 
 impl MetadataRecoveryRebootstrapTrigger {
@@ -428,7 +431,7 @@ impl Client {
     async fn request_metadata_from_current_cluster(
         &self,
         request: &MetadataRequest,
-    ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
+    ) -> Result<metadata_response::MetadataResponse, ClientError> {
         let broker_ids = self.pool.broker_ids();
         if broker_ids.is_empty() {
             let connection = self.pool.bootstrap_connection().await?;
@@ -547,7 +550,7 @@ impl Client {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn refresh_metadata(
         &self,
-    ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
+    ) -> Result<metadata_response::MetadataResponse, ClientError> {
         let response = self
             .refresh_metadata_with(self.metadata_topics.request())
             .await?;
@@ -578,7 +581,7 @@ impl Client {
     pub async fn refresh_metadata_with(
         &self,
         request: MetadataRequest,
-    ) -> Result<krabka_protocol::owned::metadata_response::MetadataResponse, ClientError> {
+    ) -> Result<metadata_response::MetadataResponse, ClientError> {
         self.metadata_recovery.begin_attempt();
         let first = self.request_metadata_from_current_cluster(&request).await;
         let resp = match first {
@@ -670,7 +673,7 @@ impl Client {
         partition: i32,
         current_leader_epoch: i32,
         leader_epoch: i32,
-    ) -> Result<crate::offset_for_leader_epoch::EpochEndOffset, ClientError> {
+    ) -> Result<offset_for_leader_epoch::EpochEndOffset, ClientError> {
         let conn = match self.pool.bootstrap_connection().await {
             Ok(conn) => conn,
             Err(
@@ -686,7 +689,7 @@ impl Client {
             }
             Err(e) => return Err(e),
         };
-        crate::offset_for_leader_epoch::offset_for_leader_epoch(
+        offset_for_leader_epoch::offset_for_leader_epoch(
             &conn,
             topic,
             partition,
@@ -726,7 +729,7 @@ impl Client {
         partition: i32,
         current_leader_epoch: i32,
         leader_epoch: i32,
-    ) -> Result<crate::offset_for_leader_epoch::EpochEndOffset, ClientError> {
+    ) -> Result<offset_for_leader_epoch::EpochEndOffset, ClientError> {
         let conn = match self.pool.get(broker_id).await {
             Ok(conn) => conn,
             Err(
@@ -742,7 +745,7 @@ impl Client {
             }
             Err(e) => return Err(e),
         };
-        crate::offset_for_leader_epoch::offset_for_leader_epoch(
+        offset_for_leader_epoch::offset_for_leader_epoch(
             &conn,
             topic,
             partition,
@@ -776,8 +779,8 @@ impl Client {
     pub async fn fetch_partition_with_isolation_on(
         &self,
         broker_id: i32,
-        fetch: crate::fetch::IsolatedFetch<'_>,
-    ) -> Result<Vec<crate::fetch::FetchedRecord>, ClientError> {
+        fetch: fetch::IsolatedFetch<'_>,
+    ) -> Result<Vec<fetch::FetchedRecord>, ClientError> {
         let conn = match self.pool.get(broker_id).await {
             Ok(conn) => conn,
             Err(ClientError::Disconnected) if !self.pool.knows_broker(broker_id) => {
@@ -802,7 +805,7 @@ impl Client {
             }
             Err(error) => return Err(error),
         };
-        crate::fetch::fetch_partition_with_isolation(&conn, fetch).await
+        fetch::fetch_partition_with_isolation(&conn, fetch).await
     }
 
     /// Close the client and all pooled connections.
@@ -1317,7 +1320,7 @@ mod bootstrap_failover_tests {
             .expect("client builds");
 
         let _ = client
-            .send(krabka_protocol::owned::metadata_request::MetadataRequest::default())
+            .send(metadata_request::MetadataRequest::default())
             .await
             .expect("first send succeeds via A");
 
@@ -1327,7 +1330,7 @@ mod bootstrap_failover_tests {
         client.reconnect_bootstrap().await;
 
         let md = client
-            .send(krabka_protocol::owned::metadata_request::MetadataRequest::default())
+            .send(metadata_request::MetadataRequest::default())
             .await
             .expect("send after reconnect_bootstrap reaches B");
         assert2::assert!(!md.brokers.is_empty());
@@ -1361,7 +1364,7 @@ mod bootstrap_failover_tests {
 
         let md = client
             .broker(1)
-            .send(krabka_protocol::owned::metadata_request::MetadataRequest::default())
+            .send(metadata_request::MetadataRequest::default())
             .await
             .expect("broker send should refresh metadata and redial broker 1 at B");
         assert2::assert!(!md.brokers.is_empty());

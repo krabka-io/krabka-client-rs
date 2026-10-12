@@ -17,6 +17,7 @@ use krabka_protocol::{
         api_versions_response::{ApiVersion, ApiVersionsResponse},
         metadata_request as metadata_request_mod,
         metadata_request::MetadataRequest,
+        metadata_response,
         metadata_response::MetadataResponse,
     },
 };
@@ -72,7 +73,7 @@ fn metadata_response_at(version: i16) -> Vec<u8> {
 /// Encode a `MetadataResponse` at the given version with a custom
 /// `throttle_time_ms`, preceded by the correct `ResponseHeader` prefix.
 fn metadata_response_with_throttle(version: i16, throttle_time_ms: i32) -> Vec<u8> {
-    use krabka_protocol::owned::metadata_response::FLEXIBLE_MIN;
+    use metadata_response::FLEXIBLE_MIN;
     let resp = MetadataResponse {
         throttle_time_ms,
         ..Default::default()
@@ -244,9 +245,7 @@ async fn concurrent_sends_get_correct_responses() {
 /// registry population.
 #[tokio::test]
 async fn client_refresh_metadata_populates_pool() {
-    use krabka_protocol::owned::metadata_response::{
-        FLEXIBLE_MIN, MetadataResponse, MetadataResponseBroker,
-    };
+    use metadata_response::{FLEXIBLE_MIN, MetadataResponse, MetadataResponseBroker};
 
     let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
         if api_key == api_versions_request::API_KEY {

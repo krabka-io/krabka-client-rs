@@ -11,9 +11,10 @@
 
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
-use krabka_protocol::owned::metadata_response::MetadataResponse;
+use krabka_protocol::owned::metadata_response;
+use metadata_response::MetadataResponse;
 
-use crate::{consumer::Consumer, error::ConsumerError};
+use crate::{consumer::Consumer, error::ConsumerError, fetch_buffer};
 
 /// A topic pattern for [`Consumer::subscribe_pattern`]. Kafka's
 /// `subscribe(java.util.regex.Pattern)`.
@@ -248,7 +249,7 @@ impl Consumer {
         }
         // Kafka's `subscribe(pattern)` calls
         // `fetcher.clearBufferedDataForUnassignedPartitions(emptySet())`.
-        self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
+        self.fetch_buffer = fetch_buffer::FetchBuffer::default();
         self.subscription.send_modify(|subscription| {
             subscription.topics.clear();
             subscription.pattern = Some(pattern);
@@ -291,7 +292,7 @@ impl Consumer {
                 "Subscription to topics, partitions and pattern are mutually exclusive".to_owned(),
             ));
         }
-        self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
+        self.fetch_buffer = fetch_buffer::FetchBuffer::default();
         self.subscription.send_modify(|subscription| {
             // The topics of a regular expression subscription are the topics
             // of its assignment, not a list of the application. They stay
@@ -324,7 +325,7 @@ impl Consumer {
         } else {
             Ok(())
         };
-        self.fetch_buffer = crate::fetch_buffer::FetchBuffer::default();
+        self.fetch_buffer = fetch_buffer::FetchBuffer::default();
         // Kafka's `SubscriptionState.unsubscribe` clears the assignment before
         // `unsubscribe` returns. The coordinator task also clears it when it
         // handles the change.
@@ -390,7 +391,7 @@ mod tests {
         assert2::assert!(actual == wanted);
     }
 
-    use krabka_protocol::owned::metadata_response::MetadataResponseTopic;
+    use metadata_response::MetadataResponseTopic;
 
     use super::*;
 

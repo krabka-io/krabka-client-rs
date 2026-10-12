@@ -2,7 +2,22 @@
 
 use std::collections::BTreeSet;
 
+use krabka_client_core::ClientError;
 use thiserror::Error;
+
+pub(crate) fn is_transport_error(
+    error: &krabka_client_core::ClientError,
+    includes_timeout: bool,
+) -> bool {
+    matches!(
+        error,
+        ClientError::Connect { .. }
+            | ClientError::Tls { .. }
+            | ClientError::Sasl { .. }
+            | ClientError::Disconnected
+            | ClientError::Io(_)
+    ) || (includes_timeout && matches!(error, ClientError::Timeout(_)))
+}
 
 /// Errors returned by [`Consumer`](crate::Consumer).
 #[derive(Debug, Error)]

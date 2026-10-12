@@ -355,6 +355,7 @@ pub(crate) mod test_support {
         },
     };
 
+    use bon::Builder;
     use bytes::{Buf, BytesMut};
     use krabka_client_core::{MockBroker, MockReply};
     use krabka_protocol::{
@@ -371,6 +372,17 @@ pub(crate) mod test_support {
     };
 
     use crate::AdminClient;
+
+    /// The supported version interval for one API in a mock broker's
+    /// `ApiVersions` answer.
+    #[derive(Builder, Clone, Copy, Debug, Default)]
+    pub(crate) struct ApiVersionRange {
+        pub(crate) api_key: i16,
+        #[builder(default)]
+        pub(crate) min_version: i16,
+        #[builder(default)]
+        pub(crate) max_version: i16,
+    }
 
     /// The body of `response` at `version`, behind an empty tagged-field
     /// byte when `flexible` is set.
@@ -401,9 +413,10 @@ pub(crate) mod test_support {
     }
 
     /// An `ApiVersions` answer that advertises `ApiVersions` v0, `Metadata`
-    /// v12 unless `apis` names `Metadata`, and each `(api_key, min, max)` of
+    /// v12 unless `apis` names `Metadata`, and each API version range in
     /// `apis`.
-    pub(crate) fn api_versions(apis: &[(i16, i16, i16)]) -> Vec<u8> {
+    #[bon::builder]
+    pub(crate) fn api_versions(#[builder(default)] apis: Vec<ApiVersionRange>) -> Vec<u8> {
         let api_version = |api_key, min_version, max_version| ApiVersion {
             api_key,
             min_version,
@@ -413,13 +426,13 @@ pub(crate) mod test_support {
         let mut api_keys = vec![api_version(api_versions_request::API_KEY, 0, 0)];
         if !apis
             .iter()
-            .any(|(api_key, _, _)| *api_key == metadata_request::API_KEY)
+            .any(|api| api.api_key == metadata_request::API_KEY)
         {
             api_keys.push(api_version(metadata_request::API_KEY, 12, 12));
         }
         api_keys.extend(
-            apis.iter()
-                .map(|(api_key, min, max)| api_version(*api_key, *min, *max)),
+            apis.into_iter()
+                .map(|api| api_version(api.api_key, api.min_version, api.max_version)),
         );
         encode_response(
             &ApiVersionsResponse {
@@ -481,7 +494,7 @@ pub(crate) mod test_support {
     /// `api_key` with `answer(n, version, body)` for the `n`th such request,
     /// and records it in `seen`.
     pub(crate) async fn leader_broker(
-        apis: Vec<(i16, i16, i16)>,
+        apis: Vec<ApiVersionRange>,
         api_key: i16,
         leaders: Vec<Option<SocketAddr>>,
         seen: Arc<Mutex<Seen>>,
@@ -493,7 +506,7 @@ pub(crate) mod test_support {
             let mut seen = seen.lock().expect("seen lock");
             let own = SocketAddr::from(([127, 0, 0, 1], handler_port.load(Ordering::SeqCst)));
             let reply = match key {
-                api_versions_request::API_KEY => api_versions(&apis),
+                api_versions_request::API_KEY => api_versions().apis(apis.clone()).call(),
                 metadata_request::API_KEY => {
                     let leader = leaders[seen.metadata_requests.min(leaders.len() - 1)];
                     seen.metadata_requests += 1;
@@ -529,7 +542,7 @@ pub(crate) mod test_support {
     /// `Metadata` with [`orders_metadata`] naming itself as broker 1 and
     /// controller, so that a controller refresh reconnects to it.
     pub(crate) async fn scripted_broker(
-        apis: Vec<(i16, i16, i16)>,
+        apis: Vec<ApiVersionRange>,
         mut answer: impl FnMut(i16, i16, &[u8], SocketAddr) -> MockReply + Send + 'static,
     ) -> MockBroker {
         let port = Arc::new(AtomicU16::new(0));
@@ -537,7 +550,7 @@ pub(crate) mod test_support {
         let broker = MockBroker::start_with_replies(move |key, version, _, body| {
             let own = SocketAddr::from(([127, 0, 0, 1], handler_port.load(Ordering::SeqCst)));
             if key == api_versions_request::API_KEY {
-                return MockReply::Respond(api_versions(&apis));
+                return MockReply::Respond(api_versions().apis(apis.clone()).call());
             }
             match answer(key, version, body, own) {
                 MockReply::Silent if key == metadata_request::API_KEY => {

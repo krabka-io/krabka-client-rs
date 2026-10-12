@@ -89,6 +89,7 @@ use krabka_protocol::{
         list_offsets_request::{ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
         list_offsets_response::ListOffsetsResponse,
         metadata_request::{MetadataRequest, MetadataRequestTopic},
+        metadata_response,
         metadata_response::MetadataResponse,
     },
     primitives::uuid::Uuid as WireUuid,
@@ -875,7 +876,7 @@ fn partition_leader(response: &MetadataResponse, partition: i32) -> Result<i32, 
 /// Picks the coordination topic out of a `Metadata` response.
 fn coordination_topic(
     response: &MetadataResponse,
-) -> Option<&krabka_protocol::owned::metadata_response::MetadataResponseTopic> {
+) -> Option<&metadata_response::MetadataResponseTopic> {
     response
         .topics
         .iter()
@@ -1127,9 +1128,7 @@ mod tests {
     /// negative id and not against a non-positive one.
     #[test]
     fn the_leader_of_a_partition_comes_from_the_metadata_response() {
-        use krabka_protocol::owned::metadata_response::{
-            MetadataResponsePartition, MetadataResponseTopic,
-        };
+        use metadata_response::{MetadataResponsePartition, MetadataResponseTopic};
 
         let response = |partition: i32, leader_id: i32, error_code: i16| MetadataResponse {
             topics: vec![MetadataResponseTopic {

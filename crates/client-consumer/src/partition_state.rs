@@ -10,7 +10,7 @@ use krabka_units::convert::TimeExt as _;
 
 use crate::{
     commit::OffsetAndMetadata, consumer::Consumer, coordinator::CoordinatorRetryPolicy,
-    error::ConsumerError, poll::is_reset_sentinel,
+    error::ConsumerError, offset_wire, poll::is_reset_sentinel,
 };
 
 /// Paused partitions, with the ownership of each partition at the pause.
@@ -185,7 +185,7 @@ impl Consumer {
         for (topic, partition) in partitions {
             by_topic.entry(topic.clone()).or_default().push(*partition);
         }
-        let request = crate::offset_wire::build_offset_fetch(&self.group_id, &by_topic);
+        let request = offset_wire::build_offset_fetch(&self.group_id, &by_topic);
         let fetch = crate::coordinator::send_offset_fetch(
             &self.client,
             &self.group_id,
@@ -205,7 +205,7 @@ impl Consumer {
                     "the last committed offsets could not be determined".to_owned(),
                 )
             })??;
-        let mut committed = crate::offset_wire::parse_committed_offsets(&response);
+        let mut committed = offset_wire::parse_committed_offsets(&response);
         committed.retain(|partition, _| partitions.contains(partition));
         for partition in partitions {
             committed.entry(partition.clone()).or_insert(None);

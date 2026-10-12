@@ -20,7 +20,7 @@
 
 use krabka_ids::LeaderEpoch;
 
-use crate::{consumer::Consumer, error::ConsumerError};
+use crate::{consumer::Consumer, error::ConsumerError, poll, position};
 
 impl Consumer {
     /// Set the next offset that `poll` fetches for `(topic, partition)`.
@@ -100,7 +100,7 @@ impl Consumer {
         &self,
         partitions: &[(String, i32)],
     ) -> Result<(), ConsumerError> {
-        self.request_offset_reset(partitions, crate::poll::BEGINNING_SENTINEL)
+        self.request_offset_reset(partitions, poll::BEGINNING_SENTINEL)
             .await
     }
 
@@ -116,7 +116,7 @@ impl Consumer {
     /// Returns [`ConsumerError::NoCurrentAssignment`] if the consumer does not
     /// own a partition. The call then resets no partition.
     pub async fn seek_to_end(&self, partitions: &[(String, i32)]) -> Result<(), ConsumerError> {
-        self.request_offset_reset(partitions, crate::poll::END_SENTINEL)
+        self.request_offset_reset(partitions, poll::END_SENTINEL)
             .await
     }
 
@@ -189,7 +189,7 @@ impl Consumer {
 /// Kafka's `SubscriptionState.TopicPartitionState.validatePosition` waits for
 /// validation when the position has an offset epoch and the current leader
 /// epoch is known. Without an offset epoch there is nothing to validate.
-fn seek_position(position: &mut crate::position::PartitionPosition, leader_epoch: Option<i32>) {
+fn seek_position(position: &mut position::PartitionPosition, leader_epoch: Option<i32>) {
     position.offset_epoch = LeaderEpoch(leader_epoch.unwrap_or(-1));
     position.awaiting_validation =
         position.offset_epoch.is_known() && position.leader_epoch.is_known();
@@ -199,8 +199,7 @@ fn seek_position(position: &mut crate::position::PartitionPosition, leader_epoch
 mod tests {
     use krabka_ids::LeaderEpoch;
 
-    use super::seek_position;
-    use crate::position::PartitionPosition;
+    use super::{position::PartitionPosition, seek_position};
 
     /// Kafka's `validatePosition` waits for validation only when both the
     /// offset epoch and the current leader epoch are known.

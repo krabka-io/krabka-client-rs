@@ -205,7 +205,7 @@ mod tests {
             kafka_error,
             test_support::{Lookup, group_cluster},
         },
-        partition_leaders::test_support::{decode_request, encode_response},
+        partition_leaders::test_support::{ApiVersionRange, decode_request, encode_response},
     };
 
     fn partition(
@@ -354,11 +354,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_share_group_offsets_batches_the_groups_of_a_coordinator() {
         let loading_answers = Arc::new(Mutex::new(0_usize));
-        let cluster = group_cluster(
-            1,
-            vec![(describe_share_group_offsets_request::API_KEY, 0, 1)],
-            |_, _| Lookup::At(0),
-            move |_, api_key, version, body, _| {
+        let cluster = group_cluster()
+            .count(1)
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(describe_share_group_offsets_request::API_KEY)
+                    .max_version(1)
+                    .build(),
+            ])
+            .lookup(|_, _| Lookup::At(0))
+            .answer(move |_, api_key, version, body, _| {
                 if api_key != describe_share_group_offsets_request::API_KEY {
                     return MockReply::Silent;
                 }
@@ -398,9 +403,9 @@ mod tests {
                     version,
                     true,
                 ))
-            },
-        )
-        .await;
+            })
+            .call()
+            .await;
         let admin = cluster.admin(krabka_units::secs(5)).await;
         let specs = BTreeMap::from([
             ("ready".to_owned(), ListShareGroupOffsetsSpec::default()),

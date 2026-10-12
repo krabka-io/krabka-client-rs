@@ -177,7 +177,7 @@ mod tests {
 
     use super::*;
     use crate::partition_leaders::test_support::{
-        api_versions, decode_request, encode_response, fast_admin,
+        ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
     };
 
     #[test]
@@ -274,9 +274,16 @@ mod tests {
             let requests = Arc::new(Mutex::new(Vec::<DescribeClusterRequest>::new()));
             let handler_requests = Arc::clone(&requests);
             let broker = MockBroker::start(move |api_key, version, _, body| match api_key {
-                api_versions_request::API_KEY => {
-                    Some(api_versions(&[(describe_cluster_request::API_KEY, 0, 2)]))
-                }
+                api_versions_request::API_KEY => Some(
+                    api_versions()
+                        .apis(vec![
+                            ApiVersionRange::builder()
+                                .api_key(describe_cluster_request::API_KEY)
+                                .max_version(2)
+                                .build(),
+                        ])
+                        .call(),
+                ),
                 describe_cluster_request::API_KEY => {
                     handler_requests
                         .lock()
@@ -322,9 +329,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fenced_brokers_need_describe_cluster_v2() {
         let broker = MockBroker::start(move |api_key, _, _, _| match api_key {
-            api_versions_request::API_KEY => {
-                Some(api_versions(&[(describe_cluster_request::API_KEY, 0, 1)]))
-            }
+            api_versions_request::API_KEY => Some(
+                api_versions()
+                    .apis(vec![
+                        ApiVersionRange::builder()
+                            .api_key(describe_cluster_request::API_KEY)
+                            .max_version(1)
+                            .build(),
+                    ])
+                    .call(),
+            ),
             _ => None,
         })
         .await;

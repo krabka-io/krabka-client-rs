@@ -94,6 +94,8 @@ mod version;
 
 #[cfg(any(test, feature = "mock"))]
 mod mock;
+#[cfg(any(test, feature = "mock"))]
+pub mod mock_test_support;
 
 pub use backoff::{ExponentialBackoff, KAFKA_BACKOFF_JITTER, KAFKA_BACKOFF_MULTIPLIER};
 pub use client::{
@@ -124,7 +126,10 @@ pub use metadata_topics::{MetadataScope, MetadataTopics, all_topics_request, top
 pub use mock::{MockBroker, MockReply, MockSaslAnswer};
 pub use offset_for_leader_epoch::{EpochEndOffset, offset_for_leader_epoch};
 pub use pool::{BrokerInfo, BrokerPool};
-pub use request::ProtocolRequest;
+pub use request::{
+    AllTopicsOffsetFetch, MembersOnlyLeaveGroup, ProtocolRequest, TopicNameOffsetCommit,
+    TopicNameOffsetFetch, VersionBoundedRequest,
+};
 pub use sasl::{
     OAuthBearerTokenSource, OutboundSaslError, SaslAuthenticationError, SaslCredentials,
     SaslSession, outbound_sasl,

@@ -15,6 +15,7 @@ use std::{
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use krabka_ids::{ApiKey, ApiVersion};
+use krabka_protocol::owned::{api_versions_request, api_versions_response};
 use krabka_units::{
     ByteSize, Time,
     convert::{ByteSizeExt as _, TimeExt as _},
@@ -29,9 +30,13 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use crate::mock;
 use crate::{
     error::ClientError,
+    framing, reauth,
     request::ProtocolRequest,
+    sasl, security, telemetry,
     transport::{SocketOptions, dial_address},
     version::ApiVersionTable,
 };
@@ -86,7 +91,7 @@ pub const DEFAULT_CLIENT_FRAME_MAX: ByteSize = MAX_CLIENT_FRAME_BYTES;
 ///
 /// Stores the validated millisecond count so policy structs can retain `Eq`
 /// while public configuration boundaries use dimensioned [`Time`] values.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ClientDnsTimeout(i64);
 
 impl ClientDnsTimeout {
@@ -127,7 +132,7 @@ impl Default for ClientDnsTimeout {
 }
 
 /// Positive capacity of one connection's pending request dispatch queue.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ConnectionDispatchQueueCapacity(usize);
 
 impl ConnectionDispatchQueueCapacity {
@@ -157,7 +162,7 @@ impl Default for ConnectionDispatchQueueCapacity {
 }
 
 /// Positive whole-byte accepted-frame limit bounded by the fixed security ceiling.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
 pub struct ClientFrameMax(usize);
 
 impl ClientFrameMax {
@@ -251,11 +256,11 @@ pub struct ConnectionOptions {
     /// sites clone `ConnectionOptions` and embed it in connection-building
     /// futures, and `ClientSecurity` carries several `String`/`PathBuf`
     /// fields that would otherwise make every such future large.
-    pub security: Option<Box<crate::security::ClientSecurity>>,
+    pub security: Option<Box<security::ClientSecurity>>,
     /// The network metrics of a client that pushes its metrics (KIP-714).
     /// [`Connection::connect_with_options`] counts the new connection in
     /// them. `None` counts nowhere.
-    pub network_metrics: Option<crate::telemetry::NetworkMetrics>,
+    pub network_metrics: Option<telemetry::NetworkMetrics>,
 }
 
 impl ConnectionOptions {
@@ -365,10 +370,10 @@ struct ConnectionInner {
     shutdown: CancellationToken,
     /// SASL re-authentication state (KIP-368), for a connection whose broker
     /// sent a session lifetime.
-    reauth: Option<crate::reauth::Reauth>,
+    reauth: Option<reauth::Reauth>,
     /// The network metrics of the client, once attached. They count the
     /// requests after the `ApiVersions` exchange.
-    metrics: std::sync::OnceLock<crate::telemetry::ConnectionMetrics>,
+    metrics: std::sync::OnceLock<telemetry::ConnectionMetrics>,
     _reader: JoinHandle<()>,
     _writer: JoinHandle<()>,
 }
@@ -406,9 +411,9 @@ fn tls_handshake_error(addr: SocketAddr, source: std::io::Error) -> ClientError 
 
 /// Classify a failed SASL exchange. Only a rejection is an authentication
 /// failure.
-pub(crate) fn sasl_error(addr: SocketAddr, source: crate::sasl::OutboundSaslError) -> ClientError {
+pub(crate) fn sasl_error(addr: SocketAddr, source: sasl::OutboundSaslError) -> ClientError {
     match source {
-        crate::sasl::OutboundSaslError::Authentication(error) => ClientError::Authentication {
+        sasl::OutboundSaslError::Authentication(error) => ClientError::Authentication {
             addr,
             source: error.into(),
         },
@@ -542,7 +547,7 @@ impl Connection {
     pub async fn connect_secured(
         addr: SocketAddr,
         options: ConnectionOptions,
-        security: &crate::security::ClientSecurity,
+        security: &security::ClientSecurity,
     ) -> Result<Self, ClientError> {
         let (stream, reauth) = within_setup_timeout(&options, async {
             let tcp = tcp_connect(addr, &options).await?;
@@ -557,8 +562,8 @@ impl Connection {
         addr: SocketAddr,
         tcp: TcpStream,
         options: &ConnectionOptions,
-        security: &crate::security::ClientSecurity,
-    ) -> Result<(Box<dyn ClientDuplex>, Option<crate::reauth::Reauth>), ClientError> {
+        security: &security::ClientSecurity,
+    ) -> Result<(Box<dyn ClientDuplex>, Option<reauth::Reauth>), ClientError> {
         // 1. TLS (if the protocol demands it).
         let mut stream: Box<dyn ClientDuplex> = if security.protocol.requires_tls() {
             let tls = security.tls.as_ref().ok_or_else(|| {
@@ -595,7 +600,7 @@ impl Connection {
             // the principal matches the broker's advertised hostname.
             let target = addr.ip().to_string();
             let server_name = security.sasl_handshake_host(Some(target.as_str()));
-            let session = crate::sasl::outbound_sasl(
+            let session = sasl::outbound_sasl(
                 &mut *stream,
                 creds,
                 server_name,
@@ -604,9 +609,9 @@ impl Connection {
             )
             .await
             .map_err(|source| sasl_error(addr, source))?;
-            reauth = session.needs_reauthentication().then(|| {
-                crate::reauth::Reauth::new(addr, creds.clone(), server_name.to_owned(), session)
-            });
+            reauth = session
+                .needs_reauthentication()
+                .then(|| reauth::Reauth::new(addr, creds.clone(), server_name.to_owned(), session));
         }
         Ok((stream, reauth))
     }
@@ -636,7 +641,7 @@ impl Connection {
     pub(crate) async fn from_stream_with_reauth(
         stream: Box<dyn ClientDuplex>,
         options: ConnectionOptions,
-        reauth: Option<crate::reauth::Reauth>,
+        reauth: Option<reauth::Reauth>,
     ) -> Result<Self, ClientError> {
         options.validate().map_err(ClientError::InvalidConfig)?;
         let (writer_tx, writer_rx) =
@@ -860,7 +865,7 @@ impl Connection {
     /// `NetworkClient.nextCorrelationId` does, the ids wrap to 0 before the
     /// range that SASL re-authentication reserves.
     fn next_correlation_id(&self) -> i32 {
-        let last_normal = crate::sasl::MIN_RESERVED_CORRELATION_ID - 1;
+        let last_normal = sasl::MIN_RESERVED_CORRELATION_ID - 1;
         self.inner
             .next_corr_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -913,7 +918,7 @@ impl Connection {
     /// Count this connection in the client's network metrics from now on.
     /// A connection counts in one set of metrics; a second call does
     /// nothing.
-    pub fn attach_metrics(&self, metrics: &crate::telemetry::NetworkMetrics) {
+    pub fn attach_metrics(&self, metrics: &telemetry::NetworkMetrics) {
         self.inner.metrics.get_or_init(|| metrics.opened());
     }
 
@@ -970,7 +975,7 @@ impl Connection {
             drop(next);
             let mut next = reauth.next.write().await;
             if next.is_some_and(|due| tokio::time::Instant::now() >= due) {
-                let mut channel = crate::reauth::ConnectionChannel { connection: self };
+                let mut channel = reauth::ConnectionChannel { connection: self };
                 // The exchange nests the whole SASL state machine. Boxing it
                 // keeps every send future small.
                 match Box::pin(reauth.authenticate(
@@ -1122,8 +1127,8 @@ fn spawn_io_tasks(
     } = context;
 
     let (read_half, write_half) = tokio::io::split(stream);
-    let mut framed_read = FramedRead::new(read_half, crate::framing::codec_with_max(frame_max));
-    let mut framed_write = FramedWrite::new(write_half, crate::framing::codec_with_max(frame_max));
+    let mut framed_read = FramedRead::new(read_half, framing::codec_with_max(frame_max));
+    let mut framed_write = FramedWrite::new(write_half, framing::codec_with_max(frame_max));
 
     // WRITER: drains the dispatch channel, flushing each frame in receive
     // order. Owns only the write half, so a not-yet-writable socket can never
@@ -1289,9 +1294,8 @@ const UNSUPPORTED_VERSION: i16 = 35;
 
 /// The `ApiVersions` request of a new connection at `version`, as Kafka's
 /// `ApiVersionsRequest.Builder` fills it.
-pub(crate) fn api_versions_request()
--> krabka_protocol::owned::api_versions_request::ApiVersionsRequest {
-    krabka_protocol::owned::api_versions_request::ApiVersionsRequest {
+pub(crate) fn api_versions_request() -> api_versions_request::ApiVersionsRequest {
+    api_versions_request::ApiVersionsRequest {
         client_software_name: CLIENT_SOFTWARE_NAME.to_owned(),
         client_software_version: CLIENT_SOFTWARE_VERSION.to_owned(),
         ..Default::default()
@@ -1307,7 +1311,7 @@ pub(crate) fn api_versions_request()
 pub(crate) fn decode_api_versions_response(
     body: &[u8],
     version: i16,
-) -> Result<krabka_protocol::owned::api_versions_response::ApiVersionsResponse, ClientError> {
+) -> Result<api_versions_response::ApiVersionsResponse, ClientError> {
     use krabka_protocol::{Decode as _, owned::api_versions_response::ApiVersionsResponse};
 
     let decode = |version| {
@@ -1338,10 +1342,10 @@ pub(crate) fn decode_api_versions_response(
 /// `UNSUPPORTED_VERSION` answer to a version above 0 at the highest
 /// `ApiVersions` version that the broker lists, or at version 0.
 pub(crate) fn api_versions_retry_version(
-    response: &krabka_protocol::owned::api_versions_response::ApiVersionsResponse,
+    response: &api_versions_response::ApiVersionsResponse,
     version: i16,
 ) -> Option<i16> {
-    use krabka_protocol::owned::api_versions_request::API_KEY;
+    use api_versions_request::API_KEY;
 
     (response.error_code == UNSUPPORTED_VERSION && version > 0).then(|| {
         response
@@ -1593,9 +1597,9 @@ mod tests {
 #[cfg(test)]
 mod secured_tests {
     use krabka_security::ListenerProtocol;
+    use security::{ClientSecurity, SaslCredentials};
 
     use super::*;
-    use crate::security::{ClientSecurity, SaslCredentials};
 
     // A SASL_PLAINTEXT connect drives the handshake then ApiVersions.
     // The fake broker answers SaslHandshake(0), SaslAuthenticate(0),
@@ -1621,8 +1625,8 @@ mod secured_tests {
                 {
                     // The ApiVersions v0 that starts the SASL exchange lists
                     // the SASL APIs.
-                    let crate::mock::MockReply::Respond(body) = crate::mock::MockSaslAnswer::Accept
-                        .reply(krabka_protocol::owned::api_versions_request::API_KEY, 0)
+                    let mock::MockReply::Respond(body) = mock::MockSaslAnswer::Accept
+                        .reply(api_versions_request::API_KEY, 0)
                         .unwrap()
                     else {
                         unreachable!("ApiVersions v0 has a reply")
@@ -1943,10 +1947,10 @@ mod connection_policy_tests {
         },
     };
     use krabka_security::ListenerProtocol;
+    use security::{ClientSecurity, SaslCredentials};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
-    use crate::security::{ClientSecurity, SaslCredentials};
 
     /// Answer the `ApiVersions` request of `from_stream` on `server`, with
     /// `Metadata` v0 supported, and return the stream.
@@ -2287,7 +2291,7 @@ mod connection_policy_tests {
     #[tokio::test]
     async fn normal_correlation_ids_wrap_before_the_sasl_range() {
         let (connection, _server) = connection(ConnectionOptions::default()).await;
-        let reserved = crate::sasl::MIN_RESERVED_CORRELATION_ID;
+        let reserved = sasl::MIN_RESERVED_CORRELATION_ID;
         connection
             .inner
             .next_corr_id

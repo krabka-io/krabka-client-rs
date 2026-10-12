@@ -97,6 +97,8 @@ mod rebalance_listener;
 mod seek;
 mod share;
 mod subscription;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod validate;
 
 pub use assignor::Assignor;

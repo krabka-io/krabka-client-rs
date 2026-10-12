@@ -99,16 +99,40 @@ mod tests {
     use krabka_protocol::owned::{
         delete_groups_request,
         delete_groups_response::{DeletableGroupResult, DeleteGroupsResponse},
+        find_coordinator_request,
     };
 
     use super::*;
     use crate::{
         group_coordinators::{
             kafka_error,
-            test_support::{Lookup, group_cluster},
+            test_support::{GroupCluster, Lookup, group_cluster},
         },
-        partition_leaders::test_support::{decode_request, encode_response},
+        partition_leaders::test_support::{ApiVersionRange, decode_request, encode_response},
     };
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    async fn delete_groups_cluster(find_coordinator_max: i16) -> GroupCluster {
+        group_cluster()
+            .count(1)
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(delete_groups_request::API_KEY)
+                    .max_version(2)
+                    .build(),
+                ApiVersionRange::builder()
+                    .api_key(find_coordinator_request::API_KEY)
+                    .max_version(find_coordinator_max)
+                    .build(),
+            ])
+            .lookup(|_, _| Lookup::At(0))
+            .answer(mock_delete_groups)
+            .call()
+            .await
+    }
 
     /// Kafka's `DeleteGroupsHandler` batches the groups of one coordinator,
     /// retries 14 on the same coordinator, finds the coordinator again on 15
@@ -130,15 +154,20 @@ mod tests {
                 ("moved", vec![16, 0]),
                 ("busy", vec![68]),
             ])));
-            let cluster = group_cluster(
-                2,
-                vec![(delete_groups_request::API_KEY, 0, 2)],
-                |group, lookups| match (group, lookups) {
+            let cluster = group_cluster()
+                .count(2)
+                .apis(vec![
+                    ApiVersionRange::builder()
+                        .api_key(delete_groups_request::API_KEY)
+                        .max_version(2)
+                        .build(),
+                ])
+                .lookup(|group, lookups| match (group, lookups) {
                     ("denied", _) => Lookup::Error(30),
                     ("moved", 0) => Lookup::At(1),
                     _ => Lookup::At(0),
-                },
-                move |_, api_key, version, body, _| {
+                })
+                .answer(move |_, api_key, version, body, _| {
                     if api_key != delete_groups_request::API_KEY {
                         return MockReply::Silent;
                     }
@@ -169,9 +198,9 @@ mod tests {
                         version,
                         version >= 2,
                     ))
-                },
-            )
-            .await;
+                })
+                .call()
+                .await;
             let admin = cluster.admin(krabka_units::secs(5)).await;
             let groups = ["done", "loading", "moved", "busy", "denied"];
 
@@ -191,12 +220,6 @@ mod tests {
                     (request.broker, request.version, body.groups_names)
                 })
                 .collect::<Vec<_>>();
-            let names = |names: &[&str]| {
-                names
-                    .iter()
-                    .map(|name| (*name).to_owned())
-                    .collect::<Vec<_>>()
-            };
             let lookups = seen
                 .find_coordinator
                 .into_iter()
@@ -237,18 +260,40 @@ mod tests {
         }
     }
 
+    fn mock_delete_groups(
+        _broker: usize,
+        api_key: i16,
+        version: i16,
+        body: &[u8],
+        _addr: std::net::SocketAddr,
+    ) -> MockReply {
+        if api_key != delete_groups_request::API_KEY {
+            return MockReply::Silent;
+        }
+        let request: DeleteGroupsRequest = decode_request(body, version, version >= 2);
+        MockReply::Respond(encode_response(
+            &DeleteGroupsResponse {
+                results: request
+                    .groups_names
+                    .into_iter()
+                    .map(|group_id| DeletableGroupResult {
+                        group_id,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            version,
+            version >= 2,
+        ))
+    }
+
     /// A broker at `FindCoordinator` v4 or later gets one lookup for every
     /// group, and a broker below v4 gets one lookup for each group, sent all at
     /// once. Each row compares the version and keys of every lookup, sorted
     /// because concurrent lookups arrive in any order.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_lookups_batch_from_find_coordinator_v4_and_fan_out_below() {
-        let names = |names: &[&str]| {
-            names
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect::<Vec<_>>()
-        };
         for (name, find_coordinator_max, expected) in [
             ("v6 broker batches", 6, vec![(4, names(&["a", "b", "c"]))]),
             ("v4 broker batches", 4, vec![(4, names(&["a", "b", "c"]))]),
@@ -258,40 +303,7 @@ mod tests {
                 vec![(3, names(&["a"])), (3, names(&["b"])), (3, names(&["c"]))],
             ),
         ] {
-            let cluster = group_cluster(
-                1,
-                vec![
-                    (delete_groups_request::API_KEY, 0, 2),
-                    (
-                        krabka_protocol::owned::find_coordinator_request::API_KEY,
-                        0,
-                        find_coordinator_max,
-                    ),
-                ],
-                |_, _| Lookup::At(0),
-                |_, api_key, version, body, _| {
-                    if api_key != delete_groups_request::API_KEY {
-                        return MockReply::Silent;
-                    }
-                    let request: DeleteGroupsRequest = decode_request(body, version, version >= 2);
-                    MockReply::Respond(encode_response(
-                        &DeleteGroupsResponse {
-                            results: request
-                                .groups_names
-                                .into_iter()
-                                .map(|group_id| DeletableGroupResult {
-                                    group_id,
-                                    ..Default::default()
-                                })
-                                .collect(),
-                            ..Default::default()
-                        },
-                        version,
-                        version >= 2,
-                    ))
-                },
-            )
-            .await;
+            let cluster = delete_groups_cluster(find_coordinator_max).await;
             let admin = cluster.admin(krabka_units::secs(5)).await;
 
             let result = admin.delete_consumer_groups(&["a", "b", "c"]).await;
@@ -324,51 +336,12 @@ mod tests {
     /// one `DeleteGroups` request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_groups_looks_up_one_group_at_a_time_below_find_coordinator_v4() {
-        let cluster = group_cluster(
-            1,
-            vec![
-                (delete_groups_request::API_KEY, 0, 2),
-                (
-                    krabka_protocol::owned::find_coordinator_request::API_KEY,
-                    0,
-                    3,
-                ),
-            ],
-            |_, _| Lookup::At(0),
-            |_, api_key, version, body, _| {
-                if api_key != delete_groups_request::API_KEY {
-                    return MockReply::Silent;
-                }
-                let request: DeleteGroupsRequest = decode_request(body, version, version >= 2);
-                MockReply::Respond(encode_response(
-                    &DeleteGroupsResponse {
-                        results: request
-                            .groups_names
-                            .into_iter()
-                            .map(|group_id| DeletableGroupResult {
-                                group_id,
-                                ..Default::default()
-                            })
-                            .collect(),
-                        ..Default::default()
-                    },
-                    version,
-                    version >= 2,
-                ))
-            },
-        )
-        .await;
+        let cluster = delete_groups_cluster(3).await;
         let admin = cluster.admin(krabka_units::secs(5)).await;
 
         let result = admin.delete_consumer_groups(&["a", "b"]).await;
 
         let seen = cluster.stop();
-        let names = |names: &[&str]| {
-            names
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect::<Vec<_>>()
-        };
         assert!(
             (result, seen.find_coordinator, seen.requests.len())
                 == (

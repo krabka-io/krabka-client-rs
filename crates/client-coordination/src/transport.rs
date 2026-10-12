@@ -8,7 +8,7 @@
 //! The seam exists so a test drives the rules without a broker.
 //! `#[mockall::automock]` generates `MockCoordinationTransport` under
 //! `cfg(test)`, and a unit test scripts each method with the record sequence
-//! it wants. [`crate::broker::BrokerTransport`] is the one implementation that
+//! it wants. [`broker::BrokerTransport`] is the one implementation that
 //! talks to a cluster.
 //!
 //! # Which calls carry authority
@@ -44,7 +44,7 @@ pub type RoleRecords = Vec<(i64, CoordinationKey, CoordinationRecord)>;
 /// The cluster operations that the coordination client performs.
 ///
 /// A caller that wants the real cluster uses
-/// [`crate::broker::BrokerTransport`]. A test uses the generated
+/// [`broker::BrokerTransport`]. A test uses the generated
 /// `MockCoordinationTransport`.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]

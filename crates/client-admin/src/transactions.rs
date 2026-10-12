@@ -35,6 +35,8 @@ use krabka_protocol::{
 };
 use krabka_units::{Time, convert::TimeExt as _};
 
+#[cfg(test)]
+use crate::AdminClientConfig;
 use crate::{
     AdminClient, AdminError, KafkaError, format_host_port, kafka_error_name,
     partition_leaders::{PartitionKey, PartitionResults, complete_results},
@@ -1210,7 +1212,8 @@ mod tests {
 
     use super::*;
     use crate::partition_leaders::test_support::{
-        Seen, fast_admin as leader_fast_admin, leader_broker as partition_leader_broker,
+        ApiVersionRange, Seen, fast_admin as leader_fast_admin,
+        leader_broker as partition_leader_broker,
     };
 
     fn state_row(transactional_id: &str, error_code: i16) -> TransactionState {
@@ -2114,7 +2117,7 @@ mod tests {
                 default_api_timeout: Some(krabka_units::millis(1500)),
                 retry_backoff: krabka_units::millis(100),
                 retry_backoff_max: krabka_units::millis(100),
-                ..crate::AdminClientConfig::default()
+                ..AdminClientConfig::default()
             },
         )
         .await
@@ -2626,7 +2629,7 @@ mod tests {
                 retry_backoff: krabka_units::millis(1),
                 retry_backoff_max: krabka_units::millis(1),
                 default_api_timeout: Some(krabka_units::secs(5)),
-                ..crate::AdminClientConfig::default()
+                ..AdminClientConfig::default()
             },
         )
         .await
@@ -2779,7 +2782,11 @@ mod tests {
         ] {
             let seen = Arc::new(Mutex::new(Seen::default()));
             let broker = partition_leader_broker(
-                vec![(describe_producers_request::API_KEY, 0, 0)],
+                vec![
+                    ApiVersionRange::builder()
+                        .api_key(describe_producers_request::API_KEY)
+                        .build(),
+                ],
                 describe_producers_request::API_KEY,
                 leaders,
                 Arc::clone(&seen),
