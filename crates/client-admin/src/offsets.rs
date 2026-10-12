@@ -350,18 +350,15 @@ mod tests {
 
     #[test]
     fn request_carries_each_spec_as_kafka_encodes_it() {
-        let specs = BTreeMap::from([
-            (key(0), OffsetSpec::Earliest),
-            (key(1), OffsetSpec::Latest),
-            (key(2), OffsetSpec::MaxTimestamp),
-            (key(3), OffsetSpec::EarliestLocal),
-            (key(4), OffsetSpec::LatestTiered),
-            (key(5), OffsetSpec::EarliestPendingUpload),
-            (
-                ("audit".to_owned(), 0),
-                OffsetSpec::ForTimestamp(1_700_000_000_000),
-            ),
-        ]);
+        let specs = maplit::btreemap! {
+            key(0) => OffsetSpec::Earliest,
+            key(1) => OffsetSpec::Latest,
+            key(2) => OffsetSpec::MaxTimestamp,
+            key(3) => OffsetSpec::EarliestLocal,
+            key(4) => OffsetSpec::LatestTiered,
+            key(5) => OffsetSpec::EarliestPendingUpload,
+            ("audit".to_owned(), 0) => OffsetSpec::ForTimestamp(1_700_000_000_000),
+        };
         let keys = specs.keys().cloned().collect::<Vec<_>>();
         let partition = |partition_index, timestamp| ListOffsetsPartition {
             partition_index,
@@ -460,32 +457,23 @@ mod tests {
 
         assert2::assert!(
             list_offsets_results(&[key(0), key(1), key(2)], response)
-                == BTreeMap::from([
-                    (
-                        key(0),
-                        Ok(ListedOffset {
-                            offset: 42,
-                            timestamp_ms: 1_700_000_000_000,
-                            leader_epoch: Some(3),
-                        })
-                    ),
-                    (
-                        key(1),
-                        Ok(ListedOffset {
-                            offset: 7,
-                            timestamp_ms: -1,
-                            leader_epoch: None,
-                        })
-                    ),
-                    (
-                        key(2),
-                        Err(KafkaError {
-                            code: 3,
-                            name: "UNKNOWN_TOPIC_OR_PARTITION",
-                            message: None,
-                        })
-                    ),
-                ])
+                == maplit::btreemap! {
+                    key(0) => Ok(ListedOffset {
+                    offset: 42,
+                    timestamp_ms: 1_700_000_000_000,
+                    leader_epoch: Some(3),
+                }),
+                    key(1) => Ok(ListedOffset {
+                    offset: 7,
+                    timestamp_ms: -1,
+                    leader_epoch: None,
+                }),
+                    key(2) => Err(KafkaError {
+                    code: 3,
+                    name: "UNKNOWN_TOPIC_OR_PARTITION",
+                    message: None,
+                }),
+                }
         );
     }
 
@@ -654,8 +642,10 @@ mod tests {
             )
             .await;
             let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
-            let specs =
-                BTreeMap::from([(key(0), OffsetSpec::Latest), (key(1), case.orders_1_spec)]);
+            let specs = maplit::btreemap! {
+                key(0) => OffsetSpec::Latest,
+                key(1) => case.orders_1_spec,
+            };
 
             let result = admin
                 .list_offsets(&specs, IsolationLevel::ReadUncommitted)
@@ -683,17 +673,14 @@ mod tests {
             assert2::assert!(
                 (result, seen.metadata_requests, requests)
                     == (
-                        BTreeMap::from([
-                            (
-                                key(0),
-                                Ok(ListedOffset {
-                                    offset: 100,
-                                    timestamp_ms: -1,
-                                    leader_epoch: Some(4),
-                                })
-                            ),
-                            (key(1), case.expected),
-                        ]),
+                        maplit::btreemap! {
+                            key(0) => Ok(ListedOffset {
+                            offset: 100,
+                            timestamp_ms: -1,
+                            leader_epoch: Some(4),
+                        }),
+                            key(1) => case.expected,
+                        },
                         case.metadata_requests,
                         expected_requests,
                     ),
@@ -726,7 +713,9 @@ mod tests {
 
         let result = admin
             .list_offsets(
-                &BTreeMap::from([(("missing".to_owned(), 0), OffsetSpec::Latest)]),
+                &maplit::btreemap! {
+                    ("missing".to_owned(), 0) => OffsetSpec::Latest,
+                },
                 IsolationLevel::ReadUncommitted,
             )
             .await;

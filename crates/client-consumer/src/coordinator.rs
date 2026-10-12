@@ -3503,7 +3503,7 @@ mod retry_tests {
             ),
             (
                 "topic authorization failed",
-                ConsumerError::TopicAuthorizationFailed(BTreeSet::from(["orders".to_string()])),
+                ConsumerError::TopicAuthorizationFailed(maplit::btreeset! {"orders".to_string()}),
                 true,
             ),
             (
@@ -3613,7 +3613,8 @@ mod retry_tests {
         handle_subscription_change(&mut state, &mut rejoin, &mut known_counts).await;
         mock.stop();
         assert2::assert!(
-            (known_counts, rejoin.requested()) == (HashMap::from([(PAYMENTS.to_owned(), 2)]), true)
+            (known_counts, rejoin.requested())
+                == (maplit::hashmap! {PAYMENTS.to_owned() => 2}, true)
         );
     }
 
@@ -4292,14 +4293,14 @@ mod retry_tests {
             .commit_identity(Arc::new(Mutex::new(CommitIdentity {
                 generation: 1,
                 member_id: "member-a".into(),
-                ownership_ids: HashMap::from([(orders_0.clone(), 1)]),
+                ownership_ids: maplit::hashmap! {orders_0.clone() => 1},
                 rejoin_on_poll: false,
             })))
             .group_instance_id("instance-a")
             .subscription(subscription::shared(vec![ORDERS.into()], None, true))
             .assigned(vec![orders_0.clone()])
             .next_ownership_id(2_u64)
-            .next_offsets(HashMap::from([(orders_0, 5)]))
+            .next_offsets(maplit::hashmap! {orders_0 => 5})
             .heartbeat_interval(millis(20))
             .subscription_metadata_refresh_interval(minutes(10))
             .leave_group_timeout(millis(200))
@@ -4765,7 +4766,7 @@ mod refind_tests {
     fn cooperative_ownership_preserves_retained_and_rotates_reassigned_partitions() {
         let p0 = ("topic".to_string(), 0);
         let p1 = ("topic".to_string(), 1);
-        let mut ownership = HashMap::from([(p0.clone(), 7), (p1.clone(), 8)]);
+        let mut ownership = maplit::hashmap! {p0.clone() => 7, p1.clone() => 8};
         let mut next_id = 9;
 
         update_ownership(
@@ -4774,7 +4775,7 @@ mod refind_tests {
             true,
             &mut next_id,
         );
-        assert2::assert!(ownership == HashMap::from([(p0.clone(), 7)]));
+        assert2::assert!(ownership == maplit::hashmap! {p0.clone() => 7});
 
         update_ownership(
             &mut ownership,
@@ -4782,13 +4783,13 @@ mod refind_tests {
             true,
             &mut next_id,
         );
-        assert2::assert!(ownership == HashMap::from([(p0, 7), (p1, 9)]));
+        assert2::assert!(ownership == maplit::hashmap! {p0 => 7, p1 => 9});
     }
 
     #[test]
     fn eager_assignment_rotates_even_retained_partition_ownership() {
         let p0 = ("topic".to_string(), 0);
-        let mut ownership = HashMap::from([(p0.clone(), 7)]);
+        let mut ownership = maplit::hashmap! {p0.clone() => 7};
         let mut next_id = 8;
 
         update_ownership(
@@ -4798,6 +4799,6 @@ mod refind_tests {
             &mut next_id,
         );
 
-        assert2::assert!(ownership == HashMap::from([(p0, 8)]));
+        assert2::assert!(ownership == maplit::hashmap! {p0 => 8});
     }
 }

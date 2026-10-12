@@ -64,12 +64,7 @@
 //! partition to the last stable offset, and it drops every record whose key
 //! belongs to another role.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    io,
-    net::SocketAddr,
-    sync::Arc,
-};
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
 use krabka_client_admin::{
@@ -789,10 +784,7 @@ fn coordination_topic_spec(partitions: i32, replication: i32) -> CreateTopicSpec
         .name(COORDINATION_STATE_TOPIC)
         .partitions(partitions)
         .replicas(replication)
-        .configs(BTreeMap::from([(
-            "cleanup.policy".to_owned(),
-            "compact".to_owned(),
-        )]))
+        .configs(maplit::btreemap! {"cleanup.policy".to_owned() => "compact".to_owned()})
         .build()
 }
 
@@ -1415,7 +1407,7 @@ mod tests {
         check!(spec.partitions == 16);
         check!(spec.replicas == 3);
         check!(
-            spec.configs == BTreeMap::from([("cleanup.policy".to_owned(), "compact".to_owned())])
+            spec.configs == maplit::btreemap! {"cleanup.policy".to_owned() => "compact".to_owned()}
         );
     }
 

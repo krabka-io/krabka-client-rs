@@ -457,13 +457,12 @@ mod tests {
             .await
             .unwrap();
         client.metadata_topics().add(TOPIC);
-        let metadata_cache = Arc::new(Mutex::new(HashMap::from([(
-            TOPIC.to_owned(),
-            TopicMetadata {
+        let metadata_cache = Arc::new(Mutex::new(
+            maplit::hashmap! {TOPIC.to_owned() => TopicMetadata {
                 num_partitions: 4,
                 topic_id: krabka_protocol::primitives::uuid::Uuid::ZERO,
-            },
-        )])));
+            }},
+        ));
         let partition_leaders = Arc::new(DashMap::from_iter([((TOPIC.to_owned(), 0), 1)]));
         let accumulators = AccumulatorMap::default();
         let in_flight = Arc::new(AtomicUsize::new(0));

@@ -2304,10 +2304,7 @@ mod offset_advance_tests {
             SessionRequest {
                 session_id: 77,
                 session_epoch: 3,
-                partitions: BTreeMap::from([
-                    (("topic-a".to_owned(), 2), partition(42)),
-                    (("topic-a".to_owned(), 3), partition(43)),
-                ]),
+                partitions: maplit::btreemap! {("topic-a".to_owned(), 2) => partition(42), ("topic-a".to_owned(), 3) => partition(43)},
                 forgotten: vec![
                     (("topic-b".to_owned(), 0), id(8)),
                     (("topic-b".to_owned(), 1), id(8)),
@@ -2374,7 +2371,7 @@ mod offset_advance_tests {
             (EARLIEST_TIMESTAMP, IsolationLevel::ReadUncommitted, 0, 9),
         ] {
             let by_topic =
-                BTreeMap::from([("topic-a".to_string(), vec![(3, LeaderEpoch(leader_epoch))])]);
+                maplit::btreemap! {"topic-a".to_string() => vec![(3, LeaderEpoch(leader_epoch))]};
             let req = build_offsets_request(by_topic, timestamp, isolation);
 
             check!(
@@ -2409,12 +2406,7 @@ mod offset_advance_tests {
             leader_epoch: LeaderEpoch(leader_epoch),
             ..Default::default()
         };
-        let positions = HashMap::from([
-            (("topic-a".to_string(), 0), position(1, 5)),
-            (("topic-a".to_string(), 1), position(2, 6)),
-            (("topic-b".to_string(), 0), position(1, 3)),
-            (("topic-b".to_string(), 1), position(3, 8)),
-        ]);
+        let positions = maplit::hashmap! {("topic-a".to_string(), 0) => position(1, 5), ("topic-a".to_string(), 1) => position(2, 6), ("topic-b".to_string(), 0) => position(1, 3), ("topic-b".to_string(), 1) => position(3, 8)};
         let keys = [
             ("topic-a".to_string(), 0),
             ("topic-a".to_string(), 1),
@@ -2425,26 +2417,19 @@ mod offset_advance_tests {
         let grouped = group_list_offsets(&keys, &positions, |id| id != 3);
         assert2::assert!(
             grouped
-                == BTreeMap::from([
-                    (
-                        BOOTSTRAP_LEADER,
-                        BTreeMap::from([
-                            ("topic-b".to_string(), vec![(1, LeaderEpoch(8))]),
-                            ("topic-c".to_string(), vec![(0, LeaderEpoch(-1))]),
-                        ]),
-                    ),
-                    (
-                        1,
-                        BTreeMap::from([
-                            ("topic-a".to_string(), vec![(0, LeaderEpoch(5))]),
-                            ("topic-b".to_string(), vec![(0, LeaderEpoch(3))]),
-                        ]),
-                    ),
-                    (
-                        2,
-                        BTreeMap::from([("topic-a".to_string(), vec![(1, LeaderEpoch(6))])]),
-                    ),
-                ])
+                == maplit::btreemap! {
+                    BOOTSTRAP_LEADER => maplit::btreemap! {
+                        "topic-b".to_string() => vec![(1, LeaderEpoch(8))],
+                        "topic-c".to_string() => vec![(0, LeaderEpoch(-1))],
+                    },
+                    1 => maplit::btreemap! {
+                        "topic-a".to_string() => vec![(0, LeaderEpoch(5))],
+                        "topic-b".to_string() => vec![(0, LeaderEpoch(3))],
+                    },
+                    2 => maplit::btreemap! {
+                        "topic-a".to_string() => vec![(1, LeaderEpoch(6))],
+                    },
+                }
         );
     }
 
@@ -2512,7 +2497,7 @@ mod offset_advance_tests {
         };
         let requested = [("topic-a".to_string(), 0), ("topic-a".to_string(), 1)];
         let retry_with_first_offset = ListOffsetsResult {
-            offsets: HashMap::from([(("topic-a".to_string(), 0), 5)]),
+            offsets: maplit::hashmap! {("topic-a".to_string(), 0) => 5},
             retry: true,
             unauthorized: BTreeSet::new(),
         };
@@ -2521,10 +2506,7 @@ mod offset_advance_tests {
                 "every partition answered",
                 vec![answer("topic-a", vec![row(0, 0, 5), row(1, 0, 9)])],
                 ListOffsetsResult {
-                    offsets: HashMap::from([
-                        (("topic-a".to_string(), 0), 5),
-                        (("topic-a".to_string(), 1), 9),
-                    ]),
+                    offsets: maplit::hashmap! {("topic-a".to_string(), 0) => 5, ("topic-a".to_string(), 1) => 9},
                     retry: false,
                     unauthorized: BTreeSet::new(),
                 },
@@ -2545,7 +2527,7 @@ mod offset_advance_tests {
                 ListOffsetsResult {
                     offsets: HashMap::new(),
                     retry: true,
-                    unauthorized: BTreeSet::from(["topic-a".to_string()]),
+                    unauthorized: maplit::btreeset! {"topic-a".to_string()},
                 },
             ),
         ] {
@@ -2564,9 +2546,9 @@ mod offset_advance_tests {
         result.unauthorized.insert("topic-a".to_string());
         check!(
             result.authorization().map_err(|e| e.to_string())
-                == Err(ConsumerError::TopicAuthorizationFailed(BTreeSet::from([
-                    "topic-a".to_string()
-                ]))
+                == Err(ConsumerError::TopicAuthorizationFailed(
+                    maplit::btreeset! {"topic-a".to_string()}
+                )
                 .to_string())
         );
     }
@@ -2583,7 +2565,7 @@ mod offset_advance_tests {
             (("topic-a".to_string(), 0), 0),
             (("topic-a".to_string(), 1), 3),
         ];
-        let log_starts = HashMap::from([(("topic-a".to_string(), 0), 5)]);
+        let log_starts = maplit::hashmap! {("topic-a".to_string(), 0) => 5};
         assert2::assert!(
             out_of_range_positions(&out_of_range, &log_starts)
                 == vec![(("topic-a".to_string(), 0), 5)]
@@ -2599,7 +2581,7 @@ mod offset_advance_tests {
     fn out_of_range_truncation_names_the_first_partition_and_its_log_start() {
         for (answered, expected_safe) in [(true, 5), (false, UNKNOWN_OFFSET)] {
             let log_starts = if answered {
-                HashMap::from([(("topic-a".to_string(), 0), 5)])
+                maplit::hashmap! {("topic-a".to_string(), 0) => 5}
             } else {
                 HashMap::new()
             };
@@ -2736,8 +2718,8 @@ pub(crate) mod partition_error_tests {
                 true,
             ))
             .assigned(vec![("orders".into(), 0)])
-            .next_offsets(HashMap::from([(("orders".into(), 0), 5)]))
-            .topic_ids(HashMap::from([("orders".into(), TOPIC_ID)]))
+            .next_offsets(maplit::hashmap! {("orders".into(), 0) => 5})
+            .topic_ids(maplit::hashmap! {"orders".into() => TOPIC_ID})
             .build()
     }
 
@@ -2789,7 +2771,7 @@ pub(crate) mod partition_error_tests {
     async fn poll_returns_a_fatal_rejoin_error_once() {
         let broker = metadata_counting_broker(Arc::default()).await;
         let mut consumer = consumer_on(&broker).await;
-        let topics = std::collections::BTreeSet::from(["orders".to_string()]);
+        let topics = maplit::btreeset! {"orders".to_string()};
         coordinator::report_rejoin_error(
             &consumer.poll_error,
             ConsumerError::TopicAuthorizationFailed(topics.clone()),
@@ -3139,7 +3121,7 @@ pub(crate) mod partition_error_tests {
             (
                 "no reset: the position at the start of poll",
                 PollReset::None,
-                HashMap::from([(orders_0.clone(), (5, -1))]),
+                maplit::hashmap! {orders_0.clone() => (5, -1)},
             ),
             (
                 "out of range under latest: no position until ListOffsets",
@@ -3149,17 +3131,17 @@ pub(crate) mod partition_error_tests {
             (
                 "out of range under earliest: the log start",
                 PollReset::EarliestOutOfRange,
-                HashMap::from([(orders_0.clone(), (2, -1))]),
+                maplit::hashmap! {orders_0.clone() => (2, -1)},
             ),
             (
                 "truncation in a Fetch response: the end offset of the diverging epoch",
                 PollReset::FetchTruncation,
-                HashMap::from([(orders_0.clone(), (3, -1))]),
+                maplit::hashmap! {orders_0.clone() => (3, -1)},
             ),
             (
                 "truncation from validation: the safe offset",
                 PollReset::ValidationTruncation,
-                HashMap::from([(orders_0.clone(), (3, -1))]),
+                maplit::hashmap! {orders_0.clone() => (3, -1)},
             ),
         ];
         let mut actual = Vec::new();
@@ -3219,13 +3201,13 @@ pub(crate) mod partition_error_tests {
                 }
                 PollReset::ValidationTruncation => {
                     consumer
-                        .apply_truncation(&HashMap::from([(orders_0.clone(), 3)]))
+                        .apply_truncation(&maplit::hashmap! {orders_0.clone() => 3})
                         .await
                 }
             };
             result.expect("the reset succeeds");
             let offsets = auto_commit
-                .polled_offsets(&HashMap::from([(orders_0.clone(), 1)]))
+                .polled_offsets(&maplit::hashmap! {orders_0.clone() => 1})
                 .await;
 
             broker.stop();
@@ -3536,8 +3518,6 @@ pub(crate) mod partition_error_tests {
     /// (`OffsetFetcherUtils.handleListOffsetResponse`).
     #[tokio::test]
     async fn list_offsets_goes_to_the_leader_with_the_isolation_level_and_honours_row_errors() {
-        use std::collections::BTreeSet;
-
         let max = list_offsets_request::MAX_VERSION;
         let latest_request =
             |isolation| vec![("leader", max, expected_list_offsets(isolation, -1))];
@@ -3588,9 +3568,9 @@ pub(crate) mod partition_error_tests {
                 latest(IsolationLevel::ReadCommitted, (29, -1)),
                 ListOffsetsOutcome {
                     requests: latest_request(1),
-                    result: Err(PollFailure::TopicAuthorizationFailed(BTreeSet::from([
-                        "orders".to_string(),
-                    ]))),
+                    result: Err(PollFailure::TopicAuthorizationFailed(
+                        maplit::btreeset! {"orders".to_string()},
+                    )),
                     metadata_requests: 1,
                     next_offset: Some(LATEST_SENTINEL),
                 },
@@ -3815,7 +3795,7 @@ pub(crate) mod partition_error_tests {
                 records: Some(timestamp_cases::batch(case).into()),
                 ..Default::default()
             };
-            let offsets = HashMap::from([(key.clone(), timestamp_cases::BASE_OFFSET)]);
+            let offsets = maplit::hashmap! {key.clone() => timestamp_cases::BASE_OFFSET};
 
             let records: Vec<ConsumerRecord> = consumer
                 .process_partition_records(&offsets, &key, "orders", &part)
@@ -4892,8 +4872,8 @@ mod fetch_path_tests {
             InFlightFetch {
                 handle: tokio::spawn(async {}),
                 result: rx,
-                requested: HashMap::from([(key.clone(), 5)]),
-                from_replica: std::collections::HashSet::from([key.clone()]),
+                requested: maplit::hashmap! {key.clone() => 5},
+                from_replica: maplit::hashset! {key.clone()},
             },
         );
         tx.send(Ok(FetchResponse {
@@ -4937,7 +4917,7 @@ mod fetch_path_tests {
             InFlightFetch {
                 handle: tokio::spawn(async {}),
                 result: rx,
-                requested: HashMap::from([(("orders".to_owned(), 0), 5)]),
+                requested: maplit::hashmap! {("orders".to_owned(), 0) => 5},
                 from_replica: std::collections::HashSet::new(),
             },
         );

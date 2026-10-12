@@ -286,7 +286,7 @@ pub(crate) fn orders_partition_commit_identity(generation: i32) -> Arc<Mutex<Com
     Arc::new(Mutex::new(CommitIdentity {
         generation,
         member_id: "member-a".into(),
-        ownership_ids: HashMap::from([(("orders".into(), 0), 1)]),
+        ownership_ids: maplit::hashmap! {("orders".into(), 0) => 1},
         rejoin_on_poll: false,
     }))
 }

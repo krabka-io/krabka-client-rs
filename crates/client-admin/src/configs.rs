@@ -842,7 +842,9 @@ impl AdminClient {
         let (conn, client_options) = (&self.conn, &self.options);
         let node_answers =
             futures_util::future::join_all(by_node.iter().map(|(node_id, resource, ops)| {
-                let request = alter_request(&BTreeMap::from([((*resource).clone(), *ops)]), options);
+                let request = alter_request(&maplit::btreemap! {
+                    (*resource).clone() => *ops,
+                }, options);
                 let target = NodeTarget {
                     node_id: *node_id,
                     supports_controllers: true,

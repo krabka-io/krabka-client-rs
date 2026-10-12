@@ -129,10 +129,7 @@ impl BrokerConnector for RecordingConnector {
     fn finalized_features(connection: &StubConn) -> FinalizedFeatures {
         FinalizedFeatures {
             epoch: i64::from(connection.addr.port() % 10),
-            levels: std::collections::BTreeMap::from([(
-                "transaction.version".to_owned(),
-                i16::try_from(connection.addr.port() % 10).unwrap(),
-            )]),
+            levels: maplit::btreemap! {"transaction.version".to_owned() => i16::try_from(connection.addr.port() % 10).unwrap()},
         }
     }
 }

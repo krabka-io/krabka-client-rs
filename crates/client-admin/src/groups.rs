@@ -67,7 +67,10 @@ use krabka_protocol::owned::{
         OffsetDeleteResponse, OffsetDeleteResponsePartition, OffsetDeleteResponseTopic,
     },
     offset_fetch_request::{OffsetFetchRequest, OffsetFetchRequestGroup},
-    offset_fetch_response::OffsetFetchResponse,
+    offset_fetch_response::{
+        OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponsePartitions,
+        OffsetFetchResponseTopic, OffsetFetchResponseTopics,
+    },
 };
 
 use crate::{
@@ -77,6 +80,19 @@ use crate::{
     retry::{CoordinatorRetry, RetryAction, RetryPolicy, connection_failure_action},
     send_connection_at_least,
 };
+
+macro_rules! group_offset_attempt {
+    ($this:ident, $group:expr, $find_coordinator:expr, $request:expr, $handle:expr) => {{
+        if $find_coordinator && let Err(action) = $this.find_group_coordinator_attempt($group).await
+        {
+            return action;
+        }
+        match $this.conn.send($request).await {
+            Ok(response) => $handle($group, response),
+            Err(error) => connection_failure_action(error),
+        }
+    }};
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerGroupOffsetOutcome {
@@ -101,47 +117,32 @@ trait GroupOffsetResponsePartition {
     fn error_code(&self) -> i16;
 }
 
-impl IntoGroupOffsetResponseTopic for OffsetCommitResponseTopic {
-    type Partition = OffsetCommitResponsePartition;
+macro_rules! impl_group_offset_response {
+    ($topic:ty, $partition:ty) => {
+        impl IntoGroupOffsetResponseTopic for $topic {
+            type Partition = $partition;
 
-    fn into_group_offset_topic(self) -> GroupOffsetResponseTopic<Self::Partition> {
-        GroupOffsetResponseTopic {
-            name: self.name,
-            partitions: self.partitions,
+            fn into_group_offset_topic(self) -> GroupOffsetResponseTopic<Self::Partition> {
+                GroupOffsetResponseTopic {
+                    name: self.name,
+                    partitions: self.partitions,
+                }
+            }
         }
-    }
-}
 
-impl IntoGroupOffsetResponseTopic for OffsetDeleteResponseTopic {
-    type Partition = OffsetDeleteResponsePartition;
-
-    fn into_group_offset_topic(self) -> GroupOffsetResponseTopic<Self::Partition> {
-        GroupOffsetResponseTopic {
-            name: self.name,
-            partitions: self.partitions,
+        impl GroupOffsetResponsePartition for $partition {
+            fn index(&self) -> i32 {
+                self.partition_index
+            }
+            fn error_code(&self) -> i16 {
+                self.error_code
+            }
         }
-    }
+    };
 }
 
-impl GroupOffsetResponsePartition for OffsetCommitResponsePartition {
-    fn index(&self) -> i32 {
-        self.partition_index
-    }
-
-    fn error_code(&self) -> i16 {
-        self.error_code
-    }
-}
-
-impl GroupOffsetResponsePartition for OffsetDeleteResponsePartition {
-    fn index(&self) -> i32 {
-        self.partition_index
-    }
-
-    fn error_code(&self) -> i16 {
-        self.error_code
-    }
-}
+impl_group_offset_response!(OffsetCommitResponseTopic, OffsetCommitResponsePartition);
+impl_group_offset_response!(OffsetDeleteResponseTopic, OffsetDeleteResponsePartition);
 
 fn group_offset_outcomes<T: IntoGroupOffsetResponseTopic>(
     topics: impl IntoIterator<Item = T>,
@@ -245,24 +246,34 @@ impl GroupState {
             Self::NotReady => "NotReady",
         }
     }
-
-    /// Reads a state name without regard to case. A name that the client
-    /// does not know gives [`GroupState::Unknown`], as Kafka's
-    /// `GroupState.parse` does.
-    #[must_use]
-    pub fn parse(name: &str) -> Self {
-        Self::ALL
-            .into_iter()
-            .find(|state| state.as_str().eq_ignore_ascii_case(name))
-            .unwrap_or(Self::Unknown)
-    }
 }
 
-impl std::fmt::Display for GroupState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
+macro_rules! impl_group_name_parse {
+    ($type:ty, $($doc:literal),+ $(,)?) => {
+        impl $type {
+            $(#[doc = $doc])+
+            #[must_use]
+            pub fn parse(name: &str) -> Self {
+                parse_group_name(Self::ALL, name, Self::as_str, Self::Unknown)
+            }
+        }
+    };
 }
+impl_group_name_parse!(
+    GroupState,
+    "Reads a state name without regard to case. A name that the client does not know gives [`GroupState::Unknown`], as Kafka's `GroupState.parse` does."
+);
+
+macro_rules! impl_display_from_as_str {
+    ($type:ty) => {
+        impl std::fmt::Display for $type {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+impl_display_from_as_str!(GroupState);
 
 /// The type of a group, as Apache Kafka's `GroupType` names it.
 ///
@@ -297,24 +308,25 @@ impl GroupType {
             Self::Streams => "Streams",
         }
     }
+}
+impl_group_name_parse!(
+    GroupType,
+    "Reads a type name without regard to case. A name that the client does not know gives [`GroupType::Unknown`], as Kafka's `GroupType.parse` does."
+);
 
-    /// Reads a type name without regard to case. A name that the client does
-    /// not know gives [`GroupType::Unknown`], as Kafka's `GroupType.parse`
-    /// does.
-    #[must_use]
-    pub fn parse(name: &str) -> Self {
-        Self::ALL
-            .into_iter()
-            .find(|group_type| group_type.as_str().eq_ignore_ascii_case(name))
-            .unwrap_or(Self::Unknown)
-    }
+fn parse_group_name<T: Copy>(
+    values: impl IntoIterator<Item = T>,
+    name: &str,
+    as_str: fn(T) -> &'static str,
+    unknown: T,
+) -> T {
+    values
+        .into_iter()
+        .find(|value| as_str(*value).eq_ignore_ascii_case(name))
+        .unwrap_or(unknown)
 }
 
-impl std::fmt::Display for GroupType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+impl_display_from_as_str!(GroupType);
 
 /// The options of [`AdminClient::list_groups`], as Apache Kafka's
 /// `ListGroupsOptions` holds them. An empty set does not filter.
@@ -337,8 +349,14 @@ impl ListGroupsOptions {
     #[must_use]
     pub fn for_consumer_groups() -> Self {
         Self::builder()
-            .types(BTreeSet::from([GroupType::Classic, GroupType::Consumer]))
-            .protocol_types(BTreeSet::from([String::new(), "consumer".to_owned()]))
+            .types(maplit::btreeset! {
+                GroupType::Classic,
+                GroupType::Consumer,
+            })
+            .protocol_types(maplit::btreeset! {
+                String::new(),
+                "consumer".to_owned(),
+            })
             .build()
     }
 
@@ -346,7 +364,9 @@ impl ListGroupsOptions {
     #[must_use]
     pub fn for_share_groups() -> Self {
         Self::builder()
-            .types(BTreeSet::from([GroupType::Share]))
+            .types(maplit::btreeset! {
+                GroupType::Share,
+            })
             .build()
     }
 
@@ -355,7 +375,9 @@ impl ListGroupsOptions {
     #[must_use]
     pub fn for_streams_groups() -> Self {
         Self::builder()
-            .types(BTreeSet::from([GroupType::Streams]))
+            .types(maplit::btreeset! {
+                GroupType::Streams,
+            })
             .build()
     }
 }
@@ -475,12 +497,11 @@ macro_rules! group_offsets_method {
 }
 
 macro_rules! retry_group_call {
-    ($admin:ident, $retry_policy:ident, $attempt:ident, $group:ident, $request:ident) => {{
+    ($retry_policy:expr, |$find:ident| $attempt:expr) => {{
         let mut retry = CoordinatorRetry::new($retry_policy);
         loop {
-            let action = retry
-                .run($admin.$attempt($group, $request, retry.find_coordinator()))
-                .await;
+            let $find = retry.find_coordinator();
+            let action = retry.run($attempt).await;
             if let Some(result) = retry.next(action).await {
                 return result;
             }
@@ -540,17 +561,12 @@ impl AdminClient {
         update: GroupOffsetUpdate<'_>,
         retry: RetryPolicy,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let attempt = GroupOffsetAttempt {
+        retry_group_call!(retry, |find_coordinator| {
+            self.alter_group_offsets_attempt(GroupOffsetAttempt {
                 update,
-                find_coordinator: retry.find_coordinator(),
-            };
-            let action = retry.run(self.alter_group_offsets_attempt(attempt)).await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
+                find_coordinator,
+            })
+        })
     }
 
     /// Sends one update attempt, finding the coordinator first when requested.
@@ -773,15 +789,7 @@ impl AdminClient {
         group: &str,
         retry: RetryPolicy,
     ) -> Result<GroupOffsets, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.offset_fetch_attempt(group, retry.find_coordinator()))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
+        retry_group_call!(retry, |find| self.offset_fetch_attempt(group, find))
     }
 
     /// One attempt of `list_consumer_group_offsets`. When `find_coordinator`
@@ -792,13 +800,10 @@ impl AdminClient {
         group: &str,
         find_coordinator: bool,
     ) -> RetryAction<GroupOffsets> {
-        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
-            return action;
-        }
-        match self.conn.send(offset_fetch_request(group)).await {
-            Ok(response) => offset_fetch_retry_action(committed_offsets(group, response)),
-            Err(error) => connection_failure_action(error),
-        }
+        let request = offset_fetch_request(group);
+        group_offset_attempt!(self, group, find_coordinator, request, |group, response| {
+            offset_fetch_retry_action(committed_offsets(group, response))
+        })
     }
 
     /// Finds the group coordinator and connects to it. A `FindCoordinator`
@@ -865,7 +870,8 @@ impl AdminClient {
         partitions: &[(String, i32)],
         retry: RetryPolicy,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
-        retry_group_call!(self, retry, offset_delete_attempt, group, partitions)
+        retry_group_call!(retry, |find| self
+            .offset_delete_attempt(group, partitions, find))
     }
 
     async fn offset_delete_attempt(
@@ -874,17 +880,10 @@ impl AdminClient {
         partitions: &[(String, i32)],
         find_coordinator: bool,
     ) -> RetryAction<Vec<ConsumerGroupOffsetOutcome>> {
-        if find_coordinator && let Err(action) = self.find_group_coordinator_attempt(group).await {
-            return action;
-        }
-        match self
-            .conn
-            .send(offset_delete_request(group, partitions))
-            .await
-        {
-            Ok(response) => offset_delete_retry_action(group, response),
-            Err(error) => connection_failure_action(error),
-        }
+        let request = offset_delete_request(group, partitions);
+        group_offset_attempt!(self, group, find_coordinator, request, |group, response| {
+            offset_delete_retry_action(group, response)
+        })
     }
 
     /// Removes members from a consumer group without waiting for their
@@ -996,7 +995,7 @@ impl AdminClient {
         members: &[MemberIdentity],
         retry: RetryPolicy,
     ) -> Result<RemovedMembers, AdminError> {
-        retry_group_call!(self, retry, leave_group_attempt, group, members)
+        retry_group_call!(retry, |find| self.leave_group_attempt(group, members, find))
     }
 
     async fn leave_group_attempt(
@@ -1094,19 +1093,9 @@ impl AdminClient {
         topics: &[String],
         retry: RetryPolicy,
     ) -> Result<Vec<(String, Option<KafkaError>)>, AdminError> {
-        let mut retry = CoordinatorRetry::new(retry);
-        loop {
-            let action = retry
-                .run(self.delete_share_group_offsets_attempt(
-                    group,
-                    topics,
-                    retry.find_coordinator(),
-                ))
-                .await;
-            if let Some(result) = retry.next(action).await {
-                return result;
-            }
-        }
+        retry_group_call!(retry, |find| {
+            self.delete_share_group_offsets_attempt(group, topics, find)
+        })
     }
 
     async fn delete_share_group_offsets_attempt(
@@ -1122,10 +1111,7 @@ impl AdminClient {
             group_id: group.into(),
             topics: topics
                 .iter()
-                .map(|topic_name| DeleteShareGroupOffsetsRequestTopic {
-                    topic_name: topic_name.clone(),
-                    ..Default::default()
-                })
+                .map(|topic_name| delete_share_offset_topic(topic_name))
                 .collect(),
             ..Default::default()
         };
@@ -1134,6 +1120,12 @@ impl AdminClient {
             Err(error) => connection_failure_action(error),
         }
     }
+}
+
+fn delete_share_offset_topic(topic_name: &str) -> DeleteShareGroupOffsetsRequestTopic {
+    let mut topic = DeleteShareGroupOffsetsRequestTopic::default();
+    topic.topic_name = topic_name.to_owned();
+    topic
 }
 
 /// `COORDINATOR_LOAD_IN_PROGRESS`: the coordinator is loading the group.
@@ -1195,11 +1187,24 @@ fn offset_commit_retry_action(
     {
         RetryAction::SameCoordinator(Ok(outcomes))
     } else {
-        RetryAction::Done(Ok(outcomes))
+        completed_group_offsets(outcomes)
     }
 }
 
 /// Builds an `OffsetDelete` request for the named partitions of `group`.
+macro_rules! offset_request_topics {
+    ($topics:expr, $topic_type:ident) => {
+        $topics
+            .into_iter()
+            .map(|(name, partitions)| $topic_type {
+                name,
+                partitions,
+                ..Default::default()
+            })
+            .collect()
+    };
+}
+
 fn offset_delete_request(group: &str, partitions: &[(String, i32)]) -> OffsetDeleteRequest {
     let mut topics = BTreeMap::<String, Vec<OffsetDeleteRequestPartition>>::new();
     for (topic, partition) in partitions {
@@ -1213,14 +1218,7 @@ fn offset_delete_request(group: &str, partitions: &[(String, i32)]) -> OffsetDel
     }
     OffsetDeleteRequest {
         group_id: group.into(),
-        topics: topics
-            .into_iter()
-            .map(|(name, partitions)| OffsetDeleteRequestTopic {
-                name,
-                partitions,
-                ..Default::default()
-            })
-            .collect(),
+        topics: offset_request_topics!(topics, OffsetDeleteRequestTopic),
         ..Default::default()
     }
 }
@@ -1244,7 +1242,7 @@ fn offset_delete_retry_action(
         return group_coordinator_error_action(response.error_code, result);
     }
     let outcomes = group_offset_outcomes(response.topics);
-    RetryAction::Done(Ok(outcomes))
+    completed_group_offsets(outcomes)
 }
 
 /// A `LeaveGroup` request that always carries its member list, needing v3.
@@ -1419,6 +1417,28 @@ fn share_group_coordinator_error_action<T>(
     }
 }
 
+fn completed_group_offsets<T>(outcomes: T) -> RetryAction<T> {
+    RetryAction::Done(Ok(outcomes))
+}
+
+fn map_group_topic_rows<T, Rows, P, O>(
+    topics: impl IntoIterator<Item = T>,
+    mut rows: impl FnMut(T) -> (String, Rows),
+    mut outcome: impl FnMut(String, P) -> O,
+) -> Vec<O>
+where
+    Rows: IntoIterator<Item = P>,
+{
+    let mut outcomes = Vec::new();
+    for topic in topics {
+        let (name, partitions) = rows(topic);
+        for partition in partitions {
+            outcomes.push(outcome(name.clone(), partition));
+        }
+    }
+    outcomes
+}
+
 /// Maps one `AlterShareGroupOffsets` answer to a retry action, as Kafka's
 /// `AlterShareGroupOffsetsHandler.handleResponse` does. A top-level
 /// `COORDINATOR_LOAD_IN_PROGRESS` or `REBALANCE_IN_PROGRESS` retries on the
@@ -1448,22 +1468,16 @@ fn alter_share_group_offsets_retry_action(
                 .collect())
         });
     }
-    let outcomes = response
-        .responses
-        .into_iter()
-        .flat_map(|topic| {
-            let name = topic.topic_name;
-            topic
-                .partitions
-                .into_iter()
-                .map(move |partition| ConsumerGroupOffsetOutcome {
-                    topic: name.clone(),
-                    partition: partition.partition_index,
-                    error: kafka_error_if(partition.error_code, partition.error_message),
-                })
-        })
-        .collect();
-    RetryAction::Done(Ok(outcomes))
+    let outcomes = map_group_topic_rows(
+        response.responses,
+        |topic| (topic.topic_name, topic.partitions),
+        |topic, partition| ConsumerGroupOffsetOutcome {
+            topic,
+            partition: partition.partition_index,
+            error: kafka_error_if(partition.error_code, partition.error_message),
+        },
+    );
+    completed_group_offsets(outcomes)
 }
 
 /// Maps one `DeleteShareGroupOffsets` answer to a retry action, as Kafka's
@@ -1484,17 +1498,17 @@ fn delete_share_group_offsets_retry_action(
         };
         return share_group_coordinator_error_action(response.error_code, error, Err);
     }
-    let outcomes = response
-        .responses
-        .into_iter()
-        .map(|topic| {
+    let outcomes = map_group_topic_rows(
+        response.responses,
+        |topic| {
             (
                 topic.topic_name,
-                kafka_error_if(topic.error_code, topic.error_message),
+                std::iter::once((topic.error_code, topic.error_message)),
             )
-        })
-        .collect();
-    RetryAction::Done(Ok(outcomes))
+        },
+        |topic, (code, message)| (topic, kafka_error_if(code, message)),
+    );
+    completed_group_offsets(outcomes)
 }
 
 /// The lowest `ListGroups` version that carries the filters of `options`, as
@@ -1705,17 +1719,21 @@ pub(crate) fn list_groups_kafka_error(error: &AdminError) -> KafkaError {
 /// `groups` array, so it is valid at each negotiated version. Kafka's
 /// `OffsetFetchRequest.Builder.maybeDowngrade` moves the group into the v2 to
 /// v7 fields in the same way.
+fn offset_fetch_group(group: &str) -> OffsetFetchRequestGroup {
+    OffsetFetchRequestGroup {
+        group_id: group.into(),
+        member_id: None,
+        member_epoch: -1,
+        topics: None,
+        ..Default::default()
+    }
+}
+
 fn offset_fetch_request(group: &str) -> AllTopicsOffsetFetch {
     AllTopicsOffsetFetch::new(OffsetFetchRequest {
         group_id: group.into(),
         topics: None,
-        groups: vec![OffsetFetchRequestGroup {
-            group_id: group.into(),
-            member_id: None,
-            member_epoch: -1,
-            topics: None,
-            ..Default::default()
-        }],
+        groups: vec![offset_fetch_group(group)],
         require_stable: false,
         ..Default::default()
     })
@@ -1738,17 +1756,7 @@ fn committed_offsets(
             response
                 .topics
                 .into_iter()
-                .flat_map(|topic| {
-                    let name = topic.name;
-                    topic.partitions.into_iter().map(move |partition| {
-                        (
-                            name.clone(),
-                            partition.partition_index,
-                            partition.committed_offset,
-                            partition.error_code,
-                        )
-                    })
-                })
+                .flat_map(offset_fetch_topic_rows)
                 .collect(),
         )
     } else {
@@ -1761,15 +1769,7 @@ fn committed_offsets(
         {
             error_code = entry.error_code;
             for topic in entry.topics {
-                let name = topic.name;
-                rows.extend(topic.partitions.into_iter().map(|partition| {
-                    (
-                        name.clone(),
-                        partition.partition_index,
-                        partition.committed_offset,
-                        partition.error_code,
-                    )
-                }));
+                rows.extend(offset_fetch_topic_rows(topic));
             }
         }
         (error_code, rows)
@@ -1802,6 +1802,57 @@ fn committed_offsets(
         .collect())
 }
 
+trait IntoOffsetFetchRow {
+    fn into_offset_fetch_row(self, topic: &str) -> (String, i32, i64, i16);
+}
+
+macro_rules! impl_offset_fetch_row {
+    ($partition:ty) => {
+        impl IntoOffsetFetchRow for $partition {
+            fn into_offset_fetch_row(self, topic: &str) -> (String, i32, i64, i16) {
+                (
+                    topic.to_owned(),
+                    self.partition_index,
+                    self.committed_offset,
+                    self.error_code,
+                )
+            }
+        }
+    };
+}
+
+impl_offset_fetch_row!(OffsetFetchResponsePartition);
+impl_offset_fetch_row!(OffsetFetchResponsePartitions);
+
+trait IntoOffsetFetchTopics {
+    type Partition: IntoOffsetFetchRow;
+
+    fn into_offset_fetch_parts(self) -> (String, Vec<Self::Partition>);
+}
+
+macro_rules! impl_offset_fetch_topics {
+    ($topics:ty, $partition:ty) => {
+        impl IntoOffsetFetchTopics for $topics {
+            type Partition = $partition;
+
+            fn into_offset_fetch_parts(self) -> (String, Vec<Self::Partition>) {
+                (self.name, self.partitions)
+            }
+        }
+    };
+}
+
+impl_offset_fetch_topics!(OffsetFetchResponseTopic, OffsetFetchResponsePartition);
+impl_offset_fetch_topics!(OffsetFetchResponseTopics, OffsetFetchResponsePartitions);
+
+fn offset_fetch_topic_rows<T: IntoOffsetFetchTopics>(topic: T) -> Vec<(String, i32, i64, i16)> {
+    let (name, partitions) = topic.into_offset_fetch_parts();
+    partitions
+        .into_iter()
+        .map(|partition| partition.into_offset_fetch_row(&name))
+        .collect()
+}
+
 fn offset_commit_request(group: &str, offsets: &GroupOffsets) -> TopicNameOffsetCommit {
     let mut topics = BTreeMap::<String, Vec<OffsetCommitRequestPartition>>::new();
     for ((topic, partition), offset) in offsets {
@@ -1821,14 +1872,7 @@ fn offset_commit_request(group: &str, offsets: &GroupOffsets) -> TopicNameOffset
         group_id: group.into(),
         generation_id_or_member_epoch: -1,
         member_id: String::new(),
-        topics: topics
-            .into_iter()
-            .map(|(name, partitions)| OffsetCommitRequestTopic {
-                name,
-                partitions,
-                ..Default::default()
-            })
-            .collect(),
+        topics: offset_request_topics!(topics, OffsetCommitRequestTopic),
         ..Default::default()
     })
 }
@@ -1882,24 +1926,38 @@ mod tests {
 
     use super::*;
 
+    fn test_group_offsets() -> GroupOffsets {
+        maplit::btreemap! { ("orders".into(), 2) => 41 }
+    }
+
     #[test]
     fn offset_reset_builds_admin_commit() {
-        let offsets = BTreeMap::from([(("orders".into(), 2), 41)]);
+        let offsets = test_group_offsets();
         let request = offset_commit_request("worker", &offsets);
-        let expected = TopicNameOffsetCommit::new(OffsetCommitRequest {
-            group_id: "worker".into(),
+        let expected = TopicNameOffsetCommit::new(commit_request_for_test("worker", 0, 0));
+        assert!(request == expected);
+    }
+
+    fn commit_request_for_test(
+        group_id: &str,
+        generation_id_or_member_epoch: i32,
+        committed_leader_epoch: i32,
+    ) -> OffsetCommitRequest {
+        OffsetCommitRequest {
+            group_id: group_id.into(),
+            generation_id_or_member_epoch,
             topics: vec![OffsetCommitRequestTopic {
                 name: "orders".into(),
                 partitions: vec![OffsetCommitRequestPartition {
                     partition_index: 2,
                     committed_offset: 41,
+                    committed_leader_epoch,
                     ..Default::default()
                 }],
                 ..Default::default()
             }],
             ..Default::default()
-        });
-        assert!(request == expected);
+        }
     }
 
     fn encode(response: &impl Encode, version: i16, flexible: bool) -> Vec<u8> {
@@ -1909,6 +1967,14 @@ mod tests {
         }
         response.encode(&mut bytes, version).unwrap();
         bytes.to_vec()
+    }
+
+    fn encode_flexible(response: &impl Encode, version: i16) -> Vec<u8> {
+        encode(response, version, true)
+    }
+
+    fn broker_port(addr: std::net::SocketAddr) -> i32 {
+        i32::from(addr.port())
     }
 
     struct MockBrokerAddress {
@@ -1921,8 +1987,30 @@ mod tests {
         MockBrokerAddress {
             node_id,
             host: addr.ip().to_string(),
-            port: i32::from(addr.port()),
+            port: broker_port(addr),
         }
+    }
+
+    macro_rules! broker_fields {
+        ($type:ident, $broker:expr) => {
+            $type {
+                node_id: $broker.node_id,
+                host: $broker.host,
+                port: $broker.port,
+                ..Default::default()
+            }
+        };
+    }
+
+    fn mock_metadata_broker(addr: std::net::SocketAddr, node_id: i32) -> MetadataResponseBroker {
+        let broker = mock_broker_address(addr, node_id);
+        broker_fields!(MetadataResponseBroker, broker)
+    }
+
+    async fn connect_admin(addr: std::net::SocketAddr, message: &'static str) -> AdminClient {
+        AdminClient::connect(&[addr.to_string()])
+            .await
+            .expect(message)
     }
 
     fn mock_coordinator_response(
@@ -1930,13 +2018,9 @@ mod tests {
         error_code: i16,
     ) -> FindCoordinatorResponse {
         let broker = mock_broker_address(addr, 2);
-        FindCoordinatorResponse {
-            error_code,
-            node_id: broker.node_id,
-            host: broker.host,
-            port: broker.port,
-            ..Default::default()
-        }
+        let mut response = broker_fields!(FindCoordinatorResponse, broker);
+        response.error_code = error_code;
+        response
     }
 
     fn incompatible_version(error: AdminError, case: &str) -> (i16, i16, i16, i16, i16) {
@@ -1952,6 +2036,15 @@ mod tests {
         }
     }
 
+    async fn with_incompatible_version<T>(
+        case: &'static str,
+        result: impl std::future::Future<Output = Result<T, AdminError>>,
+    ) -> Result<T, (i16, i16, i16, i16, i16)> {
+        result
+            .await
+            .map_err(|error| incompatible_version(error, case))
+    }
+
     /// The `OffsetCommit` and `OffsetFetch` version ranges that a mock broker
     /// advertises.
     #[derive(Clone, Copy)]
@@ -1960,47 +2053,61 @@ mod tests {
         offset_fetch: (i16, i16),
     }
 
-    /// An `ApiVersions` response that advertises `ranges`.
-    fn api_versions(ranges: GroupRanges) -> Vec<u8> {
+    impl GroupRanges {
+        fn offset_commit() -> Self {
+            Self {
+                offset_commit: (2, 10),
+                offset_fetch: (2, 10),
+            }
+        }
+
+        fn offset_fetch(offset_fetch: (i16, i16)) -> Self {
+            Self {
+                offset_commit: (2, 9),
+                offset_fetch,
+            }
+        }
+    }
+
+    fn encode_api_versions(api_keys: Vec<ApiVersion>) -> Vec<u8> {
         encode(
             &ApiVersionsResponse {
-                api_keys: vec![
-                    ApiVersion {
-                        api_key: api_versions_request::API_KEY,
-                        min_version: 0,
-                        max_version: 0,
-                        ..Default::default()
-                    },
-                    ApiVersion {
-                        api_key: find_coordinator_request::API_KEY,
-                        min_version: 0,
-                        max_version: 0,
-                        ..Default::default()
-                    },
-                    ApiVersion {
-                        api_key: offset_commit_request::API_KEY,
-                        min_version: ranges.offset_commit.0,
-                        max_version: ranges.offset_commit.1,
-                        ..Default::default()
-                    },
-                    ApiVersion {
-                        api_key: offset_fetch_request::API_KEY,
-                        min_version: ranges.offset_fetch.0,
-                        max_version: ranges.offset_fetch.1,
-                        ..Default::default()
-                    },
-                    ApiVersion {
-                        api_key: metadata_request::API_KEY,
-                        min_version: 13,
-                        max_version: 13,
-                        ..Default::default()
-                    },
-                ],
+                api_keys,
                 ..Default::default()
             },
             0,
             false,
         )
+    }
+
+    macro_rules! api_version_entry {
+        ($key:expr, $min:expr, $max:expr) => {
+            ApiVersion {
+                api_key: $key,
+                min_version: $min,
+                max_version: $max,
+                ..Default::default()
+            }
+        };
+    }
+
+    /// An `ApiVersions` response that advertises `ranges`.
+    fn api_versions(ranges: GroupRanges) -> Vec<u8> {
+        encode_api_versions(vec![
+            api_version_entry!(api_versions_request::API_KEY, 0, 0),
+            api_version_entry!(find_coordinator_request::API_KEY, 0, 0),
+            api_version_entry!(
+                offset_commit_request::API_KEY,
+                ranges.offset_commit.0,
+                ranges.offset_commit.1
+            ),
+            api_version_entry!(
+                offset_fetch_request::API_KEY,
+                ranges.offset_fetch.0,
+                ranges.offset_fetch.1
+            ),
+            api_version_entry!(metadata_request::API_KEY, 13, 13),
+        ])
     }
 
     /// Decodes a request body of type `R` behind its request header.
@@ -2026,12 +2133,7 @@ mod tests {
         MockBroker::start(move |api_key, version, _, _| match api_key {
             api_versions_request::API_KEY => Some(api_versions(ranges)),
             find_coordinator_request::API_KEY => Some(encode(
-                &FindCoordinatorResponse {
-                    node_id: 2,
-                    host: coordinator_addr.ip().to_string(),
-                    port: i32::from(coordinator_addr.port()),
-                    ..Default::default()
-                },
+                &mock_coordinator_response(coordinator_addr, 0),
                 version,
                 false,
             )),
@@ -2043,7 +2145,7 @@ mod tests {
                 group_rpcs.fetch_add(1, Ordering::SeqCst);
                 Some(encode(&OffsetFetchResponse::default(), version, true))
             }
-            metadata_request::API_KEY => Some(encode(&MetadataResponse::default(), version, true)),
+            metadata_request::API_KEY => empty_metadata_reply(version),
             _ => None,
         })
         .await
@@ -2054,31 +2156,29 @@ mod tests {
         admin: AdminClient,
     }
 
-    impl GroupAdminConnection {
-        fn stop_and_take_requests<T: Clone>(
-            self,
-            coordinator: MockBroker,
-            requests: Arc<Mutex<Vec<T>>>,
-        ) -> Vec<T> {
-            stop_group_brokers(self.bootstrap, coordinator);
-            requests.lock().expect("requests lock").clone()
-        }
-    }
-
     async fn connect_group_admin(
         coordinator: &MockBroker,
         ranges: GroupRanges,
     ) -> GroupAdminConnection {
         let bootstrap = bootstrap_for(coordinator, ranges, Arc::default()).await;
-        let admin = AdminClient::connect(&[bootstrap.addr.to_string()])
-            .await
-            .expect("admin connects");
+        let admin = connect_admin(bootstrap.addr, "admin connects").await;
         GroupAdminConnection { bootstrap, admin }
     }
 
     fn stop_group_brokers(bootstrap: MockBroker, coordinator: MockBroker) {
         bootstrap.stop();
         coordinator.stop();
+    }
+
+    fn record_group_request<Request>(
+        requests: &Arc<Mutex<Vec<(i16, Request)>>>,
+        version: i16,
+        request: Request,
+    ) {
+        requests
+            .lock()
+            .expect("requests lock")
+            .push((version, request));
     }
 
     struct GroupVersionAssertion<Request, Output> {
@@ -2101,6 +2201,92 @@ mod tests {
         );
     }
 
+    struct ExpectedGroupVersionCase<Request, Output> {
+        name: &'static str,
+        ranges: GroupRanges,
+        requests: Vec<(i16, Request)>,
+        result: Output,
+    }
+
+    fn expected_group_version_case<Request, Output>(
+        name: &'static str,
+        ranges: GroupRanges,
+        requests: Vec<(i16, Request)>,
+        result: Output,
+    ) -> ExpectedGroupVersionCase<Request, Output> {
+        ExpectedGroupVersionCase {
+            name,
+            ranges,
+            requests,
+            result,
+        }
+    }
+
+    fn incompatible_group_version<T>(
+        api_key: i16,
+        broker_min: i16,
+        broker_max: i16,
+    ) -> Result<T, (i16, i16, i16, i16, i16)> {
+        Err((api_key, broker_min, broker_max, 2, 9))
+    }
+
+    async fn run_group_version_case<Request, Output, Respond, Action, Fut>(
+        case: ExpectedGroupVersionCase<Request, Output>,
+        api_key: i16,
+        respond: Respond,
+        action: Action,
+    ) where
+        Request: ProtocolRequest
+            + for<'de> Decode<'de>
+            + Clone
+            + PartialEq
+            + std::fmt::Debug
+            + Send
+            + 'static,
+        Output: PartialEq + std::fmt::Debug,
+        Respond: Fn(&Request, i16) -> Vec<u8> + Copy + Send + Sync + 'static,
+        Action: FnOnce(&'static str, AdminClient) -> Fut,
+        Fut: std::future::Future<Output = Output>,
+    {
+        let ranges = case.ranges;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let metadata_requests = Arc::new(AtomicUsize::new(0));
+        let metadata_count = Arc::clone(&metadata_requests);
+        let coordinator =
+            MockBroker::start(move |request_api, version, _, body| match request_api {
+                api_versions_request::API_KEY => Some(api_versions(ranges)),
+                request_api if request_api == api_key => {
+                    let request = decode_request(body, version);
+                    let response = respond(&request, version);
+                    record_group_request(&recorded, version, request);
+                    Some(response)
+                }
+                metadata_request::API_KEY => {
+                    counted_reply(&metadata_count, empty_metadata_reply(version))
+                }
+                _ => None,
+            })
+            .await;
+        let GroupAdminConnection { bootstrap, admin } =
+            connect_group_admin(&coordinator, ranges).await;
+        let result = action(case.name, admin).await;
+        stop_group_brokers(bootstrap, coordinator);
+        let requests = requests.lock().expect("requests lock").clone();
+        assert!(
+            metadata_requests.load(Ordering::SeqCst) == 0,
+            "case {}",
+            case.name
+        );
+        assert_group_version_case(GroupVersionAssertion {
+            name: case.name,
+            requests,
+            result,
+            expected_requests: case.requests,
+            expected_result: case.result,
+        });
+    }
+
     /// The negotiated `OffsetCommit` version and the result of
     /// `alter_consumer_group_offsets`, with a version error as its ranges.
     type CommitResult = Result<Vec<ConsumerGroupOffsetOutcome>, (i16, i16, i16, i16, i16)>;
@@ -2108,99 +2294,65 @@ mod tests {
     /// Apache Kafka's `AlterConsumerGroupOffsetsHandler` builds `OffsetCommit`
     /// with `OffsetCommitRequest.Builder.forTopicNames`, which caps the version
     /// at 9. The request names each topic at every negotiated version.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn alter_consumer_group_offsets_sends_offset_commit_by_topic_name() {
-        let sent_request = |version| {
-            vec![(
-                version,
-                OffsetCommitRequest {
-                    group_id: "workers".into(),
-                    generation_id_or_member_epoch: -1,
-                    topics: vec![OffsetCommitRequestTopic {
-                        name: "orders".into(),
-                        partitions: vec![OffsetCommitRequestPartition {
-                            partition_index: 2,
-                            committed_offset: 41,
-                            committed_leader_epoch: -1,
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-            )]
-        };
+    fn commit_group_version_cases()
+    -> Vec<ExpectedGroupVersionCase<OffsetCommitRequest, CommitResult>> {
         let committed = Ok(successful_group_offset_outcome());
-        for (name, offset_commit_range, expected_requests, expected_result) in [
-            (
+        let commit_case = |name, requests, result| {
+            expected_group_version_case(name, GroupRanges::offset_commit(), requests, result)
+        };
+        let sent_request = |version| vec![(version, commit_request_for_test("workers", -1, -1))];
+        vec![
+            commit_case(
                 "coordinator stops at v7",
-                (2, 7),
                 sent_request(7),
                 committed.clone(),
             ),
-            (
+            commit_case(
                 "coordinator stops at v9",
-                (2, 9),
                 sent_request(9),
                 committed.clone(),
             ),
-            (
-                "coordinator supports v10",
-                (2, 10),
-                sent_request(9),
-                committed.clone(),
-            ),
-            (
+            commit_case("coordinator supports v10", sent_request(9), committed),
+            commit_case(
                 "coordinator supports only v10",
-                (10, 10),
                 Vec::new(),
-                Err((offset_commit_request::API_KEY, 10, 10, 2, 9)),
+                incompatible_group_version(offset_commit_request::API_KEY, 10, 10),
             ),
-        ] {
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let requests_in_mock = Arc::clone(&requests);
-            let ranges = GroupRanges {
-                offset_commit: offset_commit_range,
-                offset_fetch: (2, 10),
-            };
-            let coordinator = MockBroker::start(move |api_key, version, _, body| match api_key {
-                api_versions_request::API_KEY => Some(api_versions(ranges)),
-                offset_commit_request::API_KEY => {
-                    let request: OffsetCommitRequest = decode_request(body, version);
-                    let response = offset_commit_response(&request, |_| 0);
-                    requests_in_mock
-                        .lock()
-                        .expect("requests lock")
-                        .push((version, request));
-                    Some(encode(
-                        &response,
-                        version,
-                        version >= offset_commit_request::FLEXIBLE_MIN,
-                    ))
-                }
-                _ => None,
-            })
-            .await;
-            let mut connection = connect_group_admin(&coordinator, ranges).await;
+        ]
+    }
 
-            let result: CommitResult = connection
-                .admin
-                .alter_consumer_group_offsets(
-                    "workers",
-                    &BTreeMap::from([(("orders".into(), 2), 41)]),
+    #[yare::parameterized(
+        coordinator_stops_at_v7 = { 0 },
+        coordinator_stops_at_v9 = { 1 },
+        coordinator_supports_v10 = { 2 },
+        coordinator_only_supports_v10 = { 3 },
+    )]
+    fn alter_consumer_group_offsets_sends_offset_commit_by_topic_name(index: usize) {
+        let case = commit_group_version_cases().remove(index);
+        block_on_test(run_group_version_case(
+            case,
+            offset_commit_request::API_KEY,
+            |request, version| {
+                encode(
+                    &offset_commit_response(request, |_| 0),
+                    version,
+                    version >= offset_commit_request::FLEXIBLE_MIN,
                 )
-                .await
-                .map_err(|error| incompatible_version(error, name));
+            },
+            commit_group_offsets_by_topic,
+        ));
+    }
 
-            let requests = connection.stop_and_take_requests(coordinator, requests);
-            assert_group_version_case(GroupVersionAssertion {
-                name,
-                requests,
-                result,
-                expected_requests,
-                expected_result,
-            });
-        }
+    async fn commit_group_offsets_by_topic(
+        name: &'static str,
+        mut admin: AdminClient,
+    ) -> CommitResult {
+        let offsets = test_group_offsets();
+        with_incompatible_version(
+            name,
+            admin.alter_consumer_group_offsets("workers", &offsets),
+        )
+        .await
     }
 
     macro_rules! offset_fetch_topics {
@@ -2265,8 +2417,12 @@ mod tests {
     /// with `OffsetFetchRequest.Builder.forTopicNames`, which caps the version
     /// at 9. A request for all topics also needs v2. The response names each
     /// topic, so the call sends no `Metadata` request.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_consumer_group_offsets_sends_offset_fetch_by_topic_name() {
+    fn fetch_group_version_cases() -> Vec<ExpectedGroupVersionCase<OffsetFetchRequest, FetchResult>>
+    {
+        let fetched = Ok(test_group_offsets());
+        let case = |name, ranges, requests, result| {
+            expected_group_version_case(name, GroupRanges::offset_fetch(ranges), requests, result)
+        };
         let legacy_request = |version| {
             vec![(
                 version,
@@ -2281,103 +2437,81 @@ mod tests {
             vec![(
                 version,
                 OffsetFetchRequest {
-                    groups: vec![OffsetFetchRequestGroup {
-                        group_id: "workers".into(),
-                        member_id: None,
-                        member_epoch: -1,
-                        topics: None,
-                        ..Default::default()
-                    }],
+                    groups: vec![offset_fetch_group("workers")],
                     ..Default::default()
                 },
             )]
         };
-        let fetched = Ok(BTreeMap::from([(("orders".into(), 2), 41)]));
-        for (name, offset_fetch_range, expected_requests, expected_result) in [
-            (
+        vec![
+            case(
                 "coordinator stops at v7",
                 (2, 7),
                 legacy_request(7),
                 fetched.clone(),
             ),
-            (
+            case(
                 "coordinator stops at v8",
                 (2, 8),
                 grouped_request(8),
                 fetched.clone(),
             ),
-            (
+            case(
                 "coordinator stops at v9",
                 (2, 9),
                 grouped_request(9),
                 fetched.clone(),
             ),
-            (
+            case(
                 "coordinator supports v10",
                 (2, 10),
                 grouped_request(9),
-                fetched.clone(),
+                fetched,
             ),
-            (
+            case(
                 "coordinator supports only v10",
                 (10, 10),
                 Vec::new(),
-                Err((offset_fetch_request::API_KEY, 10, 10, 2, 9)),
+                incompatible_group_version(offset_fetch_request::API_KEY, 10, 10),
             ),
-            (
+            case(
                 "coordinator supports only v1",
                 (1, 1),
                 Vec::new(),
-                Err((offset_fetch_request::API_KEY, 1, 1, 2, 9)),
+                incompatible_group_version(offset_fetch_request::API_KEY, 1, 1),
             ),
-        ] {
-            let ranges = GroupRanges {
-                offset_commit: (2, 9),
-                offset_fetch: offset_fetch_range,
-            };
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let requests_in_mock = Arc::clone(&requests);
-            let metadata_requests = Arc::new(AtomicUsize::new(0));
-            let metadata_requests_in_mock = Arc::clone(&metadata_requests);
-            let coordinator = MockBroker::start(move |api_key, version, _, body| match api_key {
-                api_versions_request::API_KEY => Some(api_versions(ranges)),
-                offset_fetch_request::API_KEY => {
-                    let request: OffsetFetchRequest = decode_request(body, version);
-                    requests_in_mock
-                        .lock()
-                        .expect("requests lock")
-                        .push((version, request));
-                    Some(encode(
-                        &offset_fetch_response(version),
-                        version,
-                        version >= offset_fetch_request::FLEXIBLE_MIN,
-                    ))
-                }
-                metadata_request::API_KEY => {
-                    metadata_requests_in_mock.fetch_add(1, Ordering::SeqCst);
-                    Some(encode(&MetadataResponse::default(), version, true))
-                }
-                _ => None,
-            })
-            .await;
-            let mut connection = connect_group_admin(&coordinator, ranges).await;
+        ]
+    }
 
-            let result: FetchResult = connection
-                .admin
-                .list_consumer_group_offsets("workers")
-                .await
-                .map_err(|error| incompatible_version(error, name));
+    async fn fetch_group_offsets_by_topic(
+        name: &'static str,
+        mut admin: AdminClient,
+    ) -> FetchResult {
+        let offsets = admin.list_consumer_group_offsets("workers");
+        with_incompatible_version(name, offsets).await
+    }
 
-            let requests = connection.stop_and_take_requests(coordinator, requests);
-            assert!(metadata_requests.load(Ordering::SeqCst) == 0, "case {name}");
-            assert_group_version_case(GroupVersionAssertion {
-                name,
-                requests,
-                result,
-                expected_requests,
-                expected_result,
-            });
-        }
+    #[yare::parameterized(
+        coordinator_stops_at_v7 = { 0 },
+        coordinator_stops_at_v8 = { 1 },
+        coordinator_stops_at_v9 = { 2 },
+        coordinator_supports_v10 = { 3 },
+        coordinator_only_supports_v10 = { 4 },
+        coordinator_only_supports_v1 = { 5 },
+    )]
+    fn list_consumer_group_offsets_sends_offset_fetch_by_topic_name(index: usize) {
+        let case = fetch_group_version_cases().remove(index);
+        block_on_test(run_group_version_case(
+            case,
+            offset_fetch_request::API_KEY,
+            |_, version| {
+                encode(
+                    &offset_fetch_response(version),
+                    version,
+                    version >= offset_fetch_request::FLEXIBLE_MIN,
+                )
+            },
+            fetch_group_offsets_by_topic,
+        ));
     }
 
     /// The result of `committed_offsets`, with a broker error as its fields.
@@ -2385,58 +2519,34 @@ mod tests {
 
     /// Kafka's `OffsetFetchResponse.group` reads the group error code from the
     /// top level below v8 and from the group entry from v8.
-    #[test]
-    fn committed_offsets_reads_both_response_shapes() {
-        let offsets = BTreeMap::from([(("orders".into(), 2), 41)]);
-        let group_error =
-            |code, name| Err(("OffsetFetch", code, name, Some("group=workers".into())));
-        for (name, response, expected) in [
-            (
-                "v2 to v7 shape",
-                offset_fetch_response(7),
-                Ok(offsets.clone()),
-            ),
-            ("v8 and v9 shape", offset_fetch_response(9), Ok(offsets)),
-            (
-                "v2 to v7 group error",
-                OffsetFetchResponse {
-                    error_code: 15,
-                    ..Default::default()
-                },
-                group_error(15, "COORDINATOR_NOT_AVAILABLE"),
-            ),
-            (
-                "v8 and v9 group error",
-                OffsetFetchResponse {
-                    groups: vec![OffsetFetchResponseGroup {
-                        group_id: "workers".into(),
-                        error_code: 16,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-                group_error(16, "NOT_COORDINATOR"),
-            ),
-        ] {
-            let result: OffsetsResult =
-                committed_offsets("workers", response).map_err(|error| match error {
-                    AdminError::Broker {
-                        api,
-                        code,
-                        name,
-                        message,
-                    } => (api, code, name, message),
-                    other => panic!("case {name}: unexpected error {other:?}"),
-                });
-            assert!(result == expected, "case {name}");
-        }
+    #[yare::parameterized(
+        v2_to_v7_shape = { offset_fetch_response(7), Ok(test_group_offsets()) },
+        v8_and_v9_shape = { offset_fetch_response(9), Ok(test_group_offsets()) },
+        v2_to_v7_group_error = { OffsetFetchResponse { error_code: 15, ..Default::default() }, Err(("OffsetFetch", 15, "COORDINATOR_NOT_AVAILABLE", Some("group=workers".into()))) },
+        v8_and_v9_group_error = { OffsetFetchResponse { groups: vec![OffsetFetchResponseGroup { group_id: "workers".into(), error_code: 16, ..Default::default() }], ..Default::default() }, Err(("OffsetFetch", 16, "NOT_COORDINATOR", Some("group=workers".into()))) },
+    )]
+    fn committed_offsets_reads_both_response_shapes(
+        response: OffsetFetchResponse,
+        expected: OffsetsResult,
+    ) {
+        let result: OffsetsResult =
+            committed_offsets("workers", response).map_err(|error| match error {
+                AdminError::Broker {
+                    api,
+                    code,
+                    name,
+                    message,
+                } => (api, code, name, message),
+                other => panic!("unexpected error {other:?}"),
+            });
+        assert2::assert!(result == expected);
     }
 
-    /// The error of `list_consumer_group_offsets` in a form that tests can
-    /// compare: an `OffsetFetch` group code or a `FindCoordinator` code.
-    #[derive(Debug, PartialEq, Eq)]
-    enum ListOffsetsError {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RetryExpected {
+        Success,
         OffsetFetch(i16),
+        CommitOutcome(i16),
         FindCoordinator(i16),
         Timeout,
     }
@@ -2444,7 +2554,7 @@ mod tests {
     /// The error codes that the mock brokers answer, one per attempt. The
     /// last code repeats. A code of 0 answers with the coordinator or with the
     /// offsets of `offset_fetch_response`.
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct RetryScript {
         find_coordinator: Vec<i16>,
         offset_fetch: Vec<i16>,
@@ -2583,20 +2693,31 @@ mod tests {
             *coordinator_addr.lock().expect("coordinator lock") = Some(coordinator.addr);
             let bootstrap =
                 scripted_group_broker(Arc::clone(&script), Arc::clone(&coordinator_addr)).await;
-            let admin = AdminClient::connect(&[bootstrap.addr.to_string()])
-                .await
-                .expect("admin connects");
+            let admin = connect_admin(bootstrap.addr, "admin connects").await;
             Self {
                 coordinator,
                 bootstrap,
                 admin,
             }
         }
+    }
 
-        fn stop(self) {
-            self.bootstrap.stop();
-            self.coordinator.stop();
-        }
+    async fn run_scripted_call<T, F, Fut>(script: RetryScript, call: F) -> (T, RetryScript)
+    where
+        F: FnOnce(AdminClient) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let shared_script = Arc::new(Mutex::new(script));
+        let ScriptedGroupCluster {
+            coordinator,
+            bootstrap,
+            admin,
+        } = ScriptedGroupCluster::start(Arc::clone(&shared_script)).await;
+        let result = call(admin).await;
+        bootstrap.stop();
+        coordinator.stop();
+        let recorded = shared_script.lock().expect("script lock").clone();
+        (result, recorded)
     }
 
     const GROUP_RETRY_LONG: Duration = Duration::from_secs(5);
@@ -2620,317 +2741,404 @@ mod tests {
         }
     }
 
-    /// Apache Kafka's `ListConsumerGroupOffsetsHandler.handleGroupError`
-    /// retries `COORDINATOR_LOAD_IN_PROGRESS` (14) on the same coordinator,
-    /// unmaps the group on `COORDINATOR_NOT_AVAILABLE` (15) and
-    /// `NOT_COORDINATOR` (16) so the driver finds the coordinator again, and
-    /// fails on every other group code. `CoordinatorStrategy.handleError`
-    /// retries a `FindCoordinator` answer of 14 or 15. The driver stops at the
-    /// call timeout.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_consumer_group_offsets_retries_coordinator_errors_as_kafka_does() {
-        let offsets = || Ok(BTreeMap::from([(("orders".into(), 2), 41)]));
-        let fetch_error = |code| Err(ListOffsetsError::OffsetFetch(code));
-        let find_error = |code| Err(ListOffsetsError::FindCoordinator(code));
-        for (name, find_coordinator, offset_fetch, timeout, expected) in [
-            (
-                "no error",
-                vec![0],
-                vec![0],
-                GROUP_RETRY_LONG,
-                (offsets(), 1, 1),
-            ),
-            (
-                "coordinator load in progress retries on the same coordinator",
-                vec![0],
-                vec![14, 14, 0],
-                GROUP_RETRY_LONG,
-                (offsets(), 1, 3),
-            ),
-            (
-                "coordinator not available finds the coordinator again",
-                vec![0],
-                vec![15, 0],
-                GROUP_RETRY_LONG,
-                (offsets(), 2, 2),
-            ),
-            (
-                "not coordinator finds the coordinator again",
-                vec![0],
-                vec![16, 0],
-                GROUP_RETRY_LONG,
-                (offsets(), 2, 2),
-            ),
-            (
-                "coordinator load in progress past the timeout times out",
-                vec![0],
-                vec![14],
-                GROUP_RETRY_NOW,
-                (Err(ListOffsetsError::Timeout), 1, 1),
-            ),
-            (
-                "not coordinator past the timeout times out",
-                vec![0],
-                vec![16],
-                GROUP_RETRY_NOW,
-                (Err(ListOffsetsError::Timeout), 1, 1),
-            ),
-            (
-                "group authorization failed is final",
-                vec![0],
-                vec![30],
-                GROUP_RETRY_LONG,
-                (fetch_error(30), 1, 1),
-            ),
-            (
-                "another retriable group code is final",
-                vec![0],
-                vec![7],
-                GROUP_RETRY_LONG,
-                (fetch_error(7), 1, 1),
-            ),
-            (
-                "find coordinator answers coordinator not available, then the coordinator",
-                vec![15, 0],
-                vec![0],
-                GROUP_RETRY_LONG,
-                (offsets(), 2, 1),
-            ),
-            (
-                "find coordinator answers coordinator load in progress, then the coordinator",
-                vec![14, 0],
-                vec![0],
-                GROUP_RETRY_LONG,
-                (offsets(), 2, 1),
-            ),
-            (
-                "find coordinator not available past the timeout times out",
-                vec![15],
-                vec![0],
-                GROUP_RETRY_NOW,
-                (Err(ListOffsetsError::Timeout), 1, 0),
-            ),
-            (
-                "find coordinator group authorization failed is final",
-                vec![30],
-                vec![0],
-                GROUP_RETRY_LONG,
-                (find_error(30), 1, 0),
-            ),
-        ] {
-            let script = Arc::new(Mutex::new(RetryScript {
-                find_coordinator,
-                offset_fetch,
-                ..RetryScript::default()
-            }));
-            let mut cluster = ScriptedGroupCluster::start(Arc::clone(&script)).await;
-
-            let result = cluster
-                .admin
-                .list_consumer_group_offsets_with_retry(
-                    "workers",
-                    test_retry_policy(timeout, group_retry_backoff(timeout)),
-                )
-                .await
-                .map_err(|error| match error {
-                    AdminError::Broker {
-                        api: "OffsetFetch",
-                        code,
-                        ..
-                    } => ListOffsetsError::OffsetFetch(code),
-                    AdminError::Transport(ClientError::Server { error_code }) => {
-                        ListOffsetsError::FindCoordinator(error_code)
-                    }
-                    AdminError::Transport(ClientError::Timeout(_)) => ListOffsetsError::Timeout,
-                    other => panic!("case {name}: unexpected error {other:?}"),
-                });
-
-            cluster.stop();
-            let script = script.lock().expect("script lock");
-            assert!(
-                (
-                    result,
-                    script.find_coordinator_requests,
-                    script.offset_fetch_requests
-                ) == expected,
-                "case {name}"
-            );
+    fn list_groups_retry_policy(
+        timeout: Duration,
+        backoff: Duration,
+        max_retries: u32,
+    ) -> RetryPolicy {
+        RetryPolicy {
+            timeout,
+            initial_backoff: backoff,
+            max_backoff: backoff,
+            jitter: 0.0,
+            max_retries,
         }
     }
 
-    /// The admin client reports a call that stops at its deadline with a
-    /// timeout. The retry tests give it Kafka's `REQUEST_TIMED_OUT` code.
+    #[derive(Clone, Copy)]
+    struct GroupRetryScenario {
+        name: &'static str,
+        find_coordinator: &'static [i16],
+        offset_fetch: &'static [i16],
+        offset_commit: &'static [i16],
+        timeout: Duration,
+        fetch_expected: RetryExpected,
+        fetch_calls: (usize, usize),
+        commit_expected: RetryExpected,
+        commit_calls: (usize, usize),
+    }
+
+    #[derive(Clone, Copy)]
+    struct RetryCodes {
+        find_coordinator: &'static [i16],
+        offset_fetch: &'static [i16],
+        offset_commit: &'static [i16],
+    }
+
+    #[derive(Clone, Copy)]
+    struct RetryExpectations {
+        fetch: RetryExpected,
+        commit: RetryExpected,
+    }
+
+    fn successful_retry_case(
+        name: &'static str,
+        find_coordinator: &'static [i16],
+        rpc_errors: &'static [i16],
+        calls: (usize, usize),
+    ) -> GroupRetryScenario {
+        retry_scenario(
+            name,
+            RetryCodes {
+                find_coordinator,
+                offset_fetch: rpc_errors,
+                offset_commit: rpc_errors,
+            },
+            GROUP_RETRY_LONG,
+            RetryExpectations {
+                fetch: RetryExpected::Success,
+                commit: RetryExpected::CommitOutcome(0),
+            },
+            calls,
+        )
+    }
+
+    fn retry_scenario(
+        name: &'static str,
+        codes: RetryCodes,
+        timeout: Duration,
+        expected: RetryExpectations,
+        calls: (usize, usize),
+    ) -> GroupRetryScenario {
+        GroupRetryScenario {
+            name,
+            find_coordinator: codes.find_coordinator,
+            offset_fetch: codes.offset_fetch,
+            offset_commit: codes.offset_commit,
+            timeout,
+            fetch_expected: expected.fetch,
+            fetch_calls: calls,
+            commit_expected: expected.commit,
+            commit_calls: calls,
+        }
+    }
+
+    fn coordinator_recovery_case(name: &'static str, codes: &'static [i16]) -> GroupRetryScenario {
+        successful_retry_case(name, codes, &[0], (2, 1))
+    }
+
+    fn timed_out_retry_case(name: &'static str, codes: RetryCodes) -> GroupRetryScenario {
+        retry_scenario(
+            name,
+            codes,
+            GROUP_RETRY_NOW,
+            RetryExpectations {
+                fetch: RetryExpected::Timeout,
+                commit: RetryExpected::Timeout,
+            },
+            (1, 1),
+        )
+    }
+
+    fn group_retry_scenarios() -> Vec<GroupRetryScenario> {
+        use RetryExpected::{FindCoordinator as FetchFindError, Timeout as FetchTimeout};
+
+        vec![
+            successful_retry_case("no error", &[0], &[0], (1, 1)),
+            successful_retry_case("coordinator load in progress", &[0], &[14, 14, 0], (1, 3)),
+            successful_retry_case("coordinator not available", &[0], &[15, 0], (2, 2)),
+            successful_retry_case("not coordinator", &[0], &[16, 0], (2, 2)),
+            timed_out_retry_case(
+                "load in progress timeout",
+                RetryCodes {
+                    find_coordinator: &[0],
+                    offset_fetch: &[14],
+                    offset_commit: &[27],
+                },
+            ),
+            timed_out_retry_case(
+                "not coordinator timeout",
+                RetryCodes {
+                    find_coordinator: &[0],
+                    offset_fetch: &[16],
+                    offset_commit: &[16],
+                },
+            ),
+            retry_scenario(
+                "group error is final",
+                RetryCodes {
+                    find_coordinator: &[0],
+                    offset_fetch: &[30],
+                    offset_commit: &[25],
+                },
+                GROUP_RETRY_LONG,
+                RetryExpectations {
+                    fetch: RetryExpected::OffsetFetch(30),
+                    commit: RetryExpected::CommitOutcome(25),
+                },
+                (1, 1),
+            ),
+            retry_scenario(
+                "another group error is final",
+                RetryCodes {
+                    find_coordinator: &[0],
+                    offset_fetch: &[7],
+                    offset_commit: &[7],
+                },
+                GROUP_RETRY_LONG,
+                RetryExpectations {
+                    fetch: RetryExpected::OffsetFetch(7),
+                    commit: RetryExpected::CommitOutcome(7),
+                },
+                (1, 1),
+            ),
+            coordinator_recovery_case("find coordinator not available then succeeds", &[15, 0]),
+            coordinator_recovery_case("find coordinator load in progress then succeeds", &[14, 0]),
+            retry_scenario(
+                "find coordinator timeout",
+                RetryCodes {
+                    find_coordinator: &[15],
+                    offset_fetch: &[0],
+                    offset_commit: &[0],
+                },
+                GROUP_RETRY_NOW,
+                RetryExpectations {
+                    fetch: FetchTimeout,
+                    commit: FetchTimeout,
+                },
+                (1, 0),
+            ),
+            retry_scenario(
+                "find coordinator authorization error",
+                RetryCodes {
+                    find_coordinator: &[30],
+                    offset_fetch: &[0],
+                    offset_commit: &[0],
+                },
+                GROUP_RETRY_LONG,
+                RetryExpectations {
+                    fetch: FetchFindError(30),
+                    commit: FetchFindError(30),
+                },
+                (1, 0),
+            ),
+        ]
+    }
+
     const TIMED_OUT: i16 = 7;
 
-    /// How the coordinator of a retry case behaves.
+    #[derive(Clone, Copy)]
+    enum RetryApi {
+        Fetch,
+        Commit,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum RetryObservation {
+        Fetch(Result<GroupOffsets, RetryExpected>),
+        Commit(Result<Vec<ConsumerGroupOffsetOutcome>, i16>),
+    }
+
+    async fn alter_consumer_offsets_with_retry(
+        mut admin: AdminClient,
+        timeout: Duration,
+    ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
+        let offsets = test_group_offsets();
+        admin
+            .alter_group_offsets_with_retry(
+                GroupOffsetUpdate {
+                    kind: GroupOffsetKind::Consumer,
+                    group: "workers",
+                    offsets: &offsets,
+                },
+                test_retry_policy(timeout, group_retry_backoff(timeout)),
+            )
+            .await
+    }
+
+    async fn assert_retry_scenario(case: GroupRetryScenario, api: RetryApi) {
+        let expected = match (api, case.fetch_expected, case.commit_expected) {
+            (RetryApi::Fetch, RetryExpected::Success, _) => {
+                RetryObservation::Fetch(Ok(test_group_offsets()))
+            }
+            (RetryApi::Fetch, RetryExpected::OffsetFetch(code), _) => {
+                RetryObservation::Fetch(Err(RetryExpected::OffsetFetch(code)))
+            }
+            (RetryApi::Fetch, RetryExpected::FindCoordinator(code), _) => {
+                RetryObservation::Fetch(Err(RetryExpected::FindCoordinator(code)))
+            }
+            (RetryApi::Fetch, RetryExpected::Timeout, _) => {
+                RetryObservation::Fetch(Err(RetryExpected::Timeout))
+            }
+            (RetryApi::Commit, _, RetryExpected::CommitOutcome(code)) => {
+                RetryObservation::Commit(Ok(vec![ConsumerGroupOffsetOutcome {
+                    topic: "orders".into(),
+                    partition: 2,
+                    error: kafka_error_if(code, None),
+                }]))
+            }
+            (RetryApi::Commit, _, RetryExpected::FindCoordinator(code)) => {
+                RetryObservation::Commit(Err(code))
+            }
+            (RetryApi::Commit, _, RetryExpected::Timeout) => {
+                RetryObservation::Commit(Err(TIMED_OUT))
+            }
+            _ => unreachable!("retry expectation belongs to another API"),
+        };
+        let expected_calls = match api {
+            RetryApi::Fetch => case.fetch_calls,
+            RetryApi::Commit => case.commit_calls,
+        };
+        let mut script = RetryScript {
+            find_coordinator: case.find_coordinator.to_vec(),
+            ..RetryScript::default()
+        };
+        match api {
+            RetryApi::Fetch => script.offset_fetch = case.offset_fetch.to_vec(),
+            RetryApi::Commit => script.offset_commit = case.offset_commit.to_vec(),
+        }
+
+        let ((result, within_deadline), script) =
+            run_scripted_call(script, |mut admin| async move {
+                let started = tokio::time::Instant::now();
+                let result = match api {
+                    RetryApi::Fetch => {
+                        let result = admin
+                            .list_consumer_group_offsets_with_retry(
+                                "workers",
+                                test_retry_policy(case.timeout, group_retry_backoff(case.timeout)),
+                            )
+                            .await
+                            .map_err(|error| match error {
+                                AdminError::Broker {
+                                    api: "OffsetFetch",
+                                    code,
+                                    ..
+                                } => RetryExpected::OffsetFetch(code),
+                                AdminError::Transport(ClientError::Server { error_code }) => {
+                                    RetryExpected::FindCoordinator(error_code)
+                                }
+                                AdminError::Transport(ClientError::Timeout(_)) => {
+                                    RetryExpected::Timeout
+                                }
+                                other => panic!("case {}: unexpected error {other:?}", case.name),
+                            });
+                        RetryObservation::Fetch(result)
+                    }
+                    RetryApi::Commit => {
+                        let result = alter_consumer_offsets_with_retry(admin, case.timeout)
+                            .await
+                            .map_err(|error| match error {
+                                AdminError::Transport(ClientError::Server { error_code }) => {
+                                    error_code
+                                }
+                                AdminError::Transport(ClientError::Timeout(_)) => TIMED_OUT,
+                                other => panic!("case {}: unexpected error {other:?}", case.name),
+                            });
+                        RetryObservation::Commit(result)
+                    }
+                };
+                let within_deadline = match api {
+                    RetryApi::Fetch => true,
+                    RetryApi::Commit => started.elapsed() < case.timeout + Duration::from_secs(2),
+                };
+                (result, within_deadline)
+            })
+            .await;
+        let rpc_calls = match api {
+            RetryApi::Fetch => script.offset_fetch_requests,
+            RetryApi::Commit => script.offset_commit_requests,
+        };
+        assert!(
+            (
+                result,
+                script.find_coordinator_requests,
+                rpc_calls,
+                within_deadline
+            ) == (expected, expected_calls.0, expected_calls.1, true),
+            "case {}",
+            case.name
+        );
+    }
+
+    /// These named cases exercise the shared retry behavior of OffsetFetch and
+    /// OffsetCommit, while preserving each API's result and call-count checks.
+    #[yare::parameterized(
+        no_error = { 0 },
+        coordinator_load_in_progress = { 1 },
+        coordinator_not_available = { 2 },
+        not_coordinator = { 3 },
+        load_timeout = { 4 },
+        coordinator_timeout = { 5 },
+        group_error = { 6 },
+        other_group_error = { 7 },
+        find_coordinator_not_available = { 8 },
+        find_coordinator_load = { 9 },
+        find_coordinator_timeout = { 10 },
+        find_coordinator_authorization = { 11 },
+    )]
+    fn group_offset_retry_scenarios_match_kafka(index: usize) {
+        block_on_test(async move {
+            let case = group_retry_scenarios()[index];
+            assert_retry_scenario(case, RetryApi::Fetch).await;
+            assert_retry_scenario(case, RetryApi::Commit).await;
+        });
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Coordinator {
-        /// It answers from the script.
-        Normal,
-        /// The first `FindCoordinator` answer names an address that refuses
-        /// connections.
         UnreachableOnce,
-        /// It does not answer the group request.
         Silent,
-        /// It closes the connection on the first group request.
         ClosedOnce,
     }
 
-    /// Apache Kafka's `AlterConsumerGroupOffsetsHandler.handleError` retries
-    /// `COORDINATOR_LOAD_IN_PROGRESS` (14) and `REBALANCE_IN_PROGRESS` (27) on
-    /// the same coordinator, unmaps the group on `COORDINATOR_NOT_AVAILABLE`
-    /// (15) and `NOT_COORDINATOR` (16) so the driver finds the coordinator
-    /// again, and keeps every other partition code as the outcome.
-    /// `CoordinatorStrategy.handleError` retries a `FindCoordinator` answer of
-    /// 14 or 15. The driver stops at the call timeout.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn alter_consumer_group_offsets_retries_coordinator_errors_as_kafka_does() {
-        let outcome = |code| {
-            Ok(vec![ConsumerGroupOffsetOutcome {
-                topic: "orders".into(),
-                partition: 2,
-                error: kafka_error_if(code, None),
-            }])
+    /// The coordinator retry driver recovers from a connection close, resolves
+    /// an unreachable coordinator, and times out when the coordinator is silent.
+    #[yare::parameterized(
+        closed_connection = { "closed connection", GROUP_RETRY_LONG, Coordinator::ClosedOnce, 1, 2, Ok(0) },
+        unreachable_coordinator = { "unreachable coordinator", GROUP_RETRY_LONG, Coordinator::UnreachableOnce, 2, 1, Ok(0) },
+        silent_coordinator = { "silent coordinator", Duration::from_millis(300), Coordinator::Silent, 1, 1, Err(TIMED_OUT) },
+    )]
+    #[test_macro(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn alter_consumer_group_offsets_recovers_from_connection_failures(
+        name: &'static str,
+        timeout: Duration,
+        coordinator: Coordinator,
+        find_calls: usize,
+        commit_calls: usize,
+        expected: Result<i16, i16>,
+    ) {
+        let script = RetryScript {
+            find_coordinator: vec![0],
+            offset_commit: vec![0],
+            unreachable_answers: usize::from(coordinator == Coordinator::UnreachableOnce),
+            unreachable: Some(refused_address().await),
+            silent_offset_commit: coordinator == Coordinator::Silent,
+            closed_offset_commits: usize::from(coordinator == Coordinator::ClosedOnce),
+            ..RetryScript::default()
         };
-        let find_error = |code| Err(code);
-        let normal = Coordinator::Normal;
-        for (name, find_coordinator, offset_commit, (timeout, coordinator), expected) in [
-            (
-                "no error",
-                vec![0],
-                vec![0],
-                (GROUP_RETRY_LONG, normal),
-                (outcome(0), 1, 1),
-            ),
-            (
-                "a closed coordinator connection recovers",
-                vec![0],
-                vec![0],
-                (GROUP_RETRY_LONG, Coordinator::ClosedOnce),
-                (outcome(0), 1, 2),
-            ),
-            (
-                "an unreachable coordinator finds the coordinator again",
-                vec![0],
-                vec![0],
-                (GROUP_RETRY_LONG, Coordinator::UnreachableOnce),
-                (outcome(0), 2, 1),
-            ),
-            (
-                "a silent coordinator stops the attempt at the deadline",
-                vec![0],
-                vec![0],
-                (Duration::from_millis(300), Coordinator::Silent),
-                (find_error(TIMED_OUT), 1, 1),
-            ),
-            (
-                "coordinator load in progress retries on the same coordinator",
-                vec![0],
-                vec![14, 14, 0],
-                (GROUP_RETRY_LONG, normal),
-                (outcome(0), 1, 3),
-            ),
-            (
-                "rebalance in progress retries on the same coordinator",
-                vec![0],
-                vec![27, 0],
-                (GROUP_RETRY_LONG, normal),
-                (outcome(0), 1, 2),
-            ),
-            (
-                "coordinator not available finds the coordinator again",
-                vec![0],
-                vec![15, 0],
-                (GROUP_RETRY_LONG, normal),
-                (outcome(0), 2, 2),
-            ),
-            (
-                "not coordinator finds the coordinator again",
-                vec![0],
-                vec![16, 0],
-                (GROUP_RETRY_LONG, normal),
-                (outcome(0), 2, 2),
-            ),
-            (
-                "rebalance in progress past the timeout times out",
-                vec![0],
-                vec![27],
-                (GROUP_RETRY_NOW, normal),
-                (find_error(TIMED_OUT), 1, 1),
-            ),
-            (
-                "not coordinator past the timeout times out",
-                vec![0],
-                vec![16],
-                (GROUP_RETRY_NOW, normal),
-                (find_error(TIMED_OUT), 1, 1),
-            ),
-            (
-                "unknown member id is a final outcome",
-                vec![0],
-                vec![25],
-                (GROUP_RETRY_LONG, normal),
-                (outcome(25), 1, 1),
-            ),
-            (
-                "find coordinator answers coordinator not available, then the coordinator",
-                vec![15, 0],
-                vec![0],
-                (GROUP_RETRY_LONG, normal),
-                (outcome(0), 2, 1),
-            ),
-            (
-                "find coordinator group authorization failed is final",
-                vec![30],
-                vec![0],
-                (GROUP_RETRY_LONG, normal),
-                (find_error(30), 1, 0),
-            ),
-        ] {
-            let script = Arc::new(Mutex::new(RetryScript {
-                find_coordinator,
-                offset_commit,
-                unreachable_answers: usize::from(coordinator == Coordinator::UnreachableOnce),
-                unreachable: Some(refused_address().await),
-                silent_offset_commit: coordinator == Coordinator::Silent,
-                closed_offset_commits: usize::from(coordinator == Coordinator::ClosedOnce),
-                ..RetryScript::default()
-            }));
-            let mut cluster = ScriptedGroupCluster::start(Arc::clone(&script)).await;
-
+        let ((result, within_deadline), script) = run_scripted_call(script, |admin| async move {
             let started = tokio::time::Instant::now();
-            let offsets = BTreeMap::from([(("orders".into(), 2), 41)]);
-            let result = cluster
-                .admin
-                .alter_group_offsets_with_retry(
-                    GroupOffsetUpdate {
-                        kind: GroupOffsetKind::Consumer,
-                        group: "workers",
-                        offsets: &offsets,
-                    },
-                    test_retry_policy(timeout, group_retry_backoff(timeout)),
-                )
+            let result = alter_consumer_offsets_with_retry(admin, timeout)
                 .await
+                .map(|_| 0_i16)
                 .map_err(|error| match error {
                     AdminError::Transport(ClientError::Server { error_code }) => error_code,
                     AdminError::Transport(ClientError::Timeout(_)) => TIMED_OUT,
                     other => panic!("case {name}: unexpected error {other:?}"),
                 });
-
-            cluster.stop();
-            let script = script.lock().expect("script lock");
-            // A call never runs far past its deadline.
-            let within_deadline = started.elapsed() < timeout + Duration::from_secs(2);
-            assert!(
-                (
-                    result,
-                    script.find_coordinator_requests,
-                    script.offset_commit_requests,
-                    within_deadline
-                ) == (expected.0, expected.1, expected.2, true),
-                "case {name}"
-            );
-        }
+            (result, started.elapsed() < timeout + Duration::from_secs(2))
+        })
+        .await;
+        assert2::assert!(
+            (
+                result,
+                script.find_coordinator_requests,
+                script.offset_commit_requests,
+                within_deadline
+            ) == (expected, find_calls, commit_calls, true),
+            "case {name}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2945,19 +3153,16 @@ mod tests {
             api_versions_request::API_KEY => Some(api_versions(ranges)),
             offset_commit_request::API_KEY => {
                 seen.fetch_add(1, Ordering::SeqCst);
-                Some(encode(
-                    &OffsetCommitResponse {
-                        topics: vec![successful_offset_commit_topic()],
-                        ..Default::default()
-                    },
+                Some(crate::encode_test_struct_field!(
+                    encode,
+                    OffsetCommitResponse,
+                    topics,
+                    vec![successful_offset_commit_topic()],
                     version,
                     true,
                 ))
             }
-            offset_fetch_request::API_KEY => {
-                seen.fetch_add(1, Ordering::SeqCst);
-                Some(encode(&offset_fetch_response(version), version, true))
-            }
+            offset_fetch_request::API_KEY => counted_reply(&seen, offset_fetch_reply(version)),
             _ => None,
         })
         .await;
@@ -2965,17 +3170,13 @@ mod tests {
         let bootstrap_group_rpcs = Arc::new(AtomicUsize::new(0));
         let bootstrap =
             bootstrap_for(&coordinator, ranges, Arc::clone(&bootstrap_group_rpcs)).await;
-        let mut admin = AdminClient::connect(&[bootstrap.addr.to_string()])
-            .await
-            .expect("admin connects");
+        let mut admin = connect_admin(bootstrap.addr, "admin connects").await;
 
         let committed = admin
-            .alter_consumer_group_offsets("workers", &BTreeMap::from([(("orders".into(), 2), 41)]))
+            .alter_consumer_group_offsets("workers", &test_group_offsets())
             .await
             .expect("offset commit succeeds");
-        let mut admin = AdminClient::connect(&[bootstrap.addr.to_string()])
-            .await
-            .expect("second admin connects");
+        let mut admin = connect_admin(bootstrap.addr, "second admin connects").await;
         let fetched = admin
             .list_consumer_group_offsets("workers")
             .await
@@ -2984,7 +3185,7 @@ mod tests {
         assert!(bootstrap_group_rpcs.load(Ordering::SeqCst) == 0);
         assert!(coordinator_group_rpcs.load(Ordering::SeqCst) == 2);
         assert!(committed == successful_group_offset_outcome());
-        assert!(fetched == BTreeMap::from([(("orders".into(), 2), 41)]));
+        assert!(fetched == test_group_offsets());
         bootstrap.stop();
         coordinator.stop();
     }
@@ -3075,49 +3276,22 @@ mod tests {
         body: &[u8],
     ) -> Option<Vec<u8>> {
         match api_key {
-            api_versions_request::API_KEY => Some(encode(
-                &ApiVersionsResponse {
-                    api_keys: vec![
-                        ApiVersion {
-                            api_key: api_versions_request::API_KEY,
-                            ..Default::default()
-                        },
-                        ApiVersion {
-                            api_key: metadata_request::API_KEY,
-                            min_version: 12,
-                            max_version: 12,
-                            ..Default::default()
-                        },
-                        ApiVersion {
-                            api_key: list_groups_request::API_KEY,
-                            max_version: script.max_version,
-                            ..Default::default()
-                        },
-                    ],
-                    ..Default::default()
-                },
-                0,
-                false,
-            )),
-            metadata_request::API_KEY => Some(encode(
-                &MetadataResponse {
-                    brokers: cluster
-                        .lock()
-                        .expect("cluster lock")
-                        .iter()
-                        .zip(1..)
-                        .map(|(addr, node_id)| {
-                            let broker = mock_broker_address(*addr, node_id);
-                            MetadataResponseBroker {
-                                node_id: broker.node_id,
-                                host: broker.host,
-                                port: broker.port,
-                                ..Default::default()
-                            }
-                        })
-                        .collect(),
-                    ..Default::default()
-                },
+            api_versions_request::API_KEY => Some(encode_api_versions(vec![
+                api_version_entry!(api_versions_request::API_KEY, 0, 0),
+                api_version_entry!(metadata_request::API_KEY, 12, 12),
+                api_version_entry!(list_groups_request::API_KEY, 0, script.max_version),
+            ])),
+            metadata_request::API_KEY => Some(crate::encode_test_struct_field!(
+                encode,
+                MetadataResponse,
+                brokers,
+                cluster
+                    .lock()
+                    .expect("cluster lock")
+                    .iter()
+                    .zip(1..)
+                    .map(|(addr, node_id)| mock_metadata_broker(*addr, node_id))
+                    .collect(),
                 version,
                 true,
             )),
@@ -3253,7 +3427,7 @@ mod tests {
         (
             version,
             ListGroupsRequest {
-                states_filter: vec!["Stable".into()],
+                states_filter: stable_state_filter(),
                 ..Default::default()
             },
         )
@@ -3304,6 +3478,18 @@ mod tests {
             .build()
     }
 
+    fn stable_state_filter() -> Vec<String> {
+        vec![GroupState::Stable.to_string()]
+    }
+
+    fn single_broker_error() -> Vec<ExpectedError> {
+        vec![(2, 31, None)]
+    }
+
+    fn expected_kafka_error(code: i16, message: Option<String>) -> KafkaError {
+        kafka_error_if(code, message).expect("error code is nonzero")
+    }
+
     fn types(types: &[GroupType]) -> ListGroupsOptions {
         ListGroupsOptions::builder()
             .types(types.iter().copied().collect())
@@ -3326,23 +3512,15 @@ mod tests {
         let broker =
             list_groups_broker(broker_error(14), Arc::clone(&cluster), Arc::clone(&sent)).await;
         *cluster.lock().expect("cluster lock") = vec![broker.addr];
-        let admin = AdminClient::connect(&[broker.addr.to_string()])
-            .await
-            .expect("admin connects");
+        let admin = connect_admin(broker.addr, "admin connects").await;
 
-        let result = admin
-            .list_groups_with_retry(
-                &ListGroupsOptions::builder().build(),
-                RetryPolicy {
-                    timeout: Duration::from_secs(10),
-                    initial_backoff: Duration::from_millis(1),
-                    max_backoff: Duration::from_millis(1),
-                    jitter: 0.0,
-                    max_retries: 2,
-                },
-            )
-            .await
-            .expect("list_groups succeeds");
+        let options = ListGroupsOptions::builder().build();
+        let result = run_list_groups_with_retry(
+            &admin,
+            &options,
+            list_groups_retry_policy(Duration::from_secs(10), Duration::from_millis(1), 2),
+        )
+        .await;
 
         broker.stop();
         let codes = result
@@ -3372,23 +3550,14 @@ mod tests {
             requests.push(sent);
         }
         *cluster.lock().expect("cluster lock") = brokers.iter().map(|broker| broker.addr).collect();
-        let admin = AdminClient::connect(&[brokers[0].addr.to_string()])
-            .await
-            .expect("admin connects");
+        let admin = connect_admin(brokers[0].addr, "admin connects").await;
 
-        let result = admin
-            .list_groups_with_retry(
-                &case.options,
-                RetryPolicy {
-                    timeout: case.timeout,
-                    initial_backoff: BACKOFF,
-                    max_backoff: BACKOFF,
-                    jitter: 0.0,
-                    max_retries: u32::MAX,
-                },
-            )
-            .await
-            .expect("list_groups succeeds");
+        let result = run_list_groups_with_retry(
+            &admin,
+            &case.options,
+            list_groups_retry_policy(case.timeout, BACKOFF, u32::MAX),
+        )
+        .await;
 
         let expected = ListGroupsResult {
             valid: case.valid,
@@ -3400,12 +3569,8 @@ mod tests {
                     ListGroupsError {
                         node_id,
                         host: addr.ip().to_string(),
-                        port: i32::from(addr.port()),
-                        error: KafkaError {
-                            code,
-                            name: kafka_error_name(code),
-                            message,
-                        },
+                        port: broker_port(addr),
+                        error: expected_kafka_error(code, message),
                     }
                 })
                 .collect(),
@@ -3424,82 +3589,45 @@ mod tests {
         );
     }
 
+    async fn run_list_groups_with_retry(
+        admin: &AdminClient,
+        options: &ListGroupsOptions,
+        policy: RetryPolicy,
+    ) -> ListGroupsResult {
+        admin
+            .list_groups_with_retry(options, policy)
+            .await
+            .expect("list_groups succeeds")
+    }
+
+    fn block_on_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(future);
+    }
+
+    fn run_list_groups_case_sync(case: ListGroupsCase) {
+        block_on_test(run_list_groups_case(case));
+    }
+
     /// Apache Kafka's `KafkaAdminClient.listGroups` sends `Metadata`, then
     /// `ListGroups` to every broker, and merges the answers: one listing per
     /// group id, and one error per failed broker. It retries 14 and 15 on the
     /// broker until the deadline, and then `Call.fail` gives a
     /// `TimeoutException` (7) with the last error as its cause.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_groups_asks_every_broker_and_merges() {
-        for case in [
-            ListGroupsCase::builder()
-                .name("one group on each broker")
-                .brokers([groups(&["a"]), groups(&["b"]), groups(&["c"])])
-                .valid(stable_listings(&["a", "b", "c"]))
-                .build(),
-            ListGroupsCase::builder()
-                .name("broker 2 has no groups")
-                .brokers([groups(&["a"]), groups(&[]), groups(&["c"])])
-                .valid(stable_listings(&["a", "c"]))
-                .build(),
-            ListGroupsCase::builder()
-                .name("a group on two brokers is listed once")
-                .brokers([groups(&["a"]), groups(&["a", "b"]), groups(&["c"])])
-                .valid(stable_listings(&["a", "b", "c"]))
-                .build(),
-            ListGroupsCase::builder()
-                .name("broker 2 answers coordinator not available until the timeout")
-                .brokers([groups(&["a"]), broker_error(15), groups(&["c"])])
-                .timeout(SHORT)
-                .valid(stable_listings(&["a", "c"]))
-                .errors(vec![(
-                    2,
-                    7,
-                    Some(format!(
-                        "ListGroups timed out after 1 attempt(s); last error: {}",
-                        AdminError::Broker {
-                            api: "ListGroups",
-                            code: 15,
-                            name: "COORDINATOR_NOT_AVAILABLE",
-                            message: None,
-                        }
-                    )),
-                )])
-                .build(),
-            ListGroupsCase::builder()
-                .name("broker 2 answers coordinator load in progress, then its groups")
-                .brokers([
-                    groups(&["a"]),
-                    ListGroupsBroker {
-                        max_version: 5,
-                        answers: vec![
-                            ListGroupsAnswer::Error(14),
-                            ListGroupsAnswer::Error(15),
-                            ListGroupsAnswer::Groups(vec![consumer_group("b")]),
-                        ],
-                    },
-                    groups(&["c"]),
-                ])
-                .valid(vec![
-                    stable_listing("a"),
-                    stable_listing("b"),
-                    stable_listing("c"),
-                ])
-                .requests([
-                    vec![plain(5)],
-                    vec![plain(5), plain(5), plain(5)],
-                    vec![plain(5)],
-                ])
-                .build(),
-            ListGroupsCase::builder()
-                .name("broker 2 answers cluster authorization failed")
-                .brokers([groups(&["a"]), broker_error(31), groups(&["c"])])
-                .valid(stable_listings(&["a", "c"]))
-                .errors(vec![(2, 31, None)])
-                .build(),
-        ] {
-            run_list_groups_case(case).await;
-        }
+    #[yare::parameterized(
+        one_group_each_broker = { 0 },
+        empty_broker = { 1 },
+        duplicate_group = { 2 },
+        broker_timeout = { 3 },
+        broker_retries = { 4 },
+        authorization_error = { 5 },
+    )]
+    fn list_groups_asks_every_broker_and_merges(index: usize) {
+        run_list_groups_case_sync(list_groups_merge_cases().remove(index));
     }
 
     /// Kafka's `listGroups` sends the state and type filters to every broker,
@@ -3507,97 +3635,15 @@ mod tests {
     /// rejects a state filter below v4 and a type filter below v5, except a
     /// type filter of `Classic` and `Consumer` at most, with `Classic`, which
     /// it omits. The rejection is an error for that broker only.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_groups_sends_filters_as_kafka_does() {
-        for case in [
-            ListGroupsCase::builder()
-                .name("state filter Stable is sent to every broker")
-                .brokers([
-                    ListGroupsBroker {
-                        max_version: 5,
-                        answers: vec![ListGroupsAnswer::Groups(vec![
-                            listed("a", "consumer", "Empty", "Classic"),
-                            consumer_group("b"),
-                        ])],
-                    },
-                    groups(&["c"]),
-                    groups(&[]),
-                ])
-                .options(states(&[GroupState::Stable]))
-                .valid(stable_listings(&["b", "c"]))
-                .requests([vec![stable(5)], vec![stable(5)], vec![stable(5)]])
-                .build(),
-            ListGroupsCase::builder()
-                .name("state filter on a broker below v4 is unsupported on that broker")
-                .brokers([groups(&["a"]), below(3, &["b"]), groups(&["c"])])
-                .options(states(&[GroupState::Stable]))
-                .valid(stable_listings(&["a", "c"]))
-                .errors(vec![(2, 35, Some(unsupported(3, 4)))])
-                .requests([vec![stable(5)], Vec::new(), vec![stable(5)]])
-                .build(),
-            ListGroupsCase::builder()
-                .name("type filter Consumer on a broker below v5 is unsupported on that broker")
-                .brokers([groups(&["a"]), below(4, &["b"]), groups(&["c"])])
-                .options(types(&[GroupType::Consumer]))
-                .errors(vec![(2, 35, Some(unsupported(4, 5)))])
-                .requests([vec![consumer_type(5)], Vec::new(), vec![consumer_type(5)]])
-                .build(),
-            ListGroupsCase::builder()
-                .name("type filter Classic and Consumer on a broker below v5 is omitted")
-                .brokers([groups(&["a"]), below(4, &["b"]), groups(&["c"])])
-                .options(types(&[GroupType::Classic, GroupType::Consumer]))
-                .valid(vec![
-                    stable_listing("a"),
-                    GroupListing {
-                        group_type: None,
-                        ..stable_listing("b")
-                    },
-                    stable_listing("c"),
-                ])
-                .requests([
-                    vec![classic_and_consumer(5)],
-                    vec![classic_and_consumer(4)],
-                    vec![classic_and_consumer(5)],
-                ])
-                .build(),
-            ListGroupsCase::builder()
-                .name("protocol type filter is applied by the client")
-                .brokers([
-                    ListGroupsBroker {
-                        max_version: 5,
-                        answers: vec![ListGroupsAnswer::Groups(vec![
-                            consumer_group("a"),
-                            listed("connect-a", "connect", "Stable", "Classic"),
-                            listed("simple", "", "Empty", "Classic"),
-                        ])],
-                    },
-                    groups(&[]),
-                    ListGroupsBroker {
-                        max_version: 5,
-                        answers: vec![ListGroupsAnswer::Groups(vec![listed(
-                            "share", "share", "Stable", "Share",
-                        )])],
-                    },
-                ])
-                .options(ListGroupsOptions::for_consumer_groups())
-                .valid(vec![
-                    stable_listing("a"),
-                    GroupListing {
-                        group_id: "simple".into(),
-                        group_type: Some(GroupType::Classic),
-                        protocol_type: String::new(),
-                        group_state: Some(GroupState::Empty),
-                    },
-                ])
-                .requests([
-                    vec![classic_and_consumer(5)],
-                    vec![classic_and_consumer(5)],
-                    vec![classic_and_consumer(5)],
-                ])
-                .build(),
-        ] {
-            run_list_groups_case(case).await;
-        }
+    #[yare::parameterized(
+        state_filter = { 0 },
+        old_state_filter = { 1 },
+        consumer_type_filter = { 2 },
+        old_consumer_type_pair = { 3 },
+        protocol_filter = { 4 },
+    )]
+    fn list_groups_sends_filters_as_kafka_does(index: usize) {
+        run_list_groups_case_sync(list_groups_filter_cases().remove(index));
     }
 
     /// Broker 2 of a SASL cluster in
@@ -3717,8 +3763,12 @@ mod tests {
     /// The test runs in real time. With paused time, Tokio moves the clock
     /// forward while loopback I/O is in flight, and the healthy brokers time
     /// out too.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_groups_isolates_a_secured_broker_that_stalls_or_rejects() {
+    #[yare::parameterized(
+        stalls = { SecuredBroker::Stalls },
+        rejects_authentication = { SecuredBroker::RejectsAuthentication },
+    )]
+    #[test_macro(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn list_groups_isolates_a_secured_broker_that_stalls_or_rejects(broker_2: SecuredBroker) {
         const RETRY: RetryPolicy = RetryPolicy {
             timeout: Duration::from_secs(2),
             initial_backoff: Duration::from_millis(100),
@@ -3726,137 +3776,291 @@ mod tests {
             jitter: 0.0,
             max_retries: u32::MAX,
         };
-        for broker_2 in [SecuredBroker::Stalls, SecuredBroker::RejectsAuthentication] {
-            let cluster = Arc::new(Mutex::new(Vec::new()));
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let broker_1 =
-                list_groups_broker(groups(&["a"]), Arc::clone(&cluster), Arc::clone(&requests))
-                    .await;
-            let broker_2_started = broker_2.start().await;
-            let broker_3 =
-                list_groups_broker(groups(&["c"]), Arc::clone(&cluster), Arc::clone(&requests))
-                    .await;
-            let broker_2_addr = broker_2_started.addr;
-            *cluster.lock().expect("cluster lock") =
-                vec![broker_1.addr, broker_2_addr, broker_3.addr];
-            let admin = AdminClient::connect_secured(
-                &[broker_1.addr.to_string()],
-                Some(ClientSecurity {
-                    protocol: krabka_security::ListenerProtocol::SaslPlaintext,
-                    tls: None,
-                    sasl: Some(SaslCredentials::Plain {
-                        username: "alice".into(),
-                        password: "secret".into(),
-                    }),
-                    sasl_host: None,
+        let cluster = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let broker_1 =
+            list_groups_broker(groups(&["a"]), Arc::clone(&cluster), Arc::clone(&requests)).await;
+        let broker_2_started = broker_2.start().await;
+        let broker_3 =
+            list_groups_broker(groups(&["c"]), Arc::clone(&cluster), Arc::clone(&requests)).await;
+        let broker_2_addr = broker_2_started.addr;
+        *cluster.lock().expect("cluster lock") = vec![broker_1.addr, broker_2_addr, broker_3.addr];
+        let admin = AdminClient::connect_secured(
+            &[broker_1.addr.to_string()],
+            Some(ClientSecurity {
+                protocol: krabka_security::ListenerProtocol::SaslPlaintext,
+                tls: None,
+                sasl: Some(SaslCredentials::Plain {
+                    username: "alice".into(),
+                    password: "secret".into(),
                 }),
-            )
-            .await
-            .expect("admin connects");
+                sasl_host: None,
+            }),
+        )
+        .await
+        .expect("admin connects");
 
-            let outcome = tokio::time::timeout(
-                RETRY.timeout * 5,
-                admin.list_groups_with_retry(&ListGroupsOptions::builder().build(), RETRY),
-            )
-            .await
-            .map(|result| result.expect("list_groups succeeds"));
-            let observed = (outcome, broker_2_started.connections.load(Ordering::SeqCst));
+        let outcome = tokio::time::timeout(
+            RETRY.timeout * 5,
+            admin.list_groups_with_retry(&ListGroupsOptions::builder().build(), RETRY),
+        )
+        .await
+        .map(|result| result.expect("list_groups succeeds"));
+        let observed = (outcome, broker_2_started.connections.load(Ordering::SeqCst));
 
-            let (code, message) = broker_2.expected_error(broker_2_addr);
-            let expected = (
-                Ok(ListGroupsResult {
-                    valid: stable_listings(&["a", "c"]),
-                    errors: vec![ListGroupsError {
-                        node_id: 2,
-                        host: broker_2_addr.ip().to_string(),
-                        port: i32::from(broker_2_addr.port()),
-                        error: KafkaError {
-                            code,
-                            name: kafka_error_name(code),
-                            message,
-                        },
-                    }],
-                }),
-                1,
-            );
-            broker_1.stop();
-            broker_2_started.stop();
-            broker_3.stop();
-            assert!(observed == expected, "case {broker_2:?}");
-        }
+        let (code, message) = broker_2.expected_error(broker_2_addr);
+        let expected = (
+            Ok(ListGroupsResult {
+                valid: stable_listings(&["a", "c"]),
+                errors: vec![ListGroupsError {
+                    node_id: 2,
+                    host: broker_2_addr.ip().to_string(),
+                    port: broker_port(broker_2_addr),
+                    error: expected_kafka_error(code, message),
+                }],
+            }),
+            1,
+        );
+        broker_1.stop();
+        broker_2_started.stop();
+        broker_3.stop();
+        assert2::assert!(observed == expected, "case {broker_2:?}");
     }
 
-    /// Kafka's `GroupListing.isSimpleConsumerGroup` is
-    /// `type.filter(gt -> gt == GroupType.CLASSIC).isPresent() && protocol.isEmpty()`.
+    fn list_groups_merge_cases() -> Vec<ListGroupsCase> {
+        vec![
+            ListGroupsCase::builder()
+                .name("one group on each broker")
+                .brokers([groups(&["a"]), groups(&["b"]), groups(&["c"])])
+                .valid(stable_listings(&["a", "b", "c"]))
+                .build(),
+            ListGroupsCase::builder()
+                .name("broker 2 has no groups")
+                .brokers([groups(&["a"]), groups(&[]), groups(&["c"])])
+                .valid(stable_listings(&["a", "c"]))
+                .build(),
+            ListGroupsCase::builder()
+                .name("a group on two brokers is listed once")
+                .brokers([groups(&["a"]), groups(&["a", "b"]), groups(&["c"])])
+                .valid(stable_listings(&["a", "b", "c"]))
+                .build(),
+            ListGroupsCase::builder()
+                .name("broker 2 answers coordinator not available until the timeout")
+                .brokers([groups(&["a"]), broker_error(15), groups(&["c"])])
+                .timeout(SHORT)
+                .valid(stable_listings(&["a", "c"]))
+                .errors(vec![(
+                    2,
+                    7,
+                    Some(format!(
+                        "ListGroups timed out after 1 attempt(s); last error: {}",
+                        AdminError::Broker {
+                            api: "ListGroups",
+                            code: 15,
+                            name: "COORDINATOR_NOT_AVAILABLE",
+                            message: None,
+                        }
+                    )),
+                )])
+                .build(),
+            ListGroupsCase::builder()
+                .name("broker 2 answers coordinator load in progress, then its groups")
+                .brokers([
+                    groups(&["a"]),
+                    ListGroupsBroker {
+                        max_version: 5,
+                        answers: vec![
+                            ListGroupsAnswer::Error(14),
+                            ListGroupsAnswer::Error(15),
+                            ListGroupsAnswer::Groups(vec![consumer_group("b")]),
+                        ],
+                    },
+                    groups(&["c"]),
+                ])
+                .valid(vec![
+                    stable_listing("a"),
+                    stable_listing("b"),
+                    stable_listing("c"),
+                ])
+                .requests([
+                    vec![plain(5)],
+                    vec![plain(5), plain(5), plain(5)],
+                    vec![plain(5)],
+                ])
+                .build(),
+            ListGroupsCase::builder()
+                .name("broker 2 answers cluster authorization failed")
+                .brokers([groups(&["a"]), broker_error(31), groups(&["c"])])
+                .valid(stable_listings(&["a", "c"]))
+                .errors(single_broker_error())
+                .build(),
+        ]
+    }
+
+    fn list_groups_filter_cases() -> Vec<ListGroupsCase> {
+        vec![
+            ListGroupsCase::builder()
+                .name("state filter Stable is sent to every broker")
+                .brokers([
+                    ListGroupsBroker {
+                        max_version: 5,
+                        answers: vec![ListGroupsAnswer::Groups(vec![
+                            listed("a", "consumer", "Empty", "Classic"),
+                            consumer_group("b"),
+                        ])],
+                    },
+                    groups(&["c"]),
+                    groups(&[]),
+                ])
+                .options(states(&[GroupState::Stable]))
+                .valid(stable_listings(&["b", "c"]))
+                .requests([vec![stable(5)], vec![stable(5)], vec![stable(5)]])
+                .build(),
+            ListGroupsCase::builder()
+                .name("state filter on a broker below v4 is unsupported on that broker")
+                .brokers([groups(&["a"]), below(3, &["b"]), groups(&["c"])])
+                .options(states(&[GroupState::Stable]))
+                .valid(stable_listings(&["a", "c"]))
+                .errors(vec![(2, 35, Some(unsupported(3, 4)))])
+                .requests([vec![stable(5)], Vec::new(), vec![stable(5)]])
+                .build(),
+            ListGroupsCase::builder()
+                .name("type filter Consumer on a broker below v5 is unsupported on that broker")
+                .brokers([groups(&["a"]), below(4, &["b"]), groups(&["c"])])
+                .options(types(&[GroupType::Consumer]))
+                .errors(vec![(2, 35, Some(unsupported(4, 5)))])
+                .requests([vec![consumer_type(5)], Vec::new(), vec![consumer_type(5)]])
+                .build(),
+            ListGroupsCase::builder()
+                .name("type filter Classic and Consumer on a broker below v5 is omitted")
+                .brokers([groups(&["a"]), below(4, &["b"]), groups(&["c"])])
+                .options(types(&[GroupType::Classic, GroupType::Consumer]))
+                .valid(vec![
+                    stable_listing("a"),
+                    GroupListing {
+                        group_type: None,
+                        ..stable_listing("b")
+                    },
+                    stable_listing("c"),
+                ])
+                .requests([
+                    vec![classic_and_consumer(5)],
+                    vec![classic_and_consumer(4)],
+                    vec![classic_and_consumer(5)],
+                ])
+                .build(),
+            ListGroupsCase::builder()
+                .name("protocol type filter is applied by the client")
+                .brokers([
+                    ListGroupsBroker {
+                        max_version: 5,
+                        answers: vec![ListGroupsAnswer::Groups(vec![
+                            consumer_group("a"),
+                            listed("connect-a", "connect", "Stable", "Classic"),
+                            listed("simple", "", "Empty", "Classic"),
+                        ])],
+                    },
+                    groups(&[]),
+                    ListGroupsBroker {
+                        max_version: 5,
+                        answers: vec![ListGroupsAnswer::Groups(vec![listed(
+                            "share", "share", "Stable", "Share",
+                        )])],
+                    },
+                ])
+                .options(ListGroupsOptions::for_consumer_groups())
+                .valid(vec![
+                    stable_listing("a"),
+                    GroupListing {
+                        group_id: "simple".into(),
+                        group_type: Some(GroupType::Classic),
+                        protocol_type: String::new(),
+                        group_state: Some(GroupState::Empty),
+                    },
+                ])
+                .requests([
+                    vec![classic_and_consumer(5)],
+                    vec![classic_and_consumer(5)],
+                    vec![classic_and_consumer(5)],
+                ])
+                .build(),
+        ]
+    }
+
     /// A listing with no type is not a simple consumer group.
-    #[test]
-    fn is_simple_consumer_group_matches_kafka() {
-        for (group_type, protocol_type, expected) in [
-            (Some(GroupType::Classic), "", true),
-            (Some(GroupType::Classic), "consumer", false),
-            (Some(GroupType::Consumer), "", false),
-            (Some(GroupType::Unknown), "", false),
-            (None, "", false),
-            (None, "consumer", false),
-        ] {
-            let listing = GroupListing {
-                group_id: "g".into(),
-                group_type,
-                protocol_type: protocol_type.into(),
-                group_state: None,
-            };
-            assert!(
-                listing.is_simple_consumer_group() == expected,
-                "type {group_type:?}, protocol type {protocol_type:?}"
-            );
-        }
+    #[yare::parameterized(
+        classic_without_protocol = {
+            Some(GroupType::Classic),
+            "",
+            true,
+        },
+        classic_with_protocol = {
+            Some(GroupType::Classic),
+            "consumer",
+            false,
+        },
+        consumer = { Some(GroupType::Consumer), "", false },
+        unknown = { Some(GroupType::Unknown), "", false },
+        no_type = { None, "", false },
+        no_type_with_protocol = { None, "consumer", false },
+    )]
+    fn is_simple_consumer_group_matches_kafka(
+        group_type: Option<GroupType>,
+        protocol_type: &str,
+        expected: bool,
+    ) {
+        let listing = GroupListing {
+            group_id: "g".into(),
+            group_type,
+            protocol_type: protocol_type.into(),
+            group_state: None,
+        };
+        assert2::assert!(listing.is_simple_consumer_group() == expected);
     }
 
     /// Kafka's `GroupListing` has no type or state when the broker sends an
     /// empty name, and `GroupState.parse` and `GroupType.parse` ignore case
     /// and map an unknown name to `Unknown`.
-    #[test]
-    fn group_listing_reads_listed_group() {
-        for (group, expected) in [
-            (
-                listed("g", "consumer", "Stable", "Consumer"),
-                GroupListing {
-                    group_id: "g".into(),
-                    group_type: Some(GroupType::Consumer),
-                    protocol_type: "consumer".into(),
-                    group_state: Some(GroupState::Stable),
-                },
-            ),
-            (
-                listed("g", "", "", ""),
-                GroupListing {
-                    group_id: "g".into(),
-                    group_type: None,
-                    protocol_type: String::new(),
-                    group_state: None,
-                },
-            ),
-            (
-                listed("g", "consumer", "preparingrebalance", "STREAMS"),
-                GroupListing {
-                    group_id: "g".into(),
-                    group_type: Some(GroupType::Streams),
-                    protocol_type: "consumer".into(),
-                    group_state: Some(GroupState::PreparingRebalance),
-                },
-            ),
-            (
-                listed("g", "consumer", "Rebalancing", "Future"),
-                GroupListing {
-                    group_id: "g".into(),
-                    group_type: Some(GroupType::Unknown),
-                    protocol_type: "consumer".into(),
-                    group_state: Some(GroupState::Unknown),
-                },
-            ),
-        ] {
-            assert!(GroupListing::from(group) == expected);
-        }
+    #[yare::parameterized(
+        consumer = {
+            listed("g", "consumer", "Stable", "Consumer"),
+            GroupListing {
+                group_id: "g".into(),
+                group_type: Some(GroupType::Consumer),
+                protocol_type: "consumer".into(),
+                group_state: Some(GroupState::Stable),
+            },
+        },
+        empty = {
+            listed("g", "", "", ""),
+            GroupListing {
+                group_id: "g".into(),
+                group_type: None,
+                protocol_type: String::new(),
+                group_state: None,
+            },
+        },
+        streams = {
+            listed("g", "consumer", "preparingrebalance", "STREAMS"),
+            GroupListing {
+                group_id: "g".into(),
+                group_type: Some(GroupType::Streams),
+                protocol_type: "consumer".into(),
+                group_state: Some(GroupState::PreparingRebalance),
+            },
+        },
+        unknown = {
+            listed("g", "consumer", "Rebalancing", "Future"),
+            GroupListing {
+                group_id: "g".into(),
+                group_type: Some(GroupType::Unknown),
+                protocol_type: "consumer".into(),
+                group_state: Some(GroupState::Unknown),
+            },
+        },
+    )]
+    fn group_listing_reads_listed_group(group: ListedGroup, expected: GroupListing) {
+        assert2::assert!(GroupListing::from(group) == expected);
     }
 
     /// An `ApiVersions` answer that advertises every group RPC this module's
@@ -3870,24 +4074,38 @@ mod tests {
             max_version,
             ..Default::default()
         };
-        encode(
-            &ApiVersionsResponse {
-                api_keys: vec![
-                    api(api_versions_request::API_KEY, 0),
-                    api(find_coordinator_request::API_KEY, 0),
-                    api(metadata_request::API_KEY, 13),
-                    api(offset_commit_request::API_KEY, 9),
-                    api(offset_fetch_request::API_KEY, 9),
-                    api(OffsetDeleteRequest::API_KEY, 0),
-                    api(LeaveGroupRequest::API_KEY, 5),
-                    api(AlterShareGroupOffsetsRequest::API_KEY, 1),
-                    api(DeleteShareGroupOffsetsRequest::API_KEY, 0),
-                ],
-                ..Default::default()
-            },
-            0,
-            false,
-        )
+        encode_api_versions(vec![
+            api(api_versions_request::API_KEY, 0),
+            api(find_coordinator_request::API_KEY, 0),
+            api(metadata_request::API_KEY, 13),
+            api(offset_commit_request::API_KEY, 9),
+            api(offset_fetch_request::API_KEY, 9),
+            api(OffsetDeleteRequest::API_KEY, 0),
+            api(LeaveGroupRequest::API_KEY, 5),
+            api(AlterShareGroupOffsetsRequest::API_KEY, 1),
+            api(DeleteShareGroupOffsetsRequest::API_KEY, 0),
+        ])
+    }
+
+    fn empty_metadata_response(version: i16) -> Vec<u8> {
+        encode(&MetadataResponse::default(), version, true)
+    }
+
+    fn offset_fetch_response_bytes(version: i16) -> Vec<u8> {
+        encode(&offset_fetch_response(version), version, true)
+    }
+
+    fn empty_metadata_reply(version: i16) -> Option<Vec<u8>> {
+        Some(empty_metadata_response(version))
+    }
+
+    fn offset_fetch_reply(version: i16) -> Option<Vec<u8>> {
+        Some(offset_fetch_response_bytes(version))
+    }
+
+    fn counted_reply(counter: &AtomicUsize, response: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        response
     }
 
     /// Connects an `AdminClient` to a single mock broker that is its own
@@ -3926,18 +4144,14 @@ mod tests {
                             .expect("coordinator address set before use");
                         Some(encode(&mock_coordinator_response(addr, 0), version, false))
                     }
-                    metadata_request::API_KEY => {
-                        Some(encode(&MetadataResponse::default(), version, true))
-                    }
+                    metadata_request::API_KEY => empty_metadata_reply(version),
                     _ => None,
                 }
             }
         })
         .await;
         *coordinator_addr.lock().expect("coordinator lock") = Some(broker.addr);
-        let admin = AdminClient::connect(&[broker.addr.to_string()])
-            .await
-            .expect("admin connects");
+        let admin = connect_admin(broker.addr, "admin connects").await;
         (admin, broker, calls)
     }
 
@@ -3949,28 +4163,88 @@ mod tests {
         }]
     }
 
+    macro_rules! successful_offset_topic {
+        ($topic:ident, $partition:ident, $name_field:ident) => {
+            $topic {
+                $name_field: "orders".into(),
+                partitions: vec![$partition {
+                    partition_index: 2,
+                    error_code: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        };
+    }
+
     fn successful_offset_delete_topic() -> OffsetDeleteResponseTopic {
-        OffsetDeleteResponseTopic {
-            name: "orders".into(),
-            partitions: vec![OffsetDeleteResponsePartition {
-                partition_index: 2,
+        successful_offset_topic!(
+            OffsetDeleteResponseTopic,
+            OffsetDeleteResponsePartition,
+            name
+        )
+    }
+
+    fn offset_delete_response(error_code: i16, version: i16) -> Vec<u8> {
+        let topics =
+            successful_response_rows(error_code, || vec![successful_offset_delete_topic()]);
+        encode(
+            &OffsetDeleteResponse {
+                error_code,
+                topics,
+                ..Default::default()
+            },
+            version,
+            false,
+        )
+    }
+
+    fn offset_commit_success_response(version: i16) -> Vec<u8> {
+        encode(
+            &OffsetCommitResponse {
+                topics: vec![successful_offset_commit_topic()],
+                ..Default::default()
+            },
+            version,
+            true,
+        )
+    }
+
+    fn delete_share_offsets_response(error_code: i16, version: i16) -> Vec<u8> {
+        let responses = successful_response_rows(error_code, || {
+            vec![DeleteShareGroupOffsetsResponseTopic {
+                topic_name: "orders".into(),
                 error_code: 0,
                 ..Default::default()
-            }],
-            ..Default::default()
-        }
+            }]
+        });
+        crate::encode_test_struct_fields!(
+            encode,
+            DeleteShareGroupOffsetsResponse,
+            { error_code: error_code, responses: responses },
+            version,
+            true,
+        )
     }
 
     fn successful_offset_commit_topic() -> OffsetCommitResponseTopic {
-        OffsetCommitResponseTopic {
-            name: "orders".into(),
-            partitions: vec![OffsetCommitResponsePartition {
-                partition_index: 2,
-                error_code: 0,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
+        successful_offset_topic!(
+            OffsetCommitResponseTopic,
+            OffsetCommitResponsePartition,
+            name
+        )
+    }
+
+    fn successful_share_offset_topic() -> AlterShareGroupOffsetsResponseTopic {
+        successful_offset_topic!(
+            AlterShareGroupOffsetsResponseTopic,
+            AlterShareGroupOffsetsResponsePartition,
+            topic_name
+        )
+    }
+
+    fn successful_response_rows<T>(error_code: i16, rows: impl FnOnce() -> Vec<T>) -> Vec<T> {
+        if error_code == 0 { rows() } else { Vec::new() }
     }
 
     fn assert_single_group_offset_success(
@@ -4045,6 +4319,11 @@ mod tests {
             );
             cases
         }
+
+        fn with_authorization_failure(mut cases: Vec<Self>) -> Vec<Self> {
+            cases.push(Self::error("group authorization failed is final", 30));
+            cases
+        }
     }
 
     #[bon::builder]
@@ -4075,42 +4354,58 @@ mod tests {
         }
     }
 
+    macro_rules! run_retry_cases {
+        ($api_key:expr, $respond:expr, $cases:expr, $action:expr) => {
+            run_coordinator_retry_cases()
+                .api_key($api_key)
+                .respond($respond)
+                .cases($cases)
+                .action($action)
+                .call()
+                .await
+        };
+    }
+
+    async fn delete_consumer_offsets(
+        mut admin: AdminClient,
+    ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
+        admin
+            .delete_consumer_group_offsets("workers", &[("orders".into(), 2)])
+            .await
+    }
+
+    async fn alter_share_offsets(
+        mut admin: AdminClient,
+    ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
+        admin
+            .alter_share_group_offsets("workers", &test_group_offsets())
+            .await
+    }
+
+    async fn delete_share_offsets(
+        mut admin: AdminClient,
+    ) -> Result<Vec<(String, Option<KafkaError>)>, AdminError> {
+        admin
+            .delete_share_group_offsets("workers", &["orders".to_string()])
+            .await
+    }
+
     /// Apache Kafka's `DeleteConsumerGroupOffsetsHandler.handleResponse`
     /// reads the top-level `error_code` as a group-level failure, retried the
     /// same way as `DeleteGroups`, and otherwise returns one outcome per
     /// requested partition.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_consumer_group_offsets_retries_coordinator_errors_as_kafka_does() {
-        let respond = |code: i16, version: i16| {
-            let topics = if code == 0 {
-                vec![successful_offset_delete_topic()]
-            } else {
-                Vec::new()
-            };
-            encode(
-                &OffsetDeleteResponse {
-                    error_code: code,
-                    topics,
-                    ..Default::default()
-                },
-                version,
-                false,
-            )
-        };
+        let respond = offset_delete_response;
         let outcome = successful_group_offset_outcome();
         let mut cases = CoordinatorRetryCase::standard(&outcome);
         cases.push(CoordinatorRetryCase::error("non-empty group is final", 68));
-        run_coordinator_retry_cases()
-            .api_key(OffsetDeleteRequest::API_KEY)
-            .respond(respond)
-            .cases(cases)
-            .action(|mut admin| async move {
-                admin
-                    .delete_consumer_group_offsets("workers", &[("orders".into(), 2)])
-                    .await
-            })
-            .call()
-            .await;
+        run_retry_cases!(
+            OffsetDeleteRequest::API_KEY,
+            respond,
+            cases,
+            delete_consumer_offsets
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -4129,23 +4424,8 @@ mod tests {
 
         fn response(self, version: i16) -> Vec<u8> {
             match self {
-                Self::Delete => encode(
-                    &OffsetDeleteResponse {
-                        error_code: 0,
-                        topics: vec![successful_offset_delete_topic()],
-                        ..Default::default()
-                    },
-                    version,
-                    false,
-                ),
-                Self::Alter => encode(
-                    &OffsetCommitResponse {
-                        topics: vec![successful_offset_commit_topic()],
-                        ..Default::default()
-                    },
-                    version,
-                    true,
-                ),
+                Self::Delete => offset_delete_response(0, version),
+                Self::Alter => offset_commit_success_response(version),
             }
         }
 
@@ -4161,10 +4441,7 @@ mod tests {
                 }
                 Self::Alter => {
                     admin
-                        .alter_streams_group_offsets(
-                            "workers",
-                            &BTreeMap::from([(("orders".into(), 2), 41)]),
-                        )
+                        .alter_streams_group_offsets("workers", &test_group_offsets())
                         .await
                 }
             }
@@ -4173,22 +4450,21 @@ mod tests {
 
     /// Kafka's Streams group offset APIs delegate to their Consumer group
     /// counterparts.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn streams_group_offset_calls_delegate_to_consumer_calls() {
-        for call in [
-            StreamsGroupOffsetCall::Delete,
-            StreamsGroupOffsetCall::Alter,
-        ] {
-            let respond = move |_code: i16, version: i16| call.response(version);
-            let (mut admin, broker, calls) =
-                connect_self_coordinating(call.api_key(), vec![0], respond).await;
-            let result = call
-                .call(&mut admin)
-                .await
-                .map_err(|error| error.to_string());
-            broker.stop();
-            assert_single_group_offset_success(result, calls.load(Ordering::SeqCst));
-        }
+    #[yare::parameterized(
+        delete = { StreamsGroupOffsetCall::Delete },
+        alter = { StreamsGroupOffsetCall::Alter },
+    )]
+    #[test_macro(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+    async fn streams_group_offset_calls_delegate_to_consumer_calls(call: StreamsGroupOffsetCall) {
+        let respond = move |_code: i16, version: i16| call.response(version);
+        let (mut admin, broker, calls) =
+            connect_self_coordinating(call.api_key(), vec![0], respond).await;
+        let result = call
+            .call(&mut admin)
+            .await
+            .map_err(|error| error.to_string());
+        broker.stop();
+        assert_single_group_offset_success(result, calls.load(Ordering::SeqCst));
     }
 
     /// Apache Kafka's `RemoveMembersFromConsumerGroupHandler.handleResponse`
@@ -4205,49 +4481,39 @@ mod tests {
             ..Default::default()
         };
         let respond = move |code: i16, version: i16| {
-            let members = if code == 0 {
+            let members = successful_response_rows(code, || {
                 // The coordinator answers in its own order.
                 vec![answered("b", 25), answered("a", 0)]
-            } else {
-                Vec::new()
+            });
+            let response = LeaveGroupResponse {
+                error_code: code,
+                members,
+                ..Default::default()
             };
-            encode(
-                &LeaveGroupResponse {
-                    error_code: code,
-                    members,
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
+            encode_flexible(&response, version)
         };
         let removed = |instance_id: &str| RemovedMember {
             member_id: String::new(),
             group_instance_id: Some(instance_id.into()),
         };
         let outcome = RemovedMembers {
-            members: BTreeMap::from([
-                (removed("a"), None),
-                (
-                    removed("b"),
-                    Some(KafkaError {
-                        code: 25,
-                        name: "UNKNOWN_MEMBER_ID",
-                        message: None,
-                    }),
-                ),
-            ]),
+            members: maplit::btreemap! {
+                removed("a") => None,
+                removed("b") => Some(KafkaError {
+                code: 25,
+                name: "UNKNOWN_MEMBER_ID",
+                message: None,
+            }),
+            },
         };
-        let mut cases = CoordinatorRetryCase::standard(&outcome);
-        cases.push(CoordinatorRetryCase::error(
-            "group authorization failed is final",
-            30,
-        ));
-        run_coordinator_retry_cases()
-            .api_key(LeaveGroupRequest::API_KEY)
-            .respond(respond)
-            .cases(cases)
-            .action(|mut admin| async move {
+        let cases = CoordinatorRetryCase::with_authorization_failure(
+            CoordinatorRetryCase::standard(&outcome),
+        );
+        run_retry_cases!(
+            LeaveGroupRequest::API_KEY,
+            respond,
+            cases,
+            |mut admin| async move {
                 admin
                     .remove_members_from_consumer_group(
                         "workers",
@@ -4262,29 +4528,21 @@ mod tests {
                         &RemoveMembersOptions::builder().build(),
                     )
                     .await
-            })
-            .call()
-            .await;
+            }
+        );
     }
 
     /// Kafka's `removeMembersFromConsumerGroup` sends each member with
     /// `UNKNOWN_MEMBER_ID`, its instance id and the reason, which is the
     /// default for `None` or empty and is cut to 255 characters.
-    #[test]
-    fn leave_group_reason_matches_kafka() {
-        let long = "r".repeat(300);
-        for (name, reason, expected) in [
-            ("none", None, DEFAULT_LEAVE_GROUP_REASON.to_owned()),
-            ("empty", Some(""), DEFAULT_LEAVE_GROUP_REASON.to_owned()),
-            (
-                "short",
-                Some("rolling restart"),
-                "rolling restart".to_owned(),
-            ),
-            ("long", Some(long.as_str()), "r".repeat(255)),
-        ] {
-            assert!(leave_group_reason(reason) == expected, "case {name}");
-        }
+    #[yare::parameterized(
+        none = { None, DEFAULT_LEAVE_GROUP_REASON.to_owned() },
+        empty = { Some(String::new()), DEFAULT_LEAVE_GROUP_REASON.to_owned() },
+        short = { Some("rolling restart".to_owned()), "rolling restart".to_owned() },
+        long = { Some("r".repeat(300)), "r".repeat(255) },
+    )]
+    fn leave_group_reason_matches_kafka(reason: Option<String>, expected: String) {
+        assert2::assert!(leave_group_reason(reason.as_deref()) == expected);
     }
 
     /// `RemoveMembersFromConsumerGroupResult.memberResult` looks a member up
@@ -4301,22 +4559,16 @@ mod tests {
             message: None,
         };
         let result = RemovedMembers {
-            members: BTreeMap::from([
-                (
-                    RemovedMember {
-                        member_id: String::new(),
-                        group_instance_id: Some("a".into()),
-                    },
-                    None,
-                ),
-                (
-                    RemovedMember {
-                        member_id: String::new(),
-                        group_instance_id: Some("b".into()),
-                    },
-                    Some(fenced.clone()),
-                ),
-            ]),
+            members: maplit::btreemap! {
+                RemovedMember {
+                member_id: String::new(),
+                group_instance_id: Some("a".into()),
+            } => None,
+                RemovedMember {
+                member_id: String::new(),
+                group_instance_id: Some("b".into()),
+            } => Some(fenced.clone()),
+            },
         };
         assert!(
             [member("a"), member("b"), member("c")].map(|member| result.member_result(&member))
@@ -4341,28 +4593,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn alter_share_group_offsets_retries_coordinator_errors_as_kafka_does() {
         let respond = |code: i16, version: i16| {
-            let responses = if code == 0 {
-                vec![AlterShareGroupOffsetsResponseTopic {
-                    topic_name: "orders".into(),
-                    partitions: vec![AlterShareGroupOffsetsResponsePartition {
-                        partition_index: 2,
-                        error_code: 0,
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }]
-            } else {
-                Vec::new()
+            let responses =
+                successful_response_rows(code, || vec![successful_share_offset_topic()]);
+            let response = AlterShareGroupOffsetsResponse {
+                error_code: code,
+                responses,
+                ..Default::default()
             };
-            encode(
-                &AlterShareGroupOffsetsResponse {
-                    error_code: code,
-                    responses,
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
+            encode_flexible(&response, version)
         };
         let outcome = successful_group_offset_outcome();
         let mut cases = CoordinatorRetryCase::with_rebalance_in_progress(&outcome);
@@ -4382,20 +4620,12 @@ mod tests {
                 }])
                 .call(),
         );
-        run_coordinator_retry_cases()
-            .api_key(AlterShareGroupOffsetsRequest::API_KEY)
-            .respond(respond)
-            .cases(cases)
-            .action(|mut admin| async move {
-                admin
-                    .alter_share_group_offsets(
-                        "workers",
-                        &BTreeMap::from([(("orders".into(), 2), 41)]),
-                    )
-                    .await
-            })
-            .call()
-            .await;
+        run_retry_cases!(
+            AlterShareGroupOffsetsRequest::API_KEY,
+            respond,
+            cases,
+            alter_share_offsets
+        );
     }
 
     /// Apache Kafka's `KafkaAdminClient.listStreamsGroupOffsets` delegates to
@@ -4411,10 +4641,7 @@ mod tests {
             .await
             .map_err(|error| error.to_string());
         broker.stop();
-        assert!(
-            (result, calls.load(Ordering::SeqCst))
-                == (Ok(BTreeMap::from([(("orders".into(), 2), 41)])), 1)
-        );
+        assert!((result, calls.load(Ordering::SeqCst)) == (Ok(test_group_offsets()), 1));
     }
 
     /// Apache Kafka's `DeleteShareGroupOffsetsHandler.handleResponse` reads
@@ -4423,42 +4650,16 @@ mod tests {
     /// per requested topic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_share_group_offsets_retries_coordinator_errors_as_kafka_does() {
-        let respond = |code: i16, version: i16| {
-            let responses = if code == 0 {
-                vec![DeleteShareGroupOffsetsResponseTopic {
-                    topic_name: "orders".into(),
-                    error_code: 0,
-                    ..Default::default()
-                }]
-            } else {
-                Vec::new()
-            };
-            encode(
-                &DeleteShareGroupOffsetsResponse {
-                    error_code: code,
-                    responses,
-                    ..Default::default()
-                },
-                version,
-                true,
-            )
-        };
+        let respond = delete_share_offsets_response;
         let outcome = vec![("orders".to_string(), None)];
-        let mut cases = CoordinatorRetryCase::with_rebalance_in_progress(&outcome);
-        cases.push(CoordinatorRetryCase::error(
-            "group authorization failed is final",
-            30,
-        ));
-        run_coordinator_retry_cases()
-            .api_key(DeleteShareGroupOffsetsRequest::API_KEY)
-            .respond(respond)
-            .cases(cases)
-            .action(|mut admin| async move {
-                admin
-                    .delete_share_group_offsets("workers", &["orders".to_string()])
-                    .await
-            })
-            .call()
-            .await;
+        let cases = CoordinatorRetryCase::with_authorization_failure(
+            CoordinatorRetryCase::with_rebalance_in_progress(&outcome),
+        );
+        run_retry_cases!(
+            DeleteShareGroupOffsetsRequest::API_KEY,
+            respond,
+            cases,
+            delete_share_offsets
+        );
     }
 }

@@ -2111,7 +2111,7 @@ mod tests {
         let join = build_heartbeat(&fields(0, true, BTreeMap::new()), &mut sent);
         let steady = build_heartbeat(&fields(1, false, BTreeMap::new()), &mut sent);
         let owned = build_heartbeat(
-            &fields(1, false, BTreeMap::from([(TOPIC_ID.0, vec![0, 1])])),
+            &fields(1, false, maplit::btreemap! {TOPIC_ID.0 => vec![0, 1]}),
             &mut sent,
         );
         assert2::assert!(
@@ -2275,12 +2275,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let names = HashMap::from([(TOPIC_ID, "orders".to_owned())]);
+        let names = maplit::hashmap! {TOPIC_ID => "orders".to_owned()};
         assert2::assert!(
             assignment_partitions(&response, &names)
                 == Some((
                     vec![("orders".to_owned(), 0), ("orders".to_owned(), 1)],
-                    HashSet::from([other])
+                    maplit::hashset! {other}
                 ))
         );
         assert2::assert!(

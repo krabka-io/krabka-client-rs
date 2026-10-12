@@ -317,10 +317,9 @@ impl AdminClient {
         upgrade_type: UpgradeType,
         timeout: Time,
     ) -> Result<MetadataVersionUpdate, AdminError> {
-        let updates = BTreeMap::from([(
-            METADATA_VERSION_FEATURE.to_owned(),
-            FeatureUpdate::new(level, upgrade_type)?,
-        )]);
+        let updates = maplit::btreemap! {
+            METADATA_VERSION_FEATURE.to_owned() => FeatureUpdate::new(level, upgrade_type)?,
+        };
         let results = self
             .update_features(
                 &updates,
@@ -541,13 +540,10 @@ mod tests {
 
     #[test]
     fn update_results_complete_every_feature_as_kafka_does() {
-        let updates = BTreeMap::from([
-            ("group.version".to_owned(), update(1, UpgradeType::Upgrade)),
-            (
-                "metadata.version".to_owned(),
-                update(20, UpgradeType::Upgrade),
-            ),
-        ]);
+        let updates = maplit::btreemap! {
+            "group.version".to_owned() => update(1, UpgradeType::Upgrade),
+            "metadata.version".to_owned() => update(20, UpgradeType::Upgrade),
+        };
         let row = |feature: &str, error_code, message: Option<&str>| UpdatableFeatureResult {
             feature: feature.into(),
             error_code,
@@ -589,10 +585,10 @@ mod tests {
             let [group, metadata] = expected;
             assert2::assert!(
                 update_results(&updates, response)
-                    == BTreeMap::from([
-                        ("group.version".to_owned(), group),
-                        ("metadata.version".to_owned(), metadata),
-                    ]),
+                    == maplit::btreemap! {
+                        "group.version".to_owned() => group,
+                        "metadata.version".to_owned() => metadata,
+                    },
                 "case {name}"
             );
         }
@@ -660,10 +656,10 @@ mod tests {
                     } else {
                         0
                     };
-                    let updates = BTreeMap::from([
-                        ("group.version".to_owned(), update(1, upgrade_type)),
-                        ("share.version".to_owned(), update(level, upgrade_type)),
-                    ]);
+                    let updates = maplit::btreemap! {
+                        "group.version".to_owned() => update(1, upgrade_type),
+                        "share.version".to_owned() => update(level, upgrade_type),
+                    };
 
                     let result = admin
                         .update_features(
@@ -701,10 +697,10 @@ mod tests {
                     };
                     assert2::assert!(
                         result.expect("update succeeds")
-                            == BTreeMap::from([
-                                ("group.version".to_owned(), Ok(())),
-                                ("share.version".to_owned(), Ok(())),
-                            ]),
+                            == maplit::btreemap! {
+                                "group.version".to_owned() => Ok(()),
+                                "share.version".to_owned() => Ok(()),
+                            },
                         "case {name}"
                     );
                     assert2::assert!(
@@ -750,7 +746,9 @@ mod tests {
             ("empty", BTreeMap::new()),
             (
                 "blank",
-                BTreeMap::from([(" ".to_owned(), update(1, UpgradeType::Upgrade))]),
+                maplit::btreemap! {
+                    " ".to_owned() => update(1, UpgradeType::Upgrade),
+                },
             ),
         ] {
             let result = admin

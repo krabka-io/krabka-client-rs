@@ -375,28 +375,25 @@ mod tests {
             (
                 "tracked topic gets the new id",
                 topic("orders", 0, new_id),
-                HashMap::from([("orders".to_string(), new_id)]),
+                maplit::hashmap! {"orders".to_string() => new_id},
             ),
             (
                 "row with an error keeps the old id",
                 topic("orders", 3, new_id),
-                HashMap::from([("orders".to_string(), old_id)]),
+                maplit::hashmap! {"orders".to_string() => old_id},
             ),
             (
                 "row with the zero id keeps the old id",
                 topic("orders", 0, WireUuid::ZERO),
-                HashMap::from([("orders".to_string(), old_id)]),
+                maplit::hashmap! {"orders".to_string() => old_id},
             ),
             (
                 "a new topic is added",
                 topic("payments", 0, other_id),
-                HashMap::from([
-                    ("orders".to_string(), old_id),
-                    ("payments".to_string(), other_id),
-                ]),
+                maplit::hashmap! {"orders".to_string() => old_id, "payments".to_string() => other_id},
             ),
         ] {
-            let mut topic_ids = HashMap::from([("orders".to_string(), old_id)]);
+            let mut topic_ids = maplit::hashmap! {"orders".to_string() => old_id};
             let metadata = MetadataResponse {
                 topics: vec![row],
                 ..Default::default()

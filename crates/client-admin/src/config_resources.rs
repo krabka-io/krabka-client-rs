@@ -142,7 +142,9 @@ impl AdminClient {
     /// # Errors
     /// See [`Self::list_config_resources`].
     pub async fn list_client_metrics_resources(&self) -> Result<Vec<String>, AdminError> {
-        let types = BTreeSet::from([ConfigResourceType::ClientMetrics]);
+        let types = maplit::btreeset! {
+            ConfigResourceType::ClientMetrics,
+        };
         Ok(self
             .list_config_resources(&types)
             .await?
@@ -286,8 +288,10 @@ mod tests {
             resource(32, "billing"),
             resource(64, "future"),
         ];
-        let topic_and_group =
-            BTreeSet::from([ConfigResourceType::Topic, ConfigResourceType::Group]);
+        let topic_and_group = maplit::btreeset! {
+            ConfigResourceType::Topic,
+            ConfigResourceType::Group,
+        };
         for (name, max_version, types, answers, expected) in [
             (
                 "v1 sends the types",

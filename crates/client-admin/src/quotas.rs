@@ -295,7 +295,9 @@ fn alter_results(
 
 /// The single-user entity `{user: name}`.
 fn user_entity(username: &str) -> ClientQuotaEntity {
-    BTreeMap::from([(ENTITY_USER.to_owned(), Some(username.to_owned()))])
+    maplit::btreemap! {
+        ENTITY_USER.to_owned() => Some(username.to_owned()),
+    }
 }
 
 impl AdminClient {
@@ -779,11 +781,15 @@ mod tests {
         let quotas = ClientQuotas::from([
             (
                 entity(&[("user", Some("alice")), ("client-id", None)]),
-                BTreeMap::from([("producer_byte_rate".to_owned(), 1024.0)]),
+                maplit::btreemap! {
+                    "producer_byte_rate".to_owned() => 1024.0,
+                },
             ),
             (
                 entity(&[("ip", Some("10.0.0.1"))]),
-                BTreeMap::from([("connection_creation_rate".to_owned(), 5.0)]),
+                maplit::btreemap! {
+                    "connection_creation_rate".to_owned() => 5.0,
+                },
             ),
         ]);
         for (name, close_first, error_code, expected) in [
@@ -895,22 +901,22 @@ mod tests {
             (
                 "each entity has its result",
                 vec![alice_answer.clone(), answer("ip", None, 42)],
-                BTreeMap::from([
-                    (alice.clone(), Ok(())),
-                    (
-                        ip.clone(),
-                        Err(KafkaError {
-                            code: 42,
-                            name: "INVALID_REQUEST",
-                            message: Some("bad".to_owned()),
-                        }),
-                    ),
-                ]),
+                maplit::btreemap! {
+                    alice.clone() => Ok(()),
+                    ip.clone() => Err(KafkaError {
+                    code: 42,
+                    name: "INVALID_REQUEST",
+                    message: Some("bad".to_owned()),
+                }),
+                },
             ),
             (
                 "a missing entity and an unasked entity",
                 vec![alice_answer.clone(), answer("user", Some("bob"), 0)],
-                BTreeMap::from([(alice.clone(), Ok(())), (ip.clone(), unknown)]),
+                maplit::btreemap! {
+                    alice.clone() => Ok(()),
+                    ip.clone() => unknown,
+                },
             ),
         ] {
             let response = AlterClientQuotasResponse {

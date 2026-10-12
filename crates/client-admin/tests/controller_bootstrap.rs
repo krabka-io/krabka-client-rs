@@ -12,12 +12,9 @@
 //!   its own 115 preflight, because it needs a broker bootstrap.
 //! - A 115 rejection sends nothing, so the controller connection stays usable.
 
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU16, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU16, Ordering},
 };
 
 use assert2::assert;
@@ -198,12 +195,11 @@ fn expected_configs() -> DescribeConfigsResults {
         config_type: ConfigType::Unknown,
         documentation: Some(String::new()),
     };
-    BTreeMap::from([(
-        ConfigResource::topic(TOPIC),
-        Ok(Config {
-            entries: BTreeMap::from([(retention.name.clone(), retention)]),
+    maplit::btreemap! {
+        ConfigResource::topic(TOPIC) => Ok(Config {
+            entries: maplit::btreemap! { retention.name.clone() => retention },
         }),
-    )])
+    }
 }
 
 async fn describe_topic(admin: &AdminClient) -> DescribeConfigsResults {

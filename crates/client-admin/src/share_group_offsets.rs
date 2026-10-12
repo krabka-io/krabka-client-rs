@@ -227,22 +227,16 @@ mod tests {
 
     #[test]
     fn request_names_the_partitions_of_each_spec() {
-        let specs = BTreeMap::from([
-            (
-                "all".to_owned(),
-                ListShareGroupOffsetsSpec::builder().build(),
-            ),
-            (
-                "some".to_owned(),
-                ListShareGroupOffsetsSpec::builder()
-                    .topic_partitions(vec![
-                        ("orders".to_owned(), 2),
-                        ("audit".to_owned(), 0),
-                        ("orders".to_owned(), 0),
-                    ])
-                    .build(),
-            ),
-        ]);
+        let specs = maplit::btreemap! {
+            "all".to_owned() => ListShareGroupOffsetsSpec::builder().build(),
+            "some".to_owned() => ListShareGroupOffsetsSpec::builder()
+        .topic_partitions(vec![
+            ("orders".to_owned(), 2),
+            ("audit".to_owned(), 0),
+            ("orders".to_owned(), 0),
+        ])
+        .build(),
+        };
         let keys = ["all".to_owned(), "some".to_owned()];
         assert!(
             describe_share_group_offsets_request(&keys, &specs)
@@ -326,29 +320,17 @@ mod tests {
         };
         assert!(
             share_group_offsets_outcomes(&keys, response)
-                == BTreeMap::from([
-                    (
-                        "good".to_owned(),
-                        GroupOutcome::Done(Ok(BTreeMap::from([
-                            (("orders".to_owned(), 0), info(41, Some(3), Some(5))),
-                            (("orders".to_owned(), 1), info(7, None, None)),
-                            (("orders".to_owned(), 2), None),
-                        ])))
-                    ),
-                    (
-                        "loading".to_owned(),
-                        GroupOutcome::Retry("COORDINATOR_LOAD_IN_PROGRESS".to_owned())
-                    ),
-                    (
-                        "moved".to_owned(),
-                        GroupOutcome::Unmap("NOT_COORDINATOR".to_owned())
-                    ),
-                    (
-                        "denied".to_owned(),
-                        GroupOutcome::Done(Err(kafka_error(30, Some("denied".to_owned()))))
-                    ),
-                    ("absent".to_owned(), GroupOutcome::Done(Ok(BTreeMap::new()))),
-                ])
+                == maplit::btreemap! {
+                    "good".to_owned() => GroupOutcome::Done(Ok(maplit::btreemap! {
+                        ("orders".to_owned(), 0) => info(41, Some(3), Some(5)),
+                        ("orders".to_owned(), 1) => info(7, None, None),
+                        ("orders".to_owned(), 2) => None,
+                    })),
+                    "loading".to_owned() => GroupOutcome::Retry("COORDINATOR_LOAD_IN_PROGRESS".to_owned()),
+                    "moved".to_owned() => GroupOutcome::Unmap("NOT_COORDINATOR".to_owned()),
+                    "denied".to_owned() => GroupOutcome::Done(Err(kafka_error(30, Some("denied".to_owned())))),
+                    "absent".to_owned() => GroupOutcome::Done(Ok(BTreeMap::new())),
+                }
         );
     }
 
@@ -410,16 +392,10 @@ mod tests {
             .call()
             .await;
         let admin = cluster.admin(krabka_units::secs(5)).await;
-        let specs = BTreeMap::from([
-            (
-                "ready".to_owned(),
-                ListShareGroupOffsetsSpec::builder().build(),
-            ),
-            (
-                "loading".to_owned(),
-                ListShareGroupOffsetsSpec::builder().build(),
-            ),
-        ]);
+        let specs = maplit::btreemap! {
+            "ready".to_owned() => ListShareGroupOffsetsSpec::builder().build(),
+            "loading".to_owned() => ListShareGroupOffsetsSpec::builder().build(),
+        };
 
         let result = admin.list_share_group_offsets(&specs).await;
 
@@ -439,21 +415,20 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let offsets = Ok(BTreeMap::from([(
-            ("orders".to_owned(), 0),
-            Some(SharePartitionOffsetInfo {
-                start_offset: 41,
-                leader_epoch: Some(3),
-                lag: Some(5),
-            }),
-        )]));
+        let offsets = Ok(maplit::btreemap! {
+            ("orders".to_owned(), 0) => Some(SharePartitionOffsetInfo {
+            start_offset: 41,
+            leader_epoch: Some(3),
+            lag: Some(5),
+        }),
+        });
         assert!(
             (result, requested)
                 == (
-                    BTreeMap::from([
-                        ("loading".to_owned(), offsets.clone()),
-                        ("ready".to_owned(), offsets),
-                    ]),
+                    maplit::btreemap! {
+                        "loading".to_owned() => offsets.clone(),
+                        "ready".to_owned() => offsets,
+                    },
                     vec![
                         (1, vec!["loading".to_owned(), "ready".to_owned()]),
                         (1, vec!["loading".to_owned()]),

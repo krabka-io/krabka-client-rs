@@ -2435,37 +2435,31 @@ mod tests {
     /// `orders`-1.
     fn orders_producer_results()
     -> BTreeMap<(String, i32), Result<Vec<ProducerStateInfo>, KafkaError>> {
-        BTreeMap::from([
-            (
-                ("orders".to_owned(), 0),
-                Ok(vec![
-                    ProducerStateInfo {
-                        producer_id: 4242,
-                        producer_epoch: 7,
-                        last_sequence: 12,
-                        last_timestamp_ms: 1_700_000_000_123,
-                        coordinator_epoch: 3,
-                        current_txn_start_offset: Some(88),
-                    },
-                    ProducerStateInfo {
-                        producer_id: 11,
-                        producer_epoch: 0,
-                        last_sequence: -1,
-                        last_timestamp_ms: -1,
-                        coordinator_epoch: 0,
-                        current_txn_start_offset: None,
-                    },
-                ]),
-            ),
-            (
-                ("orders".to_owned(), 1),
-                Err(KafkaError {
-                    code: NOT_LEADER_OR_FOLLOWER,
-                    name: "NOT_LEADER_OR_FOLLOWER",
-                    message: Some("moved".to_owned()),
-                }),
-            ),
-        ])
+        maplit::btreemap! {
+            ("orders".to_owned(), 0) => Ok(vec![
+            ProducerStateInfo {
+                producer_id: 4242,
+                producer_epoch: 7,
+                last_sequence: 12,
+                last_timestamp_ms: 1_700_000_000_123,
+                coordinator_epoch: 3,
+                current_txn_start_offset: Some(88),
+            },
+            ProducerStateInfo {
+                producer_id: 11,
+                producer_epoch: 0,
+                last_sequence: -1,
+                last_timestamp_ms: -1,
+                coordinator_epoch: 0,
+                current_txn_start_offset: None,
+            },
+        ]),
+            ("orders".to_owned(), 1) => Err(KafkaError {
+            code: NOT_LEADER_OR_FOLLOWER,
+            name: "NOT_LEADER_OR_FOLLOWER",
+            message: Some("moved".to_owned()),
+        }),
+        }
     }
 
     #[test]
@@ -2816,10 +2810,10 @@ mod tests {
             assert2::assert!(
                 (result, seen.metadata_requests, requests)
                     == (
-                        BTreeMap::from([
-                            (both[0].clone(), producers_0.clone()),
-                            (both[1].clone(), expected.0),
-                        ]),
+                        maplit::btreemap! {
+                            both[0].clone() => producers_0.clone(),
+                            both[1].clone() => expected.0,
+                        },
                         expected.1,
                         expected
                             .2
@@ -2955,11 +2949,11 @@ mod tests {
                 script.find_coordinator_requests,
                 script.coordinator_requests
             ) == (
-                BTreeMap::from([
-                    (String::new(), failed("protocol", 0)),
-                    ("orders".to_owned(), OK),
-                    ("payments".to_owned(), OK),
-                ]),
+                maplit::btreemap! {
+                    String::new() => failed("protocol", 0),
+                    "orders".to_owned() => OK,
+                    "payments".to_owned() => OK,
+                },
                 2,
                 2
             )

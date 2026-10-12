@@ -58,6 +58,36 @@ mod telemetry;
 pub mod topic_descriptions;
 pub mod topics;
 pub mod transactions;
+
+#[cfg(test)]
+#[macro_export]
+macro_rules! encode_test_struct_field {
+    ($encoder:ident, $response:ident, $field:ident, $value:expr, $version:expr, $flexible:expr $(,)?) => {
+        $encoder(
+            &$response {
+                $field: $value,
+                ..Default::default()
+            },
+            $version,
+            $flexible,
+        )
+    };
+}
+
+#[cfg(test)]
+#[macro_export]
+macro_rules! encode_test_struct_fields {
+    ($encoder:ident, $response:ident, { $($field:ident: $value:expr),+ $(,)? }, $version:expr, $flexible:expr $(,)?) => {
+        $encoder(
+            &$response {
+                $($field: $value,)+
+                ..Default::default()
+            },
+            $version,
+            $flexible,
+        )
+    };
+}
 pub mod users;
 
 /// Result of applying a `metadata.version` feature update.
@@ -2173,41 +2203,40 @@ mod tests {
         assert2::assert!(names == cases.to_vec());
         // Kafka's codes are contiguous from -1, so every code outside the
         // table is one Kafka does not define.
-        for code in [i16::MIN, -2, 137, i16::MAX] {
-            assert2::assert!(kafka_error_name(code) == "UNKNOWN", "code {code}");
-        }
     }
 
-    #[test]
-    fn kafka_error_name_known_codes() {
-        for (_name, code, want) in [
-            ("success", 0, "NONE"),
-            ("topic exists", 36, "TOPIC_ALREADY_EXISTS"),
-            ("not controller", 41, "NOT_CONTROLLER"),
-        ] {
-            assert2::assert!(kafka_error_name(code) == want);
-        }
+    #[yare::parameterized(
+        minimum = { i16::MIN },
+        negative = { -2 },
+        beyond_table = { 137 },
+        maximum = { i16::MAX },
+    )]
+    fn kafka_error_name_unknown_codes_are_unknown(code: i16) {
+        assert2::assert!(kafka_error_name(code) == "UNKNOWN", "code {code}");
     }
 
-    #[test]
-    fn users_kafka_error_name_includes_scram_describe_codes() {
-        for (_name, code, want) in [
-            ("cluster authorization", 31, "CLUSTER_AUTHORIZATION_FAILED"),
-            ("unsupported SASL", 33, "UNSUPPORTED_SASL_MECHANISM"),
-            ("unsupported version", 35, "UNSUPPORTED_VERSION"),
-            ("delegation token expired", 66, "DELEGATION_TOKEN_EXPIRED"),
-            (
-                "eligible leaders unavailable",
-                83,
-                "ELIGIBLE_LEADERS_NOT_AVAILABLE",
-            ),
-            ("election unnecessary", 84, "ELECTION_NOT_NEEDED"),
-            ("resource not found", 91, "RESOURCE_NOT_FOUND"),
-            ("duplicate resource", 92, "DUPLICATE_RESOURCE"),
-            ("unacceptable credential", 93, "UNACCEPTABLE_CREDENTIAL"),
-        ] {
-            assert2::assert!(kafka_error_name(code) == want);
-        }
+    #[yare::parameterized(
+        success = { 0, "NONE" },
+        topic_exists = { 36, "TOPIC_ALREADY_EXISTS" },
+        not_controller = { 41, "NOT_CONTROLLER" },
+    )]
+    fn kafka_error_name_known_codes(code: i16, want: &str) {
+        assert2::assert!(kafka_error_name(code) == want);
+    }
+
+    #[yare::parameterized(
+        cluster_authorization = { 31, "CLUSTER_AUTHORIZATION_FAILED" },
+        unsupported_sasl = { 33, "UNSUPPORTED_SASL_MECHANISM" },
+        unsupported_version = { 35, "UNSUPPORTED_VERSION" },
+        delegation_token_expired = { 66, "DELEGATION_TOKEN_EXPIRED" },
+        eligible_leaders_unavailable = { 83, "ELIGIBLE_LEADERS_NOT_AVAILABLE" },
+        election_unnecessary = { 84, "ELECTION_NOT_NEEDED" },
+        resource_not_found = { 91, "RESOURCE_NOT_FOUND" },
+        duplicate_resource = { 92, "DUPLICATE_RESOURCE" },
+        unacceptable_credential = { 93, "UNACCEPTABLE_CREDENTIAL" },
+    )]
+    fn users_kafka_error_name_includes_scram_describe_codes(code: i16, want: &str) {
+        assert2::assert!(kafka_error_name(code) == want);
     }
 
     #[test]

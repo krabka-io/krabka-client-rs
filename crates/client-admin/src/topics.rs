@@ -1441,7 +1441,9 @@ mod tests {
 
     #[test]
     fn exact_assignment_request_preserves_replica_order() {
-        let assignments = BTreeMap::from([(("orders".into(), 3), Some(vec![4, 2, 1]))]);
+        let assignments = maplit::btreemap! {
+            ("orders".into(), 3) => Some(vec![4, 2, 1]),
+        };
         let request = build_partition_assignment_request(
             &assignments,
             krabka_units::secs(30),
@@ -1530,7 +1532,9 @@ mod tests {
                 .await
                 .expect("admin connects");
 
-            let assignments = BTreeMap::from([(("orders".into(), 0), Some(vec![1, 2]))]);
+            let assignments = maplit::btreemap! {
+                ("orders".into(), 0) => Some(vec![1, 2]),
+            };
             let timeout = krabka_units::secs(5);
             let outcome = match allow {
                 None => {
@@ -1684,10 +1688,9 @@ mod tests {
                 .name("foo")
                 .partitions(3)
                 .replicas(1)
-                .configs(BTreeMap::from([(
-                    "retention.ms".to_string(),
-                    "60000".to_string(),
-                )]))
+                .configs(maplit::btreemap! {
+                    "retention.ms".to_string() => "60000".to_string(),
+                })
                 .build()],
             5_000,
         );
@@ -1722,7 +1725,10 @@ mod tests {
                 .name("placed")
                 .partitions(-1)
                 .replicas(-1)
-                .replica_assignments(BTreeMap::from([(1, vec![3, 1]), (0, vec![1, 2])]))
+                .replica_assignments(maplit::btreemap! {
+                    1 => vec![3, 1],
+                    0 => vec![1, 2],
+                })
                 .build()],
             5_000,
         );

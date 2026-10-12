@@ -1162,7 +1162,10 @@ mod tests {
                     Received::Describe(1, all.clone()),
                     Received::Describe(2, all.clone()),
                 ],
-                BTreeMap::from([(1, Ok(described(1))), (2, Ok(described(2)))]),
+                maplit::btreemap! {
+                    1 => Ok(described(1)),
+                    2 => Ok(described(2)),
+                },
             ),
             (
                 "one broker",
@@ -1170,7 +1173,9 @@ mod tests {
                 vec![2],
                 LONG,
                 vec![Received::Describe(2, all.clone())],
-                BTreeMap::from([(2, Ok(described(2)))]),
+                maplit::btreemap! {
+                    2 => Ok(described(2)),
+                },
             ),
             (
                 "an unknown broker times out",
@@ -1178,7 +1183,9 @@ mod tests {
                 vec![3],
                 SHORT,
                 vec![],
-                BTreeMap::from([(3, Err(REQUEST_TIMED_OUT))]),
+                maplit::btreemap! {
+                    3 => Err(REQUEST_TIMED_OUT),
+                },
             ),
             (
                 "a known broker is asked while an unknown broker waits",
@@ -1186,7 +1193,10 @@ mod tests {
                 vec![1, 3],
                 SHORT,
                 vec![Received::Describe(1, all.clone())],
-                BTreeMap::from([(1, Ok(described(1))), (3, Err(REQUEST_TIMED_OUT))]),
+                maplit::btreemap! {
+                    1 => Ok(described(1)),
+                    3 => Err(REQUEST_TIMED_OUT),
+                },
             ),
             (
                 "a broker at a new address is found again",
@@ -1194,7 +1204,9 @@ mod tests {
                 vec![2],
                 LONG,
                 vec![Received::Describe(2, all.clone())],
-                BTreeMap::from([(2, Ok(described(2)))]),
+                maplit::btreemap! {
+                    2 => Ok(described(2)),
+                },
             ),
             (
                 "a broker with no log dir",
@@ -1205,10 +1217,10 @@ mod tests {
                     Received::Describe(1, all.clone()),
                     Received::Describe(2, all.clone()),
                 ],
-                BTreeMap::from([
-                    (1, Ok(described(1))),
-                    (2, Err(CLUSTER_AUTHORIZATION_FAILED)),
-                ]),
+                maplit::btreemap! {
+                    1 => Ok(described(1)),
+                    2 => Err(CLUSTER_AUTHORIZATION_FAILED),
+                },
             ),
             (
                 "an unreachable broker times out",
@@ -1216,7 +1228,10 @@ mod tests {
                 vec![1, 2],
                 SHORT,
                 vec![Received::Describe(1, all.clone())],
-                BTreeMap::from([(1, Ok(described(1))), (2, Err(REQUEST_TIMED_OUT))]),
+                maplit::btreemap! {
+                    1 => Ok(described(1)),
+                    2 => Err(REQUEST_TIMED_OUT),
+                },
             ),
         ] {
             let mut cluster = Cluster::start(broker_2).await;
@@ -1235,7 +1250,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn describe_log_dirs_sends_the_topic_filter() {
         let mut cluster = Cluster::start(Behavior::Normal).await;
-        let filter = BTreeMap::from([("orders".to_string(), vec![0])]);
+        let filter = maplit::btreemap! {
+            "orders".to_string() => vec![0],
+        };
         cluster.admin.describe_log_dirs(&[1], Some(&filter)).await;
         let received = cluster.stop();
         assert!(
@@ -1297,7 +1314,10 @@ mod tests {
                     Received::Alter(1, alter(&[("/a", &[0])])),
                     Received::Alter(2, alter(&[("/b", &[1])])),
                 ],
-                BTreeMap::from([(replica(0, 1), Ok(())), (replica(1, 2), Ok(()))]),
+                maplit::btreemap! {
+                    replica(0, 1) => Ok(()),
+                    replica(1, 2) => Ok(()),
+                },
             ),
             (
                 "a broker groups its moves by log dir",
@@ -1309,11 +1329,11 @@ mod tests {
                 ],
                 LONG,
                 vec![Received::Alter(1, alter(&[("/a", &[0, 5]), ("/b", &[6])]))],
-                BTreeMap::from([
-                    (replica(0, 1), Ok(())),
-                    (replica(5, 1), Err(KAFKA_STORAGE_ERROR)),
-                    (replica(6, 1), Err(KAFKA_STORAGE_ERROR)),
-                ]),
+                maplit::btreemap! {
+                    replica(0, 1) => Ok(()),
+                    replica(5, 1) => Err(KAFKA_STORAGE_ERROR),
+                    replica(6, 1) => Err(KAFKA_STORAGE_ERROR),
+                },
             ),
             (
                 "an unreachable broker fails only its replicas",
@@ -1321,10 +1341,10 @@ mod tests {
                 vec![(replica(0, 1), "/a"), (replica(1, 2), "/b")],
                 SHORT,
                 vec![Received::Alter(1, alter(&[("/a", &[0])]))],
-                BTreeMap::from([
-                    (replica(0, 1), Ok(())),
-                    (replica(1, 2), Err(REQUEST_TIMED_OUT)),
-                ]),
+                maplit::btreemap! {
+                    replica(0, 1) => Ok(()),
+                    replica(1, 2) => Err(REQUEST_TIMED_OUT),
+                },
             ),
             (
                 "an unknown broker times out",
@@ -1332,7 +1352,9 @@ mod tests {
                 vec![(replica(0, 9), "/a")],
                 SHORT,
                 vec![],
-                BTreeMap::from([(replica(0, 9), Err(REQUEST_TIMED_OUT))]),
+                maplit::btreemap! {
+                    replica(0, 9) => Err(REQUEST_TIMED_OUT),
+                },
             ),
         ] {
             let mut cluster = Cluster::start(broker_2).await;
@@ -1399,11 +1421,11 @@ mod tests {
                     Received::Describe(1, replica_request_of(&[("orders", &[0, 5])])),
                     Received::Describe(2, replica_request_of(&[("orders", &[1])])),
                 ],
-                BTreeMap::from([
-                    (replica(0, 1), Ok(hosted(1))),
-                    (replica(5, 1), Ok(ReplicaLogDirInfo::default())),
-                    (replica(1, 2), Ok(hosted(2))),
-                ]),
+                maplit::btreemap! {
+                    replica(0, 1) => Ok(hosted(1)),
+                    replica(5, 1) => Ok(ReplicaLogDirInfo::default()),
+                    replica(1, 2) => Ok(hosted(2)),
+                },
             ),
             (
                 "a broker at a new address is found again",
@@ -1414,7 +1436,9 @@ mod tests {
                     2,
                     replica_request_of(&[("orders", &[1])]),
                 )],
-                BTreeMap::from([(replica(1, 2), Ok(hosted(2)))]),
+                maplit::btreemap! {
+                    replica(1, 2) => Ok(hosted(2)),
+                },
             ),
             (
                 "a broker with no log dir reports no replica",
@@ -1425,7 +1449,9 @@ mod tests {
                     2,
                     replica_request_of(&[("orders", &[1])]),
                 )],
-                BTreeMap::from([(replica(1, 2), Ok(ReplicaLogDirInfo::default()))]),
+                maplit::btreemap! {
+                    replica(1, 2) => Ok(ReplicaLogDirInfo::default()),
+                },
             ),
             (
                 "an unreachable broker fails the replicas still pending",
@@ -1436,10 +1462,10 @@ mod tests {
                     1,
                     replica_request_of(&[("orders", &[0])]),
                 )],
-                BTreeMap::from([
-                    (replica(0, 1), Ok(hosted(1))),
-                    (replica(1, 2), Err(REQUEST_TIMED_OUT)),
-                ]),
+                maplit::btreemap! {
+                    replica(0, 1) => Ok(hosted(1)),
+                    replica(1, 2) => Err(REQUEST_TIMED_OUT),
+                },
             ),
         ] {
             let mut cluster = Cluster::start(broker_2).await;
@@ -1491,7 +1517,12 @@ mod tests {
                 offset_lag,
             })
         };
-        let asked = BTreeMap::from([("orders".to_owned(), BTreeSet::from([0, 1]))]);
+        let asked = maplit::btreemap! {
+            "orders".to_owned() => maplit::btreeset! {
+                0,
+                1,
+            },
+        };
         for (name, error_code, results, expected) in [
             (
                 "a replica being moved has a current and a future log dir",
@@ -1500,22 +1531,16 @@ mod tests {
                     dir("/a", 0, vec![(0, 0, false), (1, 3, false)]),
                     dir("/b", 0, vec![(0, 42, true), (9, 0, false)]),
                 ],
-                Ok(BTreeMap::from([
-                    (
-                        ("orders".to_owned(), 0),
-                        ReplicaLogDirInfo {
-                            current: at("/a", 0),
-                            future: at("/b", 42),
-                        },
-                    ),
-                    (
-                        ("orders".to_owned(), 1),
-                        ReplicaLogDirInfo {
-                            current: at("/a", 3),
-                            future: None,
-                        },
-                    ),
-                ])),
+                Ok(maplit::btreemap! {
+                    ("orders".to_owned(), 0) => ReplicaLogDirInfo {
+                    current: at("/a", 0),
+                    future: at("/b", 42),
+                },
+                    ("orders".to_owned(), 1) => ReplicaLogDirInfo {
+                    current: at("/a", 3),
+                    future: None,
+                },
+                }),
             ),
             (
                 "an offline log dir is skipped",
@@ -1524,13 +1549,12 @@ mod tests {
                     dir("/offline", KAFKA_STORAGE_ERROR, vec![(0, 0, false)]),
                     dir("/a", 0, vec![(1, 0, false)]),
                 ],
-                Ok(BTreeMap::from([(
-                    ("orders".to_owned(), 1),
-                    ReplicaLogDirInfo {
-                        current: at("/a", 0),
-                        future: None,
-                    },
-                )])),
+                Ok(maplit::btreemap! {
+                    ("orders".to_owned(), 1) => ReplicaLogDirInfo {
+                    current: at("/a", 0),
+                    future: None,
+                },
+                }),
             ),
             (
                 "another log dir error fails the broker",
@@ -1550,13 +1574,12 @@ mod tests {
                 "the top-level error is not read",
                 CLUSTER_AUTHORIZATION_FAILED,
                 vec![dir("/a", 0, vec![(1, 0, false)])],
-                Ok(BTreeMap::from([(
-                    ("orders".to_owned(), 1),
-                    ReplicaLogDirInfo {
-                        current: at("/a", 0),
-                        future: None,
-                    },
-                )])),
+                Ok(maplit::btreemap! {
+                    ("orders".to_owned(), 1) => ReplicaLogDirInfo {
+                    current: at("/a", 0),
+                    future: None,
+                },
+                }),
             ),
         ] {
             let response = DescribeLogDirsResponse {
@@ -1578,12 +1601,14 @@ mod tests {
     #[test]
     fn a_failure_fails_every_replica_still_pending() {
         let asked = |partitions: &[i32]| {
-            BTreeMap::from([(
-                "orders".to_owned(),
-                partitions.iter().copied().collect::<BTreeSet<_>>(),
-            )])
+            maplit::btreemap! {
+                "orders".to_owned() => partitions.iter().copied().collect::<BTreeSet<_>>(),
+            }
         };
-        let by_broker = BTreeMap::from([(1, asked(&[0, 5])), (2, asked(&[1]))]);
+        let by_broker = maplit::btreemap! {
+            1 => asked(&[0, 5]),
+            2 => asked(&[1]),
+        };
         let found = |partition: i32, broker_id: i32| {
             (
                 ("orders".to_owned(), partition),
@@ -1597,7 +1622,13 @@ mod tests {
             )
         };
         let answer = |broker_id: i32, partition: i32| {
-            (broker_id, Ok(BTreeMap::from([found(partition, broker_id)])))
+            let (key, value) = found(partition, broker_id);
+            (
+                broker_id,
+                Ok(maplit::btreemap! {
+                    key => value,
+                }),
+            )
         };
         let illegal = KafkaError {
             code: 57,
@@ -1614,38 +1645,38 @@ mod tests {
             (
                 "every broker answers",
                 vec![answer(2, 1), answer(1, 0)],
-                BTreeMap::from([
-                    (replica(0, 1), hosted(0, 1)),
-                    (replica(5, 1), Ok(ReplicaLogDirInfo::default())),
-                    (replica(1, 2), hosted(1, 2)),
-                ]),
+                maplit::btreemap! {
+                    replica(0, 1) => hosted(0, 1),
+                    replica(5, 1) => Ok(ReplicaLogDirInfo::default()),
+                    replica(1, 2) => hosted(1, 2),
+                },
             ),
             (
                 "an illegal log dir after an answer",
                 vec![answer(1, 0), (2, Err(illegal.clone()))],
-                BTreeMap::from([
-                    (replica(0, 1), hosted(0, 1)),
-                    (replica(5, 1), Ok(ReplicaLogDirInfo::default())),
-                    (replica(1, 2), Err(illegal.clone())),
-                ]),
+                maplit::btreemap! {
+                    replica(0, 1) => hosted(0, 1),
+                    replica(5, 1) => Ok(ReplicaLogDirInfo::default()),
+                    replica(1, 2) => Err(illegal.clone()),
+                },
             ),
             (
                 "an illegal log dir before an answer",
                 vec![(2, Err(illegal.clone())), answer(1, 0)],
-                BTreeMap::from([
-                    (replica(0, 1), Err(illegal.clone())),
-                    (replica(5, 1), Err(illegal.clone())),
-                    (replica(1, 2), Err(illegal.clone())),
-                ]),
+                maplit::btreemap! {
+                    replica(0, 1) => Err(illegal.clone()),
+                    replica(5, 1) => Err(illegal.clone()),
+                    replica(1, 2) => Err(illegal.clone()),
+                },
             ),
             (
                 "a failed call before an answer",
                 vec![(1, Err(timed_out.clone())), answer(2, 1)],
-                BTreeMap::from([
-                    (replica(0, 1), Err(timed_out.clone())),
-                    (replica(5, 1), Err(timed_out.clone())),
-                    (replica(1, 2), Err(timed_out.clone())),
-                ]),
+                maplit::btreemap! {
+                    replica(0, 1) => Err(timed_out.clone()),
+                    replica(5, 1) => Err(timed_out.clone()),
+                    replica(1, 2) => Err(timed_out.clone()),
+                },
             ),
         ] {
             let mut results = ReplicaResults::new(&by_broker);
@@ -1663,10 +1694,10 @@ mod tests {
 
     #[test]
     fn a_replica_without_a_result_fails_with_unknown_server_error() {
-        let moves = BTreeMap::from([
-            (replica(0, 1), "/a".to_owned()),
-            (replica(1, 1), "/a".to_owned()),
-        ]);
+        let moves = maplit::btreemap! {
+            replica(0, 1) => "/a".to_owned(),
+            replica(1, 1) => "/a".to_owned(),
+        };
         let response = AlterReplicaLogDirsResponse {
             results: vec![AlterReplicaLogDirTopicResult {
                 topic_name: "orders".into(),
@@ -1686,21 +1717,18 @@ mod tests {
         };
         assert!(
             alter_results(1, &moves, response)
-                == BTreeMap::from([
-                    (replica(0, 1), Ok(())),
-                    (
-                        replica(1, 1),
-                        Err(KafkaError {
-                            code: UNKNOWN_SERVER_ERROR,
-                            name: "UNKNOWN_SERVER_ERROR",
-                            message: Some(
-                                "the response from broker 1 did not contain a result for replica \
-                                 orders-1"
-                                    .into()
-                            ),
-                        })
+                == maplit::btreemap! {
+                    replica(0, 1) => Ok(()),
+                    replica(1, 1) => Err(KafkaError {
+                    code: UNKNOWN_SERVER_ERROR,
+                    name: "UNKNOWN_SERVER_ERROR",
+                    message: Some(
+                        "the response from broker 1 did not contain a result for replica \
+                         orders-1"
+                            .into()
                     ),
-                ])
+                }),
+                }
         );
     }
 

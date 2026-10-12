@@ -3591,8 +3591,8 @@ mod auto_commit_tests {
         StartupState::builder()
             .generation_id(1)
             .assigned_partitions(vec![partition(0)])
-            .next_offsets(HashMap::from([(partition(0), 12)]))
-            .topic_partitions(HashMap::from([(TOPIC.to_owned(), topic_partition_count)]))
+            .next_offsets(maplit::hashmap! {partition(0) => 12})
+            .topic_partitions(maplit::hashmap! {TOPIC.to_owned() => topic_partition_count})
             .build()
     }
 
@@ -3618,8 +3618,8 @@ mod auto_commit_tests {
         StartupState::builder()
             .generation_id(1)
             .assigned_partitions(vec![partition(0), partition(1)])
-            .next_offsets(HashMap::from([(partition(0), 12), (partition(1), 7)]))
-            .topic_partitions(HashMap::from([(TOPIC.to_owned(), 2)]))
+            .next_offsets(maplit::hashmap! {partition(0) => 12, partition(1) => 7})
+            .topic_partitions(maplit::hashmap! {TOPIC.to_owned() => 2})
             .build()
     }
 
@@ -3966,8 +3966,8 @@ mod auto_commit_tests {
                         .generation_id(1)
                         .group_topics(vec![TOPIC.to_owned(), "payments".to_owned()])
                         .assigned_partitions(vec![partition(0)])
-                        .next_offsets(HashMap::from([(partition(0), 12)]))
-                        .topic_partitions(HashMap::from([(TOPIC.to_owned(), 1)]))
+                        .next_offsets(maplit::hashmap! {partition(0) => 12})
+                        .topic_partitions(maplit::hashmap! {TOPIC.to_owned() => 1})
                         .build(),
                 )
                 .build(),
@@ -4151,9 +4151,9 @@ mod auto_commit_tests {
                 StartupState::builder()
                     .generation_id(1)
                     .assigned_partitions(vec![partition(0), partition(1)])
-                    .next_offsets(HashMap::from([(partition(0), 12), (partition(1), 7)]))
-                    .positions(HashMap::from([(partition(0), primed_position(3))]))
-                    .topic_partitions(HashMap::from([(TOPIC.to_owned(), 2)]))
+                    .next_offsets(maplit::hashmap! {partition(0) => 12, partition(1) => 7})
+                    .positions(maplit::hashmap! {partition(0) => primed_position(3)})
+                    .topic_partitions(maplit::hashmap! {TOPIC.to_owned() => 2})
                     .build(),
             )
             .await
@@ -5944,7 +5944,7 @@ mod rebalance_listener_tests {
                 .generation_id(1)
                 .assigned_partitions(case.owned.clone())
                 .next_offsets(case.owned.iter().map(|key| (key.clone(), 12)).collect())
-                .topic_partitions(HashMap::from([(TOPIC.to_owned(), 2)]))
+                .topic_partitions(maplit::hashmap! {TOPIC.to_owned() => 2})
                 .build(),
         )
         .await;

@@ -172,10 +172,10 @@ mod tests {
     #[test]
     fn drain_returns_at_most_max_records_and_moves_the_position_past_them() {
         let key = |partition: i32| ("orders".to_string(), partition);
-        let all = HashSet::from([key(0), key(1)]);
-        let only_1 = HashSet::from([key(1)]);
+        let all = maplit::hashset! {key(0), key(1)};
+        let only_1 = maplit::hashset! {key(1)};
         let none = HashSet::new();
-        let paused_0 = HashSet::from([key(0)]);
+        let paused_0 = maplit::hashset! {key(0)};
         for (name, max_records, assigned, paused, seek, expected, remaining) in [
             (
                 "partial drain of the first partition",
@@ -261,7 +261,7 @@ mod tests {
             // Offsets 13..16 of partition 0 are a control batch.
             buffer.push(buffered(0, 10..14, 16));
             buffer.push(buffered(1, 20..22, 22));
-            let mut offsets = HashMap::from([(key(0), 10), (key(1), 20)]);
+            let mut offsets = maplit::hashmap! {key(0) => 10, key(1) => 20};
             if let Some(offset) = seek {
                 offsets.insert(key(0), offset);
             }
@@ -299,7 +299,7 @@ mod tests {
             key: ("payments".into(), 0),
             ..buffered(0, 20..22, 22)
         });
-        buffer.retain_topics(&HashSet::from(["payments".to_string()]));
+        buffer.retain_topics(&maplit::hashset! {"payments".to_string()});
         let mut left: Vec<_> = buffer.buffered_partitions().into_iter().collect();
         left.sort();
         assert2::assert!(left == vec![("payments".to_string(), 0)]);

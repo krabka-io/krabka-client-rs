@@ -4641,17 +4641,10 @@ mod harness {
         };
         assert2::assert!(
             state.node_latency
-                == HashMap::from([
-                    (1, drained),
-                    (
-                        2,
-                        NodeLatency {
-                            ready_at: now,
-                            drained_at: earlier,
-                        },
-                    ),
-                    (3, drained),
-                ])
+                == maplit::hashmap! {1 => drained, 2 => NodeLatency {
+                    ready_at: now,
+                    drained_at: earlier,
+                }, 3 => drained}
         );
     }
 

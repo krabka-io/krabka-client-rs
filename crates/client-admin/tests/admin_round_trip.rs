@@ -91,7 +91,7 @@ async fn assert_topic_absent(admin: &mut AdminClient, topic: &str) {
 /// Step 2. Create the topic with one config override, then read the metadata
 /// back.
 async fn create_topic_with_override(admin: &mut AdminClient, topic: &str) {
-    let configs = BTreeMap::from([("retention.ms".to_owned(), "60000".to_owned())]);
+    let configs = maplit::btreemap! {"retention.ms".to_owned() => "60000".to_owned()};
     let outcomes = admin
         .create_topics(
             &[CreateTopicSpec::builder()
@@ -182,10 +182,7 @@ async fn read_create_override(admin: &mut AdminClient, topic: &str) {
 async fn set_override(admin: &mut AdminClient, topic: &str) {
     let outcomes = admin
         .incremental_alter_configs(
-            &BTreeMap::from([(
-                ConfigResource::topic(topic),
-                vec![AlterConfigOp::set("cleanup.policy", "compact")],
-            )]),
+            &maplit::btreemap! {ConfigResource::topic(topic) => vec![AlterConfigOp::set("cleanup.policy", "compact")]},
             IncrementalAlterConfigsOptions::builder().build(),
         )
         .await
@@ -207,10 +204,7 @@ async fn set_override(admin: &mut AdminClient, topic: &str) {
 async fn delete_override(admin: &mut AdminClient, topic: &str) {
     let outcomes = admin
         .incremental_alter_configs(
-            &BTreeMap::from([(
-                ConfigResource::topic(topic),
-                vec![AlterConfigOp::delete("retention.ms")],
-            )]),
+            &maplit::btreemap! {ConfigResource::topic(topic) => vec![AlterConfigOp::delete("retention.ms")]},
             IncrementalAlterConfigsOptions::builder().build(),
         )
         .await
@@ -324,5 +318,5 @@ fn expected_overrides(entries: &[(&str, &str)]) -> Overrides {
 }
 
 fn alter_ok(topic: &str) -> AlterConfigsResults {
-    BTreeMap::from([(ConfigResource::topic(topic), Ok(()))])
+    maplit::btreemap! {ConfigResource::topic(topic) => Ok(())}
 }
