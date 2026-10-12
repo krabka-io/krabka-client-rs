@@ -24,7 +24,10 @@ use krabka_protocol::owned::{
     renew_delegation_token_request::RenewDelegationTokenRequest,
 };
 use krabka_security::KafkaPrincipal;
-use krabka_units::{Time, convert::{TimeExt as _, wire::opt_time_to_millis_i64}};
+use krabka_units::{
+    Time,
+    convert::{TimeExt as _, wire::opt_time_to_millis_i64},
+};
 
 use crate::{AdminClient, AdminError, kafka_error_name};
 
