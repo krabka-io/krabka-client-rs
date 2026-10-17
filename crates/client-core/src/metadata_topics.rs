@@ -2,7 +2,10 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{
+        Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -34,6 +37,9 @@ pub struct MetadataTopics {
     topics: Mutex<BTreeMap<String, Instant>>,
     /// When a request of this scope last succeeded.
     refreshed: Mutex<Option<Instant>>,
+    /// Whether a caller asked for a refresh before the metadata expires,
+    /// Kafka's `Metadata.requestUpdate`.
+    update_requested: AtomicBool,
 }
 
 impl MetadataTopics {
@@ -44,16 +50,32 @@ impl MetadataTopics {
             scope,
             topics: Mutex::default(),
             refreshed: Mutex::default(),
+            update_requested: AtomicBool::new(false),
         }
     }
 
     /// Record a successful response to [`Self::request`], as Kafka's
-    /// `Metadata.update` sets `lastSuccessfulRefreshMs` for a full update.
+    /// `Metadata.update` sets `lastSuccessfulRefreshMs` for a full update. It
+    /// answers any [`request_update`](Self::request_update) made before it.
     pub fn mark_refreshed(&self) {
+        self.update_requested.store(false, Ordering::SeqCst);
         *self
             .refreshed
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// Ask for a refresh before the metadata expires, as Kafka's
+    /// `Metadata.requestUpdate` does after a fetch names a stale leader or an
+    /// unknown topic.
+    pub fn request_update(&self) {
+        self.update_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a refresh was asked for since the last successful one.
+    #[must_use]
+    pub fn update_requested(&self) -> bool {
+        self.update_requested.load(Ordering::SeqCst)
     }
 
     /// When a response to [`Self::request`] last succeeded, or `None` before
@@ -85,17 +107,24 @@ impl MetadataTopics {
     }
 
     /// Replace the topics with `topics`, as a consumer subscription change
-    /// does (`SubscriptionState.metadataTopics`).
+    /// does (`SubscriptionState.metadataTopics`). A change of the topic set
+    /// asks for a refresh, as Kafka's `ConsumerMetadata` requests an update
+    /// for new topics.
     pub fn set<I, S>(&self, topics: I)
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         let now = Instant::now();
-        *self.topics() = topics
+        let topics: BTreeMap<String, Instant> = topics
             .into_iter()
             .map(|topic| (topic.into(), now))
             .collect();
+        let mut current = self.topics();
+        if !current.keys().eq(topics.keys()) {
+            self.request_update();
+        }
+        *current = topics;
     }
 
     /// Remove the topics that were not used for `idle` and return their
@@ -173,6 +202,36 @@ mod tests {
     use assert2::check;
 
     use super::*;
+
+    /// A change of the topic set or an explicit request asks for a refresh,
+    /// and a successful refresh answers it. Setting the same topics again does
+    /// not.
+    #[test]
+    fn a_topic_change_or_a_request_asks_for_an_update_until_a_refresh() {
+        // (name, topics set after the first refresh, explicit request, expected)
+        let cases: [(&str, &[&str], bool, bool); 4] = [
+            ("same topics", &["t1"], false, false),
+            ("a new topic", &["t1", "t2"], false, true),
+            ("a removed topic", &[], false, true),
+            ("an explicit request", &["t1"], true, true),
+        ];
+        for (name, topics, request, expected) in cases {
+            let metadata = MetadataTopics::new(MetadataScope::Topics {
+                allow_auto_topic_creation: false,
+            });
+            metadata.set(["t1"]);
+            check!(metadata.update_requested(), "{name}: the first topics");
+            metadata.mark_refreshed();
+            check!(!metadata.update_requested(), "{name}");
+            metadata.set(topics.iter().copied());
+            if request {
+                metadata.request_update();
+            }
+            check!(metadata.update_requested() == expected, "{name}");
+            metadata.mark_refreshed();
+            check!(!metadata.update_requested(), "{name}: refreshed");
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn requests_follow_the_scope_and_the_topics() {

@@ -432,7 +432,7 @@ impl Client {
         &self,
         request: &MetadataRequest,
     ) -> Result<metadata_response::MetadataResponse, ClientError> {
-        let broker_ids = self.pool.broker_ids();
+        let broker_ids = self.pool.broker_ids_by_load();
         if broker_ids.is_empty() {
             let connection = self.pool.bootstrap_connection().await?;
             return connection.send(request.clone()).await;

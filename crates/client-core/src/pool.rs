@@ -747,6 +747,29 @@ impl<C: BrokerConnector> BrokerPool<C> {
         ids
     }
 
+    /// [`broker_ids`](Self::broker_ids), with the brokers that have an open
+    /// connection first, fewest requests in flight first, then the others in
+    /// id order.
+    ///
+    /// Kafka sends a metadata request to `NetworkClient.leastLoadedNode`. A
+    /// broker answers the requests of one connection in order, so a request
+    /// queued behind a parked long-poll `Fetch` waits for up to the fetch's
+    /// `max_wait_ms`. A caller that walks every broker until one answers, as
+    /// the metadata refresh does, walks them in this order.
+    #[must_use]
+    pub fn broker_ids_by_load(&self) -> Vec<i32> {
+        let mut ids = self.broker_ids();
+        ids.sort_by_key(|id| {
+            self.node(*id)
+                .state()
+                .connection
+                .as_ref()
+                .filter(|connection| C::is_open(connection))
+                .map_or((1, 0), |connection| (0, C::in_flight(connection)))
+        });
+        ids
+    }
+
     /// The finalized feature levels with the highest epoch that any
     /// connection of the pool received, as Kafka's `ApiVersions.getMaxFinalizedFeaturesInfo`
     /// gives them.

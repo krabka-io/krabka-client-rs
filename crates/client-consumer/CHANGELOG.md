@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `poll` refreshes metadata only when it is due, as Kafka's consumer does:
+  older than `metadata_max_age`, after a topic change, after a fetch or
+  `ListOffsets` error asked for an update, or when an assigned partition has
+  no known leader. It used to refresh on every `poll`. That `Metadata`
+  request queued behind a parked long-poll `Fetch` on the same connection, so
+  `poll` stalled for up to `fetch_max_wait` and sent no fetch to the other
+  leaders meanwhile. Under RF3 load this showed up as a consumer end-to-end
+  tail of about 500 ms (krabka-io/krabka-broker#1394).
 - Expose DNS lookup timeout and socket send/receive buffers on the consumer builder.
   Apply overrides to subscription resolution, main connections, and coordinator clients.
   Defaults remain 10s DNS timeout, 128KiB send buffer, and 64KiB receive buffer.

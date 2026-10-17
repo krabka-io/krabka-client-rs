@@ -1000,6 +1000,7 @@ impl Consumer {
                             // Force refresh_leader_epochs to re-flag against
                             // fresher metadata next poll (any real epoch >= 0 > -1).
                             p.leader_epoch = LeaderEpoch(UNKNOWN_LEADER_ID);
+                            self.client.metadata_topics().request_update();
                             // Only gate on validation when we have a consumed epoch
                             // to validate against. A never-consumed partition
                             // (offset_epoch < 0) has nothing to validate; flagging it
@@ -1079,12 +1080,12 @@ impl Consumer {
             refresh_after_processing = true;
         }
         if refresh_after_processing {
-            // Best-effort: a NOT_LEADER_OR_FOLLOWER without a current_leader
-            // hint means our cached leader is stale; learn the new one so the
-            // next poll routes correctly. UNKNOWN_TOPIC_OR_PARTITION and
-            // UNKNOWN_TOPIC_ID mean our topic metadata is stale. A failure is
-            // non-fatal — the next refresh_leader_epochs pass retries.
-            let _ = self.client.refresh_metadata().await;
+            // A NOT_LEADER_OR_FOLLOWER without a current_leader hint means our
+            // cached leader is stale, and UNKNOWN_TOPIC_OR_PARTITION and
+            // UNKNOWN_TOPIC_ID mean our topic metadata is stale. Kafka's
+            // fetcher calls `Metadata.requestUpdate`; the next poll refreshes
+            // before it routes a fetch.
+            self.client.metadata_topics().request_update();
         }
         Ok(())
     }
@@ -1412,8 +1413,9 @@ impl Consumer {
             }
         }
         if refresh_metadata {
-            // Best effort, as the other metadata refreshes of the fetch path.
-            let _ = self.client.refresh_metadata().await;
+            // The next poll refreshes, as for the other metadata updates of
+            // the fetch path.
+            self.client.metadata_topics().request_update();
         }
 
         grouped
@@ -1462,8 +1464,37 @@ impl Consumer {
         }
     }
 
-    /// Refresh the leader epochs, resolve the offset resets and validate the
-    /// positions. Kafka's `KafkaConsumer.updateFetchPositions`.
+    /// Whether the metadata must be refreshed before this consumer fetches.
+    ///
+    /// Kafka's consumer refreshes when `Metadata.updateRequested` holds: the
+    /// metadata is older than `metadata.max.age.ms`, the topics changed, a
+    /// fetch error asked for an update, or an assigned partition has no known
+    /// leader. It does not refresh on every `poll`. A refresh on every poll
+    /// pipelines a `Metadata` request behind a parked long-poll `Fetch` on the
+    /// same connection, and the broker answers it only when the fetch
+    /// returns, so the poll stalls for up to `fetch.max.wait.ms` and sends no
+    /// fetch to the other leaders meanwhile (krabka-io/krabka-broker#1394).
+    pub(crate) async fn metadata_due(&self) -> bool {
+        let topics = self.client.metadata_topics();
+        if topics.update_requested()
+            || topics
+                .last_refreshed()
+                .is_none_or(|at| at.elapsed() >= self.metadata_max_age.to_std())
+        {
+            return true;
+        }
+        let assigned = self.assigned.lock().await.clone();
+        let positions = self.positions.lock().await;
+        assigned.iter().any(|key| {
+            positions
+                .get(key)
+                .is_none_or(|position| position.leader_id < 0)
+        })
+    }
+
+    /// Refresh the leader epochs when [`metadata_due`](Self::metadata_due),
+    /// resolve the offset resets and validate the positions. Kafka's
+    /// `KafkaConsumer.updateFetchPositions`.
     ///
     /// Return `false` after a transient error, when the caller must try again
     /// later.
@@ -1477,7 +1508,9 @@ impl Consumer {
         wakeup: Option<&control::WakeupHandle>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<bool, ConsumerError> {
-        if let Err(error) = until_woken(wakeup, self.refresh_leader_epochs()).await? {
+        if self.metadata_due().await
+            && let Err(error) = until_woken(wakeup, self.refresh_leader_epochs()).await?
+        {
             if is_transient_poll_error(&error) {
                 self.client.reconnect_bootstrap().await;
                 return Ok(false);
@@ -1744,6 +1777,16 @@ impl Consumer {
                     }
                 }
             }
+        }
+        // A row with a retriable error keeps its sentinel. Kafka's
+        // `OffsetFetcher` requests a metadata update for it, so the next poll
+        // sends the retry to the current leader. An unauthorized topic fails
+        // the poll instead.
+        if results
+            .iter()
+            .any(|(_, result)| result.retry && result.unauthorized.is_empty())
+        {
+            self.client.metadata_topics().request_update();
         }
         results
             .into_iter()
@@ -2760,7 +2803,10 @@ pub(crate) mod partition_error_tests {
         /// `Ok(record_count)`, `Err(Some(code))` for
         /// `ConsumerError::Server(code)`, or `Err(None)` for any other error.
         result: Result<usize, Option<i16>>,
+        /// The `Metadata` requests that processing the response sent.
         metadata_requests: usize,
+        /// Whether processing asked for a refresh before the next poll.
+        metadata_update_requested: bool,
         next_offset: Option<i64>,
     }
 
@@ -3019,10 +3065,84 @@ pub(crate) mod partition_error_tests {
         );
     }
 
+    /// What changes between two fetch-position updates.
+    #[derive(Clone, Copy, Debug)]
+    enum BetweenPolls {
+        Nothing,
+        UpdateRequested,
+        MaxAgeElapsed,
+        LeaderUnknown,
+    }
+
+    /// Kafka's consumer refreshes metadata only when `Metadata.updateRequested`
+    /// holds, not on every poll. A refresh on every poll pipelines a `Metadata`
+    /// request behind a parked long-poll `Fetch` on the same connection, and
+    /// the poll then stalls for up to `fetch.max.wait.ms` (krabka-io/krabka-broker#1394).
+    #[tokio::test]
+    async fn fetch_positions_refresh_metadata_only_when_it_is_due() {
+        // (what changes between the polls, `Metadata` requests of the second)
+        let cases = [
+            (BetweenPolls::Nothing, 0),
+            (BetweenPolls::UpdateRequested, 1),
+            (BetweenPolls::MaxAgeElapsed, 1),
+            (BetweenPolls::LeaderUnknown, 1),
+        ];
+        for (between, expected) in cases {
+            let metadata_requests = Arc::new(AtomicUsize::new(0));
+            let broker = metadata_counting_broker(Arc::clone(&metadata_requests)).await;
+            let mut consumer = consumer_on(&broker).await;
+            let key = ("orders".to_string(), 0);
+            consumer
+                .positions
+                .lock()
+                .await
+                .entry(key.clone())
+                .or_default()
+                .leader_id = 1;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            check!(
+                consumer
+                    .update_fetch_positions(None, Some(deadline))
+                    .await
+                    .unwrap()
+            );
+            check!(
+                metadata_requests.swap(0, Ordering::SeqCst) == 1,
+                "{between:?}: first poll"
+            );
+            match between {
+                BetweenPolls::Nothing => {}
+                BetweenPolls::UpdateRequested => consumer.client.metadata_topics().request_update(),
+                BetweenPolls::MaxAgeElapsed => consumer.metadata_max_age = Time::ZERO,
+                BetweenPolls::LeaderUnknown => {
+                    consumer
+                        .positions
+                        .lock()
+                        .await
+                        .entry(key)
+                        .or_default()
+                        .leader_id = UNKNOWN_LEADER_ID;
+                }
+            }
+            check!(
+                consumer
+                    .update_fetch_positions(None, Some(deadline))
+                    .await
+                    .unwrap()
+            );
+            check!(
+                metadata_requests.load(Ordering::SeqCst) == expected,
+                "{between:?}"
+            );
+            broker.stop();
+        }
+    }
+
     /// Kafka's `FetchCollector.handleInitializeErrors` requests a metadata
     /// update for 3, 6 and 100 and does not raise an error. The poll returns
-    /// no records, keeps the fetch position, and refreshes metadata. Any code
-    /// that Kafka does not handle fails the poll.
+    /// no records, keeps the fetch position, and asks for a refresh, which
+    /// the next poll makes before it fetches. It sends no `Metadata` request
+    /// of its own. Any code that Kafka does not handle fails the poll.
     #[tokio::test]
     async fn fetch_partition_errors_refresh_metadata_or_fail_the_poll() {
         for (name, error_code, expected) in [
@@ -3031,7 +3151,8 @@ pub(crate) mod partition_error_tests {
                 3,
                 PollOutcome {
                     result: Ok(0),
-                    metadata_requests: 1,
+                    metadata_requests: 0,
+                    metadata_update_requested: true,
                     next_offset: Some(5),
                 },
             ),
@@ -3040,7 +3161,8 @@ pub(crate) mod partition_error_tests {
                 6,
                 PollOutcome {
                     result: Ok(0),
-                    metadata_requests: 1,
+                    metadata_requests: 0,
+                    metadata_update_requested: true,
                     next_offset: Some(5),
                 },
             ),
@@ -3049,7 +3171,8 @@ pub(crate) mod partition_error_tests {
                 100,
                 PollOutcome {
                     result: Ok(0),
-                    metadata_requests: 1,
+                    metadata_requests: 0,
+                    metadata_update_requested: true,
                     next_offset: Some(5),
                 },
             ),
@@ -3059,6 +3182,7 @@ pub(crate) mod partition_error_tests {
                 PollOutcome {
                     result: Err(Some(29)),
                     metadata_requests: 0,
+                    metadata_update_requested: false,
                     next_offset: Some(5),
                 },
             ),
@@ -3079,6 +3203,7 @@ pub(crate) mod partition_error_tests {
             let outcome = PollOutcome {
                 result,
                 metadata_requests: metadata_requests.load(Ordering::SeqCst),
+                metadata_update_requested: consumer.client.metadata_topics().update_requested(),
                 next_offset: consumer
                     .next_offsets
                     .lock()
@@ -3368,6 +3493,8 @@ pub(crate) mod partition_error_tests {
         result: Result<(), PollFailure>,
         /// The `Metadata` requests after the setup.
         metadata_requests: usize,
+        /// Whether the exchange asked for a refresh before the next poll.
+        metadata_update_requested: bool,
         next_offset: Option<i64>,
     }
 
@@ -3496,6 +3623,7 @@ pub(crate) mod partition_error_tests {
             requests,
             result: result.map_err(PollFailure::from),
             metadata_requests: metadata_requests.load(Ordering::SeqCst),
+            metadata_update_requested: consumer.client.metadata_topics().update_requested(),
             next_offset: consumer
                 .next_offsets
                 .lock()
@@ -3540,6 +3668,7 @@ pub(crate) mod partition_error_tests {
                     requests: latest_request(1),
                     result: Ok(()),
                     metadata_requests: 1,
+                    metadata_update_requested: false,
                     next_offset: Some(40),
                 },
             ),
@@ -3550,6 +3679,7 @@ pub(crate) mod partition_error_tests {
                     requests: latest_request(0),
                     result: Ok(()),
                     metadata_requests: 1,
+                    metadata_update_requested: false,
                     next_offset: Some(50),
                 },
             ),
@@ -3560,6 +3690,7 @@ pub(crate) mod partition_error_tests {
                     requests: latest_request(1),
                     result: Ok(()),
                     metadata_requests: 1,
+                    metadata_update_requested: true,
                     next_offset: Some(LATEST_SENTINEL),
                 },
             ),
@@ -3572,6 +3703,7 @@ pub(crate) mod partition_error_tests {
                         maplit::btreeset! {"orders".to_string()},
                     )),
                     metadata_requests: 1,
+                    metadata_update_requested: false,
                     next_offset: Some(LATEST_SENTINEL),
                 },
             ),
@@ -3584,7 +3716,8 @@ pub(crate) mod partition_error_tests {
                 ListOffsetsOutcome {
                     requests: vec![("leader", max, expected_list_offsets(0, -2))],
                     result: Ok(()),
-                    metadata_requests: 1,
+                    metadata_requests: 0,
+                    metadata_update_requested: false,
                     next_offset: Some(7),
                 },
             ),
@@ -3597,7 +3730,8 @@ pub(crate) mod partition_error_tests {
                 ListOffsetsOutcome {
                     requests: latest_request(1),
                     result: Ok(()),
-                    metadata_requests: 1,
+                    metadata_requests: 0,
+                    metadata_update_requested: false,
                     next_offset: Some(40),
                 },
             ),
@@ -3608,6 +3742,7 @@ pub(crate) mod partition_error_tests {
                     requests: vec![("leader", max, expected_list_offsets(0, -2))],
                     result: Ok(()),
                     metadata_requests: 0,
+                    metadata_update_requested: false,
                     next_offset: Some(7),
                 },
             ),
@@ -3617,7 +3752,8 @@ pub(crate) mod partition_error_tests {
                 ListOffsetsOutcome {
                     requests: vec![("leader", max, expected_list_offsets(1, -2))],
                     result: Ok(()),
-                    metadata_requests: 1,
+                    metadata_requests: 0,
+                    metadata_update_requested: true,
                     next_offset: Some(5),
                 },
             ),
@@ -3665,6 +3801,7 @@ pub(crate) mod partition_error_tests {
                         )],
                         result: Ok(()),
                         metadata_requests: 1,
+                        metadata_update_requested: false,
                         next_offset: Some(40),
                     }
                 )
@@ -3709,6 +3846,7 @@ pub(crate) mod partition_error_tests {
                     )],
                     result: Ok(()),
                     metadata_requests: 1,
+                    metadata_update_requested: false,
                     next_offset: Some(40),
                 }
         );
@@ -3751,6 +3889,7 @@ pub(crate) mod partition_error_tests {
                         list_offsets_request::MAX_VERSION,
                     )),
                     metadata_requests: 1,
+                    metadata_update_requested: false,
                     next_offset: Some(LATEST_SENTINEL),
                 },
             ),
@@ -3761,6 +3900,7 @@ pub(crate) mod partition_error_tests {
                     requests: vec![("leader", 2, without_epoch(1))],
                     result: Ok(()),
                     metadata_requests: 1,
+                    metadata_update_requested: false,
                     next_offset: Some(40),
                 },
             ),
@@ -3771,6 +3911,7 @@ pub(crate) mod partition_error_tests {
                     requests: vec![("leader", 1, without_epoch(0))],
                     result: Ok(()),
                     metadata_requests: 1,
+                    metadata_update_requested: false,
                     next_offset: Some(40),
                 },
             ),

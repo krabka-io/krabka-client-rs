@@ -355,6 +355,53 @@ async fn least_loaded_prefers_an_idle_connection_then_the_fewest_in_flight_then_
     }
 }
 
+/// The metadata walk order: open connections by fewest in flight, then the
+/// brokers with no open connection in id order. Each row gives the connection
+/// of brokers 1, 2 and 3 as `(open, in flight)`, or `None` for no connection.
+#[tokio::test(start_paused = true)]
+async fn broker_ids_by_load_puts_the_least_loaded_open_connection_first() {
+    type Connections = [Option<(bool, usize)>; 3];
+    let cases: [(&str, Connections, [i32; 3]); 4] = [
+        (
+            "a parked fetch on the lowest id",
+            [Some((true, 1)), Some((true, 0)), Some((true, 0))],
+            [2, 3, 1],
+        ),
+        (
+            "fewest in flight first",
+            [Some((true, 2)), Some((true, 5)), Some((true, 1))],
+            [3, 1, 2],
+        ),
+        (
+            "an open connection before none and a closed one",
+            [None, Some((false, 0)), Some((true, 4))],
+            [3, 1, 2],
+        ),
+        (
+            "no connections keeps id order",
+            [None, None, None],
+            [1, 2, 3],
+        ),
+    ];
+    for (name, connections, expected) in cases {
+        let pool = pool(&[addr(1000)], RecordingConnector::new());
+        pool.refresh_brokers(&[
+            broker(1, "127.0.0.1", 9001),
+            broker(2, "127.0.0.1", 9002),
+            broker(3, "127.0.0.1", 9003),
+        ])
+        .await;
+        for (id, connection) in (1..).zip(connections) {
+            if let Some((open, in_flight)) = connection {
+                let connection = pool.get(id).await.unwrap();
+                connection.open.store(open, Ordering::SeqCst);
+                connection.in_flight.store(in_flight, Ordering::SeqCst);
+            }
+        }
+        check!(pool.broker_ids_by_load() == expected, "{name}");
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn bootstrap_connection_caches_and_skips_dead_addresses() {
     let pool = pool(
