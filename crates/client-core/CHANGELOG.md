@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `Client::refresh_metadata` tries the broker with the least-loaded open
+  connection first, as Kafka's `NetworkClient.leastLoadedNode` does, rather
+  than the lowest broker id, so a metadata request does not queue behind a
+  parked long-poll `Fetch`. `MetadataTopics` gains `request_update` and
+  `update_requested` (Kafka's `Metadata.requestUpdate`): a change of the topic
+  set requests an update, and a successful refresh clears it.
 - Add `ConnectionOptions::validate` and validate transport policy before socket I/O,
   stream negotiation, or client bootstrap. Invalid or unrepresentable durations,
   inverted setup/reconnect bounds, and invalid socket buffers return configuration errors.
