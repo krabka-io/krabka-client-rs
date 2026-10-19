@@ -148,7 +148,7 @@ impl Client {
         level = "info",
         skip_all,
         fields(bootstrap = %bootstrap, client_id = %client_id),
-        err,
+        err(level = "debug"),
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -240,7 +240,7 @@ impl Client {
         level = "info",
         skip_all,
         fields(bootstrap = %bootstrap, client_id = %options.client_id),
-        err,
+        err(level = "debug"),
     )]
     async fn start_with_options(
         bootstrap: String,
@@ -346,7 +346,7 @@ impl Client {
     /// Before the first metadata response, the request goes to a bootstrap
     /// address. After it, the request goes to the least loaded known broker,
     /// as Kafka's `NetworkClient.leastLoadedNode` picks the node.
-    #[tracing::instrument(level = "debug", skip_all, fields(api_key = R::API_KEY), err)]
+    #[tracing::instrument(level = "debug", skip_all, fields(api_key = R::API_KEY), err(level = "debug"))]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn send<R: ProtocolRequest>(&self, req: R) -> Result<R::Response, ClientError> {
@@ -576,7 +576,7 @@ impl Client {
         level = "info",
         skip_all,
         fields(brokers = tracing::field::Empty),
-        err,
+        err(level = "debug"),
     )]
     pub async fn refresh_metadata_with(
         &self,
@@ -665,7 +665,7 @@ impl Client {
         level = "debug",
         skip_all,
         fields(topic = %topic, partition, current_leader_epoch, leader_epoch),
-        err,
+        err(level = "debug"),
     )]
     pub async fn offset_for_leader_epoch(
         &self,
@@ -720,7 +720,7 @@ impl Client {
         level = "debug",
         skip_all,
         fields(broker_id, topic = %topic, partition, current_leader_epoch, leader_epoch),
-        err,
+        err(level = "debug"),
     )]
     pub async fn offset_for_leader_epoch_on(
         &self,
@@ -774,7 +774,7 @@ impl Client {
             fetch_offset = fetch.fetch_offset,
             isolation_level = fetch.isolation_level,
         ),
-        err,
+        err(level = "debug"),
     )]
     pub async fn fetch_partition_with_isolation_on(
         &self,
@@ -855,7 +855,7 @@ impl BrokerHandle<'_> {
         level = "debug",
         skip_all,
         fields(broker_id = self.broker_id, api_key = R::API_KEY),
-        err,
+        err(level = "debug"),
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.

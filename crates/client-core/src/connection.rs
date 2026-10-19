@@ -479,7 +479,7 @@ async fn within_setup_timeout<T>(
 
 impl Connection {
     /// Connect to `addr`, negotiate API versions, return a usable `Connection`.
-    #[tracing::instrument(level = "debug", skip_all, fields(addr = %addr), err)]
+    #[tracing::instrument(level = "debug", skip_all, fields(addr = %addr), err(level = "debug"))]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn connect(
@@ -504,7 +504,7 @@ impl Connection {
         level = "debug",
         skip_all,
         fields(addr = %addr, secured = options.security.is_some()),
-        err,
+        err(level = "debug"),
     )]
     pub async fn connect_with_options(
         addr: SocketAddr,
@@ -542,7 +542,7 @@ impl Connection {
         level = "debug",
         skip_all,
         fields(addr = %addr, protocol = ?security.protocol),
-        err,
+        err(level = "debug"),
     )]
     pub async fn connect_secured(
         addr: SocketAddr,
@@ -624,7 +624,7 @@ impl Connection {
     /// calls it: the TLS + SASL handshake runs before this call, so the
     /// stream is already authenticated. From here on the connection's normal
     /// request / response framing applies.
-    #[tracing::instrument(level = "debug", skip_all, err)]
+    #[tracing::instrument(level = "debug", skip_all, err(level = "debug"))]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     /// # Panics
@@ -711,7 +711,7 @@ impl Connection {
         level = "debug",
         skip_all,
         fields(api_key = R::API_KEY, version = tracing::field::Empty),
-        err,
+        err(level = "debug"),
     )]
     pub async fn send<R: ProtocolRequest>(&self, req: R) -> Result<R::Response, ClientError> {
         // 1. Negotiate version.
@@ -819,7 +819,12 @@ impl Connection {
     /// configured request timeout.
     // cargo-mutants: live-broker I/O path; not unit-testable
     #[cfg_attr(test, mutants::skip)]
-    #[tracing::instrument(level = "debug", skip_all, fields(api_key, api_version), err)]
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(api_key, api_version),
+        err(level = "debug")
+    )]
     pub async fn raw_request(
         &self,
         api_key: i16,
@@ -1365,7 +1370,7 @@ pub(crate) fn api_versions_retry_version(
 /// highest version of the client, as Kafka's `NetworkClient` does, and an
 /// `UNSUPPORTED_VERSION` answer makes it retry at the version that the broker
 /// lists.
-#[tracing::instrument(level = "debug", skip_all, err)]
+#[tracing::instrument(level = "debug", skip_all, err(level = "debug"))]
 async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, ClientError> {
     use krabka_protocol::{Encode, owned::api_versions_request::ApiVersionsRequest};
 

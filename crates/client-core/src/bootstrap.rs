@@ -30,7 +30,7 @@ where
 ///
 /// This function silently skips entries that fail to resolve. It returns
 /// [`ClientError::Disconnected`] if *none* resolve.
-#[tracing::instrument(level = "debug", skip_all, fields(bootstrap = %bootstrap), err)]
+#[tracing::instrument(level = "debug", skip_all, fields(bootstrap = %bootstrap), err(level = "debug"))]
 #[cfg(test)]
 pub async fn resolve(
     bootstrap: &str,

@@ -648,3 +648,75 @@ async fn prefer_bootstrap_keeps_the_known_bootstrap_addresses() {
     pool.prefer_bootstrap();
     check!(pool.least_loaded().await.unwrap().addr == addr(1000));
 }
+
+/// The level of every `tracing` event emitted while it is the default
+/// subscriber.
+#[derive(Clone, Default)]
+struct EventLevels(Arc<Mutex<Vec<tracing::Level>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLevels {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        self.0.lock().unwrap().push(*event.metadata().level());
+    }
+}
+
+/// A pool failure that the caller handles.
+#[derive(Clone, Copy, Debug)]
+enum PoolFailure {
+    UnknownBroker,
+    RefusedBootstrap,
+    RefusedTcpDial,
+}
+
+/// A failed connect is the caller's to retry, evict or report: Kafka's
+/// `NetworkClient` logs a disconnect at INFO or below. Every layer it passes
+/// through records it at DEBUG, so a run that recovers prints no ERROR line
+/// (krabka-io/krabka-broker#1515).
+#[tokio::test]
+async fn a_failed_connect_is_logged_at_debug() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    for failure in [
+        PoolFailure::UnknownBroker,
+        PoolFailure::RefusedBootstrap,
+        PoolFailure::RefusedTcpDial,
+    ] {
+        let levels = EventLevels::default();
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(levels.clone()));
+        check!(fails(failure).await, "{failure:?}");
+        let levels = levels.0.lock().unwrap().clone();
+        check!(!levels.is_empty(), "{failure:?}");
+        check!(
+            levels.iter().all(|level| *level == tracing::Level::DEBUG),
+            "{failure:?}: {levels:?}"
+        );
+    }
+}
+
+/// Run `failure` and say whether the pool returned an error.
+async fn fails(failure: PoolFailure) -> bool {
+    match failure {
+        PoolFailure::UnknownBroker => pool(&[], RecordingConnector::new()).get(5).await.is_err(),
+        PoolFailure::RefusedBootstrap => pool(
+            &[addr(2222)],
+            RecordingConnector::new().refuse(&[addr(2222)]),
+        )
+        .bootstrap_connection()
+        .await
+        .is_err(),
+        PoolFailure::RefusedTcpDial => {
+            // Bind and drop a listener, so the port is free and nothing
+            // accepts on it.
+            let closed = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.local_addr())
+                .expect("a free port");
+            TcpConnector {
+                options: ConnectionOptions::default(),
+            }
+            .dial(closed, "127.0.0.1", secs(1))
+            .await
+            .is_err()
+        }
+    }
+}

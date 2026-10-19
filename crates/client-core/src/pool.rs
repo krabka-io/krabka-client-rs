@@ -78,7 +78,7 @@ pub struct TcpConnector {
 impl BrokerConnector for TcpConnector {
     type Conn = Connection;
 
-    #[tracing::instrument(level = "debug", skip_all, fields(addr = %addr), err)]
+    #[tracing::instrument(level = "debug", skip_all, fields(addr = %addr), err(level = "debug"))]
     async fn dial(
         &self,
         addr: SocketAddr,
@@ -406,7 +406,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
     /// # Errors
     /// Returns [`ClientError::Disconnected`] for a broker id that the pool
     /// does not know, the resolve error, or the dial error.
-    #[tracing::instrument(level = "debug", skip_all, fields(broker_id), err)]
+    #[tracing::instrument(level = "debug", skip_all, fields(broker_id), err(level = "debug"))]
     pub async fn get(&self, broker_id: i32) -> Result<Arc<C::Conn>, ClientError> {
         let (host, port) = self
             .by_endpoint
@@ -540,7 +540,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
     /// # Errors
     /// Returns the error of the last address, an authentication failure at
     /// once, or [`ClientError::Disconnected`] for an empty address list.
-    #[tracing::instrument(level = "debug", skip_all, err)]
+    #[tracing::instrument(level = "debug", skip_all, err(level = "debug"))]
     pub async fn bootstrap_connection(&self) -> Result<Arc<C::Conn>, ClientError> {
         let node = self.node(BOOTSTRAP_ID);
         if let Some(connection) = self.cached(&node) {
