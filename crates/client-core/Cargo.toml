@@ -30,7 +30,8 @@ workspace = true
 
 [features]
 default = []
-mock = []
+# `mock_test_support::recorded_levels` captures tracing events for tests.
+mock = ["dep:tracing-subscriber"]
 
 [dependencies]
 krabka-protocol = { version = "0.6.0", default-features = false }
@@ -47,6 +48,7 @@ tokio = { workspace = true, features = ["fs", "net", "rt", "rt-multi-thread", "i
 tokio-util = { workspace = true, features = ["codec", "rt"] }
 dashmap = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
 futures-util = { workspace = true }
 maplit = { workspace = true }
 refined_type = { workspace = true }

@@ -12,6 +12,7 @@ use krabka_units::{millis, secs};
 use tokio::time::Instant;
 
 use super::*;
+use crate::mock_test_support::recorded_levels;
 
 /// Stand-in connection: the address it was dialed against, and switches
 /// that a test flips to close it or load it.
@@ -649,35 +650,6 @@ async fn prefer_bootstrap_keeps_the_known_bootstrap_addresses() {
     check!(pool.least_loaded().await.unwrap().addr == addr(1000));
 }
 
-/// The level of every event recorded while it is the default subscriber.
-#[derive(Clone, Default)]
-struct EventLevels(Arc<Mutex<Vec<tracing::Level>>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLevels {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        self.0.lock().unwrap().push(*event.metadata().level());
-    }
-}
-
-/// Run `call` with an [`EventLevels`] as the default subscriber, and give
-/// back whether it failed and the level of every event it recorded.
-async fn recorded_levels<T>(
-    call: impl Future<Output = Result<T, ClientError>>,
-) -> (bool, Vec<tracing::Level>) {
-    use tracing_subscriber::layer::SubscriberExt as _;
-
-    let levels = EventLevels::default();
-    let _default =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(levels.clone()));
-    let failed = call.await.is_err();
-    let recorded = levels.0.lock().unwrap().clone();
-    (failed, recorded)
-}
-
 /// A connection the pool cannot give is an error returned to its caller, which
 /// may retry it, so the pool records it at its span's own level, debug. It used
 /// to record it at ERROR, so a run that recovered still printed an error line
@@ -690,10 +662,13 @@ async fn a_connection_the_pool_cannot_give_is_recorded_at_debug() {
         RecordingConnector::new().refuse(&[addr(1111)]),
     );
     let cases = [
-        ("unknown broker id", recorded_levels(unknown.get(5)).await),
+        (
+            "unknown broker id",
+            recorded_levels(async { unknown.get(5).await.is_err() }).await,
+        ),
         (
             "every bootstrap address refused",
-            recorded_levels(refused.bootstrap_connection()).await,
+            recorded_levels(async { refused.bootstrap_connection().await.is_err() }).await,
         ),
     ];
     for (name, recorded) in cases {
@@ -710,7 +685,8 @@ async fn a_refused_tcp_dial_records_no_error() {
         listener.local_addr().unwrap()
     };
     let pool = BrokerPool::new(vec![closed], ConnectionOptions::default());
-    let (failed, levels) = recorded_levels(pool.bootstrap_connection()).await;
+    let (failed, levels) =
+        recorded_levels(async { pool.bootstrap_connection().await.is_err() }).await;
     check!(failed);
     check!(!levels.is_empty());
     check!(!levels.contains(&tracing::Level::ERROR), "{levels:?}");
