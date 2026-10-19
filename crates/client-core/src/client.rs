@@ -346,7 +346,7 @@ impl Client {
     /// Before the first metadata response, the request goes to a bootstrap
     /// address. After it, the request goes to the least loaded known broker,
     /// as Kafka's `NetworkClient.leastLoadedNode` picks the node.
-    #[tracing::instrument(level = "debug", skip_all, fields(api_key = R::API_KEY), err)]
+    #[tracing::instrument(level = "debug", skip_all, fields(api_key = R::API_KEY), err(level = "debug"))]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn send<R: ProtocolRequest>(&self, req: R) -> Result<R::Response, ClientError> {

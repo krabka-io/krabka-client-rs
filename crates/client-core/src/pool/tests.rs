@@ -648,3 +648,57 @@ async fn prefer_bootstrap_keeps_the_known_bootstrap_addresses() {
     pool.prefer_bootstrap();
     check!(pool.least_loaded().await.unwrap().addr == addr(1000));
 }
+
+/// The level of every event recorded while it is the default subscriber.
+#[derive(Clone, Default)]
+struct EventLevels(Arc<Mutex<Vec<tracing::Level>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLevels {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.0.lock().unwrap().push(*event.metadata().level());
+    }
+}
+
+/// A connection the pool cannot give is an error returned to its caller, which
+/// may retry it, so the pool records it at its span's own level, debug. It used
+/// to record it at ERROR, so a run that recovered still printed an error line
+/// (krabka-io/krabka-broker#1515).
+#[tokio::test(start_paused = true)]
+async fn a_connection_the_pool_cannot_give_is_recorded_at_debug() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let cases: [(&str, BrokerPool<RecordingConnector>, bool); 2] = [
+        (
+            "unknown broker id",
+            pool(&[], RecordingConnector::new()),
+            false,
+        ),
+        (
+            "every bootstrap address refused",
+            pool(
+                &[addr(1111)],
+                RecordingConnector::new().refuse(&[addr(1111)]),
+            ),
+            true,
+        ),
+    ];
+    for (name, pool, bootstrap) in cases {
+        let levels = EventLevels::default();
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(levels.clone()));
+        let failed = if bootstrap {
+            pool.bootstrap_connection().await.is_err()
+        } else {
+            pool.get(5).await.is_err()
+        };
+        check!(failed, "{name}");
+        check!(
+            *levels.0.lock().unwrap() == vec![tracing::Level::DEBUG],
+            "{name}"
+        );
+    }
+}
