@@ -504,7 +504,7 @@ impl Connection {
         level = "debug",
         skip_all,
         fields(addr = %addr, secured = options.security.is_some()),
-        err,
+        err(level = "debug"),
     )]
     pub async fn connect_with_options(
         addr: SocketAddr,
@@ -542,7 +542,7 @@ impl Connection {
         level = "debug",
         skip_all,
         fields(addr = %addr, protocol = ?security.protocol),
-        err,
+        err(level = "debug"),
     )]
     pub async fn connect_secured(
         addr: SocketAddr,
@@ -711,7 +711,7 @@ impl Connection {
         level = "debug",
         skip_all,
         fields(api_key = R::API_KEY, version = tracing::field::Empty),
-        err,
+        err(level = "debug"),
     )]
     pub async fn send<R: ProtocolRequest>(&self, req: R) -> Result<R::Response, ClientError> {
         // 1. Negotiate version.

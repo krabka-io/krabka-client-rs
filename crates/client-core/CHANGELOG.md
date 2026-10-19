@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- The pool, the connection, the bootstrap lookup and `Client::send` record
-  an error they return at debug, the level of their own tracing span, rather
-  than at ERROR. Every such error reaches the caller, which may retry it, so a
+- The pool, the connection, the fetch helpers and the `Client` calls record
+  an error they return at the level of their own tracing span, debug or info,
+  rather than at ERROR. Every such error reaches the caller, which may retry it, so a
   run that recovered no longer prints `ERROR ... error=connection closed`
   (krabka-io/krabka-broker#1515).
 - `Client::refresh_metadata` tries the broker with the least-loaded open

@@ -172,7 +172,7 @@ pub type FetchedHeader = RecordHeader;
     level = "debug",
     skip_all,
     fields(topic = %topic, partition, fetch_offset),
-    err,
+    err(level = "debug"),
 )]
 pub async fn fetch_partition(
     conn: &Connection,
@@ -242,7 +242,7 @@ async fn fetch_partition_on<T: FetchTransport + ?Sized>(
     level = "debug",
     skip_all,
     fields(topic = %fetch.topic, partition = fetch.partition, fetch_offset = fetch.fetch_offset, isolation_level = fetch.isolation_level),
-    err,
+    err(level = "debug"),
 )]
 pub async fn fetch_partition_with_isolation(
     conn: &Connection,

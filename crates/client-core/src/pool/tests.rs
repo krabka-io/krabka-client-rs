@@ -663,42 +663,55 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLevels {
     }
 }
 
+/// Run `call` with an [`EventLevels`] as the default subscriber, and give
+/// back whether it failed and the level of every event it recorded.
+async fn recorded_levels<T>(
+    call: impl Future<Output = Result<T, ClientError>>,
+) -> (bool, Vec<tracing::Level>) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let levels = EventLevels::default();
+    let _default =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(levels.clone()));
+    let failed = call.await.is_err();
+    let recorded = levels.0.lock().unwrap().clone();
+    (failed, recorded)
+}
+
 /// A connection the pool cannot give is an error returned to its caller, which
 /// may retry it, so the pool records it at its span's own level, debug. It used
 /// to record it at ERROR, so a run that recovered still printed an error line
 /// (krabka-io/krabka-broker#1515).
 #[tokio::test(start_paused = true)]
 async fn a_connection_the_pool_cannot_give_is_recorded_at_debug() {
-    use tracing_subscriber::layer::SubscriberExt as _;
-
-    let cases: [(&str, BrokerPool<RecordingConnector>, bool); 2] = [
-        (
-            "unknown broker id",
-            pool(&[], RecordingConnector::new()),
-            false,
-        ),
+    let unknown = pool(&[], RecordingConnector::new());
+    let refused = pool(
+        &[addr(1111)],
+        RecordingConnector::new().refuse(&[addr(1111)]),
+    );
+    let cases = [
+        ("unknown broker id", recorded_levels(unknown.get(5)).await),
         (
             "every bootstrap address refused",
-            pool(
-                &[addr(1111)],
-                RecordingConnector::new().refuse(&[addr(1111)]),
-            ),
-            true,
+            recorded_levels(refused.bootstrap_connection()).await,
         ),
     ];
-    for (name, pool, bootstrap) in cases {
-        let levels = EventLevels::default();
-        let _default =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(levels.clone()));
-        let failed = if bootstrap {
-            pool.bootstrap_connection().await.is_err()
-        } else {
-            pool.get(5).await.is_err()
-        };
-        check!(failed, "{name}");
-        check!(
-            *levels.0.lock().unwrap() == vec![tracing::Level::DEBUG],
-            "{name}"
-        );
+    for (name, recorded) in cases {
+        check!(recorded == (true, vec![tracing::Level::DEBUG]), "{name}");
     }
+}
+
+/// The production dial goes through `Connection::connect_with_options`, whose
+/// own span records the refused connection too. No layer of it says ERROR.
+#[tokio::test]
+async fn a_refused_tcp_dial_records_no_error() {
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    };
+    let pool = BrokerPool::new(vec![closed], ConnectionOptions::default());
+    let (failed, levels) = recorded_levels(pool.bootstrap_connection()).await;
+    check!(failed);
+    check!(!levels.is_empty());
+    check!(!levels.contains(&tracing::Level::ERROR), "{levels:?}");
 }
