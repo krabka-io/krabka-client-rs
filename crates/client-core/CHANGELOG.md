@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-20
+
+**Breaking Rust API.** Uses the krabka-protocol 0.7 crate types in its public
+API, including the OAuth and SCRAM fixes in krabka-security 0.7.
+
 - The pool, the connection, the fetch helpers and the `Client` calls record
   an error they return at the level of their own tracing span, debug or info,
   rather than at ERROR. Every such error reaches the caller, which may retry it, so a
