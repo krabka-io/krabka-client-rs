@@ -2971,6 +2971,7 @@ mod harness {
     use krabka_client_core::ClientError;
     use krabka_protocol::{
         owned::{
+            init_producer_id_response::InitProducerIdResponse,
             metadata_response::{
                 MetadataResponse, MetadataResponsePartition, MetadataResponseTopic,
             },
@@ -3115,6 +3116,7 @@ mod harness {
         sent_identities: StdMutex<Vec<(i64, i16, i32)>>,
         init_calls: AtomicUsize,
         init_failures: AtomicUsize,
+        init_response_once: StdMutex<Option<InitProducerIdResponse>>,
         /// The `(transactional_id, is_transactional)` of every `send_produce`
         /// call's batch, in order — the request-level id and the batch's own
         /// attribute bit, so a test can assert a batch shipped stamped as
@@ -3184,6 +3186,7 @@ mod harness {
                 sent_identities: StdMutex::new(Vec::new()),
                 init_calls: AtomicUsize::new(0),
                 init_failures: AtomicUsize::new(0),
+                init_response_once: StdMutex::new(None),
                 sent_transactional: StdMutex::new(Vec::new()),
                 send_started: Notify::new(),
                 active_sends: AtomicUsize::new(0),
@@ -3396,6 +3399,9 @@ mod harness {
                 .is_ok()
             {
                 return Err(ClientError::Disconnected);
+            }
+            if let Some(response) = self.init_response_once.lock().unwrap().take() {
+                return Ok(response);
             }
             Ok(
                 krabka_protocol::owned::init_producer_id_response::InitProducerIdResponse {
@@ -6250,6 +6256,39 @@ mod harness {
         assert2::assert!(rx.try_recv().unwrap().is_ok());
         assert2::assert!(cfg.producer_id.load(Ordering::Acquire) == 2);
         assert2::assert!(cfg.in_flight.load(Ordering::Acquire) == 0);
+    }
+
+    #[tokio::test]
+    async fn epoch_overflow_retries_rejected_or_malformed_identities_before_producing() {
+        for (name, error_code, producer_id, producer_epoch) in [
+            ("coordinator loading", 14, 2, 0),
+            ("missing producer ID", 0, -1, 0),
+            ("missing producer epoch", 0, 2, -1),
+        ] {
+            let transport = MockTransport::new(Duration::ZERO);
+            *transport.init_response_once.lock().unwrap() = Some(InitProducerIdResponse {
+                error_code,
+                producer_id,
+                producer_epoch,
+                ..Default::default()
+            });
+            let h = spawn_sender(transport.clone(), 1);
+            h.producer_epoch.store(i16::MAX, Ordering::Release);
+            let rx = produce_burst(&h, "t", 0, 1).await.pop().unwrap();
+            let metadata = tokio::time::timeout(Duration::from_secs(1), rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert2::assert!(metadata.offset == 0, "{name}");
+            assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE, "{name}");
+            assert2::assert!(transport.init_calls.load(Ordering::Acquire) == 2, "{name}");
+            assert2::assert!(
+                *transport.sent_identities.lock().unwrap() == vec![(2, 0, 0)],
+                "{name}"
+            );
+            shutdown(h).await;
+        }
     }
 
     #[tokio::test]

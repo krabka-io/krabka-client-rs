@@ -307,6 +307,8 @@ mod tests {
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
+            init_producer_id_request::{self, InitProducerIdRequest},
+            init_producer_id_response::FLEXIBLE_MIN as INIT_FLEXIBLE_MIN,
             metadata_request,
             metadata_response::{
                 FLEXIBLE_MIN as META_FLEXIBLE_MIN, MetadataResponse, MetadataResponseBroker,
@@ -322,7 +324,7 @@ mod tests {
     use super::*;
 
     /// `ApiVersionsResponse` (header v0) advertising `ApiVersions`, `Metadata`,
-    /// and Produce so the client can negotiate all three against the mock.
+    /// Produce and `InitProducerId` against the mock.
     fn api_versions_v0() -> Vec<u8> {
         let resp = ApiVersionsResponse {
             error_code: 0,
@@ -337,6 +339,12 @@ mod tests {
                     api_key: metadata_request::API_KEY,
                     min_version: 0,
                     max_version: 12,
+                    ..Default::default()
+                },
+                ApiVersion {
+                    api_key: init_producer_id_request::API_KEY,
+                    min_version: 0,
+                    max_version: 4,
                     ..Default::default()
                 },
                 ApiVersion {
@@ -395,6 +403,58 @@ mod tests {
         }
         resp.encode(&mut buf, version).unwrap();
         buf.to_vec()
+    }
+
+    #[tokio::test]
+    async fn client_transport_allocates_a_fresh_id_without_a_transactional_identity() {
+        const CLIENT_ID: &str = "p";
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let requests = Arc::clone(&seen);
+        let response = InitProducerIdResponse {
+            producer_id: 73,
+            producer_epoch: 0,
+            ..Default::default()
+        };
+        let broker_response = response.clone();
+        let mock = MockBroker::start(move |api_key, version, _corr, body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions_v0());
+            }
+            if api_key == init_producer_id_request::API_KEY {
+                let flexible = version >= init_producer_id_request::FLEXIBLE_MIN;
+                let mut cursor = &body[2 + CLIENT_ID.len() + usize::from(flexible)..];
+                let request = InitProducerIdRequest::decode(&mut cursor, version).unwrap();
+                *requests.lock().unwrap() = Some((version, request));
+                let mut encoded = BytesMut::new();
+                if version >= INIT_FLEXIBLE_MIN {
+                    encoded.extend_from_slice(&[0]);
+                }
+                broker_response.encode(&mut encoded, version).unwrap();
+                return Some(encoded.to_vec());
+            }
+            None
+        })
+        .await;
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .client_id(CLIENT_ID)
+            .build()
+            .await
+            .unwrap();
+        let transport = ClientTransport::new(client, Arc::new(AtomicBool::new(false)));
+        assert2::assert!(transport.init_producer_id().await.unwrap() == response);
+        assert2::assert!(
+            *seen.lock().unwrap()
+                == Some((
+                    4,
+                    InitProducerIdRequest {
+                        transactional_id: None,
+                        transaction_timeout_ms: 0,
+                        ..Default::default()
+                    }
+                ))
+        );
+        mock.stop();
     }
 
     /// `ClientTransport` forwards each operation to the underlying `Client`. A
