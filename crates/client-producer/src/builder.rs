@@ -997,7 +997,7 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
         .with_caches(&metadata_cache, &partition_leaders, &metadata_refresh)
         .with_queues((&accumulators, &in_flight))
         .spawn(shutdown.clone());
-    let sender_handle = tokio::spawn(sender::run(sender::SenderConfig {
+    let sender_config = sender::SenderConfig {
         transport: Box::new(ClientTransport::new(
             client.clone(),
             Arc::clone(&transaction_v2),
@@ -1019,7 +1019,6 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
         accumulators: Arc::clone(&accumulators),
         next_seq: Arc::clone(&next_seq),
         state: Arc::clone(&state),
-        wake_rx,
         flush_notify: Arc::clone(&flush_notify),
         in_flight: Arc::clone(&in_flight),
         shutdown: shutdown.clone(),
@@ -1029,7 +1028,8 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
         txn_recovery_required: Arc::clone(&txn_recovery_required),
         txn_recovery_generation: Arc::clone(&txn_recovery_generation),
         txn_error: Arc::clone(&txn_error),
-    }));
+    };
+    let sender_handle = tokio::spawn(sender::run(sender_config, wake_rx));
 
     ProducerRuntime {
         wake_tx,
