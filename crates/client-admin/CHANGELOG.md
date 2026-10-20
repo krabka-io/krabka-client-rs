@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-20
+
+**Breaking Rust API.** Uses the krabka-protocol 0.7 crate types in its public
+API, including the OAuth and SCRAM fixes in krabka-security 0.7.
+
 - Expose DNS selection, reconnect backoff/max, socket buffers, dispatch capacity,
   and frame limit through `AdminClientConfig`, alongside existing API retry settings.
   Resolved options reach administrative connections without losing retry or recovery policy.
