@@ -10,14 +10,13 @@
 //! `RecordBatch`es, which allocates their `base_sequence`. Each batch becomes
 //! its own single-partition `ProduceRequest`, sent through `Client::broker(id)`,
 //! and it falls back to the bootstrap `Client::send` when the leader is
-//! unknown. All of a cycle's requests are sent **concurrently**, to keep every
-//! broker busy.
+//! unknown. Requests stay in flight independently, so a stalled broker cannot
+//! hold back later batches for a healthy broker.
 //!
 //! ## Per-partition pipelining (idempotence-critical)
 //!
 //! Brokers stay busy because independent partitions send **concurrently**. Up
-//! to [`SenderConfig::max_in_flight`] Produce requests overlap on the wire per
-//! drain cycle. But each *single* partition keeps **at most one** request in
+//! to [`SenderConfig::max_in_flight`] Produce requests overlap on the wire. But each *single* partition keeps **at most one** request in
 //! flight, which is [`MAX_IN_FLIGHT_PER_PARTITION`]. Its next batch is not
 //! drained until the previous one is acked. Per-partition idempotent
 //! `base_sequence` ordering therefore holds **by construction**. The broker
@@ -56,7 +55,11 @@ use std::{
 
 use bytes::BytesMut;
 use dashmap::DashMap;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::{
+    FutureExt as _,
+    future::BoxFuture,
+    stream::{FuturesUnordered, StreamExt},
+};
 use krabka_protocol::{
     owned::{
         metadata_response::MetadataResponse,
@@ -213,8 +216,7 @@ pub(crate) struct SenderConfig {
     /// [`ProducerError::SendTimeout`], when no send acknowledged it. Kafka's
     /// `delivery.timeout.ms`.
     pub delivery_timeout: Time,
-    /// Maximum number of Produce requests fired **concurrently per drain
-    /// cycle**, across all partitions. This is the cross-partition, or
+    /// Maximum number of Produce requests outstanding across all partitions. This is the cross-partition, or
     /// per-connection, pipelining bound, which Kafka calls
     /// `max.in.flight.requests.per.connection`.
     ///
@@ -235,7 +237,6 @@ pub(crate) struct SenderConfig {
     pub accumulators: AccumulatorMap,
     pub next_seq: Arc<DashMap<(String, i32), i32>>,
     pub state: Arc<AtomicU8>,
-    pub wake_rx: tokio::sync::mpsc::Receiver<DrainIntent>,
     pub flush_notify: Arc<Notify>,
     /// Shared with `Producer`. It tracks batches popped from an accumulator
     /// that are still being sent, so `flush` can wait for them. See the field
@@ -263,7 +264,7 @@ pub(crate) struct SenderConfig {
 }
 
 /// Mutable per-partition pipeline state, owned by [`run`] and threaded into
-/// every [`drain_once`] so it persists across drain cycles.
+/// every [`drain_batches`] so it persists across drain cycles.
 ///
 /// With [`MAX_IN_FLIGHT_PER_PARTITION`] pinned to `1`, the only state a
 /// partition can carry between cycles is a single failed batch that awaits a
@@ -491,7 +492,13 @@ fn include_deadline(schedule: &mut Schedule, deadline: Instant, now: Instant) {
     }
 }
 
-async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Schedule {
+async fn schedule(
+    cfg: &SenderConfig,
+    state: &PipelineState,
+    force: bool,
+    occupied: &HashSet<(String, i32)>,
+    capacity: usize,
+) -> Schedule {
     let now = Instant::now();
     let mut schedule = Schedule {
         immediate: false,
@@ -508,10 +515,12 @@ async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Sch
         if let Some(deadline) = delivery_deadline(batch.created_at, cfg.delivery_timeout) {
             include_deadline(&mut schedule, deadline, now);
         }
-        if let Some(backoff_until) = batch.backoff_until {
-            include_deadline(&mut schedule, backoff_until, now);
-        } else {
-            schedule.immediate = true;
+        if capacity > 0 {
+            if let Some(backoff_until) = batch.backoff_until {
+                include_deadline(&mut schedule, backoff_until, now);
+            } else {
+                schedule.immediate = true;
+            }
         }
     }
 
@@ -559,7 +568,7 @@ async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Sch
             schedule.immediate = true;
             continue;
         }
-        if state.retry.contains_key(&key) {
+        if state.retry.contains_key(&key) || occupied.contains(&key) || capacity == 0 {
             continue;
         }
         if has_ready {
@@ -593,58 +602,69 @@ async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Sch
     skip_all,
     fields(producer_id = cfg.producer_id.load(Ordering::Acquire), max_in_flight = cfg.max_in_flight),
 )]
-pub(crate) async fn run(mut cfg: SenderConfig) {
+pub(crate) async fn run(cfg: SenderConfig, mut wake_rx: tokio::sync::mpsc::Receiver<DrainIntent>) {
+    let cfg = Arc::new(cfg);
     let mut state = PipelineState::default();
+    let mut requests: FuturesUnordered<BoxFuture<'static, BatchSendResult>> =
+        FuturesUnordered::new();
+    let mut occupied = HashSet::new();
+    let mut metadata_refresh: Option<BoxFuture<'static, ()>> = None;
     let mut force = false;
     let mut stopping = false;
     loop {
-        let next = schedule(&cfg, &state, force).await;
+        let capacity = cfg.max_in_flight.saturating_sub(requests.len());
+        let next = schedule(&cfg, &state, force, &occupied, capacity).await;
         if next.immediate {
             let intent = if force {
                 DrainIntent::Force
             } else {
                 DrainIntent::Expired
             };
-            drain_once(&mut cfg, &mut state, intent).await;
+            for pb in drain_batches(&cfg, &mut state, intent, &occupied, capacity).await {
+                let key = (pb.topic.clone(), pb.partition);
+                let last_acked = state.last_acked_offset.get(&key).copied();
+                occupied.insert(key);
+                let cfg = Arc::clone(&cfg);
+                requests.push(async move { send_one_batch(&cfg, pb, last_acked).await }.boxed());
+            }
             continue;
         }
-        if force && next.settled {
+        if next.settled {
             force = false;
             if stopping {
                 break;
             }
         }
-        if stopping && next.settled {
-            break;
-        }
-        if stopping {
-            tokio::time::sleep_until(
-                next.deadline
-                    .expect("unsettled stopped sender has a retry deadline"),
-            )
-            .await;
-            continue;
-        }
 
-        let received = if let Some(deadline) = next.deadline {
-            tokio::select! {
-                () = cfg.shutdown.cancelled() => None,
-                received = cfg.wake_rx.recv() => received,
-                () = tokio::time::sleep_until(deadline) => continue,
+        tokio::select! {
+            Some(result) = requests.next(), if !requests.is_empty() => {
+                let mut completed = vec![result];
+                while let Some(Some(result)) = requests.next().now_or_never() {
+                    completed.push(result);
+                }
+                for result in &completed {
+                    occupied.remove(&(result.pb.topic.clone(), result.pb.partition));
+                }
+                if complete_batches(&cfg, &mut state, completed).await && metadata_refresh.is_none() {
+                    let cfg = Arc::clone(&cfg);
+                    metadata_refresh = Some(async move { update_leaders_from_metadata(&cfg).await }.boxed());
+                }
             }
-        } else {
-            tokio::select! {
-                () = cfg.shutdown.cancelled() => None,
-                received = cfg.wake_rx.recv() => received,
+            () = async { metadata_refresh.as_mut().expect("refresh is pending").await }, if metadata_refresh.is_some() => {
+                metadata_refresh = None;
             }
-        };
-        match received {
-            Some(DrainIntent::Force) => force = true,
-            Some(DrainIntent::Ready | DrainIntent::Expired) => {}
-            None => {
+            () = cfg.shutdown.cancelled(), if !stopping => {
                 force = true;
                 stopping = true;
             }
+            received = wake_rx.recv(), if !stopping => {
+                match received {
+                    Some(DrainIntent::Force) => force = true,
+                    Some(DrainIntent::Ready | DrainIntent::Expired) => {}
+                    None => { force = true; stopping = true; }
+                }
+            }
+            () = tokio::time::sleep_until(next.deadline.unwrap_or_else(Instant::now)), if next.deadline.is_some() => {}
         }
     }
 }
@@ -717,9 +737,8 @@ impl SendFailure {
 /// One drain cycle.
 ///
 /// It builds the send list: each partition's pending resend first, then one
-/// newly drained batch for each *idle* partition. It sends every batch as its
-/// own single-partition `ProduceRequest` **concurrently**. It then dispatches
-/// each [`BatchVerdict`]: ack, park for resend, terminal fail, or fence.
+/// newly drained batch for each *idle* partition. Active requests keep their
+/// partition occupied until their result is processed by [`complete_batches`].
 ///
 /// **Per-partition ordering / idempotence.** A partition contributes at most one
 /// batch per cycle. It contributes either its pending resend, held in
@@ -742,10 +761,16 @@ impl SendFailure {
     skip_all,
     fields(batches = tracing::field::Empty),
 )]
-async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: DrainIntent) {
+async fn drain_batches(
+    cfg: &SenderConfig,
+    state: &mut PipelineState,
+    intent: DrainIntent,
+    active: &HashSet<(String, i32)>,
+    capacity: usize,
+) -> Vec<PreparedBatch> {
     if cfg.state.load(Ordering::Acquire) != STATE_ACTIVE {
         fence(cfg, state, Vec::new());
-        return;
+        return Vec::new();
     }
     let now = Instant::now();
 
@@ -759,15 +784,11 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
     fail_recovered_accumulator_batches(cfg).await;
     fail_recovered_retry_slots(cfg, &mut state.retry);
     fail_expired_accumulator_batches(cfg, now).await;
-    let (mut to_send, expired) = collect_retries(
-        &mut state.retry,
-        now,
-        cfg.delivery_timeout,
-        cfg.max_in_flight,
-    );
+    let (mut to_send, expired) =
+        collect_retries(&mut state.retry, now, cfg.delivery_timeout, capacity);
     if !expired.is_empty() {
         expire_batches(cfg, state, expired, to_send).await;
-        return;
+        return Vec::new();
     }
     fail_recovered_batches(cfg, &mut to_send);
 
@@ -775,7 +796,7 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
         for pb in to_send {
             state.retry.insert((pb.topic.clone(), pb.partition), pb);
         }
-        return;
+        return Vec::new();
     }
 
     // A partition with a pending resend is "occupied": it must not also send a
@@ -788,6 +809,7 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
         .iter()
         .map(|pb| (pb.topic.clone(), pb.partition))
         .chain(state.retry.keys().cloned())
+        .chain(active.iter().cloned())
         .collect();
 
     // 2. One eligible new batch per idle partition. Across partitions we fan out
@@ -803,7 +825,7 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
         note_node_latency(cfg, state, &(pb.topic.clone(), pb.partition), now, true);
     }
     for key in keys {
-        let capped = to_send.len() >= cfg.max_in_flight;
+        let capped = to_send.len() >= capacity;
         if capped && !track_latency {
             break;
         }
@@ -866,11 +888,16 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
     tracing::Span::current().record("batches", to_send.len());
     if to_send.is_empty() {
         cfg.flush_notify.notify_waiters();
-        return;
+        return Vec::new();
     }
 
-    // 3. Send every batch concurrently, then apply each verdict to its window.
-    send_batches(cfg, state, to_send).await;
+    to_send
+}
+
+#[cfg(test)]
+async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: DrainIntent) {
+    let batches = drain_batches(cfg, state, intent, &HashSet::new(), cfg.max_in_flight).await;
+    send_batches(cfg, state, batches).await;
 }
 
 /// Fail every batch that reached the delivery timeout, and park the rest of
@@ -1030,7 +1057,7 @@ fn collect_retries(
     (to_send, expired)
 }
 
-/// Per-batch verdict that [`send_batches`] consumes in the one-slot model. The
+/// Per-batch verdict that [`complete_batches`] consumes in the one-slot model. The
 /// broker durably accepted the batch, or the batch must be resent, or it failed
 /// with a server code, or it fatally fenced the producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1348,33 +1375,15 @@ struct BatchSendResult {
     refresh_needed: bool,
 }
 
-/// Send every batch in `to_send` as its own single-partition `ProduceRequest`,
-/// **concurrently**, then dispatch each [`BatchVerdict`]: ack the records, fail
-/// them terminally, park the batch in its partition's retry slot for a verbatim
-/// resend on the next cycle, or fence the producer.
-///
-/// The concurrency is cross-partition request pipelining. Every batch in
-/// `to_send` is for a *distinct* partition, which the `occupied` set of
-/// [`drain_once`] guarantees, and the brokers are independent. Overlapping the
-/// round-trips therefore keeps every broker busy, never puts two same-partition
-/// requests on the wire, and leaves per-partition ordering undisturbed. The
-/// futures are polled on this one task, with no spawn, so they share `&cfg`
-/// safely.
-#[tracing::instrument(level = "debug", skip_all, fields(batches = to_send.len()))]
-async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Vec<PreparedBatch>) {
-    let mut to_send = to_send;
-    fail_recovered_batches(cfg, &mut to_send);
-    let mut results: FuturesUnordered<_> = to_send
-        .into_iter()
-        .map(|pb| {
-            let last_acked_offset = state
-                .last_acked_offset
-                .get(&(pb.topic.clone(), pb.partition))
-                .copied();
-            send_one_batch(cfg, pb, last_acked_offset)
-        })
-        .collect();
-
+/// Apply completed responses, preserving pending batches on other partitions.
+/// Ready responses share one sequence repair, and any needed metadata refresh
+/// is reported to the sender so it can run alongside Produce requests.
+#[tracing::instrument(level = "debug", skip_all, fields(batches = results.len()))]
+async fn complete_batches(
+    cfg: &SenderConfig,
+    state: &mut PipelineState,
+    results: Vec<BatchSendResult>,
+) -> bool {
     let mut needs_refresh = false;
     let mut fenced: Option<Vec<PreparedBatch>> = None;
     // Kafka's idempotent producer bumps its epoch once for all the partitions
@@ -1388,7 +1397,7 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
     // Failed batches resolve their records after the sequence repair, so a
     // caller that sees the error already sees the repaired producer.
     let mut failed: Vec<(PreparedBatch, ProducerError)> = Vec::new();
-    while let Some(res) = results.next().await {
+    for res in results {
         let BatchSendResult {
             mut pb,
             verdict,
@@ -1493,7 +1502,6 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
             }
         }
     }
-    drop(results);
 
     if let Some(mut to_fail) = fenced {
         for (pb, error) in failed {
@@ -1503,7 +1511,7 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
         to_fail.append(&mut rewrites);
         to_fail.append(&mut splits);
         fence(cfg, state, to_fail);
-        return;
+        return false;
     }
 
     let mut epoch_bumped = false;
@@ -1541,7 +1549,31 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
         terminal_fail_batch(cfg, pb, error);
     }
 
-    if needs_refresh {
+    needs_refresh
+}
+
+#[cfg(test)]
+async fn send_batches(
+    cfg: &SenderConfig,
+    state: &mut PipelineState,
+    mut batches: Vec<PreparedBatch>,
+) {
+    fail_recovered_batches(cfg, &mut batches);
+    let mut requests: FuturesUnordered<_> = batches
+        .into_iter()
+        .map(|pb| {
+            let last_acked = state
+                .last_acked_offset
+                .get(&(pb.topic.clone(), pb.partition))
+                .copied();
+            send_one_batch(cfg, pb, last_acked)
+        })
+        .collect();
+    let mut results = Vec::new();
+    while let Some(result) = requests.next().await {
+        results.push(result);
+    }
+    if complete_batches(cfg, state, results).await {
         update_leaders_from_metadata(cfg).await;
     }
 }
@@ -3131,6 +3163,8 @@ mod harness {
         /// Count of `refresh_metadata` calls, so a test can assert the sender
         /// refreshed after a routing/transport failure.
         refreshes: AtomicUsize,
+        refresh_delay: StdMutex<Duration>,
+        refresh_started: Notify,
         offsets_seen: AtomicI64,
         /// Calls made through the dedicated one-way Produce transport path.
         no_response_sends: AtomicUsize,
@@ -3193,6 +3227,8 @@ mod harness {
                 peak_active_sends: AtomicUsize::new(0),
                 fail_next_sends: AtomicUsize::new(0),
                 refreshes: AtomicUsize::new(0),
+                refresh_delay: StdMutex::new(Duration::ZERO),
+                refresh_started: Notify::new(),
                 offsets_seen: AtomicI64::new(0),
                 no_response_sends: AtomicUsize::new(0),
                 sent_at: StdMutex::new(Vec::new()),
@@ -3582,6 +3618,11 @@ mod harness {
 
         async fn refresh_metadata(&self) -> Result<MetadataResponse, ClientError> {
             self.refreshes.fetch_add(1, Ordering::Relaxed);
+            self.refresh_started.notify_one();
+            let delay = *self.refresh_delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             Ok(self.refresh_response.lock().unwrap().clone())
         }
     }
@@ -3809,7 +3850,6 @@ mod harness {
             accumulators: Arc::clone(&accumulators),
             next_seq: Arc::clone(&next_seq),
             state: Arc::clone(&state),
-            wake_rx,
             flush_notify: Arc::clone(&flush_notify),
             in_flight: Arc::clone(&in_flight),
             shutdown: shutdown.clone(),
@@ -3825,7 +3865,7 @@ mod harness {
             txn_error: Arc::clone(&abortable_error),
         };
 
-        let handle = tokio::spawn(run(cfg));
+        let handle = tokio::spawn(run(cfg, wake_rx));
         Harness {
             accumulators,
             next_seq,
@@ -4423,7 +4463,6 @@ mod harness {
         max_in_flight: usize,
     ) -> (SenderConfig, Arc<MockTransport>) {
         let transport = MockTransport::new(Duration::ZERO);
-        let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
         let cfg = SenderConfig {
             transport: Box::new(ArcTransport(Arc::clone(&transport))),
             producer_id: Arc::new(AtomicI64::new(-1)),
@@ -4443,7 +4482,6 @@ mod harness {
             accumulators: Arc::new(DashMap::new()),
             next_seq: Arc::new(DashMap::new()),
             state: Arc::new(AtomicU8::new(STATE_ACTIVE)),
-            wake_rx,
             flush_notify: Arc::new(Notify::new()),
             in_flight: Arc::new(AtomicUsize::new(0)),
             shutdown: CancellationToken::new(),
@@ -4902,6 +4940,112 @@ mod harness {
         assert2::assert!(sent.len() == 3 && sent[2] == Some(1));
         assert2::assert!(sent[..2].contains(&Some(0)) && sent[..2].contains(&Some(6)));
 
+        shutdown(h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_request_does_not_block_later_batches_on_a_healthy_broker() {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.add_known_broker(0);
+        transport.add_known_broker(1);
+        transport.delay_leader(0, Duration::from_secs(10));
+        let h = spawn_sender(transport.clone(), 2);
+        h.partition_leaders.insert(("t".into(), 0), 0);
+        h.partition_leaders.insert(("t".into(), 1), 1);
+        let mut stalled = produce_single_batch_without_wake(&h, "t", 0, 1)
+            .await
+            .remove(0);
+        let first = produce_single_batch_without_wake(&h, "t", 1, 1)
+            .await
+            .remove(0);
+        h.wake_tx.send(DrainIntent::Force).await.unwrap();
+        assert2::assert!(first.await.unwrap().unwrap().offset == 0);
+        let queued = produce_single_batch_without_wake(&h, "t", 0, 1)
+            .await
+            .remove(0);
+        for expected_offset in 1..=3 {
+            let next = produce_single_batch(&h, "t", 1, 1).await.remove(0);
+            let acknowledged = tokio::time::timeout(Duration::from_millis(50), next)
+                .await
+                .expect("healthy batches must not wait for a stalled broker")
+                .unwrap()
+                .unwrap();
+            assert2::assert!(acknowledged.offset == expected_offset);
+            assert2::assert!(matches!(
+                stalled.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        assert2::assert!(transport.peak_active_sends() == 2);
+        assert2::assert!(transport.send_count() == 5);
+        assert2::assert!(
+            *transport.sent_identities.lock().unwrap()
+                == vec![(1, 0, 0), (1, 0, 0), (1, 0, 1), (1, 0, 2), (1, 0, 3)]
+        );
+        assert2::assert!(stalled.await.unwrap().unwrap().offset == 0);
+        assert2::assert!(queued.await.unwrap().unwrap().offset == 1);
+        assert2::assert!(h.in_flight.load(Ordering::Acquire) == 0);
+        shutdown(h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_metadata_refresh_does_not_block_a_known_healthy_leader() {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.add_known_broker(0);
+        transport.add_known_broker(1);
+        transport.fail_once_on_leader(0);
+        *transport.refresh_delay.lock().unwrap() = Duration::from_secs(10);
+        let h = spawn_sender(transport.clone(), 2);
+        h.partition_leaders.insert(("t".into(), 0), 0);
+        h.partition_leaders.insert(("t".into(), 1), 1);
+        let failed_route = produce_single_batch(&h, "t", 0, 1).await.remove(0);
+        transport.refresh_started.notified().await;
+        let healthy = produce_single_batch(&h, "t", 1, 1).await.remove(0);
+        let metadata = tokio::time::timeout(Duration::from_millis(50), healthy)
+            .await
+            .expect("a metadata refresh must not suspend healthy sends")
+            .unwrap()
+            .unwrap();
+        assert2::assert!((metadata.partition, metadata.offset) == (1, 0));
+        assert2::assert!(transport.refresh_count() == 1);
+        assert2::assert!(failed_route.await.unwrap().is_ok());
+        shutdown(h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identity_rollover_keeps_an_inflight_batch_on_its_original_identity() {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.add_known_broker(0);
+        transport.add_known_broker(1);
+        transport.delay_leader(0, Duration::from_secs(10));
+        let h = spawn_sender(transport.clone(), 2);
+        h.partition_leaders.insert(("t".into(), 0), 0);
+        h.partition_leaders.insert(("t".into(), 1), 1);
+        let original = produce_single_batch(&h, "t", 0, 1).await.remove(0);
+        transport.send_started.notified().await;
+        h.producer_epoch.store(i16::MAX, Ordering::Release);
+        let next = produce_single_batch_without_wake(&h, "t", 0, 1)
+            .await
+            .remove(0);
+        let healthy = produce_single_batch(&h, "t", 1, 1).await.remove(0);
+        assert2::assert!(
+            tokio::time::timeout(Duration::from_millis(50), healthy)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .offset
+                == 0
+        );
+        assert2::assert!(transport.init_calls.load(Ordering::Acquire) == 1);
+        assert2::assert!(original.await.unwrap().unwrap().offset == 0);
+        assert2::assert!(next.await.unwrap().unwrap().offset == 1);
+        assert2::assert!(
+            *transport.sent_identities.lock().unwrap() == vec![(1, 0, 0), (2, 0, 0), (2, 0, 0)]
+        );
+        assert2::assert!(transport.sent_leaders() == vec![Some(0), Some(1), Some(0)]);
+        assert2::assert!(transport.peak_active_sends() == 2);
+        assert2::assert!(h.in_flight.load(Ordering::Acquire) == 0);
         shutdown(h).await;
     }
 
@@ -6139,7 +6283,6 @@ mod harness {
     }
 
     fn rollover_config(transport: Arc<MockTransport>, epoch: i16) -> SenderConfig {
-        let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
         SenderConfig {
             transport: Box::new(ArcTransport(transport)),
             producer_id: Arc::new(AtomicI64::new(1)),
@@ -6159,7 +6302,6 @@ mod harness {
             accumulators: Arc::new(DashMap::new()),
             next_seq: Arc::new(DashMap::new()),
             state: Arc::new(AtomicU8::new(STATE_ACTIVE)),
-            wake_rx,
             flush_notify: Arc::new(Notify::new()),
             in_flight: Arc::new(AtomicUsize::new(2)),
             shutdown: CancellationToken::new(),
