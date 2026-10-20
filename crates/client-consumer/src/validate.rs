@@ -101,7 +101,7 @@ impl Consumer {
         level = "debug",
         skip_all,
         fields(group_id = %self.group_id),
-        err
+        err(level = "debug")
     )]
     pub(crate) async fn refresh_leader_epochs(&self) -> Result<(), ConsumerError> {
         // `refresh_metadata` (not a bare `send(MetadataRequest)`) so the main
@@ -143,7 +143,7 @@ impl Consumer {
             to_validate = tracing::field::Empty,
             truncated = tracing::field::Empty,
         ),
-        err
+        err(level = "debug")
     )]
     pub(crate) async fn validate_positions(
         &self,

@@ -41,7 +41,7 @@ impl Consumer {
         level = "debug",
         skip_all,
         fields(group_id = %self.group_id, topic = tracing::field::Empty, partition, offset),
-        err
+        err(level = "debug")
     )]
     pub async fn seek(
         &self,
@@ -72,7 +72,7 @@ impl Consumer {
         level = "debug",
         skip_all,
         fields(group_id = %self.group_id, topic = tracing::field::Empty, partition, offset, leader_epoch),
-        err
+        err(level = "debug")
     )]
     pub async fn seek_with_leader_epoch(
         &self,
