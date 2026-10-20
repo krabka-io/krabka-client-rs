@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The consumer and share consumer (start, poll, commit, seek, position
+  validation, group coordination and close) record an error they return at
+  the level of their own tracing span, debug or info, rather than at ERROR
+  (krabka-io/krabka-broker#1515).
 - `poll` refreshes metadata only when it is due, as Kafka's consumer does:
   older than `metadata_max_age`, after a topic change, after a fetch or
   `ListOffsets` error asked for an update, or when an assigned partition has

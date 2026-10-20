@@ -241,7 +241,7 @@ fn coordinator_node_id(r: &FindCoordinatorResponse) -> i32 {
     level = "info",
     skip_all,
     fields(group_id = %group_id, coordinator_id = tracing::field::Empty),
-    err
+    err(level = "info")
 )]
 pub(crate) async fn find_coordinator(
     client: &Client,
@@ -1126,7 +1126,7 @@ pub(crate) fn subscription_metadata_refresh_due(
     level = "debug",
     skip_all,
     fields(group_id = %state.group_id, topics = tracing::field::Empty),
-    err
+    err(level = "debug")
 )]
 async fn subscribed_partition_counts(
     state: &CoordinatorState,
@@ -1913,7 +1913,7 @@ async fn refind_after(state: &CoordinatorState, ctx: &str) {
         revoked = tracing::field::Empty,
         added = tracing::field::Empty,
     ),
-    err
+    err(level = "info")
 )]
 async fn rejoin_group(state: &mut CoordinatorState) -> Result<HashMap<String, i32>, ConsumerError> {
     let JoinOutcome {
@@ -2577,7 +2577,7 @@ async fn perform_join(
         protocol = tracing::field::Empty,
         assigned_partitions = tracing::field::Empty,
     ),
-    err
+    err(level = "info")
 )]
 async fn join_and_sync(state: &mut CoordinatorState) -> Result<JoinOutcome, ConsumerError> {
     join_prepare(state).await?;
@@ -2802,7 +2802,7 @@ async fn sync_assignment(
     level = "debug",
     skip_all,
     fields(group_id = %state.group_id, partitions = partitions.len()),
-    err
+    err(level = "debug")
 )]
 async fn prime_offsets(
     state: &CoordinatorState,

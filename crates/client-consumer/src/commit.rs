@@ -1052,7 +1052,7 @@ impl Consumer {
         level = "debug",
         skip_all,
         fields(commit_context = ?commit_trace_context(self), partitions = tracing::field::Empty),
-        err
+        err(level = "debug")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, or the broker rejects the commit with an error that is not retriable. A retriable error, such as `NOT_COORDINATOR` or a failed request, is retried. Returns [`ConsumerError::Timeout`] when the call, including any wait for a concurrent commit, the broker round trips and the retries, does not finish within `default_api_timeout`. When a retriable error left no time for another attempt, that error is the timeout's cause, as in Kafka's `commitSync`.

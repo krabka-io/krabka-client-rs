@@ -223,7 +223,7 @@ impl ShareConsumer {
             assigned_partitions = tracing::field::Empty,
             records = tracing::field::Empty,
         ),
-        err
+        err(level = "debug")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -390,7 +390,7 @@ impl ShareConsumer {
             partition = record.partition,
             offset = record.offset,
         ),
-        err
+        err(level = "debug")
     )]
     pub async fn renew(&mut self, record: &ShareConsumerRecord) -> Result<(), ConsumerError> {
         if self.ack_mode == ShareAckMode::Implicit {
@@ -436,7 +436,7 @@ impl ShareConsumer {
         level = "debug",
         skip_all,
         fields(group_id = %self.group_id, pending_acks = self.pending_acks.len()),
-        err
+        err(level = "debug")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -458,7 +458,7 @@ impl ShareConsumer {
             session_epoch = self.share_session_epoch,
             pending_acks = self.pending_acks.len(),
         ),
-        err
+        err(level = "debug")
     )]
     pub(crate) async fn flush_pending_acks(&mut self) -> Result<(), ConsumerError> {
         if self.pending_acks.is_empty() {

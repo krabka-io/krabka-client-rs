@@ -1062,7 +1062,7 @@ impl Consumer {
         level = "info",
         skip_all,
         fields(group_id = ?group_id, client_id = ?client_id),
-        err
+        err(level = "info")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -1459,7 +1459,7 @@ impl Consumer {
             is_leader = tracing::field::Empty,
             assigned_partitions = tracing::field::Empty,
         ),
-        err
+        err(level = "info")
     )]
     async fn start_once(mut config: StartConfig) -> Result<Self, ConsumerError> {
         if config.subscribe.is_empty()
@@ -2305,7 +2305,7 @@ impl Consumer {
         level = "info",
         skip_all,
         fields(group_id = %self.group_id, member_id = %self.member_id(), ?options),
-        err
+        err(level = "info")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -3156,6 +3156,41 @@ mod security_arg_tests {
             ConsumerError::Client(ClientError::Timeout(d))
                 if d == krabka_units::millis(100)
         ));
+    }
+
+    /// A refused start returns its error to the caller, so `start` records it
+    /// at its span's own level, info, and nothing under it records ERROR
+    /// (krabka-io/krabka-broker#1515).
+    #[tokio::test]
+    async fn a_refused_start_records_no_error() {
+        use krabka_client_core::mock_test_support::recorded_levels;
+
+        let (invalid, levels) = recorded_levels(Box::pin(
+            Consumer::builder()
+                .bootstrap("127.0.0.1:1")
+                .group_id("log-level-group")
+                .subscribe(vec!["orders".to_string()])
+                .fetch_min(0)
+                .build(),
+        ))
+        .await;
+        assert2::assert!(matches!(invalid, Err(ConsumerError::InvalidConfig(_))));
+        check!(levels == vec![tracing::Level::INFO]);
+
+        let mock = MockBroker::start(|_api_key, _version, _corr_id, _body| None).await;
+        let (silent, levels) = recorded_levels(Box::pin(
+            Consumer::builder()
+                .bootstrap(mock.addr.to_string())
+                .group_id("log-level-group")
+                .subscribe(vec!["orders".to_string()])
+                .request_timeout(millis(100))
+                .build(),
+        ))
+        .await;
+        mock.stop();
+        assert2::assert!(silent.is_err());
+        check!(!levels.is_empty());
+        check!(!levels.contains(&tracing::Level::ERROR), "{levels:?}");
     }
 
     #[tokio::test]

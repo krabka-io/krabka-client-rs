@@ -331,7 +331,7 @@ impl ShareConsumer {
             member_epoch = tracing::field::Empty,
             assigned_partitions = tracing::field::Empty,
         ),
-        err
+        err(level = "info")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -584,7 +584,7 @@ impl ShareConsumer {
         level = "info",
         skip_all,
         fields(group_id = %self.group_id, member_id = %self.member_id),
-        err
+        err(level = "info")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -667,6 +667,24 @@ mod tests {
                 .unwrap_err()
                 .contains("share consumer leave-heartbeat timeout")
         );
+    }
+
+    /// A refused share-consumer start returns its error to the caller, so it
+    /// is recorded at the span's own level, info, not at ERROR
+    /// (krabka-io/krabka-broker#1515).
+    #[tokio::test]
+    async fn a_refused_start_is_recorded_at_its_span_level() {
+        let (result, levels) = krabka_client_core::mock_test_support::recorded_levels(Box::pin(
+            ShareConsumer::builder()
+                .bootstrap("invalid.invalid:9092")
+                .group_id("log-level")
+                .subscribe(["topic".to_owned()])
+                .leave_heartbeat_timeout(krabka_units::secs(0))
+                .build(),
+        ))
+        .await;
+        assert2::assert!(result.is_err());
+        assert2::check!(levels == vec![tracing::Level::INFO]);
     }
 
     #[tokio::test]

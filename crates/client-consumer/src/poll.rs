@@ -619,7 +619,7 @@ impl Consumer {
             leaders = tracing::field::Empty,
             records = tracing::field::Empty,
         ),
-        err
+        err(level = "debug")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -1738,7 +1738,7 @@ impl Consumer {
         level = "debug",
         skip_all,
         fields(group_id = %self.group_id, sentinels = tracing::field::Empty),
-        err
+        err(level = "debug")
     )]
     async fn resolve_reset_sentinels(&self) -> Result<(), ConsumerError> {
         let by_sentinel = {
@@ -1961,7 +1961,7 @@ impl Consumer {
         level = "debug",
         skip_all,
         fields(group_id = %self.group_id, partitions = out_of_range.len()),
-        err
+        err(level = "debug")
     )]
     async fn recover_out_of_range(
         &self,
@@ -2052,7 +2052,7 @@ impl Consumer {
         level = "debug",
         skip_all,
         fields(group_id = %self.group_id, truncated = truncated.len()),
-        err
+        err(level = "debug")
     )]
     async fn apply_truncation(
         &self,
