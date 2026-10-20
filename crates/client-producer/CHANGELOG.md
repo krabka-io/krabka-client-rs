@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-20
+
+- Require Rustls 0.23.46 and update the locked certificate verifier to 0.103.16.
+- Allocate a new producer identity at epoch exhaustion and retain identities for batches awaiting acknowledgements.
+- Keep healthy partitions flowing while a Produce request or metadata refresh is stalled. Retain request limits, ordering and retry deduplication.
+
 ## [0.7.0] — 2026-10-20
 
 **Breaking Rust API.** Uses the krabka-protocol 0.7 crate types in its public

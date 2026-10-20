@@ -28,7 +28,7 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 derive_more = { workspace = true }
 krabka-protocol = { version = "0.7.0", default-features = false }
-krabka-client-core = { version = "0.7.0", path = "../client-core" }
+krabka-client-core = { version = "0.7.1", path = "../client-core" }
 krabka-ids = { version = "0.7.0" }
 krabka-units = { workspace = true }
 bytes = { workspace = true }
