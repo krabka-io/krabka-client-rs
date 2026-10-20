@@ -642,7 +642,7 @@ pub(crate) async fn send_init_producer_id(
 /// On the deadline it returns the last response, so the caller's
 /// `error_code != 0` handling runs. If the final attempt disconnected, it
 /// surfaces the transport error instead.
-#[tracing::instrument(level = "info", skip_all, err)]
+#[tracing::instrument(level = "info", skip_all, err(level = "info"))]
 pub(crate) async fn init_producer_id_with_retry(
     client: &Client,
     request: InitProducerIdRequest,
@@ -1127,7 +1127,7 @@ impl Producer {
             enable_idempotence = ?enable_idempotence,
             transactional_id = transactional_id.as_deref(),
         ),
-        err,
+        err(level = "info"),
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -2645,5 +2645,22 @@ mod security_arg_tests {
                 "{error:?} does not name {field:?}"
             );
         }
+    }
+
+    /// A build whose `InitProducerId` cannot connect returns the error to its
+    /// caller, so no layer of it records the failure at ERROR
+    /// (krabka-io/krabka-broker#1515).
+    #[tokio::test]
+    async fn a_build_that_cannot_connect_records_no_error() {
+        let (result, levels) = krabka_client_core::mock_test_support::recorded_levels(Box::pin(
+            Producer::builder()
+                .bootstrap("127.0.0.1:1")
+                .request_timeout(Duration::from_millis(500))
+                .build(),
+        ))
+        .await;
+        assert2::assert!(result.is_err());
+        assert2::check!(!levels.is_empty());
+        assert2::check!(!levels.contains(&tracing::Level::ERROR), "{levels:?}");
     }
 }

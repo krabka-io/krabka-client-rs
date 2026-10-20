@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The pool, the connection, the fetch helpers and the `Client` calls record
+  an error they return at the level of their own tracing span, debug or info,
+  rather than at ERROR. Every such error reaches the caller, which may retry it, so a
+  run that recovered no longer prints `ERROR ... error=connection closed`
+  (krabka-io/krabka-broker#1515). The `mock` feature's
+  `mock_test_support::recorded_levels` captures the level of every event a
+  call records, for tests.
 - `Client::refresh_metadata` tries the broker with the least-loaded open
   connection first, as Kafka's `NetworkClient.leastLoadedNode` does, rather
   than the lowest broker id, so a metadata request does not queue behind a

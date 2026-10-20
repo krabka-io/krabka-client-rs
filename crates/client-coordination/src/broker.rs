@@ -253,7 +253,7 @@ impl BrokerTransport {
         level = "info",
         skip_all,
         fields(bootstrap = %bootstrap, client_id = %client_id),
-        err,
+        err(level = "info"),
     )]
     pub async fn start(
         #[builder(into)] bootstrap: String,
@@ -371,7 +371,7 @@ impl BrokerTransport {
 
     /// Creates the coordination topic with `cleanup.policy=compact`, and takes
     /// `TOPIC_ALREADY_EXISTS` for success.
-    #[tracing::instrument(level = "info", skip_all, err)]
+    #[tracing::instrument(level = "info", skip_all, err(level = "info"))]
     async fn create_topic(&self) -> Result<(), CoordinationError> {
         let spec = coordination_topic_spec(self.topic_partitions, self.topic_replication);
         let outcomes = self
@@ -488,7 +488,7 @@ impl CoordinationTransport for BrokerTransport {
     /// `role` while this call ran. Returns [`CoordinationError::Producer`] when
     /// the coordinator refuses the call or returns no identity, and
     /// [`CoordinationError::Client`] when a connection fails.
-    #[tracing::instrument(level = "info", skip_all, fields(role = %role), err)]
+    #[tracing::instrument(level = "info", skip_all, fields(role = %role), err(level = "info"))]
     async fn acquire_epoch(&self, role: &Role) -> Result<FencingToken, CoordinationError> {
         self.topic_layout().await?;
         let producer = self.build_role_producer(role).await?;
@@ -543,7 +543,7 @@ impl CoordinationTransport for BrokerTransport {
     /// value of a record of `role` does not decode. Returns
     /// [`CoordinationError::InvalidConfig`] when the topic reports no
     /// partition.
-    #[tracing::instrument(level = "debug", skip_all, fields(role = %role), err)]
+    #[tracing::instrument(level = "debug", skip_all, fields(role = %role), err(level = "debug"))]
     async fn read_role_records(&self, role: &Role) -> Result<RoleRecords, CoordinationError> {
         let layout = self.topic_layout().await?;
         let partition = role_partition(role, layout.partitions)?;
@@ -594,7 +594,7 @@ impl CoordinationTransport for BrokerTransport {
     /// [`CoordinationError::Client`] when a connection fails. This method never
     /// reports [`CoordinationError::Fenced`], because its producer holds no
     /// epoch for the role.
-    #[tracing::instrument(level = "info", skip_all, fields(role = %role, member = %member), err)]
+    #[tracing::instrument(level = "info", skip_all, fields(role = %role, member = %member), err(level = "info"))]
     async fn register(&self, role: &Role, member: &MemberId) -> Result<(), CoordinationError> {
         let partition = self.partition_of(role).await?;
         let producer = self.registrar().await?;
@@ -624,7 +624,7 @@ impl CoordinationTransport for BrokerTransport {
         level = "info",
         skip_all,
         fields(role = %role, token = %token, member = %lease.member),
-        err,
+        err(level = "info"),
     )]
     async fn write_lease(
         &self,
@@ -675,7 +675,7 @@ impl CoordinationTransport for BrokerTransport {
     ///
     /// Returns [`CoordinationError::Admin`] when the coordinator lookup fails,
     /// or when the coordinator reports a fault other than an unknown role.
-    #[tracing::instrument(level = "debug", skip_all, fields(role = %role), err)]
+    #[tracing::instrument(level = "debug", skip_all, fields(role = %role), err(level = "debug"))]
     async fn describe(&self, role: &Role) -> Result<Option<FencingToken>, CoordinationError> {
         let admin = self.admin.lock().await;
         match admin.describe_transaction(role.as_str()).await {
@@ -1775,5 +1775,18 @@ mod tests {
             .topic_replication(0)
             .build()
             .await);
+    }
+
+    /// A refused start is an error returned to the caller, so `start` records
+    /// it at its span's own level, info, not at ERROR
+    /// (krabka-io/krabka-broker#1515).
+    #[tokio::test]
+    async fn a_refused_start_is_recorded_at_its_span_level() {
+        let (result, levels) = krabka_client_core::mock_test_support::recorded_levels(
+            BrokerTransport::builder().bootstrap("").build(),
+        )
+        .await;
+        assert!(let Err(CoordinationError::InvalidConfig(_)) = result);
+        check!(levels == vec![tracing::Level::INFO]);
     }
 }

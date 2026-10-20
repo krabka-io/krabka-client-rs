@@ -12,6 +12,7 @@ use krabka_units::{millis, secs};
 use tokio::time::Instant;
 
 use super::*;
+use crate::mock_test_support::recorded_levels;
 
 /// Stand-in connection: the address it was dialed against, and switches
 /// that a test flips to close it or load it.
@@ -647,4 +648,46 @@ async fn prefer_bootstrap_keeps_the_known_bootstrap_addresses() {
     pool.refresh_brokers(&[broker(1, "127.0.0.1", 9001)]).await;
     pool.prefer_bootstrap();
     check!(pool.least_loaded().await.unwrap().addr == addr(1000));
+}
+
+/// A connection the pool cannot give is an error returned to its caller, which
+/// may retry it, so the pool records it at its span's own level, debug. It used
+/// to record it at ERROR, so a run that recovered still printed an error line
+/// (krabka-io/krabka-broker#1515).
+#[tokio::test(start_paused = true)]
+async fn a_connection_the_pool_cannot_give_is_recorded_at_debug() {
+    let unknown = pool(&[], RecordingConnector::new());
+    let refused = pool(
+        &[addr(1111)],
+        RecordingConnector::new().refuse(&[addr(1111)]),
+    );
+    let cases = [
+        (
+            "unknown broker id",
+            recorded_levels(async { unknown.get(5).await.is_err() }).await,
+        ),
+        (
+            "every bootstrap address refused",
+            recorded_levels(async { refused.bootstrap_connection().await.is_err() }).await,
+        ),
+    ];
+    for (name, recorded) in cases {
+        check!(recorded == (true, vec![tracing::Level::DEBUG]), "{name}");
+    }
+}
+
+/// The production dial goes through `Connection::connect_with_options`, whose
+/// own span records the refused connection too. No layer of it says ERROR.
+#[tokio::test]
+async fn a_refused_tcp_dial_records_no_error() {
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    };
+    let pool = BrokerPool::new(vec![closed], ConnectionOptions::default());
+    let (failed, levels) =
+        recorded_levels(async { pool.bootstrap_connection().await.is_err() }).await;
+    check!(failed);
+    check!(!levels.is_empty());
+    check!(!levels.contains(&tracing::Level::ERROR), "{levels:?}");
 }

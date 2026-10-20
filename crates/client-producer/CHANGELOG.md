@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The producer build, `InitProducerId`, the transaction and group coordinator
+  calls, and the produce transport record an error they return at the level of
+  their own tracing span, debug or info, rather than at ERROR
+  (krabka-io/krabka-broker#1515).
 - Expose DNS selection, reconnect backoff/max, idle lifetime, and socket setup
   timeout/max on the producer builder. Retain these settings, DNS/socket budgets,
   request timeout, and metadata recovery policy in transaction and group coordinator clients.

@@ -1,4 +1,5 @@
-//! Shared protocol-response builders for mock-client tests.
+//! Shared protocol-response builders for mock-client tests, and a capture of
+//! the tracing events a call records.
 
 use bytes::BytesMut;
 use krabka_protocol::{
@@ -112,4 +113,41 @@ pub fn offset_commit_response(
             .collect(),
         ..Default::default()
     }
+}
+
+/// The level of every event recorded while it is the default subscriber.
+#[derive(Clone, Default)]
+struct EventLevels(std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLevels {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(*event.metadata().level());
+    }
+}
+
+/// Await `call` with a capturing subscriber as this thread's default, and give
+/// back its output and the level of every event it recorded.
+///
+/// The subscriber is the thread's default, so `call` must not move to another
+/// worker thread: run it on a current-thread runtime.
+pub async fn recorded_levels<T>(call: impl Future<Output = T>) -> (T, Vec<tracing::Level>) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let levels = EventLevels::default();
+    let _default =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(levels.clone()));
+    let output = call.await;
+    let recorded = levels
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    (output, recorded)
 }

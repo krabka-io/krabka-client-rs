@@ -751,7 +751,7 @@ impl Producer {
         level = "info",
         skip_all,
         fields(transactional_id = self.transactional_id.as_deref()),
-        err,
+        err(level = "info"),
     )]
     pub async fn begin_transaction(&self) -> Result<Transaction<'_>, ProducerError> {
         let guard_generation = self.begin_transaction_state().await?;
@@ -780,7 +780,7 @@ impl Producer {
         level = "info",
         skip_all,
         fields(transactional_id = self.transactional_id.as_deref()),
-        err,
+        err(level = "info"),
     )]
     pub async fn begin_transaction_owned(
         self: Arc<Self>,
@@ -961,7 +961,7 @@ impl Producer {
         level = "info",
         skip_all,
         fields(committed, error_code = tracing::field::Empty),
-        err,
+        err(level = "info"),
     )]
     pub(crate) async fn end_transaction(&self, committed: bool) -> Result<(), ProducerError> {
         let tid = self
@@ -1302,7 +1302,7 @@ impl Producer {
             producer_epoch = tracing::field::Empty,
             error_code = tracing::field::Empty,
         ),
-        err,
+        err(level = "info"),
     )]
     pub async fn init_transactions(&self) -> Result<(), ProducerError> {
         self.init_transactions_with_keep_prepared(false).await
@@ -1332,7 +1332,7 @@ impl Producer {
             producer_epoch = tracing::field::Empty,
             error_code = tracing::field::Empty,
         ),
-        err,
+        err(level = "info"),
     )]
     pub async fn init_transactions_with_keep_prepared(
         &self,
@@ -1512,7 +1512,7 @@ impl Producer {
 
     /// Discover the transaction coordinator for `tid` with `FindCoordinator`,
     /// and retry until `deadline`. See [`Self::find_coordinator`].
-    #[tracing::instrument(level = "debug", skip_all, fields(transactional_id = %tid), err)]
+    #[tracing::instrument(level = "debug", skip_all, fields(transactional_id = %tid), err(level = "debug"))]
     async fn find_txn_coordinator(
         &self,
         tid: &str,
@@ -1655,7 +1655,7 @@ impl Producer {
             generation_id = group_meta.generation_id,
             offset_count = tracing::field::Empty,
         ),
-        err,
+        err(level = "info"),
     )]
     pub async fn send_offsets_to_transaction(
         &self,
@@ -1926,7 +1926,7 @@ impl Producer {
     /// coordinator rather than the transaction coordinator.
     ///
     /// [`find_txn_coordinator`]: Self::find_txn_coordinator
-    #[tracing::instrument(level = "debug", skip_all, fields(group_id = %group_id), err)]
+    #[tracing::instrument(level = "debug", skip_all, fields(group_id = %group_id), err(level = "debug"))]
     async fn find_group_coordinator(
         &self,
         group_id: &str,
@@ -2620,7 +2620,7 @@ impl Producer {
         level = "info",
         skip_all,
         fields(client_id = %self.client_id, transactional_id = self.transactional_id.as_deref()),
-        err,
+        err(level = "info"),
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
@@ -2659,7 +2659,7 @@ impl Producer {
         Ok(self.client.client_instance_id(timeout).await?)
     }
 
-    #[tracing::instrument(level = "debug", skip_all, err)]
+    #[tracing::instrument(level = "debug", skip_all, err(level = "debug"))]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn flush(&self) -> Result<(), ProducerError> {
