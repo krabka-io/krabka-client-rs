@@ -2146,7 +2146,7 @@ mod tests {
                 group_rpcs.fetch_add(1, Ordering::SeqCst);
                 Some(encode(&OffsetFetchResponse::default(), version, true))
             }
-            metadata_request::API_KEY => empty_metadata_reply(version),
+            metadata_request::API_KEY => Some(empty_metadata_reply(version)),
             _ => None,
         })
         .await
@@ -2264,7 +2264,7 @@ mod tests {
                     Some(response)
                 }
                 metadata_request::API_KEY => {
-                    counted_reply(&metadata_count, empty_metadata_reply(version))
+                    counted_reply(&metadata_count, Some(empty_metadata_reply(version)))
                 }
                 _ => None,
             })
@@ -2362,10 +2362,10 @@ mod tests {
         mut admin: AdminClient,
     ) -> CommitResult {
         let offsets = test_group_offsets();
-        with_incompatible_version(
+        Box::pin(with_incompatible_version(
             name,
             admin.alter_consumer_group_offsets("workers", &offsets),
-        )
+        ))
         .await
     }
 
@@ -2501,7 +2501,7 @@ mod tests {
         mut admin: AdminClient,
     ) -> FetchResult {
         let offsets = admin.list_consumer_group_offsets("workers");
-        with_incompatible_version(name, offsets).await
+        Box::pin(with_incompatible_version(name, offsets)).await
     }
 
     #[yare::parameterized(
@@ -3075,8 +3075,8 @@ mod tests {
         );
     }
 
-    /// These named cases exercise the shared retry behavior of OffsetFetch and
-    /// OffsetCommit, while preserving each API's result and call-count checks.
+    /// These named cases exercise the shared retry behavior of `OffsetFetch` and
+    /// `OffsetCommit`, while preserving each API's result and call-count checks.
     #[yare::parameterized(
         no_error = { 0 },
         coordinator_load_in_progress = { 1 },
@@ -3176,7 +3176,9 @@ mod tests {
                     true,
                 ))
             }
-            offset_fetch_request::API_KEY => counted_reply(&seen, offset_fetch_reply(version)),
+            offset_fetch_request::API_KEY => {
+                counted_reply(&seen, Some(offset_fetch_reply(version)))
+            }
             _ => None,
         })
         .await;
@@ -4109,12 +4111,12 @@ mod tests {
         encode(&offset_fetch_response(version), version, true)
     }
 
-    fn empty_metadata_reply(version: i16) -> Option<Vec<u8>> {
-        Some(empty_metadata_response(version))
+    fn empty_metadata_reply(version: i16) -> Vec<u8> {
+        empty_metadata_response(version)
     }
 
-    fn offset_fetch_reply(version: i16) -> Option<Vec<u8>> {
-        Some(offset_fetch_response_bytes(version))
+    fn offset_fetch_reply(version: i16) -> Vec<u8> {
+        offset_fetch_response_bytes(version)
     }
 
     fn counted_reply(counter: &AtomicUsize, response: Option<Vec<u8>>) -> Option<Vec<u8>> {
@@ -4158,7 +4160,7 @@ mod tests {
                             .expect("coordinator address set before use");
                         Some(encode(&mock_coordinator_response(addr, 0), version, false))
                     }
-                    metadata_request::API_KEY => empty_metadata_reply(version),
+                    metadata_request::API_KEY => Some(empty_metadata_reply(version)),
                     _ => None,
                 }
             }

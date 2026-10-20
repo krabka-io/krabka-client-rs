@@ -2371,7 +2371,7 @@ impl Consumer {
     pub(crate) fn test_builder(
         client: krabka_client_core::Client,
     ) -> test_support::ConsumerTestBuilder {
-        test_support::ConsumerTest::new(client)
+        test_support::ConsumerTest::builder(client)
     }
 }
 
@@ -6240,7 +6240,7 @@ mod rebalance_listener_tests {
     #[tokio::test]
     async fn listener_calls_follow_kafkas_order() {
         let p = partition;
-        assert_listener_scenarios([
+        Box::pin(assert_listener_scenarios([
             ListenerScenario::builder()
                 .name("eager rebalance")
                 .case(case(
@@ -6339,7 +6339,7 @@ mod rebalance_listener_tests {
                 .expected_calls(range_revoke_commit_calls())
                 .expected_commit_generations(vec![1])
                 .build(),
-        ])
+        ]))
         .await;
     }
 

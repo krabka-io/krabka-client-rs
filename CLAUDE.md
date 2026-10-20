@@ -84,7 +84,8 @@ the change.
 Clippy is a Cargo-side gate. `bazel build` applies `-Funsafe_code` (the one
 `[workspace.lints]` entry whose guarantee must not lapse under a second build
 system) but does not run Clippy, so run `cargo clippy --workspace --all-targets
--- -D warnings` before you push.
+-- -D warnings` before you push. CI's `clippy · workspace` job runs the same
+command and fails the pull request on any warning.
 
 ## Execution
 
