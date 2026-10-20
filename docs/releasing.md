@@ -52,8 +52,9 @@ ones before it:
 `cargo publish` ignores `[patch.crates-io]`. The published crates, and the
 `--dry-run` that verifies them, resolve every krabka-protocol crate from
 crates.io at the `version` that the manifests name. So a release of this
-repository needs a krabka-protocol release with the same version on crates.io
-first.
+repository needs those required krabka-protocol versions on crates.io first.
+A client patch release can retain its existing protocol requirements. For
+example, client 0.7.1 retains protocol 0.7.0.
 
 crates.io must have `krabka-security`, which waits on `krabka-sspi`.
 `krabka-security` uses `sspi` from a git fork, which a crates.io package cannot
