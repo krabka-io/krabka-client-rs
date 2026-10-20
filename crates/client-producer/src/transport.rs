@@ -22,6 +22,7 @@ use krabka_client_core::{Client, ClientError};
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
     owned::{
+        init_producer_id_response::InitProducerIdResponse,
         metadata_response::MetadataResponse,
         produce_request::{self, ProduceRequest},
         produce_response::ProduceResponse,
@@ -42,6 +43,9 @@ use krabka_protocol::{
 /// crate.
 #[async_trait]
 pub(crate) trait ProduceTransport: Send + Sync {
+    /// Allocate a fresh non-transactional identity after epoch exhaustion.
+    async fn init_producer_id(&self) -> Result<InitProducerIdResponse, ClientError>;
+
     /// Send a single-partition `ProduceRequest` to `leader`, which is a broker
     /// id, or to the bootstrap connection when `leader` is `None`.
     async fn send_produce(
@@ -233,6 +237,14 @@ impl ClientTransport {
 
 #[async_trait]
 impl ProduceTransport for ClientTransport {
+    async fn init_producer_id(&self) -> Result<InitProducerIdResponse, ClientError> {
+        crate::builder::send_init_producer_id(
+            &self.client,
+            &crate::builder::build_init_producer_id_request(),
+        )
+        .await
+    }
+
     #[tracing::instrument(level = "debug", skip_all, fields(leader = ?leader), err(level = "debug"))]
     async fn send_produce(
         &self,
