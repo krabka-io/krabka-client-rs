@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -501,7 +501,7 @@ fn protocol_milliseconds(value: Duration) -> i32 {
 
 // cargo-mutants: protocol-default InitProducerId shape, so `-> Default` is equivalent.
 #[cfg_attr(test, mutants::skip)]
-fn build_init_producer_id_request() -> InitProducerIdRequest {
+pub(crate) fn build_init_producer_id_request() -> InitProducerIdRequest {
     InitProducerIdRequest {
         transactional_id: None,
         transaction_timeout_ms: 0,
@@ -925,6 +925,7 @@ struct ProducerRuntime {
     partitioner: Arc<BuiltInPartitioner>,
     flush_notify: Arc<Notify>,
     in_flight: Arc<AtomicUsize>,
+    producer_id: Arc<AtomicI64>,
     producer_epoch: Arc<AtomicI16>,
     txn_state: Arc<Mutex<TxnState>>,
     txn_recovery_required: Arc<AtomicBool>,
@@ -978,6 +979,7 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
     }));
     let flush_notify = Arc::new(Notify::new());
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let producer_id = Arc::new(AtomicI64::new(producer_id));
     let producer_epoch = Arc::new(AtomicI16::new(producer_epoch));
 
     let txn_state = Arc::new(Mutex::new(TxnState::Uninitialized));
@@ -1000,7 +1002,7 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
             client.clone(),
             Arc::clone(&transaction_v2),
         )),
-        producer_id,
+        producer_id: Arc::clone(&producer_id),
         producer_epoch: Arc::clone(&producer_epoch),
         acks,
         compression,
@@ -1041,6 +1043,7 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
         partitioner,
         flush_notify,
         in_flight,
+        producer_id,
         producer_epoch,
         txn_state,
         txn_recovery_required,
@@ -1317,6 +1320,7 @@ impl Producer {
             partitioner,
             flush_notify,
             in_flight,
+            producer_id: shared_producer_id,
             producer_epoch,
             txn_state,
             txn_recovery_required,
@@ -1375,7 +1379,7 @@ impl Producer {
                 receive: receive_buffer,
             },
             identity: ProducerIdentity {
-                id: producer_id,
+                id: shared_producer_id,
                 epoch: producer_epoch,
             },
             acks,

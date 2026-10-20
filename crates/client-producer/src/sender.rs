@@ -49,7 +49,7 @@ use std::{
     hash::{BuildHasher as _, RandomState},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI16, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -193,7 +193,8 @@ pub(crate) struct SenderConfig {
     /// Broker-facing transport. Production uses a real `Client`, and tests use
     /// a deterministic in-process broker model. See [`crate::transport`].
     pub transport: Box<dyn ProduceTransport>,
-    pub producer_id: i64,
+    /// Shared with `Producer`; epoch exhaustion allocates a fresh ID.
+    pub producer_id: Arc<AtomicI64>,
     /// The idempotent producer epoch, shared with `Producer`. The sender raises
     /// it where Kafka's idempotent producer bumps its epoch.
     pub producer_epoch: Arc<AtomicI16>,
@@ -590,7 +591,7 @@ async fn schedule(cfg: &SenderConfig, state: &PipelineState, force: bool) -> Sch
 #[tracing::instrument(
     level = "debug",
     skip_all,
-    fields(producer_id = cfg.producer_id, max_in_flight = cfg.max_in_flight),
+    fields(producer_id = cfg.producer_id.load(Ordering::Acquire), max_in_flight = cfg.max_in_flight),
 )]
 pub(crate) async fn run(mut cfg: SenderConfig) {
     let mut state = PipelineState::default();
@@ -765,10 +766,17 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
         cfg.max_in_flight,
     );
     if !expired.is_empty() {
-        expire_batches(cfg, state, expired, to_send);
+        expire_batches(cfg, state, expired, to_send).await;
         return;
     }
     fail_recovered_batches(cfg, &mut to_send);
+
+    if cfg.producer_epoch.load(Ordering::Acquire) == i16::MAX && !bump_idempotent_epoch(cfg).await {
+        for pb in to_send {
+            state.retry.insert((pb.topic.clone(), pb.partition), pb);
+        }
+        return;
+    }
 
     // A partition with a pending resend is "occupied": it must not also send a
     // new batch (two same-partition requests on the wire could reorder and trip
@@ -876,7 +884,7 @@ async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: D
 /// producer. The epoch bump starts at the next batch that the sender builds:
 /// Kafka's `maybeUpdateProducerIdAndEpoch` moves a partition to the new
 /// identity only while it has no batch in flight.
-fn expire_batches(
+async fn expire_batches(
     cfg: &SenderConfig,
     state: &mut PipelineState,
     expired: Vec<PreparedBatch>,
@@ -896,15 +904,10 @@ fn expire_batches(
         );
         failed.push(pb);
     }
-    if bump_epoch && bump_idempotent_epoch(cfg).is_none() {
-        // Kafka gets a new producer id with `InitProducerId` when the epoch
-        // overflows. This sender cannot send that request, so it fences.
-        tracing::error!("idempotent producer epoch overflow; fencing the producer");
-        for pb in failed {
-            terminal_fail_batch(cfg, pb, ProducerError::SendTimeout);
-        }
-        fence(cfg, state, to_send);
-        return;
+    if bump_epoch {
+        // An allocation outage leaves the maximum epoch in place. The next
+        // drain retries before building any new batches.
+        bump_idempotent_epoch(cfg).await;
     }
     if !bump_epoch {
         for (key, repair, base_sequence) in repairs {
@@ -1505,22 +1508,19 @@ async fn send_batches(cfg: &SenderConfig, state: &mut PipelineState, to_send: Ve
 
     let mut epoch_bumped = false;
     if bump_epoch || !rewrites.is_empty() {
-        let Some(epoch) = bump_idempotent_epoch(cfg) else {
-            // Kafka gets a new producer id with `InitProducerId` when the epoch
-            // overflows. This sender cannot send that request, so it fences.
-            tracing::error!("idempotent producer epoch overflow; fencing the producer");
-            for (pb, error) in failed {
-                terminal_fail_batch(cfg, pb, error);
+        epoch_bumped = bump_idempotent_epoch(cfg).await;
+        if epoch_bumped {
+            let epoch = cfg.producer_epoch.load(Ordering::Acquire);
+            for mut pb in rewrites {
+                pb.record_batch.producer_id = cfg.producer_id.load(Ordering::Acquire);
+                pb.record_batch.producer_epoch = epoch;
+                restart_sequence(cfg, &mut pb);
+                state.retry.insert((pb.topic.clone(), pb.partition), pb);
             }
-            rewrites.append(&mut splits);
-            fence(cfg, state, rewrites);
-            return;
-        };
-        epoch_bumped = true;
-        for mut pb in rewrites {
-            pb.record_batch.producer_epoch = epoch;
-            restart_sequence(cfg, &mut pb);
-            state.retry.insert((pb.topic.clone(), pb.partition), pb);
+        } else {
+            for pb in rewrites {
+                state.retry.insert((pb.topic.clone(), pb.partition), pb);
+            }
         }
     }
     for (key, repair, base_sequence) in repairs {
@@ -1590,8 +1590,8 @@ const fn fatal_error(code: i16) -> ProducerError {
 }
 
 /// Raise the idempotent producer epoch by one, and start every partition
-/// again at sequence 0. It returns the new epoch, or `None` when the epoch is
-/// at its maximum.
+/// again at sequence 0. At exhaustion, allocate a fresh producer ID instead.
+/// Return false when allocation failed so the next drain can retry.
 ///
 /// Kafka's `TransactionManager.bumpIdempotentProducerEpoch` raises the epoch
 /// on the client, and `maybeUpdateProducerIdAndEpoch` starts a partition at
@@ -1600,16 +1600,37 @@ const fn fatal_error(code: i16) -> ProducerError {
 /// batch per partition in flight, and it builds that batch before this call,
 /// so the next batch it builds for any partition is the first one at the new
 /// epoch.
-fn bump_idempotent_epoch(cfg: &SenderConfig) -> Option<i16> {
-    let epoch = cfg.producer_epoch.load(Ordering::Acquire).checked_add(1)?;
+async fn bump_idempotent_epoch(cfg: &SenderConfig) -> bool {
+    let epoch = if let Some(epoch) = cfg.producer_epoch.load(Ordering::Acquire).checked_add(1) {
+        epoch
+    } else {
+        let timeout = Duration::from_millis(u64::try_from(cfg.request_timeout_ms).unwrap_or(1));
+        let response = tokio::time::timeout(timeout, cfg.transport.init_producer_id()).await;
+        let Ok(Ok(response)) = response else {
+            tracing::warn!("producer-ID allocation failed; retrying on the next drain");
+            tokio::time::sleep(cfg.retry_backoff.initial).await;
+            return false;
+        };
+        if response.error_code != 0 || response.producer_id < 0 || response.producer_epoch < 0 {
+            tracing::warn!(
+                error_code = response.error_code,
+                "producer-ID allocation failed; retrying on the next drain"
+            );
+            tokio::time::sleep(cfg.retry_backoff.initial).await;
+            return false;
+        }
+        cfg.producer_id
+            .store(response.producer_id, Ordering::Release);
+        response.producer_epoch
+    };
     cfg.producer_epoch.store(epoch, Ordering::Release);
     cfg.next_seq.clear();
     tracing::info!(
-        producer_id = cfg.producer_id,
+        producer_id = cfg.producer_id.load(Ordering::Acquire),
         producer_epoch = epoch,
-        "bumped the idempotent producer epoch; sequences start again at 0"
+        "updated the idempotent producer identity; sequences start again at 0"
     );
-    Some(epoch)
+    true
 }
 
 /// Rewrite `pb` at sequence 0, and give the partition the sequences after it.
@@ -2335,8 +2356,10 @@ fn build_record_batch(
 
     // Use the txn pid/epoch when inside a transaction; fall back to the
     // idempotence pid/epoch for non-transactional batches.
-    let (producer_id, producer_epoch) =
-        txn_snapshot.unwrap_or((cfg.producer_id, cfg.producer_epoch.load(Ordering::Acquire)));
+    let (producer_id, producer_epoch) = txn_snapshot.unwrap_or((
+        cfg.producer_id.load(Ordering::Acquire),
+        cfg.producer_epoch.load(Ordering::Acquire),
+    ));
 
     let base_timestamp = batch.records.first().map_or(0, |r| r.timestamp_ms);
     let max_timestamp = batch
@@ -2948,6 +2971,7 @@ mod harness {
     use krabka_client_core::ClientError;
     use krabka_protocol::{
         owned::{
+            init_producer_id_response::InitProducerIdResponse,
             metadata_response::{
                 MetadataResponse, MetadataResponsePartition, MetadataResponseTopic,
             },
@@ -2975,6 +2999,14 @@ mod harness {
 
     #[async_trait::async_trait]
     impl ProduceTransport for ArcTransport {
+        async fn init_producer_id(
+            &self,
+        ) -> Result<
+            krabka_protocol::owned::init_producer_id_response::InitProducerIdResponse,
+            ClientError,
+        > {
+            self.0.init_producer_id().await
+        }
         async fn send_produce(
             &self,
             leader: Option<i32>,
@@ -3000,9 +3032,9 @@ mod harness {
         }
     }
 
-    /// Per-partition broker sequencing state.
+    /// Sequencing state of one producer on a partition.
     #[derive(Default)]
-    struct PartitionState {
+    struct ProducerSequence {
         /// The producer epoch the partition holds. A batch at a higher epoch
         /// must start at sequence 0, and a batch at a lower epoch gets
         /// `INVALID_PRODUCER_EPOCH`, as Kafka's `ProducerAppendInfo` checks.
@@ -3010,15 +3042,17 @@ mod harness {
         /// Next `base_sequence` the broker accepts. It is strictly increasing
         /// with no gaps, as in the Kafka idempotent producer.
         expected: i32,
-        /// Running log-end offset. Each accepted batch takes the current value
-        /// as its `base_offset`, and then the offset advances by the record
-        /// count.
-        next_offset: i64,
         /// `base_sequence -> base_offset` for sequences already accepted. A
         /// resend of a written batch can then be answered with
         /// `DUPLICATE_SEQUENCE_NUMBER` and its original offset. The broker
         /// dedups, and the sender maps that answer to an ack.
         accepted: HashMap<i32, i64>,
+    }
+
+    #[derive(Default)]
+    struct PartitionState {
+        next_offset: i64,
+        producers: HashMap<i64, ProducerSequence>,
     }
 
     /// A broker model with faithful per-partition idempotent sequencing.
@@ -3079,6 +3113,10 @@ mod harness {
         /// The `(producer_epoch, base_sequence)` of every `send_produce` call,
         /// in order.
         sent_batches: StdMutex<Vec<(i16, i32)>>,
+        sent_identities: StdMutex<Vec<(i64, i16, i32)>>,
+        init_calls: AtomicUsize,
+        init_failures: AtomicUsize,
+        init_response_once: StdMutex<Option<InitProducerIdResponse>>,
         /// The `(transactional_id, is_transactional)` of every `send_produce`
         /// call's batch, in order — the request-level id and the batch's own
         /// attribute bit, so a test can assert a batch shipped stamped as
@@ -3145,6 +3183,10 @@ mod harness {
                 sent_leaders: StdMutex::new(Vec::new()),
                 sent_topic_ids: StdMutex::new(Vec::new()),
                 sent_batches: StdMutex::new(Vec::new()),
+                sent_identities: StdMutex::new(Vec::new()),
+                init_calls: AtomicUsize::new(0),
+                init_failures: AtomicUsize::new(0),
+                init_response_once: StdMutex::new(None),
                 sent_transactional: StdMutex::new(Vec::new()),
                 send_started: Notify::new(),
                 active_sends: AtomicUsize::new(0),
@@ -3287,34 +3329,35 @@ mod harness {
 
             let mut parts = self.partitions.lock().unwrap();
             let st = parts.entry(key).or_default();
+            let producer = st.producers.entry(batch.producer_id).or_default();
 
             let (error_code, base_offset) = if batch.producer_id < 0 {
                 // No producer id: the broker does not check sequences.
                 let base_offset = st.next_offset;
                 st.next_offset += i64::from(count);
                 (codes::NONE, base_offset)
-            } else if batch.producer_epoch < st.epoch {
+            } else if batch.producer_epoch < producer.epoch {
                 (47, -1)
-            } else if batch.producer_epoch > st.epoch && base_sequence != 0 {
+            } else if batch.producer_epoch > producer.epoch && base_sequence != 0 {
                 (codes::OUT_OF_ORDER_SEQUENCE_NUMBER, -1)
-            } else if batch.producer_epoch > st.epoch {
+            } else if batch.producer_epoch > producer.epoch {
                 // A higher epoch at sequence 0 replaces the producer state.
-                st.epoch = batch.producer_epoch;
-                st.expected = count;
-                st.accepted.clear();
+                producer.epoch = batch.producer_epoch;
+                producer.expected = count;
+                producer.accepted.clear();
                 let base_offset = st.next_offset;
-                st.accepted.insert(0, base_offset);
+                producer.accepted.insert(0, base_offset);
                 st.next_offset += i64::from(count);
                 (codes::NONE, base_offset)
-            } else if base_sequence == st.expected {
+            } else if base_sequence == producer.expected {
                 // In-order: accept, assign offset, advance.
                 let base_offset = st.next_offset;
-                st.accepted.insert(base_sequence, base_offset);
+                producer.accepted.insert(base_sequence, base_offset);
                 st.next_offset += i64::from(count);
-                st.expected = st.expected.wrapping_add(count);
+                producer.expected = producer.expected.wrapping_add(count);
                 self.offsets_seen.fetch_max(base_offset, Ordering::Relaxed);
                 (codes::NONE, base_offset)
-            } else if let Some(&prev) = st.accepted.get(&base_sequence) {
+            } else if let Some(&prev) = producer.accepted.get(&base_sequence) {
                 // Already written (a resend of a durable batch): dedup.
                 (codes::DUPLICATE_SEQUENCE_NUMBER, prev)
             } else {
@@ -3341,6 +3384,33 @@ mod harness {
 
     #[async_trait::async_trait]
     impl ProduceTransport for MockTransport {
+        async fn init_producer_id(
+            &self,
+        ) -> Result<
+            krabka_protocol::owned::init_producer_id_response::InitProducerIdResponse,
+            ClientError,
+        > {
+            self.init_calls.fetch_add(1, Ordering::Relaxed);
+            if self
+                .init_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ClientError::Disconnected);
+            }
+            if let Some(response) = self.init_response_once.lock().unwrap().take() {
+                return Ok(response);
+            }
+            Ok(
+                krabka_protocol::owned::init_producer_id_response::InitProducerIdResponse {
+                    producer_id: 2,
+                    producer_epoch: 0,
+                    ..Default::default()
+                },
+            )
+        }
         async fn send_produce(
             &self,
             leader: Option<i32>,
@@ -3368,6 +3438,11 @@ mod harness {
                 .and_then(|p| p.as_v2())
                 .and_then(|b| b.first())
             {
+                self.sent_identities.lock().unwrap().push((
+                    batch.producer_id,
+                    batch.producer_epoch,
+                    batch.base_sequence,
+                ));
                 self.sent_batches
                     .lock()
                     .unwrap()
@@ -3446,8 +3521,7 @@ mod harness {
                             .unwrap()
                             .get_mut(&(topic.name.clone(), part.index))
                     {
-                        state.expected = 0;
-                        state.accepted.clear();
+                        state.producers.clear();
                     }
                     let current_leader = if inj.leader_hint >= 0 {
                         LeaderIdAndEpoch {
@@ -3718,7 +3792,7 @@ mod harness {
         // test to inspect.
         let cfg = SenderConfig {
             transport: Box::new(ArcTransport(transport.clone())),
-            producer_id,
+            producer_id: Arc::new(AtomicI64::new(producer_id)),
             producer_epoch: Arc::clone(&producer_epoch),
             acks,
             compression: Compression::None,
@@ -4352,7 +4426,7 @@ mod harness {
         let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
         let cfg = SenderConfig {
             transport: Box::new(ArcTransport(Arc::clone(&transport))),
-            producer_id: -1,
+            producer_id: Arc::new(AtomicI64::new(-1)),
             producer_epoch: Arc::new(AtomicI16::new(-1)),
             acks: Acks::All,
             compression: Compression::None,
@@ -6064,26 +6138,12 @@ mod harness {
         (pb, rx)
     }
 
-    /// `expire_batches` must not rewrite the epoch, sequence, or bytes of a
-    /// batch that did not itself reach the delivery timeout. Kafka's
-    /// `maybeUpdateProducerIdAndEpoch` moves a partition to the new identity
-    /// only once it has no batch in flight, so an unrelated parked batch keeps
-    /// its original identity: a broker that already durably wrote it must
-    /// still dedup a resend with `DUPLICATE_SEQUENCE_NUMBER`, which a rewrite
-    /// at a new epoch would defeat by making the resend look like a new batch.
-    ///
-    /// This is a plain, synchronous call into `expire_batches` (no sender loop,
-    /// no timing), so the two-partition interleaving that
-    /// `retry_exhaustion_preserves_concurrent_successful_ack` cannot pin
-    /// deterministically is exact and immediate here.
-    #[test]
-    fn expire_batches_does_not_rewrite_an_unrelated_parked_batch() {
-        let transport = MockTransport::new(Duration::ZERO);
+    fn rollover_config(transport: Arc<MockTransport>, epoch: i16) -> SenderConfig {
         let (_wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
-        let cfg = SenderConfig {
+        SenderConfig {
             transport: Box::new(ArcTransport(transport)),
-            producer_id: 1,
-            producer_epoch: Arc::new(AtomicI16::new(3)),
+            producer_id: Arc::new(AtomicI64::new(1)),
+            producer_epoch: Arc::new(AtomicI16::new(epoch)),
             acks: Acks::All,
             compression: Compression::None,
             compression_level: None,
@@ -6109,7 +6169,162 @@ mod harness {
             txn_recovery_required: Arc::new(AtomicBool::new(false)),
             txn_recovery_generation: Arc::new(AtomicU64::new(0)),
             txn_error: Arc::new(TxnErrorSlot::default()),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn epoch_overflow_allocates_a_new_id_without_changing_an_unrelated_retry() {
+        let transport = MockTransport::new(Duration::ZERO);
+        let cfg = rollover_config(transport.clone(), i16::MAX);
+        let mut state = PipelineState::default();
+        let (expired, mut expired_rx) = idempotent_batch("t", 0, 0, i16::MAX);
+        let (mut parked, mut parked_rx) = idempotent_batch("t", 1, 0, i16::MAX);
+        parked.record_batch.records.push(Record {
+            attributes: 0,
+            timestamp_delta: 0,
+            offset_delta: 0,
+            key: None,
+            value: None,
+            headers: Vec::new(),
+        });
+        // The old leader wrote this batch, but its acknowledgement was lost.
+        let request = build_single_batch_request(&cfg, &parked).unwrap();
+        assert2::assert!(
+            transport.apply(&request).responses[0].partition_responses[0].base_offset == 0
+        );
+        let original = parked.record_batch.clone();
+        expire_batches(&cfg, &mut state, vec![expired], vec![parked]).await;
+        assert2::assert!(cfg.producer_id.load(Ordering::Acquire) == 2);
+        assert2::assert!(cfg.producer_epoch.load(Ordering::Acquire) == 0);
+        assert2::assert!(matches!(
+            expired_rx.try_recv(),
+            Ok(Err(ProducerError::SendTimeout))
+        ));
+        let parked = state.retry.remove(&("t".into(), 1)).unwrap();
+        assert2::assert!(parked.record_batch == original);
+        send_batches(&cfg, &mut state, vec![parked]).await;
+        assert2::assert!(parked_rx.try_recv().unwrap().unwrap().offset == 0);
+        assert2::assert!(transport.partitions.lock().unwrap()[&("t".into(), 1)].next_offset == 1);
+        assert2::assert!(cfg.in_flight.load(Ordering::Acquire) == 0);
+        assert2::assert!(cfg.state.load(Ordering::Acquire) == STATE_ACTIVE);
+    }
+
+    #[tokio::test]
+    async fn epoch_overflow_rewrites_only_the_rejected_batch_and_continues_sending() {
+        let transport = MockTransport::new(Duration::ZERO);
+        let cfg = rollover_config(transport.clone(), i16::MAX);
+        let mut state = PipelineState::default();
+        cfg.in_flight.store(1, Ordering::Release);
+        transport.inject_code_once(0, codes::OUT_OF_ORDER_SEQUENCE_NUMBER);
+        let (rejected, mut rx) = idempotent_batch("t", 0, 0, i16::MAX);
+        send_batches(&cfg, &mut state, vec![rejected]).await;
+        let rewritten = state.retry.remove(&("t".into(), 0)).unwrap();
+        assert2::assert!(
+            (
+                rewritten.record_batch.producer_id,
+                rewritten.record_batch.producer_epoch,
+                rewritten.base_sequence
+            ) == (2, 0, 0)
+        );
+        send_batches(&cfg, &mut state, vec![rewritten]).await;
+        assert2::assert!(rx.try_recv().unwrap().is_ok());
+        assert2::assert!(cfg.state.load(Ordering::Acquire) == STATE_ACTIVE);
+        assert2::assert!(
+            *transport.sent_identities.lock().unwrap() == vec![(1, i16::MAX, 0), (2, 0, 0)]
+        );
+        assert2::assert!(transport.init_calls.load(Ordering::Acquire) == 1);
+        assert2::assert!(cfg.in_flight.load(Ordering::Acquire) == 0);
+    }
+
+    #[tokio::test]
+    async fn epoch_overflow_keeps_the_rejected_batch_when_allocation_disconnects() {
+        let transport = MockTransport::new(Duration::ZERO);
+        let mut cfg = rollover_config(transport.clone(), i16::MAX);
+        cfg.in_flight.store(1, Ordering::Release);
+        let mut state = PipelineState::default();
+        transport.init_failures.store(1, Ordering::Release);
+        transport.inject_code_once(0, codes::OUT_OF_ORDER_SEQUENCE_NUMBER);
+        let (rejected, mut rx) = idempotent_batch("t", 0, 0, i16::MAX);
+        send_batches(&cfg, &mut state, vec![rejected]).await;
+        assert2::assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert2::assert!(cfg.state.load(Ordering::Acquire) == STATE_ACTIVE);
+        assert2::assert!(cfg.in_flight.load(Ordering::Acquire) == 1);
+        drain_once(&mut cfg, &mut state, DrainIntent::Force).await;
+        assert2::assert!(rx.try_recv().unwrap().is_ok());
+        assert2::assert!(cfg.producer_id.load(Ordering::Acquire) == 2);
+        assert2::assert!(cfg.in_flight.load(Ordering::Acquire) == 0);
+    }
+
+    #[tokio::test]
+    async fn epoch_overflow_retries_rejected_or_malformed_identities_before_producing() {
+        for (name, error_code, producer_id, producer_epoch) in [
+            ("coordinator loading", 14, 2, 0),
+            ("missing producer ID", 0, -1, 0),
+            ("missing producer epoch", 0, 2, -1),
+        ] {
+            let transport = MockTransport::new(Duration::ZERO);
+            *transport.init_response_once.lock().unwrap() = Some(InitProducerIdResponse {
+                error_code,
+                producer_id,
+                producer_epoch,
+                ..Default::default()
+            });
+            let h = spawn_sender(transport.clone(), 1);
+            h.producer_epoch.store(i16::MAX, Ordering::Release);
+            let rx = produce_burst(&h, "t", 0, 1).await.pop().unwrap();
+            let metadata = tokio::time::timeout(Duration::from_secs(1), rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert2::assert!(metadata.offset == 0, "{name}");
+            assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE, "{name}");
+            assert2::assert!(transport.init_calls.load(Ordering::Acquire) == 2, "{name}");
+            assert2::assert!(
+                *transport.sent_identities.lock().unwrap() == vec![(2, 0, 0)],
+                "{name}"
+            );
+            shutdown(h).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn epoch_overflow_retries_allocation_after_a_disconnect() {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.init_failures.store(1, Ordering::Release);
+        let h = spawn_sender(transport.clone(), 1);
+        h.producer_epoch.store(i16::MAX, Ordering::Release);
+        let rx = produce_burst(&h, "t", 0, 1).await.pop().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert2::assert!(result.is_ok());
+        assert2::assert!(h.state.load(Ordering::Acquire) == STATE_ACTIVE);
+        assert2::assert!(transport.init_calls.load(Ordering::Acquire) == 2);
+        assert2::assert!(*transport.sent_identities.lock().unwrap() == vec![(2, 0, 0)]);
+        shutdown(h).await;
+    }
+
+    /// `expire_batches` must not rewrite the epoch, sequence, or bytes of a
+    /// batch that did not itself reach the delivery timeout. Kafka's
+    /// `maybeUpdateProducerIdAndEpoch` moves a partition to the new identity
+    /// only once it has no batch in flight, so an unrelated parked batch keeps
+    /// its original identity: a broker that already durably wrote it must
+    /// still dedup a resend with `DUPLICATE_SEQUENCE_NUMBER`, which a rewrite
+    /// at a new epoch would defeat by making the resend look like a new batch.
+    ///
+    /// This calls `expire_batches` directly (no sender loop,
+    /// no timing), so the two-partition interleaving that
+    /// `retry_exhaustion_preserves_concurrent_successful_ack` cannot pin
+    /// deterministically is exact and immediate here.
+    #[tokio::test]
+    async fn expire_batches_does_not_rewrite_an_unrelated_parked_batch() {
+        let transport = MockTransport::new(Duration::ZERO);
+        let cfg = rollover_config(transport, 3);
         let mut state = PipelineState::default();
 
         // Partition 0's batch reached the delivery timeout; it is the one
@@ -6121,7 +6336,7 @@ mod harness {
         let (parked_batch, _parked_rx) = idempotent_batch("t", 1, 16, 3);
         let original_record_batch = parked_batch.record_batch.clone();
 
-        expire_batches(&cfg, &mut state, vec![expired_batch], vec![parked_batch]);
+        expire_batches(&cfg, &mut state, vec![expired_batch], vec![parked_batch]).await;
 
         // The epoch bump happened (it applies to batches built after this
         // point)...
