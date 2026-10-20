@@ -4260,7 +4260,7 @@ mod fetch_path_tests {
             session_id: 0,
         };
         let sent = SentFetches::default();
-        let brokers = start_brokers(&[vec![answer.clone()], vec![answer]], &sent).await;
+        let brokers = start_brokers(&[vec![answer], vec![answer]], &sent).await;
         let consumer = consumer_on(&brokers).await;
         consumer.refresh_leader_epochs().await.expect("metadata");
         TwoPartitionFetchSetup {

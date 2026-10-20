@@ -588,7 +588,7 @@ impl CoordinatorState {
     pub(crate) fn test_builder(
         client: krabka_client_core::Client,
     ) -> test_support::CoordinatorStateTestBuilder {
-        test_support::CoordinatorStateTest::new(client)
+        test_support::CoordinatorStateTest::builder(client)
     }
 }
 
@@ -2946,7 +2946,7 @@ fn should_prime_missing_partition(seen: bool) -> bool {
 
 #[cfg(test)]
 fn assert_retried_until_deadline<T>(
-    result: Result<T, ConsumerError>,
+    result: &Result<T, ConsumerError>,
     calls: &std::sync::atomic::AtomicUsize,
 ) {
     assert2::assert!(
@@ -4543,7 +4543,7 @@ mod retry_tests {
         })
         .await;
 
-        assert_retried_until_deadline(r, &calls);
+        assert_retried_until_deadline(&r, &calls);
     }
 }
 
@@ -4759,7 +4759,7 @@ mod refind_tests {
             .run_with_refind()
             .await;
 
-        assert_retried_until_deadline(r, &calls);
+        assert_retried_until_deadline(&r, &calls);
     }
 
     #[test]

@@ -812,9 +812,10 @@ mod tests {
     }
 
     fn classic_response(groups: Vec<ClassicDescribedGroup>) -> DescribeGroupsResponse {
-        let mut response = DescribeGroupsResponse::default();
-        response.groups = groups;
-        response
+        DescribeGroupsResponse {
+            groups,
+            ..DescribeGroupsResponse::default()
+        }
     }
 
     const FALLBACK_GROUPS: [&str; 5] = ["kip848", "classic", "other", "missing", "connect"];

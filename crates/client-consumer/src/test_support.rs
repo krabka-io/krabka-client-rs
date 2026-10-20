@@ -378,7 +378,7 @@ pub(crate) struct ConsumerTest;
 
 #[bon::bon]
 impl ConsumerTest {
-    #[builder(start_fn = new, finish_fn = build)]
+    #[builder(start_fn = builder, finish_fn = build)]
     pub(crate) fn configure(
         #[builder(start_fn)] client: Client,
         #[builder(into)] coordinator_id: Option<Arc<AtomicI32>>,
@@ -481,7 +481,7 @@ pub(crate) struct CoordinatorStateTest;
 
 #[bon::bon]
 impl CoordinatorStateTest {
-    #[builder(start_fn = new, finish_fn = build)]
+    #[builder(start_fn = builder, finish_fn = build)]
     pub(crate) fn configure(
         #[builder(start_fn)] client: Client,
         #[builder(into)] commit_identity: Option<Arc<Mutex<CommitIdentity>>>,
