@@ -192,6 +192,37 @@ jobs:
             cargo clippy --locked --target wasm32-wasip1 -p "${crate}" --lib -- -D warnings
           done
 
+  # `cargo clippy` over the whole workspace, every target, on the native
+  # triple: the command CLAUDE.md asks for before a push. The `ci` job's
+  # `aspect lint` narrows to what a change touched, and the `wasm` job checks
+  # only each crate's `--lib`, so neither sees every test target. This job
+  # does.
+  clippy:
+    name: clippy · workspace
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # `rust-toolchain.toml` is the single pin, as in the `wasm` job.
+      - id: toolchain
+        run: |
+          set -euo pipefail
+          channel="$(sed -ne 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "${channel}"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
   # A mutation sweep rebuilds and re-runs a crate's unit tests once per mutant,
   # so it is far too slow to gate a pull request.
   #
