@@ -1387,6 +1387,7 @@ mod tests {
                     }
                     StepResult::Done(_, bytes) => bytes,
                     StepResult::Failed(error) => panic!("SCRAM server failed: {error:?}"),
+                    StepResult::Disconnect => panic!("SCRAM server disconnected"),
                 },
                 None => Vec::new(),
             }
