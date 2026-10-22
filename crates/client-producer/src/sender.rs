@@ -646,6 +646,14 @@ pub(crate) async fn run(cfg: SenderConfig, mut wake_rx: tokio::sync::mpsc::Recei
     let mut force = false;
     let mut stopping = false;
     loop {
+        // Ready partitions can keep scheduling immediate drains. Advance a
+        // pending refresh before selecting routes so those drains cannot
+        // starve metadata updates or keep retrying a stale broker forever.
+        if let Some(refresh) = metadata_refresh.as_mut()
+            && refresh.as_mut().now_or_never().is_some()
+        {
+            metadata_refresh = None;
+        }
         let next = schedule(&cfg, &state, force, &occupied, &capacity).await;
         if next.immediate {
             let intent = if force {
@@ -837,17 +845,18 @@ async fn drain_batches(
     }
     fail_recovered_batches(cfg, &mut to_send);
     let mut slots = capacity.clone();
-    let mut routes = HashMap::new();
+    let mut routes = Vec::new();
     let pending = std::mem::take(&mut to_send);
     for batch in pending {
-        let key = (batch.topic.clone(), batch.partition);
         let leader = resolve_leader(cfg, &batch.topic, batch.partition);
         if slots.available(leader) {
             slots.reserve(leader);
-            routes.insert(key, leader);
+            routes.push(leader);
             to_send.push(batch);
         } else {
-            state.retry.insert(key, batch);
+            state
+                .retry
+                .insert((batch.topic.clone(), batch.partition), batch);
         }
     }
 
@@ -938,7 +947,7 @@ async fn drain_batches(
             continue;
         }
         let pb = prepare_batch(cfg, &key.0, key.1, batch).await;
-        routes.insert(key.clone(), leader);
+        routes.push(leader);
         slots.reserve(leader);
         occupied.insert(key);
         to_send.push(pb);
@@ -950,13 +959,7 @@ async fn drain_batches(
         return Vec::new();
     }
 
-    to_send
-        .into_iter()
-        .map(|batch| {
-            let leader = routes[&(batch.topic.clone(), batch.partition)];
-            (leader, batch)
-        })
-        .collect()
+    routes.into_iter().zip(to_send).collect()
 }
 
 #[cfg(test)]
