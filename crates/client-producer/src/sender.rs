@@ -16,7 +16,7 @@
 //! ## Per-partition pipelining (idempotence-critical)
 //!
 //! Brokers stay busy because independent partitions send **concurrently**. Up
-//! to [`SenderConfig::max_in_flight`] Produce requests overlap on the wire. But each *single* partition keeps **at most one** request in
+//! to [`SenderConfig::max_in_flight`] Produce requests per broker connection overlap on the wire. But each *single* partition keeps **at most one** request in
 //! flight, which is [`MAX_IN_FLIGHT_PER_PARTITION`]. Its next batch is not
 //! drained until the previous one is acked. Per-partition idempotent
 //! `base_sequence` ordering therefore holds **by construction**. The broker
@@ -492,12 +492,39 @@ fn include_deadline(schedule: &mut Schedule, deadline: Instant, now: Instant) {
     }
 }
 
+#[derive(Clone)]
+struct ConnectionCapacity {
+    limit: usize,
+    used: HashMap<i32, usize>,
+}
+
+impl ConnectionCapacity {
+    fn available(&self, leader: i32) -> bool {
+        self.used.get(&leader).copied().unwrap_or_default() < self.limit
+    }
+
+    fn reserve(&mut self, leader: i32) {
+        *self.used.entry(leader).or_default() += 1;
+    }
+
+    fn release(&mut self, leader: i32) {
+        let count = self
+            .used
+            .get_mut(&leader)
+            .expect("request owns a connection slot");
+        *count -= 1;
+        if *count == 0 {
+            self.used.remove(&leader);
+        }
+    }
+}
+
 async fn schedule(
     cfg: &SenderConfig,
     state: &PipelineState,
     force: bool,
     occupied: &HashSet<(String, i32)>,
-    capacity: usize,
+    capacity: &ConnectionCapacity,
 ) -> Schedule {
     let now = Instant::now();
     let mut schedule = Schedule {
@@ -515,7 +542,7 @@ async fn schedule(
         if let Some(deadline) = delivery_deadline(batch.created_at, cfg.delivery_timeout) {
             include_deadline(&mut schedule, deadline, now);
         }
-        if capacity > 0 {
+        if capacity.available(resolve_leader(cfg, &batch.topic, batch.partition)) {
             if let Some(backoff_until) = batch.backoff_until {
                 include_deadline(&mut schedule, backoff_until, now);
             } else {
@@ -568,7 +595,10 @@ async fn schedule(
             schedule.immediate = true;
             continue;
         }
-        if state.retry.contains_key(&key) || occupied.contains(&key) || capacity == 0 {
+        if state.retry.contains_key(&key)
+            || occupied.contains(&key)
+            || !capacity.available(resolve_leader(cfg, &key.0, key.1))
+        {
             continue;
         }
         if has_ready {
@@ -605,27 +635,40 @@ async fn schedule(
 pub(crate) async fn run(cfg: SenderConfig, mut wake_rx: tokio::sync::mpsc::Receiver<DrainIntent>) {
     let cfg = Arc::new(cfg);
     let mut state = PipelineState::default();
-    let mut requests: FuturesUnordered<BoxFuture<'static, BatchSendResult>> =
+    let mut requests: FuturesUnordered<BoxFuture<'static, (i32, BatchSendResult)>> =
         FuturesUnordered::new();
     let mut occupied = HashSet::new();
+    let mut capacity = ConnectionCapacity {
+        limit: cfg.max_in_flight,
+        used: HashMap::new(),
+    };
     let mut metadata_refresh: Option<BoxFuture<'static, ()>> = None;
     let mut force = false;
     let mut stopping = false;
     loop {
-        let capacity = cfg.max_in_flight.saturating_sub(requests.len());
-        let next = schedule(&cfg, &state, force, &occupied, capacity).await;
+        let next = schedule(&cfg, &state, force, &occupied, &capacity).await;
         if next.immediate {
             let intent = if force {
                 DrainIntent::Force
             } else {
                 DrainIntent::Expired
             };
-            for pb in drain_batches(&cfg, &mut state, intent, &occupied, capacity).await {
+            for (leader, pb) in drain_batches(&cfg, &mut state, intent, &occupied, &capacity).await
+            {
+                capacity.reserve(leader);
                 let key = (pb.topic.clone(), pb.partition);
                 let last_acked = state.last_acked_offset.get(&key).copied();
                 occupied.insert(key);
                 let cfg = Arc::clone(&cfg);
-                requests.push(async move { send_one_batch(&cfg, pb, last_acked).await }.boxed());
+                requests.push(
+                    async move {
+                        (
+                            leader,
+                            send_one_batch_to_leader(&cfg, pb, last_acked, leader).await,
+                        )
+                    }
+                    .boxed(),
+                );
             }
             continue;
         }
@@ -642,9 +685,11 @@ pub(crate) async fn run(cfg: SenderConfig, mut wake_rx: tokio::sync::mpsc::Recei
                 while let Some(Some(result)) = requests.next().now_or_never() {
                     completed.push(result);
                 }
-                for result in &completed {
+                for (leader, result) in &completed {
+                    capacity.release(*leader);
                     occupied.remove(&(result.pb.topic.clone(), result.pb.partition));
                 }
+                let completed = completed.into_iter().map(|(_, result)| result).collect();
                 if complete_batches(&cfg, &mut state, completed).await && metadata_refresh.is_none() {
                     let cfg = Arc::clone(&cfg);
                     metadata_refresh = Some(async move { update_leaders_from_metadata(&cfg).await }.boxed());
@@ -766,8 +811,8 @@ async fn drain_batches(
     state: &mut PipelineState,
     intent: DrainIntent,
     active: &HashSet<(String, i32)>,
-    capacity: usize,
-) -> Vec<PreparedBatch> {
+    capacity: &ConnectionCapacity,
+) -> Vec<(i32, PreparedBatch)> {
     if cfg.state.load(Ordering::Acquire) != STATE_ACTIVE {
         fence(cfg, state, Vec::new());
         return Vec::new();
@@ -785,12 +830,26 @@ async fn drain_batches(
     fail_recovered_retry_slots(cfg, &mut state.retry);
     fail_expired_accumulator_batches(cfg, now).await;
     let (mut to_send, expired) =
-        collect_retries(&mut state.retry, now, cfg.delivery_timeout, capacity);
+        collect_retries(&mut state.retry, now, cfg.delivery_timeout, usize::MAX);
     if !expired.is_empty() {
         expire_batches(cfg, state, expired, to_send).await;
         return Vec::new();
     }
     fail_recovered_batches(cfg, &mut to_send);
+    let mut slots = capacity.clone();
+    let mut routes = HashMap::new();
+    let pending = std::mem::take(&mut to_send);
+    for batch in pending {
+        let key = (batch.topic.clone(), batch.partition);
+        let leader = resolve_leader(cfg, &batch.topic, batch.partition);
+        if slots.available(leader) {
+            slots.reserve(leader);
+            routes.insert(key, leader);
+            to_send.push(batch);
+        } else {
+            state.retry.insert(key, batch);
+        }
+    }
 
     if cfg.producer_epoch.load(Ordering::Acquire) == i16::MAX && !bump_idempotent_epoch(cfg).await {
         for pb in to_send {
@@ -813,8 +872,8 @@ async fn drain_batches(
         .collect();
 
     // 2. One eligible new batch per idle partition. Across partitions we fan out
-    //    concurrently, but bound the cycle's total fan-out to `max_in_flight`
-    //    (the per-connection pipelining bound); partitions not reached this cycle
+    //    concurrently, while each routed connection stays within `max_in_flight`.
+    //    Partitions not reached this cycle
     //    are picked up on the next drain cycle (their retry slots carry forward,
     //    so none is starved). `in_flight` is incremented per new batch while the
     //    accumulator lock is held, so a concurrent `flush` never sees a batch
@@ -825,10 +884,8 @@ async fn drain_batches(
         note_node_latency(cfg, state, &(pb.topic.clone(), pb.partition), now, true);
     }
     for key in keys {
-        let capped = to_send.len() >= capacity;
-        if capped && !track_latency {
-            break;
-        }
+        let leader = resolve_leader(cfg, &key.0, key.1);
+        let capped = !slots.available(leader);
         let acc = match cfg.accumulators.get(&key) {
             Some(a) => Arc::clone(a.value()),
             None => continue,
@@ -881,6 +938,8 @@ async fn drain_batches(
             continue;
         }
         let pb = prepare_batch(cfg, &key.0, key.1, batch).await;
+        routes.insert(key.clone(), leader);
+        slots.reserve(leader);
         occupied.insert(key);
         to_send.push(pb);
     }
@@ -892,12 +951,27 @@ async fn drain_batches(
     }
 
     to_send
+        .into_iter()
+        .map(|batch| {
+            let leader = routes[&(batch.topic.clone(), batch.partition)];
+            (leader, batch)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 async fn drain_once(cfg: &mut SenderConfig, state: &mut PipelineState, intent: DrainIntent) {
-    let batches = drain_batches(cfg, state, intent, &HashSet::new(), cfg.max_in_flight).await;
-    send_batches(cfg, state, batches).await;
+    let capacity = ConnectionCapacity {
+        limit: cfg.max_in_flight,
+        used: HashMap::new(),
+    };
+    let batches = drain_batches(cfg, state, intent, &HashSet::new(), &capacity).await;
+    send_batches(
+        cfg,
+        state,
+        batches.into_iter().map(|(_, batch)| batch).collect(),
+    )
+    .await;
 }
 
 /// Fail every batch that reached the delivery timeout, and park the rest of
@@ -1885,6 +1959,16 @@ fn back_off(pb: &mut PreparedBatch, retry_backoff: RetryBackoff, now: Instant) {
 /// The function returns the batch alongside the verdict, because the caller
 /// still owns its records. On a connection error it evicts the broker, so a
 /// reconnect targets that broker's current address.
+#[cfg(test)]
+async fn send_one_batch(
+    cfg: &SenderConfig,
+    pb: PreparedBatch,
+    last_acked_offset: Option<i64>,
+) -> BatchSendResult {
+    let leader = resolve_leader(cfg, &pb.topic, pb.partition);
+    send_one_batch_to_leader(cfg, pb, last_acked_offset, leader).await
+}
+
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -1895,10 +1979,11 @@ fn back_off(pb: &mut PreparedBatch, retry_backoff: RetryBackoff, now: Instant) {
         leader = tracing::field::Empty,
     ),
 )]
-async fn send_one_batch(
+async fn send_one_batch_to_leader(
     cfg: &SenderConfig,
     mut pb: PreparedBatch,
     last_acked_offset: Option<i64>,
+    leader: i32,
 ) -> BatchSendResult {
     if let Some(barrier) = drained_barrier(cfg, pb.transaction_generation) {
         return BatchSendResult {
@@ -1930,7 +2015,6 @@ async fn send_one_batch(
         pb.topic_id = resolved;
     }
 
-    let leader = resolve_leader(cfg, &pb.topic, pb.partition);
     tracing::Span::current().record("leader", leader);
     let req = match build_single_batch_request(cfg, &pb) {
         Ok(req) => req,
@@ -4944,12 +5028,56 @@ mod harness {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_saturated_connection_does_not_consume_another_brokers_slots() {
+        let transport = MockTransport::new(Duration::ZERO);
+        transport.add_known_broker(0);
+        transport.add_known_broker(1);
+        transport.delay_leader(0, Duration::from_secs(10));
+        let h = spawn_sender(transport.clone(), 5);
+        let mut slow = Vec::new();
+        for partition in 0..5 {
+            h.partition_leaders.insert(("t".into(), partition), 0);
+            slow.push(
+                produce_single_batch_without_wake(&h, "t", partition, 1)
+                    .await
+                    .remove(0),
+            );
+        }
+        h.wake_tx.send(DrainIntent::Force).await.unwrap();
+        while transport.send_count() < 5 {
+            tokio::task::yield_now().await;
+        }
+        h.partition_leaders.insert(("t".into(), 5), 0);
+        let mut queued = produce_single_batch(&h, "t", 5, 1).await.remove(0);
+        h.partition_leaders.insert(("t".into(), 6), 1);
+        let healthy = produce_single_batch(&h, "t", 6, 1).await.remove(0);
+        let ack = tokio::time::timeout(Duration::from_millis(50), healthy)
+            .await
+            .expect("an idle broker must send while another broker is full")
+            .unwrap()
+            .unwrap();
+        assert2::assert!((ack.partition, ack.offset) == (6, 0));
+        assert2::assert!(transport.send_count() == 6);
+        assert2::assert!(transport.peak_active_sends() == 6);
+        assert2::assert!(matches!(
+            queued.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        for receiver in slow {
+            assert2::assert!(receiver.await.unwrap().unwrap().offset == 0);
+        }
+        assert2::assert!(queued.await.unwrap().unwrap().offset == 0);
+        assert2::assert!(h.in_flight.load(Ordering::Acquire) == 0);
+        shutdown(h).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_request_does_not_block_later_batches_on_a_healthy_broker() {
         let transport = MockTransport::new(Duration::ZERO);
         transport.add_known_broker(0);
         transport.add_known_broker(1);
         transport.delay_leader(0, Duration::from_secs(10));
-        let h = spawn_sender(transport.clone(), 2);
+        let h = spawn_sender(transport.clone(), 1);
         h.partition_leaders.insert(("t".into(), 0), 0);
         h.partition_leaders.insert(("t".into(), 1), 1);
         let mut stalled = produce_single_batch_without_wake(&h, "t", 0, 1)
