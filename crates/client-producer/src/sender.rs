@@ -44,7 +44,7 @@
 //! no gap.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     hash::{BuildHasher as _, RandomState},
     sync::{
         Arc,
@@ -288,6 +288,8 @@ struct PipelineState {
     /// Per-broker drain times for `partitioner.availability.timeout.ms`.
     /// Kafka's `RecordAccumulator.nodeStats`.
     node_latency: HashMap<i32, NodeLatency>,
+    /// Last recovery generation whose healthy accumulator queues were checked.
+    recovery_generation: Option<u64>,
 }
 
 /// When the sender last found ready records for a broker, and when it last
@@ -557,13 +559,14 @@ async fn schedule(
         {
             include_deadline(&mut schedule, deadline, now);
         }
-        let has_recovery_invalid =
-            accumulator.current.as_ref().is_some_and(|batch| {
+        let inspect_recovery = recovery_scan_needed(cfg, state);
+        let has_recovery_invalid = inspect_recovery
+            && (accumulator.current.as_ref().is_some_and(|batch| {
                 undrained_barrier(cfg, batch.transaction_generation).is_some()
             }) || accumulator
                 .ready
                 .iter()
-                .any(|batch| undrained_barrier(cfg, batch.transaction_generation).is_some());
+                .any(|batch| undrained_barrier(cfg, batch.transaction_generation).is_some()));
         if has_recovery_invalid {
             schedule.immediate = true;
             continue;
@@ -781,7 +784,7 @@ async fn drain_batches(
     //    (their in-flight slot was counted at first drain, so `finish_in_flight`
     //    once).
     update_partition_load_stats(cfg, state).await;
-    fail_recovered_accumulator_batches(cfg).await;
+    fail_recovered_accumulator_batches(cfg, state).await;
     fail_recovered_retry_slots(cfg, &mut state.retry);
     fail_expired_accumulator_batches(cfg, now).await;
     let (mut to_send, expired) =
@@ -2289,7 +2292,22 @@ fn fail_recovered_retry_slots(
     }
 }
 
-async fn fail_recovered_accumulator_batches(cfg: &SenderConfig) {
+/// Error states may reject concurrent appends too, so only a healthy generation
+/// can skip a sweep. Each batch is checked again when drained and before send.
+fn recovery_scan_needed(cfg: &SenderConfig, state: &PipelineState) -> bool {
+    state.recovery_generation != Some(cfg.txn_recovery_generation.load(Ordering::Acquire))
+        || cfg.txn_recovery_required.load(Ordering::Acquire)
+        || cfg.txn_error.fatal().is_some()
+        || cfg.txn_error.abortable().is_some()
+}
+
+async fn fail_recovered_accumulator_batches(cfg: &SenderConfig, state: &mut PipelineState) {
+    if !recovery_scan_needed(cfg, state) {
+        return;
+    }
+    // Read before taking any accumulator lock. A concurrent generation change
+    // must trigger another sweep rather than being marked checked by this one.
+    let generation = cfg.txn_recovery_generation.load(Ordering::Acquire);
     let accumulators = cfg
         .accumulators
         .iter()
@@ -2308,17 +2326,17 @@ async fn fail_recovered_accumulator_batches(cfg: &SenderConfig) {
             failed_any = true;
         }
 
-        let mut retained = VecDeque::with_capacity(accumulator.ready.len());
-        while let Some(batch) = accumulator.ready.pop_front() {
+        accumulator.ready.retain_mut(|batch| {
             if let Some(barrier) = undrained_barrier(cfg, batch.transaction_generation) {
-                fail_batch(batch.records, barrier.error());
+                fail_batch(std::mem::take(&mut batch.records), barrier.error());
                 failed_any = true;
+                false
             } else {
-                retained.push_back(batch);
+                true
             }
-        }
-        accumulator.ready = retained;
+        });
     }
+    state.recovery_generation = Some(generation);
     if failed_any {
         cfg.flush_notify.notify_waiters();
     }
@@ -6733,6 +6751,62 @@ mod harness {
         assert2::assert!(h.transport.last_timeout_ms() == 5000);
 
         shutdown(h).await;
+    }
+
+    #[tokio::test]
+    async fn unchanged_recovery_does_not_relock_backlogged_accumulators() {
+        for transaction_generation in [None, Some(0)] {
+            let (cfg, _) = direct_config(
+                Arc::new(BuiltInPartitioner::new(PartitionerConfig::default())),
+                1,
+            );
+            let accumulator = Arc::new(Mutex::new(Accumulator::new(1024)));
+            cfg.accumulators
+                .insert(("t".into(), 0), Arc::clone(&accumulator));
+            let mut receivers = Vec::new();
+            {
+                let mut queue = accumulator.lock().await;
+                for _ in 0..128 {
+                    receivers.push(
+                        queue
+                            .try_append(None, None, vec![], 0, transaction_generation)
+                            .receiver,
+                    );
+                    queue.seal_current();
+                }
+            }
+            let mut state = PipelineState::default();
+            fail_recovered_accumulator_batches(&cfg, &mut state).await;
+            let queue = accumulator.lock().await;
+            for _ in 0..128 {
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    fail_recovered_accumulator_batches(&cfg, &mut state),
+                )
+                .await
+                .expect("unchanged recovery must not acquire the queue lock");
+            }
+            assert2::assert!(queue.ready.len() == 128);
+            assert2::assert!(
+                receivers
+                    .iter_mut()
+                    .all(|rx| matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)))
+            );
+            drop(queue);
+            cfg.txn_recovery_generation.store(1, Ordering::Release);
+            fail_recovered_accumulator_batches(&cfg, &mut state).await;
+            if transaction_generation.is_some() {
+                for receiver in receivers {
+                    assert2::assert!(matches!(
+                        receiver.await.unwrap(),
+                        Err(ProducerError::RecoveryRequired)
+                    ));
+                }
+                assert2::assert!(accumulator.lock().await.ready.is_empty());
+            } else {
+                assert2::assert!(accumulator.lock().await.ready.len() == 128);
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
