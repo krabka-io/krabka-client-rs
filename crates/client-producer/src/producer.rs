@@ -2322,7 +2322,13 @@ impl Producer {
                 }
                 return Err(error);
             }
-            let mut a = acc.lock().await;
+            let mut a = self
+                .lock_accumulator_for_append(
+                    &acc,
+                    transaction_state.as_deref().copied(),
+                    transaction_generation,
+                )
+                .await?;
             if self.sticky_partition_changed(&record.topic, sticky, &a, &partitions) {
                 // Another send switched the sticky partition. Adding this
                 // partition to the transaction has no effect on the outcome:
@@ -2493,6 +2499,23 @@ impl Producer {
         } else {
             None
         }
+    }
+
+    /// Recheck recovery after waiting for the queue lock. A recovery sweep can
+    /// visit this queue while an append waits, and then cache the new generation.
+    /// Reject that append before it can insert an old-generation batch behind
+    /// an occupied partition, where draining would otherwise defer its failure.
+    async fn lock_accumulator_for_append<'a>(
+        &self,
+        accumulator: &'a Mutex<Accumulator>,
+        state: Option<TxnState>,
+        expected_generation: Option<u64>,
+    ) -> Result<tokio::sync::MutexGuard<'a, Accumulator>, ProducerError> {
+        let queue = accumulator.lock().await;
+        if self.append_transaction_generation(state)? != expected_generation {
+            return Err(ProducerError::RecoveryRequired);
+        }
+        Ok(queue)
     }
 
     /// The transaction generation that a send appends with in `state`.
@@ -3214,6 +3237,37 @@ mod tests {
             .await
             .expect("flush must not wait for another notification")
             .expect("empty producer flushes");
+        mock.stop();
+    }
+
+    #[tokio::test]
+    async fn append_waiting_for_a_swept_queue_rejects_its_old_generation() {
+        let (mock, producer) = producer_with_flush_timeout(Duration::from_millis(20)).await;
+        let accumulator = tokio::sync::Mutex::new(Accumulator::new(1024));
+        let queue = accumulator.lock().await;
+        let transaction = Some(crate::transactional::TxnState::InTransaction);
+        let expected = producer.append_transaction_generation(transaction).unwrap();
+        let append = producer.lock_accumulator_for_append(&accumulator, transaction, expected);
+        tokio::pin!(append);
+        assert2::assert!(futures::poll!(append.as_mut()).is_pending());
+
+        // Recovery can sweep this locked queue before the append acquires it.
+        // Completing reinitialization clears the required flag, but must not
+        // allow the append captured in the previous generation through.
+        producer.require_transaction_recovery();
+        producer
+            .txn_recovery_required
+            .store(false, Ordering::Release);
+        drop(queue);
+        assert2::assert!(matches!(append.await, Err(ProducerError::RecoveryRequired)));
+        assert2::assert!(accumulator.lock().await.current.is_none());
+        let current = producer.append_transaction_generation(transaction).unwrap();
+        let fresh = producer
+            .lock_accumulator_for_append(&accumulator, transaction, current)
+            .await
+            .expect("a new-generation append can acquire the swept queue");
+        assert2::assert!(fresh.current.is_none());
+        drop(fresh);
         mock.stop();
     }
 
