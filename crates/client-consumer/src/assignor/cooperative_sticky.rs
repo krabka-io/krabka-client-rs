@@ -401,15 +401,13 @@ fn general_assign(
     // they're still subscribed AND giving it to them doesn't push them more
     // than 1 above the current min load among subscribed members.
     for tp in &sorted_partitions {
-        let subscribed: BTreeSet<String> = subscribers_per_topic
-            .get(&tp.0)
-            .cloned()
-            .unwrap_or_default();
+        // Step 2 enumerates only keys from this unchanged subscriber index.
+        let subscribed = &subscribers_per_topic[&tp.0];
         if subscribed.is_empty() {
             continue;
         }
 
-        let chosen = choose_assignment_owner(tp, &subscribed, &prev_owner, &new_assignment);
+        let chosen = choose_assignment_owner(tp, subscribed, &prev_owner, &new_assignment);
 
         new_assignment
             .get_mut(&chosen)
