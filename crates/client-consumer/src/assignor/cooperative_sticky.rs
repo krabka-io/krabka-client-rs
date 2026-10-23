@@ -401,9 +401,8 @@ fn general_assign(
     // they're still subscribed AND giving it to them doesn't push them more
     // than 1 above the current min load among subscribed members.
     for tp in &sorted_partitions {
-        let Some(subscribed) = subscribers_per_topic.get(&tp.0) else {
-            continue;
-        };
+        // Step 2 enumerates only keys from this unchanged subscriber index.
+        let subscribed = &subscribers_per_topic[&tp.0];
         if subscribed.is_empty() {
             continue;
         }
