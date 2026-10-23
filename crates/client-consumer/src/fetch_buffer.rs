@@ -80,27 +80,33 @@ impl FetchBuffer {
                 paused_data.extend(self.partitions.pop_front());
                 continue;
             }
+            let mut consumed_epoch = None;
             while out.len() < max_records {
                 let Some(record) = partition.records.pop_front() else {
                     break;
                 };
                 partition.position = record.offset + 1;
-                offsets.insert(partition.key.clone(), partition.position);
-                positions
-                    .entry(partition.key.clone())
-                    .or_default()
-                    .offset_epoch = LeaderEpoch(record.leader_epoch);
+                consumed_epoch = Some(LeaderEpoch(record.leader_epoch));
                 out.push(record);
             }
-            if !partition.records.is_empty() {
-                break;
+            // Both maps are exclusively borrowed. Publish the final position
+            // once per buffer, before checking the next buffer for this key.
+            let complete = partition.records.is_empty();
+            if complete {
+                partition.position = partition.next_offset;
+                consumed_epoch = partition.last_epoch.or(consumed_epoch);
             }
-            offsets.insert(partition.key.clone(), partition.next_offset);
-            if let Some(epoch) = partition.last_epoch {
+            if complete || consumed_epoch.is_some() {
+                offsets.insert(partition.key.clone(), partition.position);
+            }
+            if let Some(epoch) = consumed_epoch {
                 positions
                     .entry(partition.key.clone())
                     .or_default()
                     .offset_epoch = epoch;
+            }
+            if !complete {
+                break;
             }
             self.partitions.pop_front();
             if out.len() >= max_records {
@@ -286,6 +292,114 @@ mod tests {
             let mut left: Vec<_> = buffer.buffered_partitions().into_iter().collect();
             left.sort();
             assert2::check!((actual, left) == (expected, remaining), "case {name}");
+        }
+    }
+
+    #[test]
+    fn drain_publishes_each_buffer_before_the_next_buffer_for_the_same_partition() {
+        let key = ("orders".to_string(), 0);
+        let assigned = HashSet::from([key.clone()]);
+        for last_epoch in [None, Some(LeaderEpoch(9))] {
+            let mut buffer = FetchBuffer::default();
+            buffer.push(BufferedPartition {
+                records: VecDeque::from([record(0, 10, 2), record(0, 12, 5)]),
+                last_epoch,
+                ..buffered(0, 10..10, 15)
+            });
+            buffer.push(BufferedPartition {
+                last_epoch: None,
+                ..buffered(0, 15..17, 20)
+            });
+            // This empty fetch represents control or aborted-only batches.
+            buffer.push(BufferedPartition {
+                last_epoch: Some(LeaderEpoch(11)),
+                ..buffered(0, 20..20, 25)
+            });
+            let mut offsets = HashMap::from([(key.clone(), 10)]);
+            let initial = PartitionPosition {
+                leader_id: 7,
+                leader_epoch: LeaderEpoch(13),
+                awaiting_validation: true,
+                ..PartitionPosition::default()
+            };
+            let mut positions = HashMap::from([(key.clone(), initial)]);
+            for (limit, expected_records, expected_offset, expected_epoch) in [
+                (0, vec![], 10, LeaderEpoch(-1)),
+                (1, vec![10], 11, LeaderEpoch(2)),
+                (2, vec![12, 15], 16, LeaderEpoch(3)),
+                (1, vec![16], 20, LeaderEpoch(3)),
+                (0, vec![], 25, LeaderEpoch(11)),
+            ] {
+                let records = buffer.drain(
+                    limit,
+                    &assigned,
+                    &HashSet::new(),
+                    &mut offsets,
+                    &mut positions,
+                );
+                assert2::assert!(
+                    records
+                        .iter()
+                        .map(|record| record.offset)
+                        .collect::<Vec<_>>()
+                        == expected_records
+                );
+                assert2::assert!(offsets == HashMap::from([(key.clone(), expected_offset)]));
+                assert2::assert!(
+                    positions
+                        == HashMap::from([(
+                            key.clone(),
+                            PartitionPosition {
+                                offset_epoch: expected_epoch,
+                                ..initial
+                            }
+                        )])
+                );
+            }
+            assert2::assert!(buffer.partitions.is_empty());
+        }
+    }
+
+    #[test]
+    fn completed_buffer_uses_batch_epoch_or_last_consumed_epoch() {
+        let key = ("orders".to_string(), 0);
+        for (last_epoch, expected_epoch) in [
+            (None, LeaderEpoch(5)),
+            (Some(LeaderEpoch(9)), LeaderEpoch(9)),
+        ] {
+            let mut buffer = FetchBuffer::default();
+            buffer.push(BufferedPartition {
+                records: VecDeque::from([record(0, 10, 2), record(0, 12, 5)]),
+                last_epoch,
+                ..buffered(0, 10..10, 20)
+            });
+            let mut offsets = HashMap::from([(key.clone(), 10)]);
+            let mut positions = HashMap::new();
+            let records = buffer.drain(
+                10,
+                &HashSet::from([key.clone()]),
+                &HashSet::new(),
+                &mut offsets,
+                &mut positions,
+            );
+            assert2::assert!(
+                records
+                    .iter()
+                    .map(|record| record.offset)
+                    .collect::<Vec<_>>()
+                    == vec![10, 12]
+            );
+            assert2::assert!(offsets == HashMap::from([(key.clone(), 20)]));
+            assert2::assert!(
+                positions
+                    == HashMap::from([(
+                        key.clone(),
+                        PartitionPosition {
+                            offset_epoch: expected_epoch,
+                            ..PartitionPosition::default()
+                        }
+                    )])
+            );
         }
     }
 
