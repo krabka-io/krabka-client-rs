@@ -381,6 +381,47 @@ impl Client {
         conn.send(req).await
     }
 
+    /// Send on one fixed pool connection, without selecting another broker.
+    ///
+    /// `Some(id)` selects that broker's connection. `None` selects the distinct
+    /// bootstrap connection even after cluster metadata has been learned.
+    /// Callers that account for per-connection request limits can keep this
+    /// selection fixed until the request completes, then refresh and retry on
+    /// failure themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns a routing, connection setup, encoding or response error.
+    pub async fn send_to_connection<R: ProtocolRequest>(
+        &self,
+        broker_id: Option<i32>,
+        req: R,
+    ) -> Result<R::Response, ClientError> {
+        let connection = match broker_id {
+            Some(id) => self.pool.get(id).await?,
+            None => self.pool.bootstrap_connection().await?,
+        };
+        connection.send(req).await
+    }
+
+    /// Send without a response on the fixed connection selected by
+    /// [`send_to_connection`](Self::send_to_connection).
+    ///
+    /// # Errors
+    ///
+    /// Returns a routing, connection setup, encoding or writer enqueue error.
+    pub async fn send_to_connection_no_response<R: ProtocolRequest>(
+        &self,
+        broker_id: Option<i32>,
+        req: R,
+    ) -> Result<(), ClientError> {
+        let connection = match broker_id {
+            Some(id) => self.pool.get(id).await?,
+            None => self.pool.bootstrap_connection().await?,
+        };
+        connection.send_no_response(req).await
+    }
+
     /// Send a request, as [`send`](Self::send) routes it, without registering
     /// a pending response. Intended for protocol operations such as Produce
     /// `acks=0`.
