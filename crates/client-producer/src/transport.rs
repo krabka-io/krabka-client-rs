@@ -32,11 +32,10 @@ use krabka_protocol::{
 
 /// The broker-facing operations the sender performs.
 ///
-/// `send_produce` folds the difference between `Client::broker(id).send` and
-/// the bootstrap `Client::send` into one call. `leader = Some(id)` routes to
-/// that broker, and `None` uses the bootstrap connection. This mirrors the
-/// sender's existing `BOOTSTRAP_LEADER` fallback, and it keeps the trait a
-/// clean, testable seam.
+/// `send_produce` uses [`Client::send_to_connection`] to pin a pool node.
+/// `leader = Some(id)` routes to that broker, and `None` uses the distinct
+/// bootstrap connection. The sender can therefore account for a connection
+/// slot before dispatch without a hidden least-loaded or metadata fallback.
 ///
 /// The trait uses `async_trait` for dyn-compatibility, so `SenderConfig` can
 /// hold a `Box<dyn ProduceTransport>` without leaking generics across the whole
@@ -213,10 +212,7 @@ impl ClientTransport {
     where
         R: ProtocolRequest<Response = ProduceResponse> + Encode + Send + Sync,
     {
-        match leader {
-            Some(id) => self.client.broker(id).send(req).await,
-            None => self.client.send(req).await,
-        }
+        self.client.send_to_connection(leader, req).await
     }
 
     /// Enqueue `req`, for which the broker sends no response.
@@ -228,10 +224,9 @@ impl ClientTransport {
     where
         R: ProtocolRequest<Response = ProduceResponse> + Encode + Send + Sync,
     {
-        match leader {
-            Some(id) => self.client.broker(id).send_no_response(req).await,
-            None => self.client.send_no_response(req).await,
-        }
+        self.client
+            .send_to_connection_no_response(leader, req)
+            .await
     }
 }
 
@@ -523,6 +518,48 @@ mod tests {
             .expect("send_produce after evict reconnects");
         let after = handshakes.load(Ordering::SeqCst);
         assert2::assert!(after > before);
+
+        for no_response in [false, true] {
+            transport.client.reconnect_bootstrap().await;
+            // Refresh over the already open broker-1 connection. This clears
+            // bootstrap preference without opening the bootstrap socket.
+            transport.refresh_metadata().await.unwrap();
+            let before = handshakes.load(Ordering::SeqCst);
+            if no_response {
+                transport
+                    .send_produce_no_response(
+                        None,
+                        ProduceRequest {
+                            acks: 0,
+                            ..ProduceRequest::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                transport
+                    .send_produce(None, ProduceRequest::default())
+                    .await
+                    .unwrap();
+            }
+            // Fallback uses a distinct fixed bootstrap connection even when
+            // broker 1 is idle. Its slot cannot alias the broker-1 slot.
+            assert2::assert!(handshakes.load(Ordering::SeqCst) == before + 1);
+        }
+        // A pinned known route must fail rather than move onto the bootstrap
+        // connection after the broker disappears from metadata.
+        assert2::assert!(matches!(
+            transport
+                .send_produce(Some(999), ProduceRequest::default())
+                .await,
+            Err(ClientError::Disconnected)
+        ));
+        assert2::assert!(matches!(
+            transport
+                .send_produce_no_response(Some(999), ProduceRequest::default())
+                .await,
+            Err(ClientError::Disconnected)
+        ));
 
         mock.stop();
     }
