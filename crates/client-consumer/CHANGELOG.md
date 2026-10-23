@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Update consumed offsets and epochs once per fetched partition buffer instead of once per returned record (#203).
+
 ## [0.7.1] — 2026-10-20
 
 - Require Rustls 0.23.46 and update the locked certificate verifier to 0.103.16.
