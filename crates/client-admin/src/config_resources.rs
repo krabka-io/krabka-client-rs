@@ -228,6 +228,7 @@ mod tests {
                 let answer = answers[requests.len().min(answers.len() - 1)];
                 let request: ListConfigResourcesRequest = decode_request(body, version, true);
                 requests.push((version, request));
+                drop(requests);
                 let Some(error_code) = answer else {
                     return MockReply::Close;
                 };

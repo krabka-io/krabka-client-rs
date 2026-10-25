@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{fs, path::Path, sync::Arc};
 
 use assert2::{assert, check};
 use krabka_security::ListenerProtocol;
@@ -8,6 +8,7 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
     server::WebPkiClientVerifier,
 };
+use tokio::io::duplex;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::*;
@@ -53,12 +54,12 @@ impl Fixtures {
             ("truststore.p12", TRUSTSTORE_P12),
             ("truststore.jks", TRUSTSTORE_JKS),
         ] {
-            std::fs::write(dir.path().join(name), bytes).unwrap();
+            fs::write(dir.path().join(name), bytes).unwrap();
         }
         Self { dir }
     }
 
-    fn path(&self, name: &str) -> std::path::PathBuf {
+    fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
 }
@@ -80,13 +81,13 @@ struct Broker {
     require_client_certificate: bool,
 }
 
-const TLS12_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS12];
-const TLS13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
+const TLS12_ONLY: &[&SupportedProtocolVersion] = &[&version::TLS12];
+const TLS13_ONLY: &[&SupportedProtocolVersion] = &[&version::TLS13];
 
 const BROKER: Broker = Broker {
     certificate: SERVER,
     key: SERVER_KEY,
-    versions: &[&rustls::version::TLS12, &rustls::version::TLS13],
+    versions: &[&version::TLS12, &version::TLS13],
     require_client_certificate: false,
 };
 
@@ -123,7 +124,7 @@ fn mutual() -> Handshake {
     }
 }
 
-fn classify(error: &std::io::Error) -> Handshake {
+fn classify(error: &io::Error) -> Handshake {
     match error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
@@ -167,12 +168,12 @@ async fn handshake(client: Arc<rustls::ClientConfig>, broker: Broker) -> Handsha
         )
         .unwrap();
 
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (client_io, server_io) = duplex(64 * 1024);
     let accept = tokio::spawn(async move {
         let stream = TlsAcceptor::from(Arc::new(server))
             .accept(server_io)
             .await?;
-        Ok::<_, std::io::Error>(stream.get_ref().1.peer_certificates().is_some())
+        Ok::<_, io::Error>(stream.get_ref().1.peer_certificates().is_some())
     });
     let connected = TlsConnector::from(client)
         .connect(ServerName::try_from("localhost").unwrap(), client_io)
@@ -228,7 +229,7 @@ async fn run_handshakes(cases: Vec<HandshakeCase>) {
 
 #[tokio::test]
 async fn trust_stores_verify_the_broker_as_kafka_does() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = default_provider().install_default();
     let fixtures = Fixtures::new();
     let pem_trust = || TrustStore::PemFile(fixtures.path("ca.pem"));
     let config = |trust_store, key_store| TlsConnectorConfig {
@@ -345,7 +346,7 @@ async fn trust_stores_verify_the_broker_as_kafka_does() {
 
 #[tokio::test]
 async fn key_stores_give_mutual_tls_as_kafka_does() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = default_provider().install_default();
     let fixtures = Fixtures::new();
     let pem_trust = || TrustStore::PemFile(fixtures.path("ca.pem"));
     let config = |trust_store, key_store| TlsConnectorConfig {
@@ -472,7 +473,7 @@ async fn key_stores_give_mutual_tls_as_kafka_does() {
 
 #[tokio::test]
 async fn protocols_and_cipher_suites_follow_kafka_settings() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = default_provider().install_default();
     let fixtures = Fixtures::new();
     let pem_trust = || TrustStore::PemFile(fixtures.path("ca.pem"));
     let config = |trust_store, key_store| TlsConnectorConfig {
@@ -540,7 +541,7 @@ async fn protocols_and_cipher_suites_follow_kafka_settings() {
 
 #[test]
 fn invalid_store_and_protocol_settings_fail_to_build() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = default_provider().install_default();
     let fixtures = Fixtures::new();
     let trust = TrustStore::Pem(CA.to_owned());
     let key_store = |key_store| TlsConnectorConfig {
@@ -739,7 +740,7 @@ fn key_stores_of_every_format_load_every_key_entry_in_order() {
 
 #[tokio::test]
 async fn connector_reuses_the_configuration_until_a_setting_changes() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = default_provider().install_default();
     let fixtures = Fixtures::new();
     let config = TlsConnectorConfig {
         trust_store: TrustStore::PemFile(fixtures.path("ca.pem")),
@@ -750,8 +751,8 @@ async fn connector_reuses_the_configuration_until_a_setting_changes() {
         ..TlsConnectorConfig::default()
     };
     config.connector().expect("the stores load");
-    std::fs::remove_file(fixtures.path("ca.pem")).unwrap();
-    std::fs::remove_file(fixtures.path("client.p12")).unwrap();
+    fs::remove_file(fixtures.path("ca.pem")).unwrap();
+    fs::remove_file(fixtures.path("client.p12")).unwrap();
 
     let broker_clone = ClientSecurity {
         protocol: ListenerProtocol::Ssl,

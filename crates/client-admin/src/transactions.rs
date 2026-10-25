@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::BufMut;
+use futures_util::future::join_all;
 use krabka_client_core::{
     Connection, ConnectionOptions, CoordinatorKeyType, build_find_coordinator,
 };
@@ -33,7 +34,7 @@ use krabka_protocol::{
     },
     primitives::uuid::Uuid as ProtoUuid,
 };
-use krabka_units::{Time, convert::TimeExt as _};
+use krabka_units::{Time, convert::TimeExt};
 
 #[cfg(test)]
 use crate::AdminClientConfig;
@@ -338,7 +339,7 @@ fn transaction_description(
     coordinator_id: i32,
     response: DescribeTransactionsResponse,
 ) -> Result<TransactionDescription, AdminError> {
-    response
+    let state = response
         .transaction_states
         .into_iter()
         .find(|state| state.transactional_id == transactional_id)
@@ -346,8 +347,8 @@ fn transaction_description(
             AdminError::Protocol(format!(
                 "DescribeTransactions returned no state for transactional id {transactional_id:?}"
             ))
-        })
-        .and_then(|state| described_transaction(coordinator_id, state))
+        })?;
+    described_transaction(coordinator_id, state)
 }
 
 /// A `Metadata` request for `topics`, as Kafka's leader-routed handlers send
@@ -612,9 +613,7 @@ fn list_transactions_request(filter: &ListTransactionsFilter) -> ListTransaction
     ListTransactionsRequest {
         state_filters: filter.state_filters.clone(),
         producer_id_filters: filter.producer_id_filters.clone(),
-        duration_filter: filter
-            .min_duration
-            .map_or(-1, krabka_units::convert::TimeExt::millis_i64),
+        duration_filter: filter.min_duration.map_or(-1, TimeExt::millis_i64),
         ..Default::default()
     }
 }
@@ -758,7 +757,7 @@ impl AdminClient {
         transactional_ids: &[&str],
     ) -> BTreeMap<String, Result<(), AdminError>> {
         let deadline = self.retry.start();
-        futures_util::future::join_all(transactional_ids.iter().map(|transactional_id| {
+        join_all(transactional_ids.iter().map(|transactional_id| {
             let transactional_id = (*transactional_id).to_owned();
             async move {
                 let result = if transactional_id.is_empty() {
@@ -943,7 +942,7 @@ impl AdminClient {
         let metadata = self.conn.send(build_topic_metadata(&[])).await?;
         let request = list_transactions_request(filter);
         let options = self.options.clone();
-        let answers = futures_util::future::join_all(metadata.brokers.into_iter().map(|broker| {
+        let answers = join_all(metadata.brokers.into_iter().map(|broker| {
             list_transactions_on_broker(
                 format_host_port(&broker.host, broker.port),
                 options.clone(),
@@ -1182,6 +1181,7 @@ impl AdminClient {
 #[cfg(test)]
 mod tests {
     use std::{
+        net::SocketAddr,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -1212,6 +1212,7 @@ mod tests {
             },
         },
     };
+    use tokio::{net::TcpListener, time::Instant};
 
     use super::*;
     use crate::partition_leaders::test_support::{
@@ -1346,7 +1347,8 @@ mod tests {
                     }
                     _ => None,
                 })
-                .await;
+                .await
+                .unwrap();
             let coordinator_addr = coordinator.addr;
             let bootstrap = MockBroker::start(move |api_key, version, _, _| match api_key {
                 api_versions_request::API_KEY => Some(api_versions(init_producer_id_range)),
@@ -1365,7 +1367,8 @@ mod tests {
                 }
                 _ => None,
             })
-            .await;
+            .await
+            .unwrap();
             let admin = AdminClient::connect(&[bootstrap.addr.to_string()])
                 .await
                 .expect("admin connects");
@@ -1597,7 +1600,7 @@ mod tests {
         /// The first `unreachable_answers` `FindCoordinator` answers name
         /// `unreachable`, an address that refuses connections.
         unreachable_answers: usize,
-        unreachable: Option<std::net::SocketAddr>,
+        unreachable: Option<SocketAddr>,
         /// The coordinator does not answer the transaction request.
         silent: bool,
         /// The first `closed_find_coordinators` `FindCoordinator` requests
@@ -1621,10 +1624,8 @@ mod tests {
     }
 
     /// An address on which no listener accepts connections.
-    async fn refused_address() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port");
+    async fn refused_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
         listener.local_addr().expect("local address")
     }
 
@@ -1662,11 +1663,11 @@ mod tests {
     /// `DescribeTransactions` and `InitProducerId` with the codes of `script`.
     async fn scripted_transaction_broker(
         script: Arc<Mutex<CoordinatorScript>>,
-        coordinator: Arc<Mutex<Option<std::net::SocketAddr>>>,
+        coordinator: Arc<Mutex<Option<SocketAddr>>>,
     ) -> MockBroker {
         MockBroker::start_with_replies(move |api_key, version, _, _| {
-            let mut script = script.lock().expect("script lock");
-            let script = &mut *script;
+            let mut guard = script.lock().expect("script lock");
+            let script = &mut *guard;
             if api_key == find_coordinator_request::API_KEY && script.closed_find_coordinators > 0 {
                 script.closed_find_coordinators -= 1;
                 script.find_coordinator_requests += 1;
@@ -1743,9 +1744,11 @@ mod tests {
                 }
                 _ => None,
             };
+            drop(guard);
             reply.map_or(MockReply::Silent, MockReply::Respond)
         })
         .await
+        .unwrap()
     }
 
     /// A call that stops at its deadline gives a timeout. The retry tests give
@@ -1815,7 +1818,7 @@ mod tests {
             max_retries: u32::MAX,
         };
 
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let result = match call {
             Describe => admin
                 .describe_transaction_with_retry("payments", retry)
@@ -1836,13 +1839,18 @@ mod tests {
         bootstrap.stop();
         coordinator.stop();
         let script = script.lock().expect("script lock");
+        let (find_coordinator_requests, coordinator_requests) = (
+            script.find_coordinator_requests,
+            script.coordinator_requests,
+        );
+        drop(script);
         // A call never runs far past its deadline.
         let within_deadline = started.elapsed() < timeout + Duration::from_secs(2);
         assert2::assert!(
             (
                 result,
-                script.find_coordinator_requests,
-                script.coordinator_requests,
+                find_coordinator_requests,
+                coordinator_requests,
                 within_deadline
             ) == (expected.0, expected.1, expected.2, true),
             "case {name}"
@@ -2126,7 +2134,7 @@ mod tests {
         .await
         .expect("admin connects");
 
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let result = admin.describe_transactions(&["payments", "payments"]).await;
         let elapsed = started.elapsed();
 
@@ -2155,7 +2163,7 @@ mod tests {
     /// A `Metadata` answer in which broker 1 at `addr` leads `orders`-0 and
     /// `orders`-1, with `partition_error` on each partition, and `missing`
     /// is an unknown topic.
-    fn orders_metadata(addr: std::net::SocketAddr, partition_error: i16) -> MetadataResponse {
+    fn orders_metadata(addr: SocketAddr, partition_error: i16) -> MetadataResponse {
         let partition = |partition_index| MetadataResponsePartition {
             error_code: partition_error,
             partition_index,
@@ -2197,7 +2205,7 @@ mod tests {
 
     #[test]
     fn partition_leader_address_resolves_the_leader_or_reports_the_metadata_error() {
-        let addr: std::net::SocketAddr = "127.0.0.1:9092".parse().expect("address");
+        let addr: SocketAddr = "127.0.0.1:9092".parse().expect("address");
         let mut leaderless = orders_metadata(addr, 0);
         leaderless.topics[0].partitions[1].leader_id = 9;
         for (name, metadata, topic, partition, expected) in [
@@ -2570,7 +2578,7 @@ mod tests {
     /// brokers that its `Metadata` answer lists, itself first.
     async fn leader_broker(
         script: Arc<Mutex<LeaderScript>>,
-        cluster: Arc<Mutex<Vec<std::net::SocketAddr>>>,
+        cluster: Arc<Mutex<Vec<SocketAddr>>>,
     ) -> MockBroker {
         MockBroker::start(move |api_key, version, _, body| {
             let mut script = script.lock().expect("script lock");
@@ -2615,10 +2623,11 @@ mod tests {
             }
         })
         .await
+        .unwrap()
     }
 
     /// An admin client on `bootstrap` that retries after 1 ms.
-    async fn fast_admin(bootstrap: std::net::SocketAddr) -> AdminClient {
+    async fn fast_admin(bootstrap: SocketAddr) -> AdminClient {
         AdminClient::connect_with_config(
             &[bootstrap.to_string()],
             crate::AdminClientConfig {
@@ -2664,13 +2673,13 @@ mod tests {
 
             broker.stop();
             let script = script.lock().expect("script lock");
+            let (metadata_requests, write_requests) =
+                (script.metadata_requests, script.write_requests.clone());
+            drop(script);
             let expected_requests = vec![abort_transaction_request(&orders_spec()); expected.2];
             assert2::assert!(
-                (
-                    result,
-                    script.metadata_requests,
-                    script.write_requests.clone()
-                ) == (expected.0, expected.1, expected_requests),
+                (result, metadata_requests, write_requests)
+                    == (expected.0, expected.1, expected_requests),
                 "case {name}"
             );
         }
@@ -2799,7 +2808,7 @@ mod tests {
             let result = admin.describe_producers(&both).await;
 
             broker.stop();
-            let seen = seen.lock().expect("seen lock");
+            let seen = seen.lock().expect("seen lock").clone();
             let requests = seen
                 .requests
                 .iter()
@@ -2943,20 +2952,22 @@ mod tests {
             .map(|(transactional_id, result)| (transactional_id, outcome_of(result)))
             .collect::<BTreeMap<_, _>>();
         let script = script.lock().expect("script lock");
+        let (find_coordinator_requests, coordinator_requests) = (
+            script.find_coordinator_requests,
+            script.coordinator_requests,
+        );
+        drop(script);
         assert2::assert!(
-            (
-                results,
-                script.find_coordinator_requests,
-                script.coordinator_requests
-            ) == (
-                maplit::btreemap! {
-                    String::new() => failed("protocol", 0),
-                    "orders".to_owned() => OK,
-                    "payments".to_owned() => OK,
-                },
-                2,
-                2
-            )
+            (results, find_coordinator_requests, coordinator_requests)
+                == (
+                    maplit::btreemap! {
+                        String::new() => failed("protocol", 0),
+                        "orders".to_owned() => OK,
+                        "payments".to_owned() => OK,
+                    },
+                    2,
+                    2
+                )
         );
     }
 
@@ -2966,8 +2977,7 @@ mod tests {
     /// runtime, so each future must be `Send`.
     #[test]
     fn retrying_admin_call_futures_are_send() {
-        let _ = |admin: &mut AdminClient,
-                 offsets: &std::collections::BTreeMap<(String, i32), i64>| {
+        let _ = |admin: &mut AdminClient, offsets: &BTreeMap<(String, i32), i64>| {
             assert_send(admin.alter_consumer_group_offsets("workers", offsets));
             assert_send(admin.list_consumer_group_offsets("workers"));
             assert_send(admin.describe_transaction("payments"));

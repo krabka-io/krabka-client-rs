@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use std::{
     net::SocketAddr,
     sync::{
@@ -8,25 +10,23 @@ use std::{
 
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
-use krabka_client_admin::{AclEntryFilter, AdminClient};
+use krabka_client_admin::{AclEntryFilter, AdminClient, AdminClientLike as _};
 use krabka_protocol::{
     Encode,
     owned::{
         api_versions_request,
         api_versions_response::{ApiVersion, ApiVersionsResponse},
         describe_acls_request,
-        describe_acls_response::DescribeAclsResponse,
+        describe_acls_response::{self, DescribeAclsResponse},
     },
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::{
     codec::{Framed, LengthDelimitedCodec},
     sync::CancellationToken,
 };
 
-fn kafka_frame(
-    stream: tokio::net::TcpStream,
-) -> Framed<tokio::net::TcpStream, LengthDelimitedCodec> {
+fn kafka_frame(stream: TcpStream) -> Framed<TcpStream, LengthDelimitedCodec> {
     Framed::new(
         stream,
         LengthDelimitedCodec::builder()
@@ -65,7 +65,7 @@ fn api_versions_response_v0() -> Vec<u8> {
 
 fn describe_acls_response(version: i16) -> Vec<u8> {
     let mut buf = BytesMut::new();
-    if version >= krabka_protocol::owned::describe_acls_response::FLEXIBLE_MIN {
+    if version >= describe_acls_response::FLEXIBLE_MIN {
         buf.extend_from_slice(&[0x00]);
     }
     DescribeAclsResponse::default()

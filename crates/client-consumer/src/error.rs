@@ -5,10 +5,7 @@ use std::collections::BTreeSet;
 use krabka_client_core::ClientError;
 use thiserror::Error;
 
-pub(crate) fn is_transport_error(
-    error: &krabka_client_core::ClientError,
-    includes_timeout: bool,
-) -> bool {
+pub fn is_transport_error(error: &krabka_client_core::ClientError, includes_timeout: bool) -> bool {
     matches!(
         error,
         ClientError::Connect { .. }
@@ -42,7 +39,7 @@ pub enum ConsumerError {
     InvalidConfig(String),
 
     #[error("startup failed after joining group: {0}")]
-    StartupAfterJoin(Box<ConsumerError>),
+    StartupAfterJoin(Box<Self>),
 
     #[error("not subscribed to any topic")]
     NotSubscribed,
@@ -81,7 +78,7 @@ pub enum ConsumerError {
     Timeout {
         message: String,
         #[source]
-        cause: Option<Box<ConsumerError>>,
+        cause: Option<Box<Self>>,
     },
 
     #[error("invalid seek offset {0}: must be non-negative")]
@@ -96,7 +93,7 @@ pub enum ConsumerError {
     /// can succeed. Kafka's consumer gives `RetriableCommitFailedException` to
     /// the `OffsetCommitCallback`.
     #[error("offset commit failed with a retriable exception: {0}")]
-    RetriableCommitFailed(Box<ConsumerError>),
+    RetriableCommitFailed(Box<Self>),
 
     #[error("commit conflict: rejoined since this poll")]
     CommitInvalid,
@@ -225,7 +222,7 @@ mod tests {
             (
                 "topic authorization failed",
                 ConsumerError::TopicAuthorizationFailed(
-                    maplit::btreeset! {"orders".to_string(), "payments".to_string()},
+                    maplit::btreeset! {"orders".to_owned(), "payments".to_owned()},
                 ),
                 "not authorized to access topics: [orders, payments]",
             ),
@@ -275,7 +272,7 @@ mod tests {
             (
                 "no offset for partition",
                 ConsumerError::NoOffsetForPartition(
-                    maplit::btreeset! {("orders".to_string(), 0), ("orders".to_string(), 1)},
+                    maplit::btreeset! {("orders".to_owned(), 0), ("orders".to_owned(), 1)},
                 ),
                 "undefined offset with no reset policy for partitions: [orders-0, orders-1]",
             ),

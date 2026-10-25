@@ -26,7 +26,7 @@
 //! 0 → 1 → 2 → …. A wrong epoch makes the broker drop the session with
 //! `INVALID_SHARE_SESSION_EPOCH`.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, mem, time::Duration};
 
 use krabka_protocol::{
     owned::{
@@ -46,6 +46,8 @@ use krabka_units::{
     ByteSize, Time,
     convert::{ByteSizeExt as _, TimeExt as _},
 };
+use tokio::time::{Instant, sleep};
+use tracing::field;
 
 use super::{
     consumer::ShareConsumer,
@@ -82,17 +84,17 @@ fn build_share_fetch_topics(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[bon::builder]
 fn build_share_fetch_request(
-    group_id: String,
-    member_id: String,
+    #[builder(into)] group_id: String,
+    #[builder(into)] member_id: String,
     share_session_epoch: i32,
     timeout: Time,
     min: ByteSize,
     max: ByteSize,
     max_records: i32,
     acquire_mode: ShareAcquireMode,
-    topics: Vec<FetchTopic>,
+    #[builder(default)] topics: Vec<FetchTopic>,
 ) -> ShareFetchRequest {
     ShareFetchRequest {
         group_id: Some(group_id),
@@ -180,7 +182,7 @@ fn share_partition_records(topic_name: &str, part: &PartitionData) -> Vec<ShareC
                 .map_or(0, |ar| ar.delivery_count);
             let (timestamp, timestamp_type) = record_timestamp(batch, r);
             out.push(ShareConsumerRecord {
-                topic: topic_name.to_string(),
+                topic: topic_name.to_owned(),
                 partition: part.partition_index,
                 offset,
                 timestamp,
@@ -220,15 +222,15 @@ impl ShareConsumer {
             member_id = %self.member_id,
             session_epoch = self.share_session_epoch,
             timeout_ms = timeout.millis_i64_trunc(),
-            assigned_partitions = tracing::field::Empty,
-            records = tracing::field::Empty,
+            assigned_partitions = field::Empty,
+            records = field::Empty,
         ),
         err(level = "debug")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn poll(&mut self, timeout: Time) -> Result<Vec<ShareConsumerRecord>, ConsumerError> {
-        let deadline = tokio::time::Instant::now() + timeout.to_std();
+        let deadline = Instant::now() + timeout.to_std();
         let assignment = loop {
             // A heartbeat can assign partitions or report a fatal error while
             // this poll waits for the initial assignment or a rejoin.
@@ -239,11 +241,11 @@ impl ShareConsumer {
             if !assignment.is_empty() {
                 break assignment;
             }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(Vec::new());
             }
-            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(20))).await;
+            sleep(remaining.min(Duration::from_millis(20))).await;
         };
         tracing::Span::current().record("assigned_partitions", assignment.len());
 
@@ -257,17 +259,21 @@ impl ShareConsumer {
 
         let resp = self
             .client
-            .send(build_share_fetch_request(
-                self.group_id.clone(),
-                self.member_id.clone(),
-                self.share_session_epoch,
-                Time::from_std(deadline.saturating_duration_since(tokio::time::Instant::now())),
-                self.fetch_min,
-                self.fetch_max,
-                self.fetch_max_records,
-                self.acquire_mode,
-                topics,
-            ))
+            .send(
+                build_share_fetch_request()
+                    .group_id(self.group_id.clone())
+                    .member_id(self.member_id.clone())
+                    .share_session_epoch(self.share_session_epoch)
+                    .timeout(Time::from_std(
+                        deadline.saturating_duration_since(Instant::now()),
+                    ))
+                    .min(self.fetch_min)
+                    .max(self.fetch_max)
+                    .max_records(self.fetch_max_records)
+                    .acquire_mode(self.acquire_mode)
+                    .topics(topics)
+                    .call(),
+            )
             .await?;
 
         if response_has_error(resp.error_code) {
@@ -464,7 +470,7 @@ impl ShareConsumer {
         if self.pending_acks.is_empty() {
             return Ok(());
         }
-        let drained = std::mem::take(&mut self.pending_acks);
+        let drained = mem::take(&mut self.pending_acks);
         let topics = build_ack_topics(drained);
 
         let resp = self
@@ -496,7 +502,7 @@ impl ShareConsumer {
         let mut out: HashMap<(WireUuid, i32), Vec<FetchAckBatch>> = HashMap::new();
         match self.ack_mode {
             ShareAckMode::Implicit => {
-                for (tid, partition, first, last) in std::mem::take(&mut self.prev_delivered) {
+                for (tid, partition, first, last) in mem::take(&mut self.prev_delivered) {
                     let count = range_len(first, last);
                     out.entry((tid, partition))
                         .or_default()
@@ -509,7 +515,7 @@ impl ShareConsumer {
                 }
             }
             ShareAckMode::Explicit => {
-                for (tid, partition, first, last, ack) in std::mem::take(&mut self.pending_acks) {
+                for (tid, partition, first, last, ack) in mem::take(&mut self.pending_acks) {
                     let count = range_len(first, last);
                     out.entry((tid, partition))
                         .or_default()
@@ -590,7 +596,7 @@ fn build_ack_topics(acks: Vec<(WireUuid, i32, i64, i64, i8)>) -> Vec<Acknowledge
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use assert2::check;
     use krabka_client_core::Client;
@@ -671,7 +677,7 @@ mod tests {
             records::{Record, RecordBatch, RecordsPayload},
         };
 
-        let fetched = Arc::new(std::sync::Mutex::new(None));
+        let fetched = Arc::new(StdMutex::new(None));
         let observed = Arc::clone(&fetched);
         let broker = MockBroker::start(move |api_key, version, _corr, mut body| {
             let mut encoded = BytesMut::new();
@@ -726,7 +732,8 @@ mod tests {
             }
             Some(encoded.to_vec())
         })
-        .await;
+        .await
+        .unwrap();
         let mut consumer = test_consumer(ShareAckMode::Explicit).await;
         consumer.client = Client::builder()
             .bootstrap(broker.addr.to_string())
@@ -737,24 +744,25 @@ mod tests {
         consumer.share_session_epoch = 0;
         let assignment = Arc::clone(&consumer.assignment);
         let assigned = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
             assignment.lock().await.push((id(7), "topic-a".into(), 2));
         });
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let records = consumer.poll(krabka_units::secs(1)).await.unwrap();
         let elapsed = started.elapsed();
         assigned.await.unwrap();
         broker.stop();
 
-        assert2::assert!(elapsed < std::time::Duration::from_secs(1));
+        assert2::assert!(elapsed < Duration::from_secs(1));
         assert2::assert!(records.len() == 1);
         assert2::assert!(
             (records[0].offset, records[0].value.as_deref()) == (7, Some(&b"work"[..]))
         );
         assert2::assert!(consumer.share_session_epoch == 1);
-        let fetched = fetched.lock().unwrap();
         let request = fetched
-            .as_ref()
+            .lock()
+            .unwrap()
+            .clone()
             .expect("assignment triggers a ShareFetch in this poll");
         assert2::assert!((1..=900).contains(&request.max_wait_ms));
         assert2::assert!(request.topics[0].partitions[0].partition_index == 2);
@@ -765,15 +773,13 @@ mod tests {
         let mut consumer = test_consumer(ShareAckMode::Explicit).await;
         consumer.assignment.lock().await.clear();
         for timeout_ms in [0, 37] {
-            let started = tokio::time::Instant::now();
+            let started = Instant::now();
             let records = consumer
                 .poll(krabka_units::millis(timeout_ms))
                 .await
                 .unwrap();
             assert2::assert!(records.is_empty());
-            assert2::assert!(
-                started.elapsed() == std::time::Duration::from_millis(u64::from(timeout_ms))
-            );
+            assert2::assert!(started.elapsed() == Duration::from_millis(u64::from(timeout_ms)));
         }
         assert2::assert!(consumer.share_session_epoch == 4);
     }
@@ -784,19 +790,19 @@ mod tests {
         consumer.assignment.lock().await.clear();
         let poll_error = Arc::clone(&consumer.poll_error);
         let rejected = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            sleep(Duration::from_millis(5)).await;
             coordinator::report_rejoin_error(
                 &poll_error,
                 ConsumerError::GroupAuthorizationFailed("group-a".into()),
             );
         });
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let result = consumer.poll(krabka_units::secs(1)).await;
         rejected.await.unwrap();
         assert2::assert!(
             matches!(result, Err(ConsumerError::GroupAuthorizationFailed(group)) if group == "group-a")
         );
-        assert2::assert!(started.elapsed() <= std::time::Duration::from_millis(20));
+        assert2::assert!(started.elapsed() <= Duration::from_millis(20));
     }
 
     fn only<T>(items: &[T]) -> &T {
@@ -817,17 +823,17 @@ mod tests {
             ..Default::default()
         };
 
-        let req = build_share_fetch_request(
-            "group-a".into(),
-            "member-a".into(),
-            4,
-            krabka_units::millis(250),
-            krabka_units::bytes(7),
-            krabka_units::bytes(65_536),
-            37,
-            ShareAcquireMode::RecordLimit,
-            vec![topic.clone()],
-        );
+        let req = build_share_fetch_request()
+            .group_id("group-a")
+            .member_id("member-a")
+            .share_session_epoch(4)
+            .timeout(krabka_units::millis(250))
+            .min(krabka_units::bytes(7))
+            .max(krabka_units::bytes(65_536))
+            .max_records(37)
+            .acquire_mode(ShareAcquireMode::RecordLimit)
+            .topics(vec![topic.clone()])
+            .call();
 
         assert2::assert!(
             req == ShareFetchRequest {
@@ -847,48 +853,45 @@ mod tests {
             }
         );
 
-        let saturated = build_share_fetch_request(
-            "group-a".into(),
-            "member-a".into(),
-            4,
-            Time::from_millis(i64::from(u32::MAX)),
-            krabka_units::bytes(7),
-            krabka_units::bytes(65_536),
-            37,
-            ShareAcquireMode::BatchOptimized,
-            Vec::new(),
-        );
+        let saturated = build_share_fetch_request()
+            .group_id("group-a")
+            .member_id("member-a")
+            .share_session_epoch(4)
+            .timeout(Time::from_millis(i64::from(u32::MAX)))
+            .min(krabka_units::bytes(7))
+            .max(krabka_units::bytes(65_536))
+            .max_records(37)
+            .acquire_mode(ShareAcquireMode::BatchOptimized)
+            .call();
         assert2::assert!((saturated.max_wait_ms, saturated.share_acquire_mode) == (i32::MAX, 0));
 
         // A sub-millisecond remainder truncates: rounding 250.9 ms up to 251
         // would hold the broker's Fetch open past the caller's budget.
-        let fractional = build_share_fetch_request(
-            "group-a".into(),
-            "member-a".into(),
-            4,
-            krabka_units::micros(250_900),
-            krabka_units::bytes(7),
-            krabka_units::bytes(65_536),
-            37,
-            ShareAcquireMode::BatchOptimized,
-            Vec::new(),
-        );
+        let fractional = build_share_fetch_request()
+            .group_id("group-a")
+            .member_id("member-a")
+            .share_session_epoch(4)
+            .timeout(krabka_units::micros(250_900))
+            .min(krabka_units::bytes(7))
+            .max(krabka_units::bytes(65_536))
+            .max_records(37)
+            .acquire_mode(ShareAcquireMode::BatchOptimized)
+            .call();
         assert2::assert!(fractional.max_wait_ms == 250);
     }
 
     #[test]
     fn share_fetch_request_encodes_default_sizes_as_their_exact_wire_integers() {
-        let req = build_share_fetch_request(
-            "group-a".into(),
-            "member-a".into(),
-            0,
-            krabka_units::millis(500),
-            krabka_units::bytes(1),
-            krabka_units::mebibytes(50),
-            500,
-            ShareAcquireMode::BatchOptimized,
-            Vec::new(),
-        );
+        let req = build_share_fetch_request()
+            .group_id("group-a")
+            .member_id("member-a")
+            .share_session_epoch(0)
+            .timeout(krabka_units::millis(500))
+            .min(krabka_units::bytes(1))
+            .max(krabka_units::mebibytes(50))
+            .max_records(500)
+            .acquire_mode(ShareAcquireMode::BatchOptimized)
+            .call();
 
         assert2::assert!(
             req == ShareFetchRequest {
@@ -1065,7 +1068,7 @@ mod tests {
             },
         };
 
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
         let observed = Arc::clone(&requests);
         let mut responses = [(0, 0), (17, 0), (0, 121)].into_iter();
         let broker = MockBroker::start(move |api_key, version, _corr, mut body| {
@@ -1113,7 +1116,8 @@ mod tests {
             }
             Some(encoded.to_vec())
         })
-        .await;
+        .await
+        .unwrap();
         let mut consumer = test_consumer(ShareAckMode::Explicit).await;
         consumer.client = Client::builder()
             .bootstrap(broker.addr.to_string())
@@ -1172,7 +1176,7 @@ mod tests {
         let acks = consumer.take_piggyback_acks();
 
         assert2::assert!(consumer.prev_delivered.is_empty());
-        let batch = only(acks.get(&(id(7), 2)).unwrap());
+        let batch = only(&acks[&(id(7), 2)]);
         assert2::assert!(
             *batch
                 == FetchAckBatch {
@@ -1198,7 +1202,7 @@ mod tests {
                 consumer.pending_acks.is_empty()
             ) == (true, true)
         );
-        let batch = only(acks.get(&(id(7), 2)).unwrap());
+        let batch = only(&acks[&(id(7), 2)]);
         assert2::assert!(
             *batch
                 == FetchAckBatch {

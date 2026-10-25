@@ -1,9 +1,11 @@
 //! Shared protocol-response builders for mock-client tests, and a capture of
 //! the tracing events a call records.
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use bytes::BytesMut;
 use krabka_protocol::{
-    Encode,
+    Encode, ProtocolError,
     owned::{
         api_versions_request,
         api_versions_response::{ApiVersion, ApiVersionsResponse},
@@ -14,10 +16,14 @@ use krabka_protocol::{
         },
     },
 };
+use tracing::subscriber::set_default;
+use tracing_subscriber::layer::Context;
 
 /// Advertises API versions plus one request API at its supported maximum.
-#[must_use]
-pub fn api_versions_with(api_key: i16, max_version: i16) -> Vec<u8> {
+///
+/// # Errors
+/// Returns the codec error when the response does not encode.
+pub fn api_versions_with(api_key: i16, max_version: i16) -> Result<Vec<u8>, ProtocolError> {
     encode_api_versions(vec![
         api_version(api_versions_request::API_KEY, 0, 3),
         api_version(api_key, 0, max_version),
@@ -56,8 +62,13 @@ pub fn api_versions_response_ranges(
 
 /// Advertises one group RPC plus the API-versions, coordinator lookup, and
 /// metadata requests needed by consumer tests.
-#[must_use]
-pub fn group_api_versions(api_key: i16, version_range: (i16, i16)) -> Vec<u8> {
+///
+/// # Errors
+/// Returns the codec error when the response does not encode.
+pub fn group_api_versions(
+    api_key: i16,
+    version_range: (i16, i16),
+) -> Result<Vec<u8>, ProtocolError> {
     encode_api_versions(vec![
         api_version(api_versions_request::API_KEY, 0, 3),
         api_version(api_key, version_range.0, version_range.1),
@@ -75,16 +86,14 @@ fn api_version(api_key: i16, min_version: i16, max_version: i16) -> ApiVersion {
     }
 }
 
-fn encode_api_versions(api_keys: Vec<ApiVersion>) -> Vec<u8> {
+fn encode_api_versions(api_keys: Vec<ApiVersion>) -> Result<Vec<u8>, ProtocolError> {
     let response = ApiVersionsResponse {
         api_keys,
         ..Default::default()
     };
     let mut buffer = BytesMut::new();
-    response
-        .encode(&mut buffer, 0)
-        .expect("encode API versions");
-    buffer.to_vec()
+    response.encode(&mut buffer, 0)?;
+    Ok(buffer.to_vec())
 }
 
 /// Builds an `OffsetCommit` response with one result for every requested partition.
@@ -117,17 +126,13 @@ pub fn offset_commit_response(
 
 /// The level of every event recorded while it is the default subscriber.
 #[derive(Clone, Default)]
-struct EventLevels(std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>);
+struct EventLevels(Arc<Mutex<Vec<tracing::Level>>>);
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLevels {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _context: tracing_subscriber::layer::Context<'_, S>,
-    ) {
+    fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
         self.0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .push(*event.metadata().level());
     }
 }
@@ -141,13 +146,12 @@ pub async fn recorded_levels<T>(call: impl Future<Output = T>) -> (T, Vec<tracin
     use tracing_subscriber::layer::SubscriberExt as _;
 
     let levels = EventLevels::default();
-    let _default =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(levels.clone()));
+    let _default = set_default(tracing_subscriber::registry().with(levels.clone()));
     let output = call.await;
     let recorded = levels
         .0
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
         .clone();
     (output, recorded)
 }

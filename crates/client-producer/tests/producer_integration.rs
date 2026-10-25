@@ -17,14 +17,16 @@
 //! `flavor = "multi_thread", worker_threads = 2` stays necessary. A
 //! single-threaded runtime cannot drive the producer sender task and the test
 //! body at the same time.
+#![cfg(test)]
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use krabka_client_consumer::{AutoOffsetReset, Consumer};
 use krabka_client_producer::{Acks, Producer, ProducerError, ProducerRecord};
+use tokio::time;
 
 /// Record count for the produce-then-consume case.
 const PRODUCE_N: usize = 20;
@@ -40,19 +42,20 @@ async fn idempotence_plus_acks_zero_rejects() {
     // it claims.
     let kafka = support::start_kafka().await;
 
-    let result = Producer::builder()
+    let error = Producer::builder()
         .bootstrap(kafka.bootstrap.clone())
         .enable_idempotence(true)
         .acks(Acks::Zero)
         .build()
-        .await;
+        .await
+        .err();
 
-    assert2::assert!(matches!(result, Err(ProducerError::InvalidConfig(_))));
+    assert2::assert!(matches!(error, Some(ProducerError::InvalidConfig(_))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker"]
-async fn non_idempotent_acks_zero_fire_and_forget() {
+async fn non_idempotent_acks_zero_fire_and_forget() -> Result<(), ProducerError> {
     support::init_tracing();
     let kafka = support::start_kafka().await;
     let client = support::bootstrap_client(&kafka.bootstrap).await;
@@ -79,10 +82,9 @@ async fn non_idempotent_acks_zero_fire_and_forget() {
     producer.flush().await.expect("flush");
     // acks=0 is fire-and-forget. The case only proves that delivery does
     // not hang.
-    let _ = tokio::time::timeout(Duration::from_secs(2), acknowledgement).await;
+    let _ = time::timeout(Duration::from_secs(2), acknowledgement).await;
 
-    producer.close().await.expect("close");
-    client.close();
+    producer.close().await.map(|()| client.close())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -94,7 +96,9 @@ async fn idempotent_produce_then_consume() {
     let topic = support::unique("producer-idempotent");
     support::create_topic(&client, &topic).await;
 
-    produce_records(&kafka.bootstrap, &topic).await;
+    produce_records(&kafka.bootstrap, &topic)
+        .await
+        .expect("producer close");
     let seen = consume_records(&kafka.bootstrap, &topic).await;
     assert2::assert!(seen == PRODUCE_N);
 
@@ -102,8 +106,8 @@ async fn idempotent_produce_then_consume() {
 }
 
 /// Write [`PRODUCE_N`] records with an idempotent `acks=all` producer and wait
-/// for every acknowledgement.
-async fn produce_records(bootstrap: &str, topic: &str) {
+/// for every acknowledgement. The producer is closed.
+async fn produce_records(bootstrap: &str, topic: &str) -> Result<(), ProducerError> {
     let producer = Producer::builder()
         .bootstrap(bootstrap.to_owned())
         .enable_idempotence(true)
@@ -135,7 +139,7 @@ async fn produce_records(bootstrap: &str, topic: &str) {
         assert2::assert!(metadata.partition == 0);
     }
 
-    producer.close().await.expect("producer close");
+    producer.close().await
 }
 
 /// Read the topic back through a consumer group and return the record count.
@@ -157,8 +161,8 @@ async fn consume_records(bootstrap: &str, topic: &str) -> usize {
         .expect("consumer build");
 
     let mut seen = 0usize;
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while seen < PRODUCE_N && std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while seen < PRODUCE_N && Instant::now() < deadline {
         seen += consumer
             .poll(krabka_units::millis(500))
             .await

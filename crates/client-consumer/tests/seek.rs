@@ -19,6 +19,7 @@
 //! ```text
 //! cargo test -p krabka-client-consumer --test seek -- --ignored --nocapture
 //! ```
+#![cfg(test)]
 
 mod support;
 
@@ -28,6 +29,7 @@ use assert2::{assert, check};
 use krabka_client_consumer::{AutoOffsetReset, Consumer, ConsumerError, ConsumerRecord};
 use krabka_client_producer::{Producer, ProducerRecord};
 use krabka_units::{millis, secs};
+use tokio::time::sleep;
 
 /// How long a case waits for the records it expects.
 const POLL_BUDGET: Duration = Duration::from_secs(30);
@@ -49,7 +51,7 @@ async fn produce_n(bootstrap: &str, topic: &str, partition: i32, n: u32) {
     for i in 0..n {
         producer
             .send(ProducerRecord {
-                topic: topic.to_string(),
+                topic: topic.to_owned(),
                 partition: Some(partition),
                 key: Some(format!("k{partition}-{i}").into()),
                 value: Some(format!("p{partition}v{i}").into()),
@@ -60,6 +62,7 @@ async fn produce_n(bootstrap: &str, topic: &str, partition: i32, n: u32) {
             .expect("producer ack");
     }
     producer.flush().await.expect("producer flush");
+    drop(producer);
 }
 
 /// Poll until `want` records arrive or the budget runs out.
@@ -90,7 +93,7 @@ async fn earliest_consumer(bootstrap: &str, topic: &str, group: &str, client_id:
         .session_timeout(secs(30))
         .max_poll_interval(secs(10))
         .heartbeat_interval(millis(500))
-        .subscribe(vec![topic.to_string()])
+        .subscribe(vec![topic.to_owned()])
         .auto_offset_reset(AutoOffsetReset::Earliest)
         .build()
         .await
@@ -111,7 +114,7 @@ async fn wait_for_assignment_count(consumer: &Consumer, want: usize) {
         );
         // Real-time wait, not a progress poll: the rebalance runs in the
         // broker process and publishes no signal this side can await.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
     }
 }
 

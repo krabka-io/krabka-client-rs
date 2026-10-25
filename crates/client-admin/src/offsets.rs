@@ -332,7 +332,10 @@ impl AdminClient {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
 
     use krabka_protocol::owned::list_offsets_response::{
         ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
@@ -517,7 +520,7 @@ mod tests {
         /// The highest `ListOffsets` version that the leader advertises.
         max_version: i16,
         /// The leader of each `Metadata` answer, `None` for the mock itself.
-        leaders: Vec<Option<std::net::SocketAddr>>,
+        leaders: Vec<Option<SocketAddr>>,
         /// The code of `orders`-1 in each `ListOffsets` answer.
         orders_1_codes: Vec<i16>,
         /// The spec of `orders`-1.
@@ -652,7 +655,7 @@ mod tests {
                 .await;
 
             broker.stop();
-            let seen = seen.lock().expect("seen lock");
+            let seen = seen.lock().expect("seen lock").clone();
             let requests = seen
                 .requests
                 .iter()
@@ -725,7 +728,7 @@ mod tests {
             .into_iter()
             .map(|(key, result)| (key, result.map_err(|error| error.code)))
             .collect::<Vec<_>>();
-        let seen = seen.lock().expect("seen lock");
+        let seen = seen.lock().expect("seen lock").clone();
         assert2::assert!(codes == vec![(("missing".to_owned(), 0), Err(7))]);
         assert2::assert!(seen.metadata_requests > 1);
         assert2::assert!(seen.requests.is_empty());

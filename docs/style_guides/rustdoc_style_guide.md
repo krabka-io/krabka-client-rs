@@ -105,7 +105,7 @@ Use only these standard sections, in this order:
 
 There is no `# Safety` section: Krabka forbids `unsafe` (`unsafe_code = "forbid"`), so there are no `unsafe fn` to document.
 
-The workspace lints relax `missing_errors_doc` and `missing_panics_doc`, so the lints do **not** force a `# Errors` or `# Panics` section. Add them where they genuinely help the caller. Omit them when the error or panic condition is already obvious from the signature. Do not add sections that only repeat the summary.
+`clippy::pedantic` includes `missing_errors_doc` and `missing_panics_doc`, and the workspace denies both, so a public function that returns `Result` needs an `# Errors` section and one that can panic needs a `# Panics` section. Keep each one short, and do not add sections that only repeat the summary.
 
 **State the real conditions for the item the section sits on. Never paste a generic sentence across a crate.** A section that does not describe its own item is worse than no section, because a reader trusts it. If you cannot state the real condition, delete the section. Do not leave a placeholder.
 

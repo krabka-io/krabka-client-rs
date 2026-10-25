@@ -35,6 +35,7 @@
 //!
 //! The broker creates the `__share_group_state` topic itself, so no case
 //! bootstraps it.
+#![cfg(test)]
 
 mod support;
 
@@ -55,6 +56,7 @@ use krabka_protocol::{
     primitives::uuid::Uuid as WireUuid,
 };
 use krabka_units::millis;
+use tokio::time::{sleep, timeout};
 
 /// Bound for every settle loop in this suite.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -320,7 +322,7 @@ async fn close_leaves_group() {
         ShareAckMode::Implicit,
     )
     .await;
-    let member_id = consumer.member_id().to_string();
+    let member_id = consumer.member_id().to_owned();
     assert2::assert!(!member_id.is_empty());
 
     wait_for_coverage(&admin, &group, topic_id, &[0], 1).await;
@@ -450,7 +452,7 @@ async fn share_consumer(
         .bootstrap(bootstrap)
         .client_id(client_id)
         .group_id(group_id)
-        .subscribe([topic.to_string()])
+        .subscribe([topic.to_owned()])
         .ack_mode(ack_mode)
         .heartbeat_interval(millis(300))
         .build()
@@ -500,11 +502,11 @@ fn expected(
         .map(|(i, value)| {
             let step = i64::try_from(i).expect("test fixture small enough for i64");
             (
-                topic.to_string(),
+                topic.to_owned(),
                 partition,
                 first_offset + step,
                 delivery_count,
-                (*value).to_string(),
+                (*value).to_owned(),
             )
         })
         .collect()
@@ -544,7 +546,7 @@ async fn poll_one_with_instant(
 /// poll can replace it.
 async fn sleep_until(target: Instant) {
     if let Some(remaining) = target.checked_duration_since(Instant::now()) {
-        tokio::time::sleep(remaining).await;
+        sleep(remaining).await;
     }
 }
 
@@ -554,7 +556,7 @@ async fn sleep_until(target: Instant) {
 async fn describe_group(client: &Client, group: &str) -> Option<DescribedGroup> {
     let resp = client
         .send(ShareGroupDescribeRequest {
-            group_ids: vec![group.to_string()],
+            group_ids: vec![group.to_owned()],
             include_authorized_operations: false,
             ..Default::default()
         })
@@ -577,7 +579,7 @@ async fn wait_for_coverage(
     partitions: &[i32],
     members: usize,
 ) {
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             if group_covers(client, group, topic_id, partitions, members).await {
                 return;
@@ -617,7 +619,7 @@ async fn group_covers(
 
 /// Wait until `group` no longer lists `member_id`.
 async fn wait_for_member_absent(client: &Client, group: &str, member_id: &str) {
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             let absent = match describe_group(client, group).await {
                 // The group stays but holds no such member, or the row is gone.
@@ -637,5 +639,5 @@ async fn wait_for_member_absent(client: &Client, group: &str, member_id: &str) {
 /// Real-time pause between two describe round trips, not a progress poll: the
 /// coordinator publishes no signal that this side can await.
 async fn describe_pause() {
-    tokio::time::sleep(DESCRIBE_RETRY_DELAY).await;
+    sleep(DESCRIBE_RETRY_DELAY).await;
 }

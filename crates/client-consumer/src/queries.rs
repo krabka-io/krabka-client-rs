@@ -14,13 +14,14 @@ use krabka_protocol::owned::{
     list_offsets_request::{ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic},
     list_offsets_response::ListOffsetsResponse,
     metadata_request::MetadataRequest,
-    metadata_response::MetadataResponse,
+    metadata_response::{MetadataResponse, MetadataResponseTopic},
 };
 use krabka_units::convert::TimeExt as _;
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 use crate::{
-    IsolationLevel, consumer::Consumer, coordinator::next_backoff, error::ConsumerError, poll,
-    poll::is_reset_sentinel,
+    IsolationLevel, consumer::Consumer, coordinator::next_backoff, error::ConsumerError,
+    offset_wire::is_retriable_error, poll, poll::is_reset_sentinel,
 };
 
 /// `TOPIC_AUTHORIZATION_FAILED`.
@@ -129,7 +130,7 @@ fn requested_topic_errors(
     metadata: &MetadataResponse,
     topics: &BTreeSet<String>,
 ) -> Result<(), ConsumerError> {
-    let requested = |topic: &&krabka_protocol::owned::metadata_response::MetadataResponseTopic| {
+    let requested = |topic: &&MetadataResponseTopic| {
         topic
             .name
             .as_ref()
@@ -236,7 +237,7 @@ fn topic_partition_infos(
         match topic.error_code {
             0 | UNKNOWN_TOPIC_OR_PARTITION => {}
             INVALID_TOPIC_EXCEPTION => return Err(ConsumerError::InvalidTopic(name)),
-            code if crate::offset_wire::is_retriable_error(code) => retry = true,
+            code if is_retriable_error(code) => retry = true,
             code => return Err(ConsumerError::Server(code)),
         }
     }
@@ -430,11 +431,11 @@ impl Consumer {
         search: HashMap<(String, i32), i64>,
         require_timestamps: bool,
     ) -> Result<HashMap<(String, i32), OffsetAndTimestamp>, ConsumerError> {
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let deadline = started + self.default_api_timeout.to_std();
         // The deadline bounds each request too, as Kafka's timer bounds each
         // `client.poll`.
-        tokio::time::timeout_at(
+        timeout_at(
             deadline,
             self.search_offsets_until(search, require_timestamps, started, deadline),
         )
@@ -451,8 +452,8 @@ impl Consumer {
         &self,
         mut search: HashMap<(String, i32), i64>,
         require_timestamps: bool,
-        started: tokio::time::Instant,
-        deadline: tokio::time::Instant,
+        started: Instant,
+        deadline: Instant,
     ) -> Result<HashMap<(String, i32), OffsetAndTimestamp>, ConsumerError> {
         let mut backoff = self.retry_policy.initial_backoff;
         let mut found = HashMap::new();
@@ -519,13 +520,13 @@ impl Consumer {
             if search.is_empty() {
                 break;
             }
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 return Err(ConsumerError::timeout(format!(
                     "Failed to get offsets by times in {}ms",
                     started.elapsed().as_millis()
                 )));
             }
-            tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
+            sleep_until((Instant::now() + backoff).min(deadline)).await;
             backoff = next_backoff(backoff, self.retry_policy.max_backoff);
         }
         Ok(found)
@@ -582,8 +583,8 @@ impl Consumer {
         &self,
         request: MetadataRequest,
     ) -> Result<HashMap<String, Vec<PartitionInfo>>, ConsumerError> {
-        let deadline = tokio::time::Instant::now() + self.default_api_timeout.to_std();
-        tokio::time::timeout_at(deadline, self.topic_metadata_until(request, deadline))
+        let deadline = Instant::now() + self.default_api_timeout.to_std();
+        timeout_at(deadline, self.topic_metadata_until(request, deadline))
             .await
             .unwrap_or_else(|_| {
                 Err(ConsumerError::timeout(
@@ -595,7 +596,7 @@ impl Consumer {
     async fn topic_metadata_until(
         &self,
         request: MetadataRequest,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<HashMap<String, Vec<PartitionInfo>>, ConsumerError> {
         let mut backoff = self.retry_policy.initial_backoff;
         loop {
@@ -608,12 +609,12 @@ impl Consumer {
                 Err(error) if poll::is_transient_transport_error(&error) => {}
                 Err(error) => return Err(error.into()),
             }
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 return Err(ConsumerError::timeout(
                     "Timeout expired while fetching topic metadata".to_owned(),
                 ));
             }
-            tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
+            sleep_until((Instant::now() + backoff).min(deadline)).await;
             backoff = next_backoff(backoff, self.retry_policy.max_backoff);
         }
     }
@@ -654,7 +655,7 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicU16, Ordering},
         },
     };
@@ -687,7 +688,7 @@ mod tests {
     /// leader epoch)` for a partition and a searched timestamp.
     type Rows = fn(i32, i64) -> (i16, i64, i64, i32);
 
-    type SentRequests = Arc<std::sync::Mutex<Vec<ListOffsetsRequest>>>;
+    type SentRequests = Arc<Mutex<Vec<ListOffsetsRequest>>>;
 
     fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
         let mut buf = bytes::BytesMut::new();
@@ -797,7 +798,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         port.store(broker.addr.port(), Ordering::SeqCst);
         broker
     }
@@ -845,7 +847,7 @@ mod tests {
     /// (`OffsetFetcher.fetchOffsetsByTimes`, `OffsetFetcherUtils.handleListOffsetResponse`).
     #[tokio::test]
     async fn offset_queries_follow_kafkas_offset_fetcher() {
-        let key = |partition: i32| ("orders".to_string(), partition);
+        let key = |partition: i32| ("orders".to_owned(), partition);
         let found: Rows = |partition, timestamp| {
             if timestamp < 0 {
                 (0, i64::from(partition) + 3, -1, -1)
@@ -999,6 +1001,69 @@ mod tests {
         assert2::assert!(actual == wanted);
     }
 
+    /// Kafka's `clientInstanceId` fails for a consumer whose client does not
+    /// push metrics.
+    #[tokio::test]
+    async fn client_instance_id_needs_metrics_push() {
+        let broker = query_broker(None, 0, 5, SentRequests::default()).await;
+        let client = Client::builder()
+            .bootstrap(broker.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let consumer = consumer_with_client(client);
+
+        let id = consumer
+            .client_instance_id(millis(100))
+            .await
+            .map_err(|error| error.to_string());
+
+        broker.stop();
+        assert2::assert!(
+            id == Err(
+                "client: Telemetry is not enabled. Set config `enable.metrics.push` to `true`."
+                    .to_owned()
+            )
+        );
+    }
+
+    /// A retriable error sends the query again after a backoff until
+    /// `default.api.timeout.ms`, as Kafka's `fetchOffsetsByTimes` and
+    /// `getTopicMetadata` do: a `NOT_LEADER_OR_FOLLOWER` (6) row of every
+    /// `ListOffsets` answer, and a `LEADER_NOT_AVAILABLE` (5) topic of every
+    /// `Metadata` answer.
+    #[tokio::test]
+    async fn retriable_errors_retry_until_the_api_timeout() {
+        let sent = SentRequests::default();
+        let offsets_broker =
+            query_broker(Some(|_, _| (6, -1, -1, -1)), 0, 5, Arc::clone(&sent)).await;
+        let metadata_broker = query_broker(None, 5, 5, SentRequests::default()).await;
+        let mut answers = Vec::new();
+        for broker in [&offsets_broker, &metadata_broker] {
+            let client = Client::builder()
+                .bootstrap(broker.addr.to_string())
+                .request_timeout(secs(30))
+                .build()
+                .await
+                .expect("client");
+            let mut consumer = consumer_with_client(client);
+            consumer.default_api_timeout = millis(300);
+            let answer = if answers.is_empty() {
+                consumer
+                    .end_offsets(&[("orders".to_owned(), 0)])
+                    .await
+                    .map(|_| ())
+            } else {
+                consumer.list_topics().await.map(|_| ())
+            };
+            answers.push(matches!(answer, Err(ConsumerError::Timeout { .. })));
+        }
+        offsets_broker.stop();
+        metadata_broker.stop();
+        let list_offsets_requests = sent.lock().expect("sent lock").len();
+        assert2::assert!((answers, list_offsets_requests > 1) == (vec![true, true], true));
+    }
+
     /// Kafka's `TopicMetadataFetcher.getTopicMetadata`: an unauthorized topic
     /// and an invalid topic fail, an unknown topic is left out, a retriable
     /// error sends the request again, and a replica that the broker list does
@@ -1033,21 +1098,19 @@ mod tests {
             (
                 "no error",
                 0,
-                Ok(Some(
-                    maplit::hashmap! {"orders".to_string() => orders.clone()},
-                )),
+                Ok(Some(maplit::hashmap! {"orders".to_owned() => orders})),
             ),
             ("unknown topic", 3, Ok(Some(HashMap::new()))),
             ("leader not available", 5, Ok(None)),
             (
                 "unauthorized",
                 29,
-                Err("not authorized to access topics: [orders]".to_string()),
+                Err("not authorized to access topics: [orders]".to_owned()),
             ),
             (
                 "invalid topic",
                 17,
-                Err("topic 'orders' is invalid".to_string()),
+                Err("topic 'orders' is invalid".to_owned()),
             ),
         ] {
             let result = topic_partition_infos(&metadata(9092, error_code))
@@ -1067,7 +1130,7 @@ mod tests {
     #[tokio::test]
     async fn list_topics_asks_for_every_topic() {
         use bytes::Buf as _;
-        let seen: Arc<std::sync::Mutex<Vec<MetadataRequest>>> = Arc::default();
+        let seen: Arc<Mutex<Vec<MetadataRequest>>> = Arc::default();
         let seen_in_mock = Arc::clone(&seen);
         let port = Arc::new(AtomicU16::new(0));
         let port_in_mock = Arc::clone(&port);
@@ -1100,7 +1163,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         port.store(broker.addr.port(), Ordering::SeqCst);
         let client = Client::builder()
             .bootstrap(broker.addr.to_string())
@@ -1112,8 +1176,8 @@ mod tests {
         let topics = consumer.list_topics().await.expect("list topics");
 
         assert2::check!(topics.keys().collect::<Vec<_>>() == vec!["orders"]);
-        let seen = seen.lock().expect("seen lock");
-        assert2::check!(seen.last() == Some(&krabka_client_core::all_topics_request()));
+        let last = seen.lock().expect("seen lock").last().cloned();
+        assert2::check!(last == Some(krabka_client_core::all_topics_request()));
         assert2::check!(
             krabka_client_core::all_topics_request()
                 == MetadataRequest {
@@ -1133,7 +1197,7 @@ mod tests {
             .await
             .expect("client");
         let consumer = consumer_with_client(client);
-        let key = ("orders".to_string(), 0);
+        let key = ("orders".to_owned(), 0);
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for (name, partition, position, end, seek, awaiting_validation, expected) in [
@@ -1157,7 +1221,7 @@ mod tests {
                 Some(12),
                 None,
                 false,
-                Err("no current assignment for partition orders-9".to_string()),
+                Err("no current assignment for partition orders-9".to_owned()),
             ),
         ] {
             consumer

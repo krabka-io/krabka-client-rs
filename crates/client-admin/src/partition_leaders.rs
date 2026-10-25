@@ -8,8 +8,9 @@
 //! [`AdminClient::call_partition_leaders`] does the same for the
 //! leader-routed calls of this crate.
 
-use std::{collections::BTreeMap, future::Future};
+use std::{collections::BTreeMap, future::Future, mem};
 
+use futures_util::future::join_all;
 use krabka_protocol::{
     owned::{
         metadata_request::{MetadataRequest, MetadataRequestTopic},
@@ -24,10 +25,10 @@ use crate::{
 };
 
 /// A topic partition, as Kafka's `TopicPartition`.
-pub(crate) type PartitionKey = (String, i32);
+pub type PartitionKey = (String, i32);
 
 /// The result of each partition of a leader-routed call.
-pub(crate) type PartitionResults<V> = BTreeMap<PartitionKey, Result<V, KafkaError>>;
+pub type PartitionResults<V> = BTreeMap<PartitionKey, Result<V, KafkaError>>;
 
 /// `UNKNOWN_SERVER_ERROR`: a call failed for a reason with no Kafka code.
 const UNKNOWN_SERVER_ERROR: i16 = -1;
@@ -46,7 +47,7 @@ const KAFKA_STORAGE_ERROR: i16 = 56;
 
 /// Where the leader lookup puts one partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LeaderLookup {
+pub enum LeaderLookup {
     /// The `host:port` of the partition leader.
     Leader(String),
     /// No leader is known yet. The lookup runs again after the backoff. The
@@ -73,11 +74,7 @@ fn metadata_error(code: i16) -> KafkaError {
 /// `LEADER_NOT_AVAILABLE`, `BROKER_NOT_AVAILABLE` and `KAFKA_STORAGE_ERROR`
 /// (`handlePartitionError`). A topic or partition that the answer omits, and
 /// a partition with no leader, retry too. Every other error is final.
-pub(crate) fn lookup_leader(
-    topic: &str,
-    partition: i32,
-    metadata: &MetadataResponse,
-) -> LeaderLookup {
+pub fn lookup_leader(topic: &str, partition: i32, metadata: &MetadataResponse) -> LeaderLookup {
     let Some(topic_metadata) = metadata
         .topics
         .iter()
@@ -129,7 +126,7 @@ pub(crate) fn lookup_leader(
 
 /// The `Metadata` request of the leader lookup of `topics`, as Kafka's
 /// `PartitionLeaderStrategy.buildRequest` builds it.
-pub(crate) fn leader_metadata_request(topics: &[&str]) -> MetadataRequest {
+pub fn leader_metadata_request(topics: &[&str]) -> MetadataRequest {
     MetadataRequest {
         topics: Some(
             topics
@@ -149,7 +146,7 @@ pub(crate) fn leader_metadata_request(topics: &[&str]) -> MetadataRequest {
 /// The [`KafkaError`] that every partition of a failed call gets. A broker
 /// error keeps its code, and any other failure becomes
 /// `UNKNOWN_SERVER_ERROR` with the failure as its message.
-pub(crate) fn call_error(error: &AdminError) -> KafkaError {
+pub fn call_error(error: &AdminError) -> KafkaError {
     match error {
         AdminError::Broker {
             code,
@@ -172,7 +169,7 @@ pub(crate) fn call_error(error: &AdminError) -> KafkaError {
 /// Gives every key that `results` omits `UNKNOWN_SERVER_ERROR`, as Kafka's
 /// handlers do for a partition missing from a response, and drops the
 /// entries that nobody asked for.
-pub(crate) fn complete_results<V>(
+pub fn complete_results<V>(
     api: &str,
     keys: &[PartitionKey],
     mut results: PartitionResults<V>,
@@ -255,17 +252,17 @@ impl AdminClient {
                 // Kafka's `Call.fail` retries a disconnect with the backoff.
                 Err(error) if is_connection_failure(&error) => {
                     last_error = error.to_string();
-                    retry = std::mem::take(&mut pending);
+                    retry = mem::take(&mut pending);
                 }
                 Err(error) => {
                     let error = call_error(&error);
-                    for key in std::mem::take(&mut pending) {
+                    for key in mem::take(&mut pending) {
                         out.insert(key, Err(error.clone()));
                     }
                 }
                 Ok(metadata) => {
                     let mut groups = BTreeMap::<String, Vec<PartitionKey>>::new();
-                    for key in std::mem::take(&mut pending) {
+                    for key in mem::take(&mut pending) {
                         match lookup_leader(&key.0, key.1, &metadata) {
                             LeaderLookup::Leader(address) => {
                                 groups.entry(address).or_default().push(key);
@@ -279,12 +276,10 @@ impl AdminClient {
                             }
                         }
                     }
-                    let answers = futures_util::future::join_all(groups.into_iter().map(
-                        |(address, keys)| {
-                            let answer = call(address, keys.clone());
-                            async move { (keys, deadline.bounded(answer).await) }
-                        },
-                    ))
+                    let answers = join_all(groups.into_iter().map(|(address, keys)| {
+                        let answer = call(address, keys.clone());
+                        async move { (keys, deadline.bounded(answer).await) }
+                    }))
                     .await;
                     for (keys, answer) in answers {
                         match answer {
@@ -344,7 +339,7 @@ impl AdminClient {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     //! Mock-broker helpers of the leader-routed call tests.
 
     use std::{
@@ -370,13 +365,14 @@ pub(crate) mod test_support {
             },
         },
     };
+    use tokio::net::TcpListener;
 
     use crate::AdminClient;
 
     /// The supported version interval for one API in a mock broker's
     /// `ApiVersions` answer.
     #[derive(Builder, Clone, Copy, Debug, Default)]
-    pub(crate) struct ApiVersionRange {
+    pub struct ApiVersionRange {
         pub(crate) api_key: i16,
         #[builder(default)]
         pub(crate) min_version: i16,
@@ -386,7 +382,7 @@ pub(crate) mod test_support {
 
     /// The body of `response` at `version`, behind an empty tagged-field
     /// byte when `flexible` is set.
-    pub(crate) fn encode_response(response: &impl Encode, version: i16, flexible: bool) -> Vec<u8> {
+    pub fn encode_response(response: &impl Encode, version: i16, flexible: bool) -> Vec<u8> {
         let mut bytes = BytesMut::new();
         if flexible {
             bytes.extend_from_slice(&[0]);
@@ -399,7 +395,7 @@ pub(crate) mod test_support {
 
     /// Decodes the request body of a mock broker: the client id, the tagged
     /// field byte of a flexible header, and the request itself.
-    pub(crate) fn decode_request<T: for<'a> Decode<'a>>(
+    pub fn decode_request<T: for<'a> Decode<'a>>(
         mut body: &[u8],
         version: i16,
         flexible: bool,
@@ -416,7 +412,7 @@ pub(crate) mod test_support {
     /// v12 unless `apis` names `Metadata`, and each API version range in
     /// `apis`.
     #[bon::builder]
-    pub(crate) fn api_versions(#[builder(default)] apis: Vec<ApiVersionRange>) -> Vec<u8> {
+    pub fn api_versions(#[builder(default)] apis: Vec<ApiVersionRange>) -> Vec<u8> {
         let api_version = |api_key, min_version, max_version| ApiVersion {
             api_key,
             min_version,
@@ -446,7 +442,7 @@ pub(crate) mod test_support {
 
     /// A `Metadata` answer in which broker 1 at `leader` leads `orders`-0 and
     /// `orders`-1 and is the controller.
-    pub(crate) fn orders_metadata(leader: SocketAddr) -> MetadataResponse {
+    pub fn orders_metadata(leader: SocketAddr) -> MetadataResponse {
         let partition = |partition_index| MetadataResponsePartition {
             partition_index,
             leader_id: 1,
@@ -470,16 +466,14 @@ pub(crate) mod test_support {
     }
 
     /// An address on which no listener accepts connections.
-    pub(crate) async fn refused_address() -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port");
+    pub async fn refused_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
         listener.local_addr().expect("local address")
     }
 
     /// What a [`leader_broker`] saw.
-    #[derive(Debug, Default)]
-    pub(crate) struct Seen {
+    #[derive(Clone, Debug, Default)]
+    pub struct Seen {
         /// The number of `Metadata` requests.
         pub(crate) metadata_requests: usize,
         /// The version and body of each request of the scripted API.
@@ -493,7 +487,7 @@ pub(crate) mod test_support {
     /// entry repeats), or itself for `None`. It answers every request of
     /// `api_key` with `answer(n, version, body)` for the `n`th such request,
     /// and records it in `seen`.
-    pub(crate) async fn leader_broker(
+    pub async fn leader_broker(
         apis: Vec<ApiVersionRange>,
         api_key: i16,
         leaders: Vec<Option<SocketAddr>>,
@@ -529,9 +523,11 @@ pub(crate) mod test_support {
                 }
                 _ => return MockReply::Silent,
             };
+            drop(seen);
             MockReply::Respond(reply)
         })
-        .await;
+        .await
+        .unwrap();
         port.store(broker.addr.port(), Ordering::SeqCst);
         broker
     }
@@ -541,7 +537,7 @@ pub(crate) mod test_support {
     /// own_address)`. Unless `answer` handles `Metadata` itself, it answers
     /// `Metadata` with [`orders_metadata`] naming itself as broker 1 and
     /// controller, so that a controller refresh reconnects to it.
-    pub(crate) async fn scripted_broker(
+    pub async fn scripted_broker(
         apis: Vec<ApiVersionRange>,
         mut answer: impl FnMut(i16, i16, &[u8], SocketAddr) -> MockReply + Send + 'static,
     ) -> MockBroker {
@@ -559,17 +555,15 @@ pub(crate) mod test_support {
                 reply => reply,
             }
         })
-        .await;
+        .await
+        .unwrap();
         port.store(broker.addr.port(), Ordering::SeqCst);
         broker
     }
 
     /// An admin client on `bootstrap` that retries after 1 ms and gives up
     /// after `api_timeout`, which is also its request timeout.
-    pub(crate) async fn fast_admin(
-        bootstrap: SocketAddr,
-        api_timeout: krabka_units::Time,
-    ) -> AdminClient {
+    pub async fn fast_admin(bootstrap: SocketAddr, api_timeout: krabka_units::Time) -> AdminClient {
         AdminClient::connect_with_config(
             &[bootstrap.to_string()],
             crate::AdminClientConfig {
@@ -587,13 +581,44 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use krabka_protocol::owned::metadata_response::MetadataResponseTopic;
 
     use super::{test_support::orders_metadata, *};
 
+    /// A broker error keeps its code for every partition of the call, and any
+    /// other failure becomes `UNKNOWN_SERVER_ERROR` with its message.
+    #[test]
+    fn call_error_keeps_a_broker_code_and_wraps_other_failures() {
+        let broker = AdminError::Broker {
+            api: "ListOffsets",
+            code: 29,
+            name: "TOPIC_AUTHORIZATION_FAILED",
+            message: Some("denied".to_owned()),
+        };
+        let other = AdminError::Protocol("bad frame".to_owned());
+
+        assert2::assert!(
+            (call_error(&broker), call_error(&other))
+                == (
+                    KafkaError {
+                        code: 29,
+                        name: "TOPIC_AUTHORIZATION_FAILED",
+                        message: Some("denied".to_owned()),
+                    },
+                    KafkaError {
+                        code: UNKNOWN_SERVER_ERROR,
+                        name: "UNKNOWN_SERVER_ERROR",
+                        message: Some("protocol: bad frame".to_owned()),
+                    },
+                )
+        );
+    }
+
     #[test]
     fn lookup_classifies_each_metadata_answer_as_kafka_does() {
-        let addr: std::net::SocketAddr = "127.0.0.1:9092".parse().expect("address");
+        let addr: SocketAddr = "127.0.0.1:9092".parse().expect("address");
         let with_partition_error = |code| {
             let mut metadata = orders_metadata(addr);
             metadata.topics[0].partitions[1].error_code = code;

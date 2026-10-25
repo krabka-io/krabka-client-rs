@@ -2,17 +2,20 @@
 //!
 //! [`Client`] wraps a [`BrokerPool`] and exposes a typed-request `send` API.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use krabka_protocol::owned::{metadata_request, metadata_response};
 use krabka_units::{Time, convert::TimeExt as _, minutes};
 use metadata_request::MetadataRequest;
 use refined_type::rule::GreaterEqualI64;
+use tokio::time::Instant;
+use tracing::field;
 
 use crate::{
     bootstrap,
     connection::{
-        ClientDnsTimeout, ClientFrameMax, ConnectionDispatchQueueCapacity, ConnectionOptions,
+        ClientDnsTimeout, ClientFrameMax, Connection, ConnectionDispatchQueueCapacity,
+        ConnectionOptions,
     },
     error::ClientError,
     fetch,
@@ -20,9 +23,10 @@ use crate::{
     offset_for_leader_epoch,
     pool::{BrokerInfo, BrokerPool},
     request::ProtocolRequest,
+    security::ClientSecurity,
     telemetry::{
         ClientMetrics, ClientTelemetry, ClientTelemetryConfig, NetworkMetrics,
-        TelemetryConnections, TelemetryTiming,
+        TelemetryConnections, TelemetryTiming, client_instance_id,
     },
 };
 
@@ -96,8 +100,7 @@ impl MetadataRecoveryRebootstrapTrigger {
 
 impl Default for MetadataRecoveryRebootstrapTrigger {
     fn default() -> Self {
-        Self::new(DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)
-            .expect("default metadata recovery trigger is valid")
+        Self(DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER.millis_i64())
     }
 }
 
@@ -105,7 +108,7 @@ impl Default for MetadataRecoveryRebootstrapTrigger {
 struct MetadataRecovery {
     strategy: MetadataRecoveryStrategy,
     trigger: MetadataRecoveryRebootstrapTrigger,
-    first_attempt: Mutex<Option<tokio::time::Instant>>,
+    first_attempt: Mutex<Option<Instant>>,
 }
 
 impl MetadataRecovery {
@@ -116,15 +119,15 @@ impl MetadataRecovery {
         let mut first_attempt = self
             .first_attempt
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        first_attempt.get_or_insert_with(tokio::time::Instant::now);
+            .unwrap_or_else(PoisonError::into_inner);
+        first_attempt.get_or_insert_with(Instant::now);
     }
 
     fn complete_attempt(&self) {
         *self
             .first_attempt
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     fn timed_out(&self) -> bool {
@@ -133,7 +136,7 @@ impl MetadataRecovery {
         }
         self.first_attempt
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .is_some_and(|started| started.elapsed() >= self.trigger.time().to_std())
     }
 }
@@ -154,7 +157,7 @@ impl Client {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn start(
         #[builder(into)] bootstrap: String,
-        #[builder(into, default = "krabka".to_string())] client_id: String,
+        #[builder(into, default = "krabka".to_owned())] client_id: String,
         #[builder(default = crate::DEFAULT_CLIENT_DNS_TIMEOUT)] dns_timeout: Time,
         #[builder(default = crate::DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT)]
         socket_connection_setup_timeout: Time,
@@ -177,7 +180,7 @@ impl Client {
         #[builder(default)] metadata_recovery_strategy: MetadataRecoveryStrategy,
         #[builder(default = crate::DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER)]
         metadata_recovery_rebootstrap_trigger: Time,
-        security: Option<crate::security::ClientSecurity>,
+        security: Option<ClientSecurity>,
         /// The topics of [`Client::refresh_metadata`]. Kafka's producer and
         /// consumer name their topics. The default asks for all topics.
         #[builder(default)]
@@ -267,7 +270,7 @@ impl Client {
                     NetworkMetrics::register(metrics, config.client_type.metric_group())
                 });
         let pool = Arc::new(BrokerPool::new_with_server_names(addrs, options.clone()));
-        let client = Client {
+        let client = Self {
             bootstrap,
             pool,
             options,
@@ -294,7 +297,7 @@ impl Client {
                     timing,
                 ))
             });
-        Ok(Client {
+        Ok(Self {
             telemetry,
             ..client
         })
@@ -338,7 +341,7 @@ impl Client {
         &self,
         timeout: Time,
     ) -> Result<Option<uuid::Uuid>, ClientError> {
-        crate::telemetry::client_instance_id(self.telemetry.as_deref(), timeout).await
+        client_instance_id(self.telemetry.as_deref(), timeout).await
     }
 
     /// Send a request that has no fixed target broker.
@@ -616,7 +619,7 @@ impl Client {
     #[tracing::instrument(
         level = "info",
         skip_all,
-        fields(brokers = tracing::field::Empty),
+        fields(brokers = field::Empty),
         err(level = "info"),
     )]
     pub async fn refresh_metadata_with(
@@ -860,10 +863,7 @@ impl Client {
 }
 
 impl TelemetryConnections for Client {
-    fn open_connection(
-        &self,
-        preferred: Option<i32>,
-    ) -> Option<(i32, Arc<crate::connection::Connection>)> {
+    fn open_connection(&self, preferred: Option<i32>) -> Option<(i32, Arc<Connection>)> {
         self.pool.open_connection(preferred)
     }
 }
@@ -969,9 +969,13 @@ impl BrokerHandle<'_> {
 
 #[cfg(test)]
 mod bootstrap_failover_tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU16, Ordering},
+    use std::{
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicU16, AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use bytes::BytesMut;
@@ -987,6 +991,11 @@ mod bootstrap_failover_tests {
         },
     };
     use krabka_units::{bytes, mebibytes, millis};
+    use tokio::{
+        net::TcpStream,
+        task::yield_now,
+        time::{sleep, timeout},
+    };
 
     use super::*;
     use crate::mock::MockBroker;
@@ -1028,6 +1037,13 @@ mod bootstrap_failover_tests {
                 .expect("zero is an immediate KIP-1102 trigger")
                 .time()
                 == Time::ZERO
+        );
+        assert2::assert!(
+            MetadataRecoveryRebootstrapTrigger::default()
+                == MetadataRecoveryRebootstrapTrigger::new(
+                    DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER
+                )
+                .unwrap()
         );
         let recovery_result = Client::builder()
             .bootstrap("unused.invalid:9092")
@@ -1140,10 +1156,10 @@ mod bootstrap_failover_tests {
     /// waited for the socket teardown, so this helper polls the teardown
     /// directly and then runs the unchanged failover assertion. The timeout is
     /// a hang-guard.
-    async fn wait_for_listener_closed(addr: std::net::SocketAddr) {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while tokio::net::TcpStream::connect(addr).await.is_ok() {
-                tokio::task::yield_now().await;
+    async fn wait_for_listener_closed(addr: SocketAddr) {
+        timeout(Duration::from_secs(10), async {
+            while TcpStream::connect(addr).await.is_ok() {
+                yield_now().await;
             }
         })
         .await
@@ -1158,8 +1174,8 @@ mod bootstrap_failover_tests {
         // instead of failing forever on the dead socket — the client-side cause
         // of the on-cluster producer stall where a failover whose killed leader
         // was also the bootstrap-pinned broker left the producer stranded.
-        let a = MockBroker::start(handler(0)).await;
-        let b = MockBroker::start(handler(1)).await;
+        let a = MockBroker::start(handler(0)).await.unwrap();
+        let b = MockBroker::start(handler(1)).await.unwrap();
         let bootstrap = format!("{},{}", a.addr, b.addr);
         let client = Client::builder()
             .bootstrap(bootstrap)
@@ -1205,7 +1221,7 @@ mod bootstrap_failover_tests {
             ("all topics", crate::all_topics_request()),
             ("the topic orders", orders),
         ] {
-            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::new(Mutex::new(Vec::new()));
             let handler_seen = Arc::clone(&seen);
             let broker = MockBroker::start(move |api_key, version, _corr, body| {
                 if api_key == api_versions_request::API_KEY {
@@ -1222,7 +1238,8 @@ mod bootstrap_failover_tests {
                 }
                 None
             })
-            .await;
+            .await
+            .unwrap();
             let client = Client::builder()
                 .bootstrap(broker.addr.to_string())
                 .request_timeout(millis(500))
@@ -1244,9 +1261,9 @@ mod bootstrap_failover_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refresh_metadata_uses_a_learned_broker_after_the_only_seed_retires() {
         let healthy_port = Arc::new(AtomicU16::new(0));
-        let healthy_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let h_port = healthy_port.clone();
-        let h_calls = healthy_calls.clone();
+        let healthy_calls = Arc::new(AtomicUsize::new(0));
+        let h_port = Arc::clone(&healthy_port);
+        let h_calls = Arc::clone(&healthy_calls);
         let healthy = MockBroker::start(move |api_key, version, _corr, _body| {
             if api_key == api_versions_request::API_KEY {
                 return Some(api_versions_v0());
@@ -1261,11 +1278,14 @@ mod bootstrap_failover_tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         healthy_port.store(healthy.addr.port(), Ordering::SeqCst);
 
-        let seed_port = healthy_port.clone();
-        let seed = MockBroker::start(dynamic_port_handler(7, seed_port)).await;
+        let seed_port = Arc::clone(&healthy_port);
+        let seed = MockBroker::start(dynamic_port_handler(7, seed_port))
+            .await
+            .unwrap();
         let client = Client::builder()
             .bootstrap(seed.addr.to_string())
             .request_timeout(millis(500))
@@ -1294,8 +1314,7 @@ mod bootstrap_failover_tests {
     /// to the bootstrap address.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_goes_to_a_known_broker_after_the_first_metadata() {
-        let counting_handler = |calls: Arc<std::sync::atomic::AtomicUsize>,
-                                port: Arc<AtomicU16>| {
+        let counting_handler = |calls: Arc<AtomicUsize>, port: Arc<AtomicU16>| {
             move |api_key, version, _corr, _body: &[u8]| {
                 if api_key == api_versions_request::API_KEY {
                     return Some(api_versions_v0());
@@ -1312,16 +1331,18 @@ mod bootstrap_failover_tests {
             }
         };
         let port = Arc::new(AtomicU16::new(0));
-        let seed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let broker_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seed_calls = Arc::new(AtomicUsize::new(0));
+        let broker_calls = Arc::new(AtomicUsize::new(0));
         let broker = MockBroker::start(counting_handler(
             Arc::clone(&broker_calls),
             Arc::clone(&port),
         ))
-        .await;
+        .await
+        .unwrap();
         port.store(broker.addr.port(), Ordering::SeqCst);
-        let seed =
-            MockBroker::start(counting_handler(Arc::clone(&seed_calls), Arc::clone(&port))).await;
+        let seed = MockBroker::start(counting_handler(Arc::clone(&seed_calls), Arc::clone(&port)))
+            .await
+            .unwrap();
         let client = Client::builder()
             .bootstrap(seed.addr.to_string())
             .request_timeout(millis(500))
@@ -1350,8 +1371,8 @@ mod bootstrap_failover_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconnect_bootstrap_forces_next_send_to_redial() {
-        let a = MockBroker::start(handler(0)).await;
-        let b = MockBroker::start(handler(1)).await;
+        let a = MockBroker::start(handler(0)).await.unwrap();
+        let b = MockBroker::start(handler(1)).await.unwrap();
         let bootstrap = format!("{},{}", a.addr, b.addr);
         let client = Client::builder()
             .bootstrap(bootstrap)
@@ -1381,9 +1402,13 @@ mod bootstrap_failover_tests {
     async fn broker_send_refreshes_metadata_when_learned_address_is_stale() {
         let a_port = Arc::new(AtomicU16::new(0));
         let b_port = Arc::new(AtomicU16::new(0));
-        let a = MockBroker::start(dynamic_port_handler(1, a_port.clone())).await;
+        let a = MockBroker::start(dynamic_port_handler(1, Arc::clone(&a_port)))
+            .await
+            .unwrap();
         a_port.store(a.addr.port(), Ordering::SeqCst);
-        let b = MockBroker::start(dynamic_port_handler(1, b_port.clone())).await;
+        let b = MockBroker::start(dynamic_port_handler(1, Arc::clone(&b_port)))
+            .await
+            .unwrap();
         b_port.store(b.addr.port(), Ordering::SeqCst);
 
         let bootstrap = format!("{},{}", a.addr, b.addr);
@@ -1413,12 +1438,12 @@ mod bootstrap_failover_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn metadata_error_129_rebootstraps_immediately() {
-        let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let metadata_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
         let broker_port = Arc::new(AtomicU16::new(0));
-        let h_handshakes = handshakes.clone();
-        let h_metadata_calls = metadata_calls.clone();
-        let h_broker_port = broker_port.clone();
+        let h_handshakes = Arc::clone(&handshakes);
+        let h_metadata_calls = Arc::clone(&metadata_calls);
+        let h_broker_port = Arc::clone(&broker_port);
         let broker = MockBroker::start(move |api_key, version, _corr, _body| {
             if api_key == api_versions_request::API_KEY {
                 h_handshakes.fetch_add(1, Ordering::SeqCst);
@@ -1434,7 +1459,8 @@ mod bootstrap_failover_tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         broker_port.store(broker.addr.port(), Ordering::SeqCst);
         let client = Client::builder()
             .bootstrap(broker.addr.to_string())
@@ -1454,12 +1480,12 @@ mod bootstrap_failover_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_metadata_timeout_rebootstraps_after_first_bad_attempt() {
-        let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let metadata_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
         let broker_port = Arc::new(AtomicU16::new(0));
-        let h_handshakes = handshakes.clone();
-        let h_metadata_calls = metadata_calls.clone();
-        let h_broker_port = broker_port.clone();
+        let h_handshakes = Arc::clone(&handshakes);
+        let h_metadata_calls = Arc::clone(&metadata_calls);
+        let h_broker_port = Arc::clone(&broker_port);
         let broker = MockBroker::start(move |api_key, version, _corr, _body| {
             if api_key == api_versions_request::API_KEY {
                 h_handshakes.fetch_add(1, Ordering::SeqCst);
@@ -1475,7 +1501,8 @@ mod bootstrap_failover_tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         broker_port.store(broker.addr.port(), Ordering::SeqCst);
         let client = Client::builder()
             .bootstrap(broker.addr.to_string())
@@ -1489,7 +1516,7 @@ mod bootstrap_failover_tests {
             .await
             .expect("first empty metadata response remains observable");
         assert2::assert!(first.brokers.is_empty());
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        sleep(Duration::from_millis(25)).await;
         let recovered = client
             .refresh_metadata()
             .await
@@ -1502,8 +1529,8 @@ mod bootstrap_failover_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn metadata_recovery_none_surfaces_error_129_without_retry() {
-        let metadata_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let h_metadata_calls = metadata_calls.clone();
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
+        let h_metadata_calls = Arc::clone(&metadata_calls);
         let broker = MockBroker::start(move |api_key, version, _corr, _body| {
             if api_key == api_versions_request::API_KEY {
                 return Some(api_versions_v0());
@@ -1514,7 +1541,8 @@ mod bootstrap_failover_tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         let client = Client::builder()
             .bootstrap(broker.addr.to_string())
             .metadata_recovery_strategy(MetadataRecoveryStrategy::None)
@@ -1541,7 +1569,7 @@ mod bootstrap_failover_tests {
 mod authentication_failure_tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU16, AtomicUsize, Ordering},
     };
 
     use bytes::BytesMut;
@@ -1621,7 +1649,7 @@ mod authentication_failure_tests {
     /// `script[n]`, or with the last entry once the script runs out. It also
     /// answers `ApiVersions` and a `Metadata` that names itself as broker 1.
     async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) -> MockBroker {
-        let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let port = Arc::new(AtomicU16::new(0));
         let handler_port = Arc::clone(&port);
         let mut answer = *script.last().unwrap();
         let broker = MockBroker::start_with_replies(move |api_key, version, _corr, _body| {
@@ -1632,7 +1660,7 @@ mod authentication_failure_tests {
                     .copied()
                     .unwrap_or_else(|| *script.last().unwrap());
             }
-            if let Some(reply) = answer.reply(api_key, version) {
+            if let Some(reply) = answer.reply(api_key, version).unwrap() {
                 return reply;
             }
             match api_key {
@@ -1671,7 +1699,8 @@ mod authentication_failure_tests {
                 _ => MockReply::Silent,
             }
         })
-        .await;
+        .await
+        .unwrap();
         port.store(broker.addr.port(), Ordering::SeqCst);
         broker
     }

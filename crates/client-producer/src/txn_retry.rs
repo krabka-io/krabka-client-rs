@@ -70,7 +70,7 @@ const INVALID_PRODUCER_ID_MAPPING: i16 = 49;
 
 /// The result of one send to the transaction coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CoordinatorAttempt {
+pub enum CoordinatorAttempt {
     /// The coordinator answered with this error code.
     Answered(i16),
     /// The request failed in transport. The coordinator may have applied it.
@@ -79,7 +79,7 @@ pub(crate) enum CoordinatorAttempt {
 
 /// What the producer does after one `EndTxn` attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EndTxnDecision {
+pub enum EndTxnDecision {
     /// The coordinator applied the requested result.
     Complete,
     /// Send the same request again after a backoff.
@@ -121,7 +121,7 @@ pub(crate) enum EndTxnDecision {
 /// `committed` is the result that the request asks for. Kafka's
 /// `EndTxnHandler` makes `TRANSACTION_ABORTABLE` fatal for an abort, because
 /// an abort that is abortable again would loop.
-pub(crate) const fn decide_end_txn(
+pub const fn decide_end_txn(
     attempt: CoordinatorAttempt,
     earlier_attempt_lost: bool,
     committed: bool,
@@ -150,7 +150,7 @@ pub(crate) const fn decide_end_txn(
 /// Decide what to report when the retry deadline ends before an answer.
 ///
 /// `last` is the final attempt, whose decision was a retry.
-pub(crate) const fn decide_end_txn_at_deadline(
+pub const fn decide_end_txn_at_deadline(
     last: CoordinatorAttempt,
     earlier_attempt_lost: bool,
 ) -> EndTxnDecision {
@@ -169,7 +169,7 @@ pub(crate) const fn decide_end_txn_at_deadline(
 
 /// What the producer does after one `AddPartitionsToTxn` attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AddPartitionsDecision {
+pub enum AddPartitionsDecision {
     /// The coordinator added the partition to the transaction.
     Added,
     /// Send the same request again after a backoff. The coordinator ignores a
@@ -196,7 +196,7 @@ pub(crate) enum AddPartitionsDecision {
 /// `INVALID_PRODUCER_ID_MAPPING` are fatal. Every other code, which includes
 /// `TOPIC_AUTHORIZATION_FAILED`, `OPERATION_NOT_ATTEMPTED` and an unexpected
 /// code, gives an abortable error.
-pub(crate) const fn decide_add_partitions(attempt: CoordinatorAttempt) -> AddPartitionsDecision {
+pub const fn decide_add_partitions(attempt: CoordinatorAttempt) -> AddPartitionsDecision {
     match attempt {
         CoordinatorAttempt::Answered(NONE) => AddPartitionsDecision::Added,
         CoordinatorAttempt::Answered(COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR)
@@ -224,7 +224,7 @@ pub(crate) const fn decide_add_partitions(attempt: CoordinatorAttempt) -> AddPar
 /// [`TxnRequestDecision::Fatal`], except for `INVALID_PRODUCER_EPOCH` and
 /// `PRODUCER_FENCED`, which give [`TxnRequestDecision::Fenced`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TxnRequestDecision {
+pub enum TxnRequestDecision {
     /// The coordinator applied the request.
     Done,
     /// Send the same request again after a backoff.
@@ -248,7 +248,7 @@ pub(crate) enum TxnRequestDecision {
 /// again, `UNKNOWN_PRODUCER_ID`, `GROUP_AUTHORIZATION_FAILED` and
 /// `TRANSACTION_ABORTABLE` give an abortable error, `INVALID_PRODUCER_EPOCH`
 /// and `PRODUCER_FENCED` fence the producer, and every other code is fatal.
-pub(crate) const fn decide_add_offsets_to_txn(attempt: CoordinatorAttempt) -> TxnRequestDecision {
+pub const fn decide_add_offsets_to_txn(attempt: CoordinatorAttempt) -> TxnRequestDecision {
     match attempt {
         CoordinatorAttempt::Answered(NONE) => TxnRequestDecision::Done,
         CoordinatorAttempt::Answered(COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR)
@@ -276,7 +276,7 @@ pub(crate) const fn decide_add_offsets_to_txn(attempt: CoordinatorAttempt) -> Tx
 /// (`UNKNOWN_MEMBER_ID`, `ILLEGAL_GENERATION`, `GROUP_ID_NOT_FOUND`,
 /// `STALE_MEMBER_EPOCH`) give an abortable error, `INVALID_PRODUCER_EPOCH` and
 /// `PRODUCER_FENCED` fence the producer, and every other code is fatal.
-pub(crate) const fn decide_txn_offset_commit(attempt: CoordinatorAttempt) -> TxnRequestDecision {
+pub const fn decide_txn_offset_commit(attempt: CoordinatorAttempt) -> TxnRequestDecision {
     match attempt {
         CoordinatorAttempt::Answered(NONE) => TxnRequestDecision::Done,
         CoordinatorAttempt::Answered(
@@ -310,7 +310,7 @@ pub(crate) const fn decide_txn_offset_commit(attempt: CoordinatorAttempt) -> Txn
 /// `CLUSTER_AUTHORIZATION_FAILED` and `TRANSACTION_ABORTABLE` give an
 /// abortable error, `INVALID_PRODUCER_EPOCH` and `PRODUCER_FENCED` fence the
 /// producer, and every other code is fatal.
-pub(crate) const fn decide_init_producer_id(attempt: CoordinatorAttempt) -> TxnRequestDecision {
+pub const fn decide_init_producer_id(attempt: CoordinatorAttempt) -> TxnRequestDecision {
     match attempt {
         CoordinatorAttempt::Answered(NONE) => TxnRequestDecision::Done,
         CoordinatorAttempt::Answered(COORDINATOR_NOT_AVAILABLE | NOT_COORDINATOR)
@@ -332,7 +332,7 @@ pub(crate) const fn decide_init_producer_id(attempt: CoordinatorAttempt) -> TxnR
 
 /// A `FindCoordinator` answer that ends the lookup with no coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LookupRefusal {
+pub enum LookupRefusal {
     /// Kafka's `FindCoordinatorHandler` calls `abortableError` for this code:
     /// the application must abort the transaction.
     Abortable(i16),
@@ -342,7 +342,7 @@ pub(crate) enum LookupRefusal {
 
 /// What the producer does after one `FindCoordinator` attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FindCoordinatorDecision {
+pub enum FindCoordinatorDecision {
     /// The broker named the coordinator.
     Found,
     /// Send the same lookup again after a backoff.
@@ -359,9 +359,7 @@ pub(crate) enum FindCoordinatorDecision {
 /// is fatal, `GROUP_AUTHORIZATION_FAILED` and `TRANSACTION_ABORTABLE` give an
 /// abortable error, and every other code is fatal ("Could not find a
 /// coordinator with type X with key Y due to unexpected error").
-pub(crate) const fn decide_find_coordinator(
-    attempt: CoordinatorAttempt,
-) -> FindCoordinatorDecision {
+pub const fn decide_find_coordinator(attempt: CoordinatorAttempt) -> FindCoordinatorDecision {
     match attempt {
         CoordinatorAttempt::Answered(NONE) => FindCoordinatorDecision::Found,
         CoordinatorAttempt::Lost => FindCoordinatorDecision::Retry,
@@ -387,7 +385,7 @@ pub(crate) const fn decide_find_coordinator(
 /// was lost, which leaves the outcome unknown. During an abort, Kafka's
 /// `transitionToAbortableError` skips the transition, and the `EndTxn`
 /// request waits for the next lookup, so the retry goes on.
-pub(crate) const fn decide_end_txn_after_refused_lookup(
+pub const fn decide_end_txn_after_refused_lookup(
     refusal: LookupRefusal,
     earlier_attempt_lost: bool,
     committed: bool,

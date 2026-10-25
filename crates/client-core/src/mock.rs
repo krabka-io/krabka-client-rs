@@ -23,13 +23,20 @@
 #![cfg(any(test, feature = "mock"))]
 
 use std::{
+    io,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use bytes::BytesMut;
-use tokio::{net::TcpListener, task::JoinHandle};
+use krabka_protocol::ProtocolError;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
+
+use crate::framing;
 
 /// A simple in-process mock Kafka broker for unit testing.
 ///
@@ -81,10 +88,10 @@ impl MockSaslAnswer {
     /// authenticated connection at a higher version, and the handler of the
     /// test answers it.
     ///
-    /// # Panics
-    /// Panics if a SASL response does not encode at `version`.
-    #[must_use]
-    pub fn reply(self, api_key: i16, version: i16) -> Option<MockReply> {
+    /// # Errors
+    /// Returns the codec error when a SASL response does not encode at
+    /// `version`.
+    pub fn reply(self, api_key: i16, version: i16) -> Result<Option<MockReply>, ProtocolError> {
         use krabka_protocol::{
             Encode,
             owned::{
@@ -114,25 +121,22 @@ impl MockSaslAnswer {
                 .collect(),
                 ..Default::default()
             }
-            .encode(&mut body, 0)
-            .unwrap(),
+            .encode(&mut body, 0)?,
             (sasl_handshake_request::API_KEY, Self::HandshakeError(error_code)) => {
                 SaslHandshakeResponse {
                     error_code,
                     mechanisms: vec![MOCK_SASL_MECHANISM.into()],
                     ..Default::default()
                 }
-                .encode(&mut body, version)
-                .unwrap();
+                .encode(&mut body, version)?;
             }
             (sasl_handshake_request::API_KEY, _) => SaslHandshakeResponse {
                 mechanisms: vec![MOCK_SASL_MECHANISM.into()],
                 ..Default::default()
             }
-            .encode(&mut body, version)
-            .unwrap(),
+            .encode(&mut body, version)?,
             (sasl_authenticate_request::API_KEY, Self::CloseAfterHandshake) => {
-                return Some(MockReply::Close);
+                return Ok(Some(MockReply::Close));
             }
             (sasl_authenticate_request::API_KEY, answer) => {
                 if version >= sasl_authenticate_response::FLEXIBLE_MIN {
@@ -147,12 +151,11 @@ impl MockSaslAnswer {
                     error_message: (error_code != 0).then(|| "rejected by mock broker".into()),
                     ..Default::default()
                 }
-                .encode(&mut body, version)
-                .unwrap();
+                .encode(&mut body, version)?;
             }
-            _ => return None,
+            _ => return Ok(None),
         }
-        Some(MockReply::Respond(body.to_vec()))
+        Ok(Some(MockReply::Respond(body.to_vec())))
     }
 }
 
@@ -170,9 +173,9 @@ impl MockBroker {
     /// The `MockBroker` prepends the correlation-id to the returned body
     /// automatically. The handler only supplies the response body bytes.
     ///
-    /// # Panics
-    /// Panics if synchronized client state is poisoned or a response violates an invariant established by protocol validation.
-    pub async fn start<F>(mut handler: F) -> Self
+    /// # Errors
+    /// Returns the I/O error when the listener cannot bind a localhost port.
+    pub async fn start<F>(mut handler: F) -> io::Result<Self>
     where
         F: FnMut(i16, i16, i32, &[u8]) -> Option<Vec<u8>> + Send + 'static,
     {
@@ -186,14 +189,14 @@ impl MockBroker {
     /// Start a mock broker whose handler returns a [`MockReply`] for each
     /// request.
     ///
-    /// # Panics
-    /// Panics if the listener cannot bind a localhost port.
-    pub async fn start_with_replies<F>(handler: F) -> Self
+    /// # Errors
+    /// Returns the I/O error when the listener cannot bind a localhost port.
+    pub async fn start_with_replies<F>(handler: F) -> io::Result<Self>
     where
         F: FnMut(i16, i16, i32, &[u8]) -> MockReply + Send + 'static,
     {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         let handler: Arc<Mutex<Handler>> = Arc::new(Mutex::new(Box::new(handler)));
         let shutdown = CancellationToken::new();
 
@@ -208,7 +211,7 @@ impl MockBroker {
                         // delay. Without this, a response can wait for the
                         // delayed ACK of the client, and a paused-time test
                         // then jumps to a request timeout.
-                        stream.set_nodelay(true).ok();
+                        let _ = stream.set_nodelay(true);
                         let h = Arc::clone(&task_handler);
                         let sd = task_shutdown.clone();
                         tokio::spawn(async move {
@@ -219,11 +222,11 @@ impl MockBroker {
             }
         });
 
-        Self {
+        Ok(Self {
             addr,
             shutdown,
             _task: task,
-        }
+        })
     }
 
     /// Stop the broker, cancelling all connection tasks.
@@ -233,13 +236,13 @@ impl MockBroker {
 }
 
 async fn handle_connection(
-    stream: tokio::net::TcpStream,
+    stream: TcpStream,
     handler: Arc<Mutex<Handler>>,
     shutdown: CancellationToken,
 ) {
     use futures_util::{SinkExt, StreamExt};
 
-    let mut framed = crate::framing::frame(stream);
+    let mut framed = framing::frame(stream);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
@@ -247,19 +250,19 @@ async fn handle_connection(
                 let Some(frame) = maybe_frame else { break; };
                 let Ok(frame) = frame else { break; };
                 // Minimum: api_key(2) + version(2) + corr_id(4) = 8 bytes.
-                if frame.len() < 8 { continue; }
+                // Everything after the first 8 bytes is passed as the request body.
+                // (We skip client_id parsing — tests don't need it.)
+                let Some((header, body)) = frame.split_first_chunk::<8>() else { continue; };
 
                 // RequestHeader v1+ wire shape:
                 //   api_key:i16, api_version:i16, correlation_id:i32, client_id...
-                let api_key = i16::from_be_bytes([frame[0], frame[1]]);
-                let version  = i16::from_be_bytes([frame[2], frame[3]]);
-                let corr_id  = i32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]);
-                // Everything after the first 8 bytes is passed as the request body.
-                // (We skip client_id parsing — tests don't need it.)
-                let body = &frame[8..];
+                let [k0, k1, v0, v1, c0, c1, c2, c3] = *header;
+                let api_key = i16::from_be_bytes([k0, k1]);
+                let version  = i16::from_be_bytes([v0, v1]);
+                let corr_id  = i32::from_be_bytes([c0, c1, c2, c3]);
 
                 let response_body_opt = {
-                    let mut h = handler.lock().unwrap();
+                    let mut h = handler.lock().unwrap_or_else(PoisonError::into_inner);
                     h(api_key, version, corr_id, body)
                 };
 

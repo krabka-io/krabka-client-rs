@@ -7,6 +7,7 @@ use std::sync::{
 };
 
 use krabka_units::{Time, convert::TimeExt, secs};
+use tokio::sync::Notify;
 
 use crate::{
     consumer::{Consumer, GroupMembershipOperation},
@@ -18,7 +19,7 @@ pub const DEFAULT_CONSUMER_CLOSE_TIMEOUT: Time = secs(30);
 
 /// The `JoinGroup` reason of [`Consumer::enforce_rebalance`] without a reason.
 /// Kafka's `ClassicKafkaConsumer.DEFAULT_REASON`.
-pub(crate) const ENFORCED_REBALANCE_REASON: &str = "rebalance enforced by user";
+pub const ENFORCED_REBALANCE_REASON: &str = "rebalance enforced by user";
 
 /// How [`Consumer::close_with`](Consumer::close_with) closes the
 /// consumer. Kafka's `CloseOptions` (KIP-1092).
@@ -55,12 +56,12 @@ impl CloseOptions {
 
 /// What the coordinator task needs when it stops.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CloseRequest {
+pub struct CloseRequest {
     pub operation: GroupMembershipOperation,
 }
 
 /// The close timeout of `options`, or an error for a negative timeout.
-pub(crate) fn close_timeout(options: CloseOptions) -> Result<Time, ConsumerError> {
+pub fn close_timeout(options: CloseOptions) -> Result<Time, ConsumerError> {
     let timeout = options.timeout.unwrap_or(DEFAULT_CONSUMER_CLOSE_TIMEOUT);
     if timeout.secs_f64() < 0.0 || !timeout.secs_f64().is_finite() {
         return Err(ConsumerError::InvalidArgument(
@@ -84,7 +85,7 @@ pub struct WakeupHandle {
 #[derive(Debug, Default)]
 struct WakeupState {
     pending: AtomicBool,
-    notify: tokio::sync::Notify,
+    notify: Notify,
 }
 
 impl WakeupHandle {
@@ -170,7 +171,10 @@ impl Consumer {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use krabka_units::millis;
+    use tokio::time::timeout;
 
     use super::*;
 
@@ -214,10 +218,8 @@ mod tests {
     async fn wakeup_is_taken_once() {
         let handle = WakeupHandle::default();
         handle.wakeup();
-        let first =
-            tokio::time::timeout(std::time::Duration::from_millis(50), handle.woken()).await;
-        let second =
-            tokio::time::timeout(std::time::Duration::from_millis(50), handle.woken()).await;
+        let first = timeout(Duration::from_millis(50), handle.woken()).await;
+        let second = timeout(Duration::from_millis(50), handle.woken()).await;
         assert2::assert!((first.is_ok(), second.is_ok()) == (true, false));
     }
 }

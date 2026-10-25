@@ -1,12 +1,18 @@
 //! Parse a Kafka-style bootstrap string ("host:port,host:port") into
 //! a list of resolved [`SocketAddr`](std::net::SocketAddr)s.
 
+#[cfg(target_family = "wasm")]
+use std::future::{Ready, ready};
 use std::{
     future::Future,
+    iter,
     net::{IpAddr, SocketAddr},
 };
 
 use krabka_units::convert::TimeExt as _;
+#[cfg(not(target_family = "wasm"))]
+use tokio::task::spawn_blocking;
+use tokio::time::{self, error::Elapsed};
 
 use crate::{
     connection::{ClientDnsLookup, ClientDnsTimeout},
@@ -15,14 +21,11 @@ use crate::{
     transport,
 };
 
-pub(crate) async fn bounded_lookup<F>(
-    timeout: ClientDnsTimeout,
-    lookup: F,
-) -> Result<F::Output, tokio::time::error::Elapsed>
+pub async fn bounded_lookup<F>(timeout: ClientDnsTimeout, lookup: F) -> Result<F::Output, Elapsed>
 where
     F: Future,
 {
-    tokio::time::timeout(timeout.time().to_std(), lookup).await
+    time::timeout(timeout.time().to_std(), lookup).await
 }
 
 /// Parse a comma-separated `host:port` list and resolve each entry with
@@ -41,7 +44,7 @@ pub async fn resolve(
         .map(|addresses| addresses.into_iter().map(|(address, _)| address).collect())
 }
 
-pub(crate) async fn resolve_with_server_names(
+pub async fn resolve_with_server_names(
     bootstrap: &str,
     dns_timeout: ClientDnsTimeout,
     lookup: ClientDnsLookup,
@@ -119,17 +122,14 @@ async fn canonical_addresses(
 /// fails or does not end within `dns_timeout`.
 #[cfg(not(target_family = "wasm"))]
 async fn reverse_lookup(ip: IpAddr, dns_timeout: ClientDnsTimeout) -> Option<String> {
-    let reverse = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip));
+    let reverse = spawn_blocking(move || dns_lookup::lookup_addr(&ip));
     bounded_lookup(dns_timeout, reverse).await.ok()?.ok()?.ok()
 }
 
 /// WebAssembly has no reverse lookup, so no address has a host name.
 #[cfg(target_family = "wasm")]
-fn reverse_lookup(
-    _ip: IpAddr,
-    _dns_timeout: ClientDnsTimeout,
-) -> std::future::Ready<Option<String>> {
-    std::future::ready(None)
+fn reverse_lookup(_ip: IpAddr, _dns_timeout: ClientDnsTimeout) -> Ready<Option<String>> {
+    ready(None)
 }
 
 /// Add the addresses of one canonical host name, once each. Kafka resolves the
@@ -149,21 +149,21 @@ fn add_canonical_addresses(
 
 /// Keep the first address and the later addresses of the same family, as
 /// Kafka's `ClientUtils.filterPreferredAddresses` does.
-pub(crate) fn filter_preferred_addresses(
+pub fn filter_preferred_addresses(
     addresses: impl IntoIterator<Item = SocketAddr>,
 ) -> Vec<SocketAddr> {
     let mut addresses = addresses.into_iter();
     let Some(first) = addresses.next() else {
         return Vec::new();
     };
-    std::iter::once(first)
+    iter::once(first)
         .chain(addresses.filter(|address| address.is_ipv4() == first.is_ipv4()))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{future::pending, time::Duration};
 
     use assert2::assert;
     use krabka_units::millis;
@@ -219,8 +219,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bounded_lookup_stops_at_the_configured_deadline() {
         let timeout = ClientDnsTimeout::new(millis(37)).expect("positive timeout");
-        let started = tokio::time::Instant::now();
-        let result = bounded_lookup(timeout, std::future::pending::<()>()).await;
+        let started = time::Instant::now();
+        let result = bounded_lookup(timeout, pending::<()>()).await;
         assert!(result.is_err());
         assert!(started.elapsed() == Duration::from_millis(37));
     }

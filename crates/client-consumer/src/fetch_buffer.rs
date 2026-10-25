@@ -14,7 +14,7 @@ use crate::{consumer::ConsumerRecord, position::PartitionPosition};
 
 /// The fetched data of one partition that `poll` did not return yet.
 #[derive(Debug, Clone)]
-pub(crate) struct BufferedPartition {
+pub struct BufferedPartition {
     pub key: (String, i32),
     /// The consumed position that the buffered data starts at. The data is
     /// stale when `next_offsets` holds another value, for example after a seek
@@ -31,7 +31,7 @@ pub(crate) struct BufferedPartition {
 
 /// Fetched records, by partition in fetch order.
 #[derive(Debug, Default)]
-pub(crate) struct FetchBuffer {
+pub struct FetchBuffer {
     partitions: VecDeque<BufferedPartition>,
 }
 
@@ -135,6 +135,8 @@ impl FetchBuffer {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use bytes::Bytes;
 
     use super::*;
@@ -153,11 +155,7 @@ mod tests {
         }
     }
 
-    fn buffered(
-        partition: i32,
-        offsets: std::ops::Range<i64>,
-        next_offset: i64,
-    ) -> BufferedPartition {
+    fn buffered(partition: i32, offsets: Range<i64>, next_offset: i64) -> BufferedPartition {
         BufferedPartition {
             key: ("orders".into(), partition),
             position: offsets.start,
@@ -177,7 +175,7 @@ mod tests {
 
     #[test]
     fn drain_returns_at_most_max_records_and_moves_the_position_past_them() {
-        let key = |partition: i32| ("orders".to_string(), partition);
+        let key = |partition: i32| ("orders".to_owned(), partition);
         let all = maplit::hashset! {key(0), key(1)};
         let only_1 = maplit::hashset! {key(1)};
         let none = HashSet::new();
@@ -297,7 +295,7 @@ mod tests {
 
     #[test]
     fn drain_publishes_each_buffer_before_the_next_buffer_for_the_same_partition() {
-        let key = ("orders".to_string(), 0);
+        let key = ("orders".to_owned(), 0);
         let assigned = HashSet::from([key.clone()]);
         for last_epoch in [None, Some(LeaderEpoch(9))] {
             let mut buffer = FetchBuffer::default();
@@ -362,7 +360,7 @@ mod tests {
 
     #[test]
     fn completed_buffer_uses_batch_epoch_or_last_consumed_epoch() {
-        let key = ("orders".to_string(), 0);
+        let key = ("orders".to_owned(), 0);
         for (last_epoch, expected_epoch) in [
             (None, LeaderEpoch(5)),
             (Some(LeaderEpoch(9)), LeaderEpoch(9)),
@@ -413,9 +411,9 @@ mod tests {
             key: ("payments".into(), 0),
             ..buffered(0, 20..22, 22)
         });
-        buffer.retain_topics(&maplit::hashset! {"payments".to_string()});
+        buffer.retain_topics(&maplit::hashset! {"payments".to_owned()});
         let mut left: Vec<_> = buffer.buffered_partitions().into_iter().collect();
         left.sort();
-        assert2::assert!(left == vec![("payments".to_string(), 0)]);
+        assert2::assert!(left == vec![("payments".to_owned(), 0)]);
     }
 }

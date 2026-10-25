@@ -11,7 +11,7 @@
 //! protocol. The owner sees its loss on the next `SyncGroup` and revokes, and a
 //! follow-up rebalance places the released partition.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 /// One member's input to [`assign`]: `(member_id, subscribed_topics, owned_partitions, generation_id)`.
 pub type MemberInput = (String, Vec<String>, Vec<(String, i32)>, i32);
@@ -46,22 +46,15 @@ pub fn assign(
     // previous owner to a new member.
     let mut adjusted: HashMap<String, Vec<(String, i32)>> = HashMap::new();
     for id in &member_ids {
-        adjusted.insert(id.clone(), Vec::new());
-    }
-    for id in &member_ids {
         let new_parts = raw_assignment.get(id).cloned().unwrap_or_default();
-        for tp in new_parts {
-            match previous_owner.get(&tp) {
-                Some(prev) if prev != id => {
-                    // Previous owner still alive (it's in current_assignment,
-                    // which by construction means they're in members & subscribed).
-                    // Omit: phase 2 will place it.
-                }
-                _ => {
-                    adjusted.get_mut(id).unwrap().push(tp);
-                }
-            }
-        }
+        let kept = new_parts
+            .into_iter()
+            // A previous owner still alive (it's in current_assignment, which
+            // by construction means they're in members & subscribed) keeps the
+            // partition out: phase 2 will place it.
+            .filter(|tp| !matches!(previous_owner.get(tp), Some(prev) if prev != id))
+            .collect();
+        adjusted.insert(id.clone(), kept);
     }
 
     // Sort each member's partition list (topic, partition) for determinism.
@@ -148,10 +141,7 @@ fn sticky_assignment(
     // constrained algorithm; else the general algorithm.
     let all_equal = {
         let mut iter = subs.values();
-        match iter.next() {
-            None => true,
-            Some(first) => iter.all(|s| s == first),
-        }
+        iter.next().is_none_or(|first| iter.all(|s| s == first))
     };
 
     let raw_assignment = if all_equal {
@@ -192,17 +182,16 @@ fn prepopulate_current_assignments(
                 continue;
             }
             let key = (t.clone(), *p);
-            match best.get(&key) {
+            match best.get_mut(&key) {
                 None => {
                     best.insert(key, (*generation, id.clone(), false));
                 }
-                Some((existing_gen, _existing_id, _tied)) => {
-                    if *generation > *existing_gen {
-                        best.insert(key, (*generation, id.clone(), false));
-                    } else if *generation == *existing_gen {
+                Some(existing) => {
+                    if *generation > existing.0 {
+                        *existing = (*generation, id.clone(), false);
+                    } else if *generation == existing.0 {
                         // Tie → mark as dropped.
-                        let prev = best.get(&key).cloned().unwrap();
-                        best.insert(key, (prev.0, prev.1, true));
+                        existing.2 = true;
                     }
                     // else: lower-gen claim loses silently.
                 }
@@ -265,13 +254,13 @@ fn constrained_assign(
         .collect();
     let mut assigned: HashSet<(String, i32)> = HashSet::new();
     let mut under_min: Vec<String> = Vec::new();
-    let mut exactly_min: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut exactly_min: VecDeque<String> = VecDeque::new();
 
     // `assignOwnedPartitions`.
     for id in member_ids {
         let mut owned: Vec<(String, i32)> = current_assignment.get(id).cloned().unwrap_or_default();
         owned.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        let slot = assignment.get_mut(id).expect("member slot");
+        let slot = assignment.entry(id.clone()).or_default();
         if owned.len() < min_quota {
             assigned.extend(owned.iter().cloned());
             slot.extend(owned);
@@ -304,26 +293,26 @@ fn constrained_assign(
     // `assignRoundRobin`.
     let mut cursor = 0;
     for partition in unassigned {
-        let member = if cursor < under_min.len() {
-            under_min[cursor].clone()
-        } else if under_min.is_empty() {
+        let member = if let Some(member) = under_min.get(cursor) {
+            member.clone()
+        } else if let Some(first) = under_min.first() {
+            cursor = 0;
+            first.clone()
+        } else {
             let Some(member) = exactly_min.pop_front() else {
                 // Kafka throws `IllegalStateException`; the quotas make this
                 // unreachable.
                 break;
             };
             member
-        } else {
-            cursor = 0;
-            under_min[0].clone()
         };
-        let slot = assignment.get_mut(&member).expect("member slot");
+        let slot = assignment.entry(member.clone()).or_default();
         slot.push(partition);
         let count = slot.len();
         // A member from the exactly-min queue now holds `max_quota` and leaves
         // the queue. A member below `min_quota` moves to that queue when it
         // reaches `min_quota`.
-        if cursor < under_min.len() && under_min[cursor] == member {
+        if under_min.get(cursor) == Some(&member) {
             if count == min_quota {
                 under_min.remove(cursor);
                 exactly_min.push_back(member);
@@ -402,17 +391,15 @@ fn general_assign(
     // than 1 above the current min load among subscribed members.
     for tp in &sorted_partitions {
         // Step 2 enumerates only keys from this unchanged subscriber index.
-        let subscribed = &subscribers_per_topic[&tp.0];
-        if subscribed.is_empty() {
+        let Some(subscribed) = subscribers_per_topic.get(&tp.0) else {
             continue;
-        }
+        };
+        let Some(chosen) = choose_assignment_owner(tp, subscribed, &prev_owner, &new_assignment)
+        else {
+            continue;
+        };
 
-        let chosen = choose_assignment_owner(tp, subscribed, &prev_owner, &new_assignment);
-
-        new_assignment
-            .get_mut(&chosen)
-            .expect("chosen exists")
-            .push(tp.clone());
+        new_assignment.entry(chosen).or_default().push(tp.clone());
     }
 
     // Step 4: balance pass. While there exist two members m1, m2 with
@@ -442,14 +429,15 @@ fn general_assign(
 fn pick_least_loaded(
     subscribed: &BTreeSet<String>,
     assignment: &BTreeMap<String, Vec<(String, i32)>>,
-) -> String {
-    least_loaded(subscribed, assignment).1
+) -> Option<String> {
+    least_loaded(subscribed, assignment).map(|(_, id)| id)
 }
 
+/// The least loaded member of `subscribed`, or `None` when it is empty.
 fn least_loaded(
     subscribed: &BTreeSet<String>,
     assignment: &BTreeMap<String, Vec<(String, i32)>>,
-) -> (usize, String) {
+) -> Option<(usize, String)> {
     let mut best: Option<(usize, String)> = None;
     for id in subscribed {
         let load = assignment.get(id).map_or(0, Vec::len);
@@ -463,7 +451,7 @@ fn least_loaded(
             }
         }
     }
-    best.expect("non-empty subscription")
+    best
 }
 
 fn choose_assignment_owner(
@@ -471,13 +459,13 @@ fn choose_assignment_owner(
     subscribed: &BTreeSet<String>,
     prev_owner: &HashMap<(String, i32), String>,
     assignment: &BTreeMap<String, Vec<(String, i32)>>,
-) -> String {
-    let (min_load, _) = least_loaded(subscribed, assignment);
+) -> Option<String> {
+    let (min_load, _) = least_loaded(subscribed, assignment)?;
     match prev_owner.get(tp) {
         Some(prev) if subscribed.contains(prev) => {
             let prev_load = assignment.get(prev).map_or(0, Vec::len);
             if prev_load <= min_load {
-                prev.clone()
+                Some(prev.clone())
             } else {
                 pick_least_loaded(subscribed, assignment)
             }
@@ -574,11 +562,11 @@ mod tests {
     use super::*;
 
     fn tp(items: &[(&str, i32)]) -> Vec<(String, i32)> {
-        items.iter().map(|(t, p)| ((*t).to_string(), *p)).collect()
+        items.iter().map(|(t, p)| ((*t).to_owned(), *p)).collect()
     }
 
     fn topics(ts: &[&str]) -> Vec<String> {
-        ts.iter().map(|s| (*s).to_string()).collect()
+        ts.iter().map(|s| (*s).to_owned()).collect()
     }
 
     fn total_assigned(out: &HashMap<String, Vec<(String, i32)>>) -> usize {
@@ -586,7 +574,7 @@ mod tests {
     }
 
     fn member_ids(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|id| (*id).to_string()).collect()
+        ids.iter().map(|id| (*id).to_owned()).collect()
     }
 
     fn subs(items: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
@@ -594,8 +582,8 @@ mod tests {
             .iter()
             .map(|(id, topics)| {
                 (
-                    (*id).to_string(),
-                    topics.iter().map(|t| (*t).to_string()).collect(),
+                    (*id).to_owned(),
+                    topics.iter().map(|t| (*t).to_owned()).collect(),
                 )
             })
             .collect()
@@ -604,30 +592,30 @@ mod tests {
     fn topic_parts(items: &[(&str, i32)]) -> HashMap<String, i32> {
         items
             .iter()
-            .map(|(topic, count)| ((*topic).to_string(), *count))
+            .map(|(topic, count)| ((*topic).to_owned(), *count))
             .collect()
     }
 
     fn current(items: &[(&str, &[(&str, i32)])]) -> BTreeMap<String, Vec<(String, i32)>> {
         items
             .iter()
-            .map(|(id, partitions)| ((*id).to_string(), tp(partitions)))
+            .map(|(id, partitions)| ((*id).to_owned(), tp(partitions)))
             .collect()
     }
 
     fn assigned(items: &[(&str, &[(&str, i32)])]) -> HashMap<String, Vec<(String, i32)>> {
         items
             .iter()
-            .map(|(id, partitions)| ((*id).to_string(), tp(partitions)))
+            .map(|(id, partitions)| ((*id).to_owned(), tp(partitions)))
             .collect()
     }
 
     #[test]
     fn single_member_takes_all() {
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 4);
+        topic_parts.insert("t".to_owned(), 4);
         let a = assign(
-            &[("m1".to_string(), topics(&["t"]), vec![], 0)],
+            &[("m1".to_owned(), topics(&["t"]), vec![], 0)],
             &topic_parts,
         );
         assert2::assert!(a["m1"] == tp(&[("t", 0), ("t", 1), ("t", 2), ("t", 3)]));
@@ -646,24 +634,19 @@ mod tests {
             (
                 "a new member does not take the only partition from its owner",
                 vec![
-                    ("a".to_string(), topics(&["t"]), vec![], 1),
-                    ("z".to_string(), topics(&["t"]), tp(&[("t", 0)]), 1),
+                    ("a".to_owned(), topics(&["t"]), vec![], 1),
+                    ("z".to_owned(), topics(&["t"]), tp(&[("t", 0)]), 1),
                 ],
-                one.clone(),
+                one,
                 assigned(&[("a", &[]), ("z", &[("t", 0)])]),
             ),
             (
                 "the owner of two keeps both when one member may be over the min quota",
                 vec![
-                    ("a".to_string(), topics(&["t"]), vec![], 1),
-                    (
-                        "z".to_string(),
-                        topics(&["t"]),
-                        tp(&[("t", 0), ("t", 2)]),
-                        1,
-                    ),
+                    ("a".to_owned(), topics(&["t"]), vec![], 1),
+                    ("z".to_owned(), topics(&["t"]), tp(&[("t", 0), ("t", 2)]), 1),
                 ],
-                three.clone(),
+                three,
                 assigned(&[("a", &[("t", 1)]), ("z", &[("t", 0), ("t", 2)])]),
             ),
         ] {
@@ -680,10 +663,10 @@ mod tests {
     fn general_assignment_moves_between_any_compatible_pair() {
         let counts = topic_parts(&[("x", 2), ("y", 5), ("z", 1)]);
         let members = vec![
-            ("a".to_string(), topics(&["x"]), vec![], -1),
-            ("b".to_string(), topics(&["y"]), vec![], -1),
-            ("c".to_string(), topics(&["z"]), vec![], -1),
-            ("d".to_string(), topics(&["x", "y"]), vec![], -1),
+            ("a".to_owned(), topics(&["x"]), vec![], -1),
+            ("b".to_owned(), topics(&["y"]), vec![], -1),
+            ("c".to_owned(), topics(&["z"]), vec![], -1),
+            ("d".to_owned(), topics(&["x", "y"]), vec![], -1),
         ];
         let loads: BTreeMap<String, usize> = assign_eager(&members, &counts)
             .into_iter()
@@ -691,18 +674,18 @@ mod tests {
             .collect();
         assert2::assert!(
             loads
-                == maplit::btreemap! {"a".to_string() => 2, "b".to_string() => 3, "c".to_string() => 1, "d".to_string() => 2}
+                == maplit::btreemap! {"a".to_owned() => 2, "b".to_owned() => 3, "c".to_owned() => 1, "d".to_owned() => 2}
         );
     }
 
     #[test]
     fn fresh_join_balances() {
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 4);
+        topic_parts.insert("t".to_owned(), 4);
         let a = assign(
             &[
-                ("m1".to_string(), topics(&["t"]), vec![], 0),
-                ("m2".to_string(), topics(&["t"]), vec![], 0),
+                ("m1".to_owned(), topics(&["t"]), vec![], 0),
+                ("m2".to_owned(), topics(&["t"]), vec![], 0),
             ],
             &topic_parts,
         );
@@ -716,18 +699,18 @@ mod tests {
         let topic_parts = topic_parts(&[("t", 3)]);
         let subs = subs(&[("m1", &["t"]), ("m2", &["t"]), ("m3", &["t"])]);
         let gens =
-            maplit::btreemap! {"m1".to_string() => 5, "m2".to_string() => 4, "m3".to_string() => 5};
+            maplit::btreemap! {"m1".to_owned() => 5, "m2".to_owned() => 4, "m3".to_owned() => 5};
 
         let out = prepopulate_current_assignments(
             &[
                 (
-                    "m1".to_string(),
+                    "m1".to_owned(),
                     topics(&["t"]),
                     tp(&[("t", 0), ("t", 1)]),
                     5,
                 ),
-                ("m2".to_string(), topics(&["t"]), tp(&[("t", 0)]), 4),
-                ("m3".to_string(), topics(&["t"]), tp(&[("t", 1)]), 5),
+                ("m2".to_owned(), topics(&["t"]), tp(&[("t", 0)]), 4),
+                ("m3".to_owned(), topics(&["t"]), tp(&[("t", 1)]), 5),
             ],
             &subs,
             &gens,
@@ -735,6 +718,27 @@ mod tests {
         );
 
         assert2::assert!(out == current(&[("m1", &[("t", 0)]), ("m2", &[]), ("m3", &[])]));
+    }
+
+    /// A later claim of a higher generation takes the partition from an
+    /// earlier claim of a lower one.
+    #[test]
+    fn prepopulate_replaces_an_earlier_lower_generation_claim() {
+        let topic_parts = topic_parts(&[("t", 1)]);
+        let subs = subs(&[("m1", &["t"]), ("m2", &["t"])]);
+        let gens = maplit::btreemap! {"m1".to_owned() => 5, "m2".to_owned() => 4};
+
+        let out = prepopulate_current_assignments(
+            &[
+                ("m2".to_owned(), topics(&["t"]), tp(&[("t", 0)]), 4),
+                ("m1".to_owned(), topics(&["t"]), tp(&[("t", 0)]), 5),
+            ],
+            &subs,
+            &gens,
+            &topic_parts,
+        );
+
+        assert2::assert!(out == current(&[("m1", &[("t", 0)]), ("m2", &[])]));
     }
 
     #[test]
@@ -816,14 +820,16 @@ mod tests {
                 "m1",
             ),
         ] {
-            assert2::assert!(pick_least_loaded(&subscribed, &assignment) == expected);
+            assert2::assert!(
+                pick_least_loaded(&subscribed, &assignment) == Some(expected.to_owned())
+            );
         }
     }
 
     #[test]
     fn choose_assignment_owner_uses_least_loaded_and_sticky_previous_owner_bounds() {
         let subscribed: BTreeSet<String> = member_ids(&["m1", "m2", "m3"]).into_iter().collect();
-        let tp = ("t".to_string(), 0);
+        let tp = ("t".to_owned(), 0);
         for (_name, prev_owner, assignment, expected) in [
             // No previous owner: least-loaded member wins.
             (
@@ -839,7 +845,7 @@ mod tests {
             // Sticky previous owner above the min load: least-loaded wins.
             (
                 "overloaded sticky owner",
-                maplit::hashmap! {tp.clone() => "m1".to_string()},
+                maplit::hashmap! {tp.clone() => "m1".to_owned()},
                 current(&[
                     ("m1", &[("a", 0)]),
                     ("m2", &[]),
@@ -850,14 +856,14 @@ mod tests {
             // Sticky previous owner at the min load keeps the partition.
             (
                 "balanced sticky owner",
-                maplit::hashmap! {tp.clone() => "m1".to_string()},
+                maplit::hashmap! {tp.clone() => "m1".to_owned()},
                 current(&[("m1", &[]), ("m2", &[]), ("m3", &[("b", 0), ("b", 1)])]),
                 "m1",
             ),
             // Unsubscribed previous owner: least-loaded wins.
             (
                 "unsubscribed previous owner",
-                maplit::hashmap! {tp.clone() => "mx".to_string()},
+                maplit::hashmap! {tp.clone() => "mx".to_owned()},
                 current(&[
                     ("m1", &[("a", 0)]),
                     ("m2", &[]),
@@ -867,7 +873,8 @@ mod tests {
             ),
         ] {
             assert2::assert!(
-                choose_assignment_owner(&tp, &subscribed, &prev_owner, &assignment) == expected
+                choose_assignment_owner(&tp, &subscribed, &prev_owner, &assignment)
+                    == Some(expected.to_owned())
             );
         }
     }
@@ -886,7 +893,7 @@ mod tests {
     fn balance_assignment_moves_from_heaviest_to_lightest_with_sticky_candidate_order() {
         let ids = member_ids(&["m1", "m2", "m3"]);
         let subs = subs(&[("m1", &["t"]), ("m2", &["t"]), ("m3", &["t"])]);
-        let prev_owner = maplit::hashmap! {("t".to_string(), 1) => "m2".to_string()};
+        let prev_owner = maplit::hashmap! {("t".to_owned(), 1) => "m2".to_owned()};
         let mut assignment = current(&[
             ("m1", &[("t", 0), ("t", 1), ("t", 2), ("t", 3)]),
             ("m2", &[]),
@@ -911,7 +918,7 @@ mod tests {
     fn balance_assignment_selects_non_first_heaviest_and_non_sticky_candidate() {
         let ids = member_ids(&["m1", "m2", "m3"]);
         let subs = subs(&[("m1", &["t"]), ("m2", &["t"]), ("m3", &["t"])]);
-        let prev_owner = maplit::hashmap! {("t".to_string(), 1) => "m1".to_string()};
+        let prev_owner = maplit::hashmap! {("t".to_owned(), 1) => "m1".to_owned()};
         let mut assignment = current(&[
             ("m1", &[]),
             ("m2", &[("t", 0), ("t", 1), ("t", 2)]),
@@ -956,7 +963,7 @@ mod tests {
     fn balance_assignment_moves_a_partition_back_to_its_previous_owner() {
         let ids = member_ids(&["m1", "m2"]);
         let subs = subs(&[("m1", &["t"]), ("m2", &["t"])]);
-        let prev_owner = maplit::hashmap! {("t".to_string(), 0) => "m1".to_string()};
+        let prev_owner = maplit::hashmap! {("t".to_owned(), 0) => "m1".to_owned()};
         let mut assignment = current(&[("m1", &[]), ("m2", &[("t", 0), ("t", 1), ("t", 2)])]);
 
         balance_assignment(&ids, &subs, &prev_owner, &mut assignment, 1);
@@ -991,13 +998,13 @@ mod tests {
     #[test]
     fn all_owned_stable_no_op() {
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 4);
+        topic_parts.insert("t".to_owned(), 4);
         let owned_m1 = tp(&[("t", 0), ("t", 1)]);
         let owned_m2 = tp(&[("t", 2), ("t", 3)]);
         let a = assign(
             &[
-                ("m1".to_string(), topics(&["t"]), owned_m1.clone(), 5),
-                ("m2".to_string(), topics(&["t"]), owned_m2.clone(), 5),
+                ("m1".to_owned(), topics(&["t"]), owned_m1, 5),
+                ("m2".to_owned(), topics(&["t"]), owned_m2, 5),
             ],
             &topic_parts,
         );
@@ -1014,15 +1021,15 @@ mod tests {
         // three of those (the ones that would go to m3) are OMITTED in
         // phase 1 because they need to move from a live owner.
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 9);
+        topic_parts.insert("t".to_owned(), 9);
         let owned_m1 = tp(&[("t", 0), ("t", 1), ("t", 2), ("t", 3)]);
         let owned_m2 = tp(&[("t", 4), ("t", 5), ("t", 6), ("t", 7)]);
         // partition 8 is brand new (unowned).
         let a = assign(
             &[
-                ("m1".to_string(), topics(&["t"]), owned_m1.clone(), 5),
-                ("m2".to_string(), topics(&["t"]), owned_m2.clone(), 5),
-                ("m3".to_string(), topics(&["t"]), vec![], 5),
+                ("m1".to_owned(), topics(&["t"]), owned_m1, 5),
+                ("m2".to_owned(), topics(&["t"]), owned_m2, 5),
+                ("m3".to_owned(), topics(&["t"]), vec![], 5),
             ],
             &topic_parts,
         );
@@ -1045,22 +1052,22 @@ mod tests {
         // down to phase-1 output. m3 owned remains empty.
         // Phase 1 produced m1=3, m2=3, m3 owns whatever was unowned.
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 9);
+        topic_parts.insert("t".to_owned(), 9);
         let phase1 = assign(
             &[
                 (
-                    "m1".to_string(),
+                    "m1".to_owned(),
                     topics(&["t"]),
                     tp(&[("t", 0), ("t", 1), ("t", 2), ("t", 3)]),
                     5,
                 ),
                 (
-                    "m2".to_string(),
+                    "m2".to_owned(),
                     topics(&["t"]),
                     tp(&[("t", 4), ("t", 5), ("t", 6), ("t", 7)]),
                     5,
                 ),
-                ("m3".to_string(), topics(&["t"]), vec![], 5),
+                ("m3".to_owned(), topics(&["t"]), vec![], 5),
             ],
             &topic_parts,
         );
@@ -1068,9 +1075,9 @@ mod tests {
         // Now feed phase-1 output back as owned and re-assign.
         let phase2 = assign(
             &[
-                ("m1".to_string(), topics(&["t"]), phase1["m1"].clone(), 6),
-                ("m2".to_string(), topics(&["t"]), phase1["m2"].clone(), 6),
-                ("m3".to_string(), topics(&["t"]), phase1["m3"].clone(), 6),
+                ("m1".to_owned(), topics(&["t"]), phase1["m1"].clone(), 6),
+                ("m2".to_owned(), topics(&["t"]), phase1["m2"].clone(), 6),
+                ("m3".to_owned(), topics(&["t"]), phase1["m3"].clone(), 6),
             ],
             &topic_parts,
         );
@@ -1093,10 +1100,10 @@ mod tests {
         // partitions have no live owner now, so they're freely
         // redistributed in this round (not held back).
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 4);
+        topic_parts.insert("t".to_owned(), 4);
         let a = assign(
             &[(
-                "m2".to_string(),
+                "m2".to_owned(),
                 topics(&["t"]),
                 tp(&[("t", 2), ("t", 3)]),
                 5,
@@ -1112,12 +1119,12 @@ mod tests {
         // t1 has 2 partitions, t2 has 2 partitions.
         // t2 partitions can only go to m1; t1 must be split.
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t1".to_string(), 2);
-        topic_parts.insert("t2".to_string(), 2);
+        topic_parts.insert("t1".to_owned(), 2);
+        topic_parts.insert("t2".to_owned(), 2);
         let a = assign(
             &[
-                ("m1".to_string(), topics(&["t1", "t2"]), vec![], 0),
-                ("m2".to_string(), topics(&["t1"]), vec![], 0),
+                ("m1".to_owned(), topics(&["t1", "t2"]), vec![], 0),
+                ("m2".to_owned(), topics(&["t1"]), vec![], 0),
             ],
             &topic_parts,
         );
@@ -1143,16 +1150,16 @@ mod tests {
         // others). The new assignment should give m1 some, m2 some;
         // total should be 4 (no live owner is losing partitions).
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 4);
+        topic_parts.insert("t".to_owned(), 4);
         let a = assign(
             &[
                 (
-                    "m1".to_string(),
+                    "m1".to_owned(),
                     topics(&["t"]),
                     tp(&[("t", 0), ("t", 1)]),
                     5,
                 ),
-                ("m2".to_string(), topics(&["t"]), tp(&[("t", 0)]), 4),
+                ("m2".to_owned(), topics(&["t"]), tp(&[("t", 0)]), 4),
             ],
             &topic_parts,
         );
@@ -1169,17 +1176,17 @@ mod tests {
         // Both also claim other unique partitions to keep current_assignment
         // non-empty.
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 4);
+        topic_parts.insert("t".to_owned(), 4);
         let a = assign(
             &[
                 (
-                    "m1".to_string(),
+                    "m1".to_owned(),
                     topics(&["t"]),
                     tp(&[("t", 0), ("t", 1)]),
                     5,
                 ),
                 (
-                    "m2".to_string(),
+                    "m2".to_owned(),
                     topics(&["t"]),
                     tp(&[("t", 0), ("t", 2)]),
                     5,
@@ -1200,11 +1207,11 @@ mod tests {
         // Topic added between rebalances; nobody owns its partitions.
         // They're all assigned in this round.
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("newt".to_string(), 3);
+        topic_parts.insert("newt".to_owned(), 3);
         let a = assign(
             &[
-                ("m1".to_string(), topics(&["newt"]), vec![], 5),
-                ("m2".to_string(), topics(&["newt"]), vec![], 5),
+                ("m1".to_owned(), topics(&["newt"]), vec![], 5),
+                ("m2".to_owned(), topics(&["newt"]), vec![], 5),
             ],
             &topic_parts,
         );
@@ -1218,10 +1225,10 @@ mod tests {
     fn partition_count_decreased() {
         // m1 claims (t,5) but topic only has 3 partitions now → dropped.
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 3);
+        topic_parts.insert("t".to_owned(), 3);
         let a = assign(
             &[(
-                "m1".to_string(),
+                "m1".to_owned(),
                 topics(&["t"]),
                 tp(&[("t", 0), ("t", 5)]),
                 5,
@@ -1243,11 +1250,11 @@ mod tests {
     fn member_with_no_subscriptions() {
         // m2 subscribes to nothing → empty assignment.
         let mut topic_parts = HashMap::new();
-        topic_parts.insert("t".to_string(), 2);
+        topic_parts.insert("t".to_owned(), 2);
         let a = assign(
             &[
-                ("m1".to_string(), topics(&["t"]), vec![], 0),
-                ("m2".to_string(), vec![], vec![], 0),
+                ("m1".to_owned(), topics(&["t"]), vec![], 0),
+                ("m2".to_owned(), vec![], vec![], 0),
             ],
             &topic_parts,
         );

@@ -4,6 +4,7 @@
 //! Kafka's `KafkaAdminClient` fails a call with the `AuthenticationException`
 //! that `NetworkClient` stored for the node, and `AdminMetadataManager` makes
 //! it fatal. Kafka keeps a disconnect in the `AUTHENTICATE` state retriable.
+#![cfg(test)]
 
 use std::sync::{
     Arc,
@@ -12,7 +13,9 @@ use std::sync::{
 
 use assert2::check;
 use bytes::BytesMut;
-use krabka_client_admin::{AdminClient, AdminError, CreateTopicSpec, TopicMutationOptions};
+use krabka_client_admin::{
+    AdminClient, AdminClientLike as _, AdminError, CreateTopicSpec, TopicMutationOptions,
+};
 use krabka_client_core::{
     AuthenticationError, ClientError, MockBroker, MockReply, MockSaslAnswer,
     SaslAuthenticationError,
@@ -80,7 +83,7 @@ async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) 
                 .copied()
                 .unwrap_or_else(|| *script.last().unwrap());
         }
-        if let Some(reply) = answer.reply(api_key, version) {
+        if let Some(reply) = answer.reply(api_key, version).unwrap() {
             return reply;
         }
         match api_key {
@@ -112,6 +115,7 @@ async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) 
         }
     })
     .await
+    .unwrap()
 }
 
 fn plain_security() -> ClientSecurity {

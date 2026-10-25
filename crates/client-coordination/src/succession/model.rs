@@ -439,7 +439,7 @@ impl Model for SuccessionModel {
             // owns an epoch the broker still accepts.
             Property::always(
                 "at_most_one_live_authority",
-                |model: &SuccessionModel, state: &State| {
+                |model: &Self, state: &State| {
                     model
                         .outcomes(state)
                         .into_iter()
@@ -456,7 +456,7 @@ impl Model for SuccessionModel {
             // A `Hold` outcome always names a live lease of this member.
             Property::always(
                 "hold_needs_a_live_lease_of_the_member",
-                |model: &SuccessionModel, state: &State| {
+                |model: &Self, state: &State| {
                     model
                         .outcomes(state)
                         .into_iter()
@@ -473,8 +473,8 @@ impl Model for SuccessionModel {
             // live, so a short pause never moves the role.
             Property::always(
                 "no_challenge_while_the_lease_is_live",
-                |model: &SuccessionModel, state: &State| {
-                    !SuccessionModel::lease_is_live(state)
+                |model: &Self, state: &State| {
+                    !Self::lease_is_live(state)
                         || model
                             .outcomes(state)
                             .into_iter()
@@ -485,7 +485,7 @@ impl Model for SuccessionModel {
             // that joined earlier. The holder is out of the rank order.
             Property::always(
                 "a_later_joiner_never_outranks_an_earlier_one",
-                |model: &SuccessionModel, state: &State| {
+                |model: &Self, state: &State| {
                     let role_state = model.role_state(state);
                     let holder = role_state.holder().cloned();
                     let contenders: Vec<&RosterEntry> = role_state
@@ -505,7 +505,7 @@ impl Model for SuccessionModel {
             // Every registered member that runs gets an actionable outcome.
             Property::always(
                 "a_registered_member_always_has_a_rank",
-                |model: &SuccessionModel, state: &State| {
+                |model: &Self, state: &State| {
                     model
                         .outcomes(state)
                         .into_iter()
@@ -543,8 +543,8 @@ impl Model for SuccessionModel {
             }),
             Property::sometimes(
                 "a_recovered_member_ranks_last_behind_its_replacement",
-                |model: &SuccessionModel, state: &State| {
-                    if !SuccessionModel::lease_is_live(state) {
+                |model: &Self, state: &State| {
+                    if !Self::lease_is_live(state) {
                         return false;
                     }
                     let role_state = model.role_state(state);
@@ -564,7 +564,7 @@ impl Model for SuccessionModel {
             ),
             Property::sometimes(
                 "two_standbys_wait_for_different_instants",
-                |model: &SuccessionModel, state: &State| {
+                |model: &Self, state: &State| {
                     let waits: Vec<i64> = model
                         .outcomes(state)
                         .into_iter()

@@ -8,10 +8,10 @@
 //! type. As in Kafka's client, the broker validates the combination.
 //!
 //! The `KafkaUser` reconciler uses the per-user shortcuts
-//! [`AdminClient::describe_user_quotas`] and
-//! [`AdminClient::alter_user_quotas`].
+//! [`AdminClientLike::describe_user_quotas`](crate::AdminClientLike::describe_user_quotas) and
+//! [`AdminClientLike::alter_user_quotas`](crate::AdminClientLike::alter_user_quotas).
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, slice};
 
 use krabka_protocol::owned::{
     alter_client_quotas_request::{
@@ -346,16 +346,9 @@ impl AdminClient {
         Ok(alter_results(alterations, response))
     }
 
-    /// Reads the quotas of the user entity `{user: username}`.
-    ///
-    /// The filter is strict on the single component `("user", username)`, as
-    /// `ClientQuotaFilter.containsOnly`: an entry whose entity also has a
-    /// `client-id` does not match.
-    ///
-    /// # Errors
-    /// See [`Self::describe_client_quotas`].
-    pub async fn describe_user_quotas(
-        &mut self,
+    /// The call behind [`AdminClientLike::describe_user_quotas`](crate::AdminClientLike::describe_user_quotas).
+    pub(crate) async fn describe_user_quotas_impl(
+        &self,
         username: &str,
     ) -> Result<UserQuotaConfig, AdminError> {
         let filter = ClientQuotaFilter::contains_only(vec![ClientQuotaFilterComponent::of_entity(
@@ -370,14 +363,9 @@ impl AdminClient {
             .collect())
     }
 
-    /// Applies `ops` to the user entity `{user: username}`. Returns the
-    /// error the broker gave for the entity, or `None` on success. No
-    /// request is sent for an empty `ops`.
-    ///
-    /// # Errors
-    /// See [`Self::alter_client_quotas`].
-    pub async fn alter_user_quotas(
-        &mut self,
+    /// The call behind [`AdminClientLike::alter_user_quotas`](crate::AdminClientLike::alter_user_quotas).
+    pub(crate) async fn alter_user_quotas_impl(
+        &self,
         username: &str,
         ops: &[QuotaOp],
         validate_only: bool,
@@ -390,7 +378,7 @@ impl AdminClient {
             ops: ops.to_vec(),
         };
         Ok(self
-            .alter_client_quotas(std::slice::from_ref(&alteration), validate_only)
+            .alter_client_quotas(slice::from_ref(&alteration), validate_only)
             .await?
             .into_values()
             .next()
@@ -413,7 +401,9 @@ fn op_to_wire(op: &QuotaOp) -> AlterOp {
     }
 }
 
-/// Pure function. It diffs the desired key-set against the current key-set and
+/// Pure function.
+///
+/// It diffs the desired key-set against the current key-set and
 /// produces the minimal `(set, remove)` op stream. Floats compare bit-equal,
 /// so it does not re-issue a no-op `Set` with the same value.
 #[must_use]
@@ -458,6 +448,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::AdminClientLike as _;
 
     fn encode_v0(resp: &impl Encode) -> Vec<u8> {
         let mut buf = BytesMut::new();
@@ -514,11 +505,11 @@ mod tests {
         assert2::assert!(
             ops == vec![
                 QuotaOp::Set {
-                    key: "producer_byte_rate".to_string(),
+                    key: "producer_byte_rate".to_owned(),
                     value: 1_048_576.0,
                 },
                 QuotaOp::Set {
-                    key: "request_percentage".to_string(),
+                    key: "request_percentage".to_owned(),
                     value: 25.0,
                 },
             ]
@@ -570,15 +561,15 @@ mod tests {
         assert2::assert!(
             ops == vec![
                 QuotaOp::Set {
-                    key: "producer_byte_rate".to_string(),
+                    key: "producer_byte_rate".to_owned(),
                     value: 5.0,
                 },
                 QuotaOp::Set {
-                    key: "request_percentage".to_string(),
+                    key: "request_percentage".to_owned(),
                     value: 25.0,
                 },
                 QuotaOp::Remove {
-                    key: "consumer_byte_rate".to_string(),
+                    key: "consumer_byte_rate".to_owned(),
                 },
             ]
         );
@@ -593,7 +584,7 @@ mod tests {
         let w = op_to_wire(&op);
         assert2::assert!(
             w == AlterOp {
-                key: "producer_byte_rate".to_string(),
+                key: "producer_byte_rate".to_owned(),
                 value: 1.0,
                 remove: false,
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
@@ -609,7 +600,7 @@ mod tests {
         let w = op_to_wire(&op);
         assert2::assert!(
             w == AlterOp {
-                key: "producer_byte_rate".to_string(),
+                key: "producer_byte_rate".to_owned(),
                 value: 0.0,
                 remove: true,
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
@@ -823,7 +814,9 @@ mod tests {
                     }
                     let mut requests = handler_requests.lock().expect("requests lock");
                     *requests += 1;
-                    if close_first && *requests == 1 {
+                    let first = *requests == 1;
+                    drop(requests);
+                    if close_first && first {
                         return MockReply::Close;
                     }
                     MockReply::Respond(encode_response(
@@ -914,8 +907,8 @@ mod tests {
                 "a missing entity and an unasked entity",
                 vec![alice_answer.clone(), answer("user", Some("bob"), 0)],
                 maplit::btreemap! {
-                    alice.clone() => Ok(()),
-                    ip.clone() => unknown,
+                    alice => Ok(()),
+                    ip => unknown,
                 },
             ),
         ] {
@@ -969,7 +962,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         let mut admin = AdminClient::connect(&[mock.addr.to_string()])
             .await
             .expect("admin connects to mock broker");
@@ -1037,7 +1031,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         let mut admin = AdminClient::connect(&[mock.addr.to_string()])
             .await
             .expect("admin connects to mock broker");

@@ -34,21 +34,23 @@
 //!   no retry when the response is clean. The case therefore covers the
 //!   integration path through `parse_create_topics`, `parse_delete_topics` and
 //!   `parse_create_partitions`.
+#![cfg(test)]
 
 mod support;
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, slice, time::Duration};
 
 /// The dynamic config overrides of one topic.
 type Overrides = BTreeMap<String, String>;
 
 use assert2::assert;
 use krabka_client_admin::{
-    AdminClient, AlterConfigOp, AlterConfigsResults, ConfigResource, CreatePartitionsOp,
-    CreatePartitionsOutcome, CreateTopicOutcome, CreateTopicSpec, DeleteTopicOutcome,
-    DescribeConfigsOptions, IncrementalAlterConfigsOptions, TopicMetadataEntry,
+    AdminClient, AdminClientLike as _, AlterConfigOp, AlterConfigsResults, ConfigResource,
+    CreatePartitionsOp, CreatePartitionsOutcome, CreateTopicOutcome, CreateTopicSpec,
+    DeleteTopicOutcome, DescribeConfigsOptions, IncrementalAlterConfigsOptions, TopicMetadataEntry,
     TopicMutationOptions,
 };
+use tokio::time::{sleep, timeout};
 
 /// Bound on every read-back loop. The broker applies a change and then makes
 /// it visible in its own time.
@@ -257,14 +259,14 @@ async fn await_topic(
     what: &str,
     ready: impl Fn(Option<&TopicMetadataEntry>) -> bool,
 ) -> Option<TopicMetadataEntry> {
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             let md = admin.metadata(&[topic]).await.expect("metadata");
             let entry = md.topics.into_iter().find(|t| t.name == topic);
             if ready(entry.as_ref()) {
                 break entry;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            sleep(POLL_INTERVAL).await;
         }
     })
     .await
@@ -282,11 +284,11 @@ async fn await_overrides(
     ready: impl Fn(&Overrides) -> bool,
 ) -> Overrides {
     let resource = ConfigResource::topic(topic);
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             let mut described = admin
                 .describe_configs(
-                    std::slice::from_ref(&resource),
+                    slice::from_ref(&resource),
                     DescribeConfigsOptions::builder().build(),
                 )
                 .await
@@ -299,7 +301,7 @@ async fn await_overrides(
             if ready(&overrides) {
                 break overrides;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            sleep(POLL_INTERVAL).await;
         }
     })
     .await

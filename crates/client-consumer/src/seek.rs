@@ -19,6 +19,7 @@
 //! one. Kafka's `FetchCollector` does the same check.
 
 use krabka_ids::LeaderEpoch;
+use tracing::field;
 
 use crate::{consumer::Consumer, error::ConsumerError, poll, position};
 
@@ -40,7 +41,7 @@ impl Consumer {
         name = "consumer.seek",
         level = "debug",
         skip_all,
-        fields(group_id = %self.group_id, topic = tracing::field::Empty, partition, offset),
+        fields(group_id = %self.group_id, topic = field::Empty, partition, offset),
         err(level = "debug")
     )]
     pub async fn seek(
@@ -71,7 +72,7 @@ impl Consumer {
         name = "consumer.seek_with_leader_epoch",
         level = "debug",
         skip_all,
-        fields(group_id = %self.group_id, topic = tracing::field::Empty, partition, offset, leader_epoch),
+        fields(group_id = %self.group_id, topic = field::Empty, partition, offset, leader_epoch),
         err(level = "debug")
     )]
     pub async fn seek_with_leader_epoch(
@@ -164,7 +165,7 @@ impl Consumer {
         if offset < 0 {
             return Err(ConsumerError::InvalidOffset(offset));
         }
-        tracing::Span::current().record("topic", tracing::field::display(&topic));
+        tracing::Span::current().record("topic", field::display(&topic));
         let key = (topic, partition);
         // Lock order: `assigned`, then `next_offsets`, then `positions`, as
         // `drain_fetch_buffer` in poll.rs.

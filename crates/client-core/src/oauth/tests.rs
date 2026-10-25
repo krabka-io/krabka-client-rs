@@ -1,4 +1,5 @@
 use std::{
+    future,
     io::Write as _,
     sync::{
         Mutex,
@@ -7,7 +8,12 @@ use std::{
 };
 
 use assert2::check;
-use tokio::{io::AsyncBufReadExt as _, net::TcpListener};
+use tokio::{
+    io::{AsyncBufReadExt as _, BufReader},
+    net::TcpListener,
+    task::yield_now,
+    time::advance,
+};
 
 use super::*;
 
@@ -265,9 +271,9 @@ fn a_chunked_body_that_splits_a_character_still_decodes() {
     let body = r#"{"access_token":"t","scope":"café"}"#.as_bytes();
     // The second chunk starts inside the two bytes of "é".
     let split = body.len() - 3;
-    let (first, second) = body.split_at(split);
+    let chunks = <[&[u8]; 2]>::from(body.split_at(split));
     let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
-    for chunk in [first, second] {
+    for chunk in chunks {
         response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
         response.extend_from_slice(chunk);
         response.extend_from_slice(b"\r\n");
@@ -299,7 +305,7 @@ fn refresh_times_follow_the_expiring_credential_rules() {
         ("too short for the buffers", 0, 0, 300, 0.0, at(240)),
     ] {
         check!(
-            provider.refresh_at(at(now), at(start), at(expire), unit) == expected,
+            provider.refresh_time(at(now), at(start), at(expire), unit) == expected,
             "{name}"
         );
     }
@@ -316,7 +322,7 @@ async fn endpoint(answers: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<String>
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = tokio::io::BufReader::new(stream);
+            let mut reader = BufReader::new(stream);
             let mut head = String::new();
             let mut length = 0;
             loop {
@@ -573,8 +579,7 @@ async fn the_jwt_bearer_provider_posts_a_signed_assertion_the_endpoint_can_verif
         )
     );
 
-    let body_start = requests[0].find("\r\n\r\n").unwrap() + 4;
-    let body = &requests[0][body_start..];
+    let (_, body) = requests[0].split_once("\r\n\r\n").unwrap();
     let assertion = body
         .strip_prefix("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=")
         .unwrap();
@@ -586,12 +591,9 @@ async fn the_jwt_bearer_provider_posts_a_signed_assertion_the_endpoint_can_verif
 
     let signing_input = format!("{header}.{payload}");
     let public_key = test_rsa_public_key();
-    ring::signature::UnparsedPublicKey::new(
-        &ring::signature::RSA_PKCS1_2048_8192_SHA256,
-        &public_key,
-    )
-    .verify(signing_input.as_bytes(), &signature)
-    .unwrap();
+    signature::UnparsedPublicKey::new(&signature::RSA_PKCS1_2048_8192_SHA256, &public_key)
+        .verify(signing_input.as_bytes(), &signature)
+        .unwrap();
 
     let claims: serde_json::Value =
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
@@ -610,7 +612,7 @@ async fn wait_for_requests(requests: &Mutex<Vec<String>>, count: usize) {
         if requests.lock().unwrap().len() >= count {
             return;
         }
-        tokio::task::yield_now().await;
+        yield_now().await;
     }
     panic!("timed out waiting for {count} request(s)");
 }
@@ -637,7 +639,8 @@ async fn background_refresh_fetches_at_the_refresh_time_with_no_application_exch
         ClientCredentialsTokenProvider::new(ClientCredentialsConfig::new(url, "id", "secret"))
             .unwrap();
 
-    let handle = spawn_background_refresh(provider.clone()).unwrap();
+    let handle =
+        spawn_background_refresh(Arc::<ClientCredentialsTokenProvider>::clone(&provider)).unwrap();
     wait_for_requests(&requests, 1).await;
     check!(
         requests.lock().unwrap().len() == 1,
@@ -649,9 +652,9 @@ async fn background_refresh_fetches_at_the_refresh_time_with_no_application_exch
     // Stepping keeps the test independent of whether the task has reached
     // its sleep before the clock first moves.
     for _ in 0..95 {
-        tokio::time::advance(Duration::from_secs(1)).await;
+        advance(Duration::from_secs(1)).await;
         for _ in 0..100 {
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
     }
     wait_for_requests(&requests, 2).await;
@@ -689,4 +692,36 @@ fn background_refresh_is_on_by_default_and_can_be_turned_off() {
     })
     .unwrap();
     check!(!jwt_bearer_off.background_refresh_enabled());
+}
+
+/// Kafka's `HttpJwtRetriever.formatErrorMessage` keeps a short response
+/// body, and trims a long one to its first 1000 characters, here without
+/// splitting a character.
+#[test]
+fn snippet_keeps_a_short_body_and_trims_a_long_one() {
+    let short = "a".repeat(MAX_RESPONSE_SNIPPET);
+    let long = format!(
+        "{}é{}",
+        "a".repeat(MAX_RESPONSE_SNIPPET - 1),
+        "b".repeat(10)
+    );
+    check!(
+        (snippet(&short), snippet(&long))
+            == (
+                short.clone(),
+                format!(
+                    "{} (trimmed to first 1000 characters out of 1011 total)",
+                    "a".repeat(MAX_RESPONSE_SNIPPET - 1)
+                ),
+            )
+    );
+}
+
+/// `within` bounds a step by its limit, and without a limit it waits.
+#[tokio::test]
+async fn within_bounds_a_step_by_its_limit() {
+    let bounded = within(Some(Duration::from_millis(1)), future::pending::<()>()).await;
+    let in_time = within(Some(Duration::from_secs(5)), async { 7 }).await;
+    let unbounded = within(None, async { 8 }).await;
+    check!((bounded, in_time, unbounded) == (Err(()), Ok(7), Ok(8)));
 }

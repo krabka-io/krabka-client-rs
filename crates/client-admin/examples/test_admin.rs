@@ -1,9 +1,13 @@
-use krabka_client_admin::{AdminClient, CreateTopicSpec, TopicMutationOptions};
+use std::error::Error;
+
+use krabka_client_admin::{
+    AdminClient, AdminClientLike as _, CreateTopicSpec, TopicMutationOptions,
+};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     println!("Connecting to Krabka broker at 127.0.0.1:9092...");
-    let mut admin = AdminClient::connect(&["127.0.0.1:9092".to_string()]).await?;
+    let mut admin = AdminClient::connect(&["127.0.0.1:9092".to_owned()]).await?;
     println!("Connected successfully! Creating topic 'test-topic'...");
 
     admin

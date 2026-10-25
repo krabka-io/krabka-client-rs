@@ -165,9 +165,12 @@ impl AdminClient {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicU16, Ordering},
+    use std::{
+        net::SocketAddr,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU16, Ordering},
+        },
     };
 
     use krabka_client_core::MockBroker;
@@ -313,10 +316,7 @@ mod tests {
             let port = Arc::new(AtomicU16::new(0));
             let handler_port = Arc::clone(&port);
             let broker = MockBroker::start(move |api_key, version, _, body| {
-                let own = std::net::SocketAddr::from((
-                    [127, 0, 0, 1],
-                    handler_port.load(Ordering::SeqCst),
-                ));
+                let own = SocketAddr::from(([127, 0, 0, 1], handler_port.load(Ordering::SeqCst)));
                 match api_key {
                     api_versions_request::API_KEY => Some(
                         api_versions()
@@ -336,6 +336,7 @@ mod tests {
                         let mut requests = handler_requests.lock().expect("requests lock");
                         let (top, code) = answers[requests.len().min(answers.len() - 1)];
                         requests.push((version, decode_request(body, version, flexible)));
+                        drop(requests);
                         Some(encode_response(
                             &election_answer(top, code),
                             version,
@@ -345,7 +346,8 @@ mod tests {
                     _ => None,
                 }
             })
-            .await;
+            .await
+            .unwrap();
             port.store(broker.addr.port(), Ordering::SeqCst);
             let mut admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
@@ -358,7 +360,7 @@ mod tests {
                 });
 
             broker.stop();
-            let requests = requests.lock().expect("requests lock");
+            let requests = requests.lock().expect("requests lock").clone();
             let shapes = requests
                 .iter()
                 .map(|(version, request)| {
@@ -411,7 +413,8 @@ mod tests {
             }
             _ => None,
         })
-        .await;
+        .await
+        .unwrap();
         let mut admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
         let result = admin

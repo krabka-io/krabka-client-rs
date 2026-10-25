@@ -51,13 +51,15 @@ where
 }
 
 /// LEB128-encode `v` into `buf`.
-pub(crate) fn put_uvarint<B: BufMut>(buf: &mut B, mut v: u32) {
+pub fn put_uvarint<B: BufMut>(buf: &mut B, mut v: u32) {
     while (v & !0x7F) != 0 {
-        let byte = u8::try_from(v & 0x7F).expect("varint payload is seven bits");
-        buf.put_u8(byte | 0x80);
+        let [low, ..] = v.to_le_bytes();
+        buf.put_u8((low & 0x7F) | 0x80);
         v >>= 7;
     }
-    buf.put_u8(u8::try_from(v).expect("final varint byte is less than 128"));
+    // The loop leaves `v` below 128, so its low byte is all of it.
+    let [low, ..] = v.to_le_bytes();
+    buf.put_u8(low);
 }
 
 #[cfg(test)]
@@ -66,7 +68,7 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use futures_util::{SinkExt, StreamExt};
     use tokio::{
-        io::AsyncWriteExt,
+        io::{AsyncWriteExt, duplex},
         net::{TcpListener, TcpStream},
     };
     use tokio_util::codec::Decoder;
@@ -128,7 +130,7 @@ mod tests {
 
     #[tokio::test]
     async fn codec_accepts_frames_larger_than_tokio_util_default() {
-        let (client, server) = tokio::io::duplex(10 * 1024 * 1024);
+        let (client, server) = duplex(10 * 1024 * 1024);
         let payload = Bytes::from(vec![0xA5; 9 * 1024 * 1024]);
 
         let server_task = tokio::spawn(async move {

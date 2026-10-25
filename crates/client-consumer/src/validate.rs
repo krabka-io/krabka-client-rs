@@ -8,16 +8,68 @@
 
 use std::collections::HashMap;
 
+use krabka_client_core::EpochEndOffset;
 use krabka_ids::LeaderEpoch;
 use krabka_protocol::{
     owned::metadata_response::MetadataResponse, primitives::uuid::Uuid as WireUuid,
 };
+use tracing::field;
 
 use crate::{
     consumer::Consumer,
     error::ConsumerError,
     position::{PartitionPosition, ValidationOutcome, classify},
 };
+
+/// Apply the `OffsetForLeaderEpoch` `answer` for the position `offset` and
+/// `offset_epoch` that the request asked about with `leader_epoch` to `pos`,
+/// the position of the partition now, or `None` when the consumer no longer
+/// holds it. Returns the safe offset of a truncated log.
+fn apply_epoch_answer(
+    pos: Option<&mut PartitionPosition>,
+    answer: &EpochEndOffset,
+    offset: i64,
+    offset_epoch: LeaderEpoch,
+    leader_epoch: LeaderEpoch,
+) -> Option<i64> {
+    let pos = pos?;
+    if should_skip_stale_response(pos, leader_epoch) {
+        return None; // metadata moved under us; revalidate next poll
+    }
+
+    // CRITICAL: inspect the per-partition error_code BEFORE classify.
+    // On a non-zero code (FENCED_LEADER_EPOCH=74, UNKNOWN_LEADER_EPOCH=75,
+    // NOT_LEADER_OR_FOLLOWER=6, UNKNOWN_TOPIC_OR_PARTITION=3, ...) the
+    // broker returns end_offset = -1. Feeding that into `classify` would
+    // look like truncation and wrongly reset to 0. Instead leave the
+    // partition flagged for re-validation (and force a metadata refresh
+    // next poll) and skip it.
+    if response_has_error(answer.error_code) {
+        // Reset leader_epoch so refresh_leader_epochs re-flags + the next
+        // pass re-issues this RPC against fresher metadata.
+        mark_validation_error(pos);
+        return None;
+    }
+
+    // Wrap the leader's answer epoch (raw wire `int32`) at the
+    // OffsetForLeaderEpoch decode boundary.
+    match classify(
+        offset,
+        offset_epoch,
+        LeaderEpoch(answer.leader_epoch),
+        answer.end_offset,
+    ) {
+        ValidationOutcome::Valid { leader_epoch: le } => {
+            pos.offset_epoch = le;
+            pos.awaiting_validation = false;
+            None
+        }
+        ValidationOutcome::Truncated { safe_offset } => {
+            pos.awaiting_validation = false;
+            Some(safe_offset)
+        }
+    }
+}
 
 fn update_leader_epoch(pos: &mut PartitionPosition, leader_epoch: LeaderEpoch) {
     if leader_epoch > pos.leader_epoch {
@@ -28,10 +80,7 @@ fn update_leader_epoch(pos: &mut PartitionPosition, leader_epoch: LeaderEpoch) {
     }
 }
 
-pub(crate) fn should_await_validation(
-    leader_epoch: LeaderEpoch,
-    offset_epoch: LeaderEpoch,
-) -> bool {
+pub fn should_await_validation(leader_epoch: LeaderEpoch, offset_epoch: LeaderEpoch) -> bool {
     leader_epoch > offset_epoch && offset_epoch.is_known()
 }
 
@@ -71,7 +120,7 @@ fn response_has_error(error_code: i16) -> bool {
 /// ids of each metadata response in the same way. The metadata requests name
 /// the topics of the consumer, so the response holds no other topics. This
 /// function skips a topic row with an error or with the zero id.
-pub(crate) fn refresh_tracked_topic_ids(
+pub fn refresh_tracked_topic_ids(
     topic_ids: &mut HashMap<String, WireUuid>,
     metadata: &MetadataResponse,
 ) {
@@ -140,8 +189,8 @@ impl Consumer {
         skip_all,
         fields(
             group_id = %self.group_id,
-            to_validate = tracing::field::Empty,
-            truncated = tracing::field::Empty,
+            to_validate = field::Empty,
+            truncated = field::Empty,
         ),
         err(level = "debug")
     )]
@@ -217,44 +266,18 @@ impl Consumer {
 
             // Re-check the partition is still assigned + epoch unchanged before
             // applying — a rebalance may have moved it.
-            let mut positions = self.positions.lock().await;
-            let Some(pos) = positions.get_mut(&(topic.clone(), partition)) else {
-                continue;
-            };
-            if should_skip_stale_response(pos, leader_epoch) {
-                continue; // metadata moved under us; revalidate next poll
-            }
-
-            // CRITICAL: inspect the per-partition error_code BEFORE classify.
-            // On a non-zero code (FENCED_LEADER_EPOCH=74, UNKNOWN_LEADER_EPOCH=75,
-            // NOT_LEADER_OR_FOLLOWER=6, UNKNOWN_TOPIC_OR_PARTITION=3, ...) the
-            // broker returns end_offset = -1. Feeding that into `classify` would
-            // look like truncation and wrongly reset to 0. Instead leave the
-            // partition flagged for re-validation (and force a metadata refresh
-            // next poll) and skip it.
-            if response_has_error(answer.error_code) {
-                // Reset leader_epoch so refresh_leader_epochs re-flags + the next
-                // pass re-issues this RPC against fresher metadata.
-                mark_validation_error(pos);
-                continue;
-            }
-
-            // Wrap the leader's answer epoch (raw wire `int32`) at the
-            // OffsetForLeaderEpoch decode boundary.
-            match classify(
+            let safe_offset = apply_epoch_answer(
+                self.positions
+                    .lock()
+                    .await
+                    .get_mut(&(topic.clone(), partition)),
+                &answer,
                 offset,
                 offset_epoch,
-                LeaderEpoch(answer.leader_epoch),
-                answer.end_offset,
-            ) {
-                ValidationOutcome::Valid { leader_epoch: le } => {
-                    pos.offset_epoch = le;
-                    pos.awaiting_validation = false;
-                }
-                ValidationOutcome::Truncated { safe_offset } => {
-                    pos.awaiting_validation = false;
-                    truncated.insert((topic, partition), safe_offset);
-                }
+                leader_epoch,
+            );
+            if let Some(safe_offset) = safe_offset {
+                truncated.insert((topic, partition), safe_offset);
             }
         }
         tracing::Span::current().record("truncated", truncated.len());
@@ -275,6 +298,71 @@ mod tests {
             leader_epoch: LeaderEpoch(leader_epoch),
             awaiting_validation,
             ..Default::default()
+        }
+    }
+
+    fn answer(leader_epoch: i32, end_offset: i64, error_code: i16) -> EpochEndOffset {
+        EpochEndOffset {
+            partition: 0,
+            leader_epoch,
+            end_offset,
+            error_code,
+        }
+    }
+
+    /// `apply_epoch_answer` applies an `OffsetForLeaderEpoch` answer for a
+    /// position at offset 100, epoch 2, asked with leader epoch 3.
+    #[test]
+    fn epoch_answers_update_the_position_or_report_truncation() {
+        for (name, position, answer, expected_position, expected_truncation) in [
+            (
+                "the partition moved away",
+                None,
+                answer(2, 150, 0),
+                None,
+                None,
+            ),
+            (
+                "metadata moved past the asked leader epoch",
+                Some(pos(2, 4, true)),
+                answer(2, 150, 0),
+                Some(pos(2, 4, true)),
+                None,
+            ),
+            (
+                "an error answer keeps the partition flagged",
+                Some(pos(2, 3, true)),
+                answer(-1, -1, 74),
+                Some(pos(2, -1, true)),
+                None,
+            ),
+            (
+                "a consistent answer validates the position",
+                Some(pos(2, 3, true)),
+                answer(3, 150, 0),
+                Some(pos(3, 3, false)),
+                None,
+            ),
+            (
+                "an epoch that ends below the offset is a truncation",
+                Some(pos(2, 3, true)),
+                answer(2, 80, 0),
+                Some(pos(2, 3, false)),
+                Some(80),
+            ),
+        ] {
+            let mut position = position;
+            let truncation = apply_epoch_answer(
+                position.as_mut(),
+                &answer,
+                100,
+                LeaderEpoch(2),
+                LeaderEpoch(3),
+            );
+            check!(
+                (position, truncation) == (expected_position, expected_truncation),
+                "{name}"
+            );
         }
     }
 
@@ -375,25 +463,25 @@ mod tests {
             (
                 "tracked topic gets the new id",
                 topic("orders", 0, new_id),
-                maplit::hashmap! {"orders".to_string() => new_id},
+                maplit::hashmap! {"orders".to_owned() => new_id},
             ),
             (
                 "row with an error keeps the old id",
                 topic("orders", 3, new_id),
-                maplit::hashmap! {"orders".to_string() => old_id},
+                maplit::hashmap! {"orders".to_owned() => old_id},
             ),
             (
                 "row with the zero id keeps the old id",
                 topic("orders", 0, WireUuid::ZERO),
-                maplit::hashmap! {"orders".to_string() => old_id},
+                maplit::hashmap! {"orders".to_owned() => old_id},
             ),
             (
                 "a new topic is added",
                 topic("payments", 0, other_id),
-                maplit::hashmap! {"orders".to_string() => old_id, "payments".to_string() => other_id},
+                maplit::hashmap! {"orders".to_owned() => old_id, "payments".to_owned() => other_id},
             ),
         ] {
-            let mut topic_ids = maplit::hashmap! {"orders".to_string() => old_id};
+            let mut topic_ids = maplit::hashmap! {"orders".to_owned() => old_id};
             let metadata = MetadataResponse {
                 topics: vec![row],
                 ..Default::default()

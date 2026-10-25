@@ -59,8 +59,8 @@ impl ShareAcquireMode {
     /// The `i8` wire value carried in `ShareFetch` version 2 and later.
     pub(crate) fn wire(self) -> i8 {
         match self {
-            ShareAcquireMode::BatchOptimized => 0,
-            ShareAcquireMode::RecordLimit => 1,
+            Self::BatchOptimized => 0,
+            Self::RecordLimit => 1,
         }
     }
 }
@@ -81,9 +81,9 @@ impl ShareAckType {
     /// acknowledgement batches.
     pub(crate) fn wire(self) -> i8 {
         match self {
-            ShareAckType::Accept => 1,
-            ShareAckType::Release => 2,
-            ShareAckType::Reject => 3,
+            Self::Accept => 1,
+            Self::Release => 2,
+            Self::Reject => 3,
         }
     }
 }

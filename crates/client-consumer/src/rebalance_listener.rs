@@ -5,14 +5,19 @@
 //! task sends each call to the `Consumer` and waits until `poll` ran it. It
 //! sends heartbeats while it waits.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    error::Error,
+    sync::{Arc, Mutex as StdMutex, PoisonError},
+};
 
 use async_trait::async_trait;
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{consumer::Consumer, error::ConsumerError};
 
 /// The error that a listener callback returns.
-pub type RebalanceListenerError = Box<dyn std::error::Error + Send + Sync>;
+pub type RebalanceListenerError = Box<dyn Error + Send + Sync>;
 
 /// Callbacks for the partitions that a rebalance takes from or gives to the
 /// consumer. Kafka's `ConsumerRebalanceListener`.
@@ -75,16 +80,16 @@ pub trait ConsumerRebalanceListener: Send + Sync {
 
 /// The rebalance listener of a consumer. A cancelled `poll` drops only its
 /// lock guard, so the listener stays with the consumer.
-pub(crate) type SharedListener = Arc<tokio::sync::Mutex<Box<dyn ConsumerRebalanceListener>>>;
+pub type SharedListener = Arc<Mutex<Box<dyn ConsumerRebalanceListener>>>;
 
 /// Share `listener` for the consumer.
-pub(crate) fn shared(listener: Box<dyn ConsumerRebalanceListener>) -> SharedListener {
-    Arc::new(tokio::sync::Mutex::new(listener))
+pub fn shared(listener: Box<dyn ConsumerRebalanceListener>) -> SharedListener {
+    Arc::new(Mutex::new(listener))
 }
 
 /// Which callback a [`ListenerCall`] runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ListenerCallKind {
+pub enum ListenerCallKind {
     Revoked,
     Assigned,
     Lost,
@@ -92,15 +97,15 @@ pub(crate) enum ListenerCallKind {
 
 /// One callback that the coordinator task asks `poll` to run.
 #[derive(Debug)]
-pub(crate) struct ListenerCall {
+pub struct ListenerCall {
     pub kind: ListenerCallKind,
     pub partitions: Vec<(String, i32)>,
     /// Completed when the callback ran.
-    pub done: tokio::sync::oneshot::Sender<()>,
+    pub done: oneshot::Sender<()>,
 }
 
 /// The sending side of the listener calls, in the coordinator task.
-pub(crate) type ListenerCalls = tokio::sync::mpsc::UnboundedSender<ListenerCall>;
+pub type ListenerCalls = mpsc::UnboundedSender<ListenerCall>;
 
 impl Consumer {
     /// Run one listener callback on `partitions`.
@@ -110,7 +115,7 @@ impl Consumer {
     /// Returns [`ConsumerError::RebalanceListenerFailed`] when the callback
     /// fails.
     pub(crate) async fn run_listener(
-        &mut self,
+        &self,
         kind: ListenerCallKind,
         partitions: &[(String, i32)],
     ) -> Result<(), ConsumerError> {
@@ -120,11 +125,10 @@ impl Consumer {
         let mut listener = listener.lock().await;
         let mut sorted = partitions.to_vec();
         sorted.sort();
-        let consumer = &*self;
         let result = match kind {
-            ListenerCallKind::Revoked => listener.on_partitions_revoked(consumer, &sorted).await,
-            ListenerCallKind::Assigned => listener.on_partitions_assigned(consumer, &sorted).await,
-            ListenerCallKind::Lost => listener.on_partitions_lost(consumer, &sorted).await,
+            ListenerCallKind::Revoked => listener.on_partitions_revoked(self, &sorted).await,
+            ListenerCallKind::Assigned => listener.on_partitions_assigned(self, &sorted).await,
+            ListenerCallKind::Lost => listener.on_partitions_lost(self, &sorted).await,
         };
         drop(listener);
         result.map_err(|error| ConsumerError::RebalanceListenerFailed(error.to_string()))
@@ -132,7 +136,7 @@ impl Consumer {
 
     /// Run a listener call and tell the coordinator task that it ran.
     pub(crate) async fn complete_listener_call(
-        &mut self,
+        &self,
         call: ListenerCall,
     ) -> Result<(), ConsumerError> {
         let result = self.run_listener(call.kind, &call.partitions).await;
@@ -162,10 +166,10 @@ impl Consumer {
 /// callback on the thread that fetches, so no fetch comes between the two.
 /// Kafka's `SubscriptionState.markPendingOnAssignedCallback` does the same for
 /// the consumer with a background thread.
-pub(crate) type AssignedCallbackPending = Arc<std::sync::Mutex<HashSet<(String, i32)>>>;
+pub type AssignedCallbackPending = Arc<StdMutex<HashSet<(String, i32)>>>;
 
 /// Marks partitions as waiting for their assign callback until it drops.
-pub(crate) struct AssignedCallbackGate {
+pub struct AssignedCallbackGate {
     pending: AssignedCallbackPending,
     partitions: Vec<(String, i32)>,
 }
@@ -174,7 +178,7 @@ impl AssignedCallbackGate {
     pub(crate) fn new(pending: &AssignedCallbackPending, partitions: &[(String, i32)]) -> Self {
         pending
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .extend(partitions.iter().cloned());
         Self {
             pending: Arc::clone(pending),
@@ -185,10 +189,7 @@ impl AssignedCallbackGate {
 
 impl Drop for AssignedCallbackGate {
     fn drop(&mut self) {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         for partition in &self.partitions {
             pending.remove(partition);
         }

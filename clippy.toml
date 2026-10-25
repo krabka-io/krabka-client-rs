@@ -2,3 +2,16 @@
 # accommodates linear end-to-end integration scenarios without blanket lint
 # allows; scenarios above 200 lines must still be decomposed.
 too-many-lines-threshold = 200
+
+# `unwrap_used`, `expect_used` and `indexing_slicing` apply to shipped code
+# only. Test code may unwrap, expect and index freely: a `#[test]` function, a
+# `#[cfg(test)]` module, and an integration-test crate that opens with
+# `#![cfg(test)]`. Every `tests/*.rs` crate root carries that attribute, except
+# a `harness = false` target, which builds without `cfg(test)`.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# `clippy::absolute_paths`: a body names an item by its imported name or at
+# most `module::item`; `crate::a::b` and `std::a::b` are imported instead.
+absolute-paths-max-segments = 2

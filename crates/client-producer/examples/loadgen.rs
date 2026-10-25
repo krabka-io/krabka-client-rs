@@ -25,7 +25,9 @@
 
 use std::{
     collections::VecDeque,
+    env::var as env_var,
     process::ExitCode,
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -41,6 +43,7 @@ use krabka_protocol::owned::{
     create_topics_request::{CreatableTopic, CreateTopicsRequest},
     metadata_request::{MetadataRequest, MetadataRequestTopic},
 };
+use tokio::time::sleep;
 
 /// Error code 36 is `TOPIC_ALREADY_EXISTS`. A repeat run must not fail on it.
 const TOPIC_ALREADY_EXISTS: i16 = 36;
@@ -68,7 +71,7 @@ impl Settings {
     /// A silent fallback would let the report name a mode the producer never
     /// used, so every unreadable value is an error here.
     fn from_env() -> Result<Self, Failure> {
-        let acks_label: String = std::env::var("LOAD_ACKS").unwrap_or_else(|_| "1".into());
+        let acks_label: String = env_var("LOAD_ACKS").unwrap_or_else(|_| "1".into());
         let acks = match acks_label.as_str() {
             "0" => Acks::Zero,
             "1" => Acks::One,
@@ -76,8 +79,8 @@ impl Settings {
             other => return Err(format!("LOAD_ACKS must be 0, 1 or all, not {other:?}")),
         };
         Ok(Self {
-            bootstrap: std::env::var("LOAD_BOOTSTRAP").unwrap_or_else(|_| "127.0.0.1:9092".into()),
-            topic: std::env::var("LOAD_TOPIC").unwrap_or_else(|_| "loadgen".into()),
+            bootstrap: env_var("LOAD_BOOTSTRAP").unwrap_or_else(|_| "127.0.0.1:9092".into()),
+            topic: env_var("LOAD_TOPIC").unwrap_or_else(|_| "loadgen".into()),
             partitions: env("LOAD_PARTITIONS", 8)?,
             producers: env("LOAD_PRODUCERS", 4)?,
             value_bytes: env("LOAD_VALUE_BYTES", 128)?,
@@ -109,13 +112,14 @@ fn read(counter: &AtomicU64) -> u128 {
     u128::from(counter.load(Ordering::Relaxed))
 }
 
-fn env<T: std::str::FromStr>(key: &str, default: T) -> Result<T, Failure> {
-    match std::env::var(key) {
-        Err(_) => Ok(default),
-        Ok(text) => text
-            .parse()
-            .map_err(|_| format!("{key} is not a valid value: {text:?}")),
-    }
+fn env<T: FromStr>(key: &str, default: T) -> Result<T, Failure> {
+    env_var(key).map_or_else(
+        |_| Ok(default),
+        |text| {
+            text.parse()
+                .map_err(|_| format!("{key} is not a valid value: {text:?}"))
+        },
+    )
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -154,7 +158,7 @@ async fn run() -> Result<(), Failure> {
         )));
     }
 
-    tokio::time::sleep(Duration::from_secs(settings.seconds)).await;
+    sleep(Duration::from_secs(settings.seconds)).await;
     counters.stop.store(true, Ordering::Relaxed);
     let elapsed = start.elapsed();
 
@@ -170,8 +174,7 @@ async fn run() -> Result<(), Failure> {
         return Err(failures.join("; "));
     }
 
-    report(&settings, &counters, elapsed);
-    Ok(())
+    report(&settings, &counters, elapsed)
 }
 
 /// Create the topic, or check the one that is already there.
@@ -203,7 +206,7 @@ async fn create_topic(settings: &Settings) -> Result<(), Failure> {
         Some(0) => Ok(()),
         Some(TOPIC_ALREADY_EXISTS) => check_partition_count(&client, settings).await,
         Some(code) => Err(format!("CreateTopics returned error code {code}")),
-        None => Err("CreateTopics answered with no topic".to_string()),
+        None => Err("CreateTopics answered with no topic".to_owned()),
     };
     client.close();
     outcome
@@ -291,8 +294,8 @@ async fn run_producer(
     for acknowledgement in window {
         count_acknowledgement(&counters, &acknowledgement.await);
     }
-    producer.close().await.ok();
-    Ok(())
+    // A failed close does not void the run: every record is counted above.
+    producer.close().await.or(Ok(()))
 }
 
 /// Count one acknowledgement.
@@ -336,12 +339,12 @@ async fn run_consumer(settings: Arc<Settings>, counters: Arc<Counters>) -> Resul
                 // Stop the producers too. The run is void, so there is no
                 // reason to keep loading the broker.
                 counters.stop.store(true, Ordering::Relaxed);
-                consumer.close().await.ok();
+                let _ = consumer.close().await;
                 return Err(format!("consumer poll: {error}"));
             }
         }
     }
-    consumer.close().await.ok();
+    let _ = consumer.close().await;
     Ok(())
 }
 
@@ -351,13 +354,14 @@ async fn run_consumer(settings: Arc<Settings>, counters: Arc<Counters>) -> Resul
 /// traffic cannot inflate them. The rates use integer arithmetic. One byte per
 /// millisecond is one kilobyte per second, so the byte rate needs no scale
 /// factor.
-fn report(settings: &Settings, counters: &Counters, elapsed: Duration) {
+fn report(settings: &Settings, counters: &Counters, elapsed: Duration) -> Result<(), Failure> {
     let elapsed_ms = elapsed.as_millis().max(1);
     let sent = read(&counters.sent);
     let acked = read(&counters.acked);
     let rejected = read(&counters.rejected);
     let consumed = read(&counters.consumed);
-    let value_bytes = u128::try_from(settings.value_bytes).expect("value size fits in u128");
+    let value_bytes = u128::try_from(settings.value_bytes)
+        .map_err(|error| format!("LOAD_VALUE_BYTES does not fit the rate arithmetic: {error}"))?;
     let messages_per_second = acked * 1_000 / elapsed_ms;
     let kilobytes_per_second = acked * value_bytes / elapsed_ms;
 
@@ -376,4 +380,5 @@ fn report(settings: &Settings, counters: &Counters, elapsed: Duration) {
          | sent={sent} acked={acked} rejected={rejected}{fetched} | {messages_per_second} msg/s \
          | {kilobytes_per_second} kB/s over {seconds:.1}s"
     );
+    Ok(())
 }

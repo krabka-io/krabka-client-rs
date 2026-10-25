@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -60,7 +62,7 @@ pub enum ProducerError {
     )]
     BufferExhausted {
         size: usize,
-        max_block: std::time::Duration,
+        max_block: Duration,
         total: usize,
         available: usize,
         poolable: usize,
@@ -81,7 +83,7 @@ pub enum ProducerError {
         topic: String,
         partition: Option<i32>,
         partition_count: Option<i32>,
-        waited: std::time::Duration,
+        waited: Duration,
     },
 
     /// The batch ran out of retries, or its routing budget ended, before the
@@ -153,7 +155,7 @@ fn metadata_timeout_message(
     topic: &str,
     partition: Option<i32>,
     partition_count: Option<i32>,
-    waited: std::time::Duration,
+    waited: Duration,
 ) -> String {
     let waited_ms = waited.as_millis();
     match (partition, partition_count) {

@@ -5,11 +5,13 @@
 
 use std::{
     future::Future,
+    io,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicI32, AtomicU64, Ordering},
     },
+    time::{self, Duration},
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -23,17 +25,19 @@ use krabka_units::{
 };
 use refined_type::rule::{GreaterI64, GreaterUsize};
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, split},
     net::TcpStream,
-    sync::{mpsc, oneshot},
+    sync::{RwLockReadGuard, mpsc, oneshot},
     task::JoinHandle,
+    time::{Instant, sleep_until, timeout},
 };
 use tokio_util::sync::CancellationToken;
+use tracing::field;
 
 #[cfg(test)]
 use crate::mock;
 use crate::{
-    error::ClientError,
+    error::{AuthenticationError, ClientError},
     framing, reauth,
     request::ProtocolRequest,
     sasl, security, telemetry,
@@ -86,6 +90,8 @@ pub const DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY: usize = 64;
 pub const MAX_CLIENT_FRAME_BYTES: ByteSize = mebibytes(100);
 /// Default maximum accepted client frame size.
 pub const DEFAULT_CLIENT_FRAME_MAX: ByteSize = MAX_CLIENT_FRAME_BYTES;
+/// [`DEFAULT_CLIENT_FRAME_MAX`] as a byte count.
+const DEFAULT_CLIENT_FRAME_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 /// Positive, whole-millisecond DNS lookup deadline.
 ///
@@ -127,7 +133,7 @@ impl ClientDnsTimeout {
 
 impl Default for ClientDnsTimeout {
     fn default() -> Self {
-        Self::new(DEFAULT_CLIENT_DNS_TIMEOUT).expect("default client DNS timeout is valid")
+        Self(DEFAULT_CLIENT_DNS_TIMEOUT.millis_i64())
     }
 }
 
@@ -156,8 +162,7 @@ impl ConnectionDispatchQueueCapacity {
 
 impl Default for ConnectionDispatchQueueCapacity {
     fn default() -> Self {
-        Self::new(DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)
-            .expect("default client dispatch queue capacity is valid")
+        Self(DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)
     }
 }
 
@@ -201,7 +206,7 @@ impl TryFrom<ByteSize> for ClientFrameMax {
 
 impl Default for ClientFrameMax {
     fn default() -> Self {
-        Self::try_from(DEFAULT_CLIENT_FRAME_MAX).expect("default client frame max is valid")
+        Self(DEFAULT_CLIENT_FRAME_MAX_BYTES)
     }
 }
 
@@ -288,14 +293,14 @@ impl ConnectionOptions {
             ("connections_max_idle", self.connections_max_idle, true),
         ] {
             let seconds = value.secs_f64();
-            let duration = std::time::Duration::try_from_secs_f64(seconds);
+            let duration = Duration::try_from_secs_f64(seconds);
             if !seconds.is_finite()
                 || seconds < 0.0
                 || duration.as_ref().is_err()
-                || (!allow_zero && duration.as_ref().is_ok_and(std::time::Duration::is_zero))
-                || duration.as_ref().is_ok_and(|duration| {
-                    std::time::Instant::now().checked_add(*duration).is_none()
-                })
+                || (!allow_zero && duration.as_ref().is_ok_and(Duration::is_zero))
+                || duration
+                    .as_ref()
+                    .is_ok_and(|duration| time::Instant::now().checked_add(*duration).is_none())
             {
                 return Err(format!(
                     "{name} must be {} and representable as a transport deadline",
@@ -334,13 +339,13 @@ impl ConnectionOptions {
             .security
             .as_ref()
             .and_then(|security| security.sasl.as_ref())
-            .map(crate::sasl::SaslCredentials::mechanism)
-            && !crate::sasl::mechanism_supported(mechanism)
+            .map(sasl::SaslCredentials::mechanism)
+            && !sasl::mechanism_supported(mechanism)
         {
             return Err(format!(
                 "SASL/{}: {}",
                 mechanism.wire_name(),
-                crate::sasl::GSSAPI_UNAVAILABLE
+                sasl::GSSAPI_UNAVAILABLE
             ));
         }
         Ok(())
@@ -387,9 +392,27 @@ struct ConnectionInner {
     reauth: Option<reauth::Reauth>,
     /// The network metrics of the client, once attached. They count the
     /// requests after the `ApiVersions` exchange.
-    metrics: std::sync::OnceLock<telemetry::ConnectionMetrics>,
+    metrics: OnceLock<telemetry::ConnectionMetrics>,
     _reader: JoinHandle<()>,
     _writer: JoinHandle<()>,
+}
+
+impl ConnectionInner {
+    /// The next correlation id of a normal request. As Kafka's
+    /// `NetworkClient.nextCorrelationId` does, the ids wrap to 0 before the
+    /// range that SASL re-authentication reserves.
+    fn next_correlation_id(&self) -> i32 {
+        let last_normal = sasl::MIN_RESERVED_CORRELATION_ID - 1;
+        self.next_corr_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current >= last_normal {
+                    0
+                } else {
+                    current + 1
+                })
+            })
+            .unwrap_or(0)
+    }
 }
 
 struct DispatchItem {
@@ -403,7 +426,7 @@ struct DispatchItem {
 /// `close_notify` during the handshake and a plain I/O error retriable.
 /// `tokio-rustls` wraps an error from the TLS engine as the inner error of the
 /// `io::Error`.
-fn tls_handshake_error(addr: SocketAddr, source: std::io::Error) -> ClientError {
+fn tls_handshake_error(addr: SocketAddr, source: io::Error) -> ClientError {
     let rejected = source
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
@@ -416,7 +439,7 @@ fn tls_handshake_error(addr: SocketAddr, source: std::io::Error) -> ClientError 
     if rejected {
         ClientError::Authentication {
             addr,
-            source: crate::error::AuthenticationError::Tls(source),
+            source: AuthenticationError::Tls(source),
         }
     } else {
         ClientError::Tls { addr, source }
@@ -425,7 +448,7 @@ fn tls_handshake_error(addr: SocketAddr, source: std::io::Error) -> ClientError 
 
 /// Classify a failed SASL exchange. Only a rejection is an authentication
 /// failure.
-pub(crate) fn sasl_error(addr: SocketAddr, source: sasl::OutboundSaslError) -> ClientError {
+pub fn sasl_error(addr: SocketAddr, source: sasl::OutboundSaslError) -> ClientError {
     match source {
         sasl::OutboundSaslError::Authentication(error) => ClientError::Authentication {
             addr,
@@ -438,14 +461,14 @@ pub(crate) fn sasl_error(addr: SocketAddr, source: sasl::OutboundSaslError) -> C
 /// The last time that a connection sent or received a frame, as milliseconds
 /// since the connection started.
 struct Activity {
-    started: tokio::time::Instant,
+    started: Instant,
     last_ms: AtomicU64,
 }
 
 impl Activity {
     fn new() -> Self {
         Self {
-            started: tokio::time::Instant::now(),
+            started: Instant::now(),
             last_ms: AtomicU64::new(0),
         }
     }
@@ -455,8 +478,8 @@ impl Activity {
         self.last_ms.fetch_max(elapsed, Ordering::Relaxed);
     }
 
-    fn last(&self) -> tokio::time::Instant {
-        self.started + std::time::Duration::from_millis(self.last_ms.load(Ordering::Relaxed))
+    fn last(&self) -> Instant {
+        self.started + Duration::from_millis(self.last_ms.load(Ordering::Relaxed))
     }
 }
 
@@ -486,7 +509,7 @@ async fn within_setup_timeout<T>(
     setup: impl Future<Output = Result<T, ClientError>>,
 ) -> Result<T, ClientError> {
     options.validate().map_err(ClientError::InvalidConfig)?;
-    tokio::time::timeout(options.socket_connection_setup_timeout.to_std(), setup)
+    timeout(options.socket_connection_setup_timeout.to_std(), setup)
         .await
         .map_err(|_| ClientError::Timeout(options.socket_connection_setup_timeout))?
 }
@@ -581,7 +604,7 @@ impl Connection {
         // 1. TLS (if the protocol demands it).
         let mut stream: Box<dyn ClientDuplex> = if security.protocol.requires_tls() {
             let tls = security.tls.as_ref().ok_or_else(|| {
-                ClientError::Io(std::io::Error::other("TLS protocol without tls config"))
+                ClientError::Io(io::Error::other("TLS protocol without tls config"))
             })?;
             let connector = tls
                 .connector()
@@ -592,7 +615,7 @@ impl Connection {
                 tls.server_name.clone()
             };
             let sni = tokio_rustls::rustls::pki_types::ServerName::try_from(server_name)
-                .map_err(|e| ClientError::Io(std::io::Error::other(format!("invalid SNI: {e}"))))?;
+                .map_err(|e| ClientError::Io(io::Error::other(format!("invalid SNI: {e}"))))?;
             let s = connector
                 .connect(sni, tcp)
                 .await
@@ -606,7 +629,7 @@ impl Connection {
         let mut reauth = None;
         if security.protocol.requires_sasl() {
             let creds = security.sasl.as_ref().ok_or_else(|| {
-                ClientError::Io(std::io::Error::other("SASL protocol without credentials"))
+                ClientError::Io(io::Error::other("SASL protocol without credentials"))
             })?;
             // GSSAPI SPN host: explicit `sasl_host`, else TLS SNI, else the
             // connection's target IP, else "localhost". The target IP is a
@@ -676,26 +699,23 @@ impl Connection {
             },
         );
 
-        let mut conn = Self {
-            inner: Arc::new(ConnectionInner {
-                versions: ApiVersionTable::default(),
-                options: options.clone(),
-                next_corr_id: AtomicI32::new(0),
-                pending,
-                writer_tx,
-                shutdown,
-                reauth,
-                metrics: std::sync::OnceLock::new(),
-                _reader: reader_handle,
-                _writer: writer_handle,
-            }),
+        let mut inner = ConnectionInner {
+            versions: ApiVersionTable::default(),
+            options: options.clone(),
+            next_corr_id: AtomicI32::new(0),
+            pending,
+            writer_tx,
+            shutdown,
+            reauth,
+            metrics: OnceLock::new(),
+            _reader: reader_handle,
+            _writer: writer_handle,
         };
+        inner.versions = fetch_api_versions(&inner).await?;
 
-        let versions = fetch_api_versions(&conn).await?;
-        let inner = Arc::get_mut(&mut conn.inner).expect("unique handle at connect-time");
-        inner.versions = versions;
-
-        Ok(conn)
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// Return the peer-advertised version range for `api_key`.
@@ -724,7 +744,7 @@ impl Connection {
     #[tracing::instrument(
         level = "debug",
         skip_all,
-        fields(api_key = R::API_KEY, version = tracing::field::Empty),
+        fields(api_key = R::API_KEY, version = field::Empty),
         err(level = "debug"),
     )]
     pub async fn send<R: ProtocolRequest>(&self, req: R) -> Result<R::Response, ClientError> {
@@ -747,7 +767,7 @@ impl Connection {
             corr_id,
             &self.inner.options.client_id,
             body_flexible,
-        );
+        )?;
         req.encode(&mut frame, version)?;
 
         // 4. Dispatch request and await response.
@@ -792,7 +812,7 @@ impl Connection {
             corr_id,
             &self.inner.options.client_id,
             body_flexible,
-        );
+        )?;
         req.encode(&mut frame, version)?;
         let guard = self.reauthenticate_if_due().await?;
         if let Some(metrics) = self.inner.metrics.get() {
@@ -855,7 +875,7 @@ impl Connection {
             corr_id,
             &self.inner.options.client_id,
             true,
-        );
+        )?;
         frame.put_slice(&body);
 
         let body_bytes = self.dispatch_request(corr_id, frame).await?;
@@ -884,17 +904,7 @@ impl Connection {
     /// `NetworkClient.nextCorrelationId` does, the ids wrap to 0 before the
     /// range that SASL re-authentication reserves.
     fn next_correlation_id(&self) -> i32 {
-        let last_normal = sasl::MIN_RESERVED_CORRELATION_ID - 1;
-        self.inner
-            .next_corr_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(if current >= last_normal {
-                    0
-                } else {
-                    current + 1
-                })
-            })
-            .unwrap_or(0)
+        self.inner.next_correlation_id()
     }
 
     /// Whether the connection has closed: the peer closed it, an I/O error
@@ -963,7 +973,7 @@ impl Connection {
         version: ApiVersion,
         corr_id: i32,
         flexible: bool,
-    ) -> BytesMut {
+    ) -> Result<BytesMut, ClientError> {
         build_request_header(
             api_key,
             version,
@@ -981,19 +991,18 @@ impl Connection {
     /// exchange closes the connection and fails the request.
     async fn reauthenticate_if_due(
         &self,
-    ) -> Result<Option<tokio::sync::RwLockReadGuard<'_, Option<tokio::time::Instant>>>, ClientError>
-    {
+    ) -> Result<Option<RwLockReadGuard<'_, Option<Instant>>>, ClientError> {
         let Some(reauth) = self.inner.reauth.as_ref() else {
             return Ok(None);
         };
         loop {
             let next = reauth.next.read().await;
-            if next.is_none_or(|due| tokio::time::Instant::now() < due) {
+            if next.is_none_or(|due| Instant::now() < due) {
                 return Ok(Some(next));
             }
             drop(next);
             let mut next = reauth.next.write().await;
-            if next.is_some_and(|due| tokio::time::Instant::now() >= due) {
+            if next.is_some_and(|due| Instant::now() >= due) {
                 let mut channel = reauth::ConnectionChannel { connection: self };
                 // The exchange nests the whole SASL state machine. Boxing it
                 // keeps every send future small.
@@ -1039,7 +1048,7 @@ impl Connection {
         corr_id: i32,
         rx: oneshot::Receiver<Result<Bytes, ClientError>>,
     ) -> Result<Bytes, ClientError> {
-        match tokio::time::timeout(self.inner.options.request_timeout.to_std(), rx).await {
+        match timeout(self.inner.options.request_timeout.to_std(), rx).await {
             Ok(Ok(Ok(bytes))) => Ok(bytes),
             Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_recv_closed)) => Err(ClientError::Disconnected),
@@ -1072,7 +1081,7 @@ impl Drop for PendingRegistration<'_> {
 ///
 /// # Errors
 /// Returns a codec error for a header that ends early.
-pub(crate) fn skip_tagged_fields(mut bytes: &[u8]) -> Result<&[u8], ClientError> {
+pub fn skip_tagged_fields(mut bytes: &[u8]) -> Result<&[u8], ClientError> {
     fn uvarint(bytes: &mut &[u8]) -> Result<u32, ClientError> {
         let mut value = 0_u32;
         for shift in (0..35).step_by(7) {
@@ -1086,8 +1095,8 @@ pub(crate) fn skip_tagged_fields(mut bytes: &[u8]) -> Result<&[u8], ClientError>
         Err(truncated())
     }
     fn truncated() -> ClientError {
-        ClientError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        ClientError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
             "invalid tagged fields in a response header",
         ))
     }
@@ -1145,7 +1154,7 @@ fn spawn_io_tasks(
         max_idle,
     } = context;
 
-    let (read_half, write_half) = tokio::io::split(stream);
+    let (read_half, write_half) = split(stream);
     let mut framed_read = FramedRead::new(read_half, framing::codec_with_max(frame_max));
     let mut framed_write = FramedWrite::new(write_half, framing::codec_with_max(frame_max));
 
@@ -1181,10 +1190,10 @@ fn spawn_io_tasks(
                     let Some(frame) = maybe_frame else { break; };
                     let Ok(frame) = frame else { break; };
                     activity.touch();
-                    if frame.len() < 4 { continue; }
-                    let corr_id = i32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+                    let Some((corr_id, body)) = frame.split_first_chunk::<4>() else { continue; };
+                    let corr_id = i32::from_be_bytes(*corr_id);
                     if let Some((_, tx)) = pending.remove(&corr_id) {
-                        let body = Bytes::copy_from_slice(&frame[4..]);
+                        let body = Bytes::copy_from_slice(body);
                         let _ = tx.send(Ok(body));
                     }
                 }
@@ -1209,7 +1218,7 @@ struct IoContext {
     pending: Pending,
     activity: Arc<Activity>,
     frame_max: ClientFrameMax,
-    max_idle: std::time::Duration,
+    max_idle: Duration,
 }
 
 /// The writer loop: send each dispatched frame in order, and stop when the
@@ -1219,7 +1228,7 @@ async fn write_loop<W>(
     shutdown: &CancellationToken,
     activity: &Activity,
     pending: &Pending,
-    max_idle: std::time::Duration,
+    max_idle: Duration,
     writer_rx: &mut mpsc::Receiver<DispatchItem>,
     framed_write: &mut W,
 ) where
@@ -1246,8 +1255,8 @@ async fn write_loop<W>(
                 }
                 activity.touch();
             }
-            () = tokio::time::sleep_until(idle_deadline), if !max_idle.is_zero() => {
-                let idle = activity.last() + max_idle <= tokio::time::Instant::now();
+            () = sleep_until(idle_deadline), if !max_idle.is_zero() => {
+                let idle = activity.last() + max_idle <= Instant::now();
                 if idle && pending.is_empty() && writer_rx.is_empty() {
                     tracing::debug!(
                         max_idle_ms = max_idle.as_millis(),
@@ -1288,18 +1297,24 @@ fn build_request_header(
     corr_id: i32,
     client_id: &str,
     with_tagged_fields: bool,
-) -> BytesMut {
+) -> Result<BytesMut, ClientError> {
     let mut buf = BytesMut::with_capacity(32);
     buf.put_i16(api_key.0);
     buf.put_i16(version.0);
     buf.put_i32(corr_id);
-    let n = i16::try_from(client_id.len()).expect("client_id fits in i16");
+    let n = i16::try_from(client_id.len()).map_err(|_| {
+        ClientError::InvalidConfig(format!(
+            "client_id is {} bytes, longer than {} bytes",
+            client_id.len(),
+            i16::MAX
+        ))
+    })?;
     buf.put_i16(n);
     buf.put_slice(client_id.as_bytes());
     if with_tagged_fields {
         buf.put_u8(0); // empty tagged fields
     }
-    buf
+    Ok(buf)
 }
 
 /// The client software name that `ApiVersions` v3 and later sends (KIP-511).
@@ -1313,7 +1328,7 @@ const UNSUPPORTED_VERSION: i16 = 35;
 
 /// The `ApiVersions` request of a new connection at `version`, as Kafka's
 /// `ApiVersionsRequest.Builder` fills it.
-pub(crate) fn api_versions_request() -> api_versions_request::ApiVersionsRequest {
+pub fn api_versions_request() -> api_versions_request::ApiVersionsRequest {
     api_versions_request::ApiVersionsRequest {
         client_software_name: CLIENT_SOFTWARE_NAME.to_owned(),
         client_software_version: CLIENT_SOFTWARE_VERSION.to_owned(),
@@ -1327,7 +1342,7 @@ pub(crate) fn api_versions_request() -> api_versions_request::ApiVersionsRequest
 /// does not support `version` answers with a version 0 `UNSUPPORTED_VERSION`
 /// response. A body that does not decode to its end at `version` is read as
 /// version 0.
-pub(crate) fn decode_api_versions_response(
+pub fn decode_api_versions_response(
     body: &[u8],
     version: i16,
 ) -> Result<api_versions_response::ApiVersionsResponse, ClientError> {
@@ -1339,8 +1354,8 @@ pub(crate) fn decode_api_versions_response(
         if cursor.is_empty() {
             Ok(response)
         } else {
-            Err(ClientError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            Err(ClientError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
                 format!(
                     "ApiVersions response v{version} has {} bytes after its end",
                     cursor.len()
@@ -1360,7 +1375,7 @@ pub(crate) fn decode_api_versions_response(
 /// Kafka's `NetworkClient.handleApiVersionsResponse` retries an
 /// `UNSUPPORTED_VERSION` answer to a version above 0 at the highest
 /// `ApiVersions` version that the broker lists, or at version 0.
-pub(crate) fn api_versions_retry_version(
+pub fn api_versions_retry_version(
     response: &api_versions_response::ApiVersionsResponse,
     version: i16,
 ) -> Option<i16> {
@@ -1385,7 +1400,7 @@ pub(crate) fn api_versions_retry_version(
 /// `UNSUPPORTED_VERSION` answer makes it retry at the version that the broker
 /// lists.
 #[tracing::instrument(level = "debug", skip_all, err(level = "debug"))]
-async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, ClientError> {
+async fn fetch_api_versions(conn: &ConnectionInner) -> Result<ApiVersionTable, ClientError> {
     use krabka_protocol::{Encode, owned::api_versions_request::ApiVersionsRequest};
 
     let mut version = ApiVersionsRequest::MAX_VERSION;
@@ -1395,24 +1410,23 @@ async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, Client
             ApiKey(ApiVersionsRequest::API_KEY),
             ApiVersion(version),
             corr_id,
-            &conn.inner.options.client_id,
+            &conn.options.client_id,
             version >= ApiVersionsRequest::FLEXIBLE_MIN,
-        );
+        )?;
         api_versions_request().encode(&mut frame, version)?;
 
         let (tx, rx) = oneshot::channel::<Result<Bytes, ClientError>>();
-        conn.inner.pending.insert(corr_id, tx);
-        conn.inner
-            .writer_tx
+        conn.pending.insert(corr_id, tx);
+        conn.writer_tx
             .send(DispatchItem {
                 bytes: frame.freeze(),
             })
             .await
             .map_err(|_| ClientError::Disconnected)?;
 
-        let body_bytes = tokio::time::timeout(conn.inner.options.request_timeout.to_std(), rx)
+        let body_bytes = timeout(conn.options.request_timeout.to_std(), rx)
             .await
-            .map_err(|_| ClientError::Timeout(conn.inner.options.request_timeout))?
+            .map_err(|_| ClientError::Timeout(conn.options.request_timeout))?
             .map_err(|_| ClientError::Disconnected)??;
 
         // ResponseHeader v0: only correlation_id (already stripped by the
@@ -1436,6 +1450,7 @@ async fn fetch_api_versions(conn: &Connection) -> Result<ApiVersionTable, Client
 mod tests {
     use assert2::assert;
     use krabka_units::{ByteSize, bytes, kibibytes, mebibytes, micros, millis};
+    use tokio::io::duplex;
 
     use super::*;
     use crate::Client;
@@ -1511,10 +1526,34 @@ mod tests {
             username: "u".into(),
             password: "p".into(),
         });
-        let want_gssapi = crate::sasl::GSSAPI_CLIENT
+        let want_gssapi = sasl::GSSAPI_CLIENT
             .then_some(())
-            .ok_or_else(|| format!("SASL/GSSAPI: {}", crate::sasl::GSSAPI_UNAVAILABLE));
+            .ok_or_else(|| format!("SASL/GSSAPI: {}", sasl::GSSAPI_UNAVAILABLE));
         assert!((gssapi.validate(), plain.validate()) == (want_gssapi, Ok(())));
+    }
+
+    #[test]
+    fn defaults_equal_their_validated_constants() {
+        assert!(
+            ClientDnsTimeout::default()
+                == ClientDnsTimeout::new(DEFAULT_CLIENT_DNS_TIMEOUT).unwrap()
+        );
+        assert!(
+            ConnectionDispatchQueueCapacity::default()
+                == ConnectionDispatchQueueCapacity::new(DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY)
+                    .unwrap()
+        );
+        assert!(
+            ClientFrameMax::default()
+                == ClientFrameMax::try_from(DEFAULT_CLIENT_FRAME_MAX).unwrap()
+        );
+    }
+
+    #[test]
+    fn request_header_rejects_a_client_id_longer_than_i16() {
+        let client_id = "x".repeat(usize::from(i16::MAX.unsigned_abs()) + 1);
+        let result = build_request_header(ApiKey(18), ApiVersion(0), 1, &client_id, false);
+        assert!(let Err(ClientError::InvalidConfig(_)) = result);
     }
 
     #[test]
@@ -1627,7 +1666,7 @@ mod tests {
             .build()
             .await;
         assert!(matches!(result, Err(ClientError::InvalidConfig(_))));
-        let (stream, _peer) = tokio::io::duplex(1024);
+        let (stream, _peer) = duplex(1024);
         let result = Connection::from_stream(Box::new(stream), options).await;
         assert!(matches!(result, Err(ClientError::InvalidConfig(_))));
     }
@@ -1646,10 +1685,56 @@ mod tests {
 
 #[cfg(test)]
 mod secured_tests {
+    use assert2::check;
+    use krabka_protocol::Encode as _;
     use krabka_security::ListenerProtocol;
     use security::{ClientSecurity, SaslCredentials};
+    use tokio::net::TcpListener;
 
     use super::*;
+
+    /// A TLS protocol without a TLS config, and a SASL protocol without
+    /// credentials, are inconsistent policies, and the connect fails before
+    /// any handshake.
+    #[tokio::test]
+    async fn connect_secured_rejects_a_policy_without_its_material() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut messages = Vec::new();
+        for protocol in [ListenerProtocol::Ssl, ListenerProtocol::SaslPlaintext] {
+            let security = ClientSecurity {
+                protocol,
+                tls: None,
+                sasl: None,
+                sasl_host: None,
+            };
+            let result =
+                Connection::connect_secured(addr, ConnectionOptions::default(), &security).await;
+            messages.push(result.err().map(|error| error.to_string()));
+        }
+        check!(
+            messages
+                == vec![
+                    Some("I/O: TLS protocol without tls config".to_owned()),
+                    Some("I/O: SASL protocol without credentials".to_owned()),
+                ]
+        );
+    }
+
+    /// An `ApiVersions` response with bytes after its end is invalid at its
+    /// own version and at version 0.
+    #[test]
+    fn api_versions_response_with_trailing_bytes_is_invalid() {
+        let mut body = BytesMut::new();
+        api_versions_response::ApiVersionsResponse::default()
+            .encode(&mut body, 0)
+            .unwrap();
+        body.put_u8(0xff);
+
+        let result = decode_api_versions_response(&body, 0).map_err(|error| error.to_string());
+
+        check!(result == Err("I/O: ApiVersions response v0 has 1 bytes after its end".to_owned()));
+    }
 
     // A SASL_PLAINTEXT connect drives the handshake then ApiVersions.
     // The fake broker answers SaslHandshake(0), SaslAuthenticate(0),
@@ -1666,7 +1751,7 @@ mod secured_tests {
         };
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
@@ -1677,6 +1762,7 @@ mod secured_tests {
                     // the SASL APIs.
                     let mock::MockReply::Respond(body) = mock::MockSaslAnswer::Accept
                         .reply(api_versions_request::API_KEY, 0)
+                        .unwrap()
                         .unwrap()
                     else {
                         unreachable!("ApiVersions v0 has a reply")
@@ -1772,8 +1858,8 @@ mod tls_handshake_failure_tests {
     /// How the handshake failed, as a caller classifies it.
     #[derive(Debug, PartialEq, Eq)]
     enum Failure {
-        Rejected(std::io::ErrorKind),
-        Transport(std::io::ErrorKind),
+        Rejected(io::ErrorKind),
+        Transport(io::ErrorKind),
         Other(String),
     }
 
@@ -1806,11 +1892,11 @@ mod tls_handshake_failure_tests {
         for (peer, expected) in [
             (
                 Peer::Plaintext,
-                Failure::Rejected(std::io::ErrorKind::InvalidData),
+                Failure::Rejected(io::ErrorKind::InvalidData),
             ),
             (
                 Peer::Close,
-                Failure::Transport(std::io::ErrorKind::UnexpectedEof),
+                Failure::Transport(io::ErrorKind::UnexpectedEof),
             ),
         ] {
             let addr = listener(peer).await;
@@ -1986,7 +2072,7 @@ mod io_task_tests {
 
 #[cfg(test)]
 mod connection_policy_tests {
-    use std::time::Duration;
+    use std::{iter::repeat_with, time::Duration};
 
     use assert2::check;
     use krabka_protocol::{
@@ -1998,7 +2084,11 @@ mod connection_policy_tests {
     };
     use krabka_security::ListenerProtocol;
     use security::{ClientSecurity, SaslCredentials};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex},
+        net::TcpListener,
+        time::sleep,
+    };
 
     use super::*;
 
@@ -2030,7 +2120,7 @@ mod connection_policy_tests {
     }
 
     async fn connection(options: ConnectionOptions) -> (Connection, DuplexStream) {
-        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client, server) = duplex(64 * 1024);
         let (connection, server) = tokio::join!(
             Connection::from_stream(Box::new(client), options),
             answer_api_versions(server)
@@ -2069,7 +2159,7 @@ mod connection_policy_tests {
                 let connection = connection.clone();
                 tokio::spawn(async move { connection.send(MetadataRequest::default()).await })
             });
-            tokio::time::sleep(idle).await;
+            sleep(idle).await;
             check!(connection.is_closed() == closed, "{name}");
             if let Some(waiter) = waiter {
                 waiter.abort();
@@ -2084,7 +2174,7 @@ mod connection_policy_tests {
             ..ConnectionOptions::default()
         })
         .await;
-        tokio::time::sleep(Duration::from_hours(24)).await;
+        sleep(Duration::from_hours(24)).await;
         check!(!connection.is_closed());
         connection.close();
     }
@@ -2108,7 +2198,7 @@ mod connection_policy_tests {
     /// Kafka node stays `CONNECTING` until it sends `ApiVersions`.
     #[tokio::test]
     async fn the_setup_timeout_covers_a_sasl_handshake_that_never_answers() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -2129,7 +2219,7 @@ mod connection_policy_tests {
             request_timeout: secs(30),
             ..ConnectionOptions::default()
         };
-        let started = std::time::Instant::now();
+        let started = time::Instant::now();
         let result = Connection::connect_secured(addr, options, &security).await;
         check!(matches!(result, Err(ClientError::Timeout(timeout)) if timeout == millis(100)));
         check!(started.elapsed() < Duration::from_secs(5));
@@ -2140,7 +2230,7 @@ mod connection_policy_tests {
     /// while a peer that does not read holds its write.
     #[tokio::test(start_paused = true)]
     async fn a_write_blocked_by_a_peer_that_does_not_read_ends_at_shutdown() {
-        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client, server) = duplex(64 * 1024);
         let (connection, _server) = tokio::join!(
             Connection::from_stream(
                 Box::new(client),
@@ -2158,7 +2248,7 @@ mod connection_policy_tests {
             .raw_request(3, 0, Bytes::from(vec![0_u8; 256 * 1024]))
             .await;
         check!(matches!(result, Err(ClientError::Timeout(_))));
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        sleep(Duration::from_millis(1)).await;
         // The writer task drops the receiver when it ends.
         check!(connection.inner.writer_tx.is_closed());
     }
@@ -2234,7 +2324,7 @@ mod connection_policy_tests {
                 features(0),
             ),
         ] {
-            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let (client, mut server) = duplex(64 * 1024);
             let script = tokio::spawn(async move {
                 let mut seen = Vec::new();
                 loop {
@@ -2343,8 +2433,8 @@ mod connection_policy_tests {
             .inner
             .next_corr_id
             .store(reserved - 2, Ordering::Relaxed);
-        let ids = (0..3)
-            .map(|_| connection.next_correlation_id())
+        let ids = repeat_with(|| connection.next_correlation_id())
+            .take(3)
             .collect::<Vec<_>>();
         check!(ids == vec![reserved - 2, reserved - 1, 0]);
     }
@@ -2378,7 +2468,7 @@ mod connection_policy_tests {
         let (connection, _server) = connection(ConnectionOptions::default()).await;
         let sending = connection.clone();
         let task = tokio::spawn(async move { sending.send(MetadataRequest::default()).await });
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        sleep(Duration::from_millis(1)).await;
         check!(connection.in_flight() == 1);
         task.abort();
         let _ = task.await;

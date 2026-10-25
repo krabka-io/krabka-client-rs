@@ -57,15 +57,16 @@ Clippy is a hard gate. CI runs:
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Every warning is an error, across all targets. Fix the lint. Do not suppress it. If a lint genuinely does not apply, use a narrowly-scoped `#[allow(...)]` on the specific item, not a crate-wide allow, and add a `//` comment that gives the reason.
+Every warning is an error, across all targets. Fix the lint. Never add `#[allow(clippy::...)]` or an equivalent Clippy suppression, including scoped exceptions. This is the policy in [CLAUDE.md](../../CLAUDE.md).
 
 The workspace sets lint levels **once**, in the `[workspace.lints]` table. Every crate inherits them through `[lints] workspace = true`. The current policy is:
 
 - `unsafe_code = "forbid"` — Krabka crates contain no `unsafe`. See [Wire-Format Safety](#wire-format-safety). The single documented exception is the `krabka-log-iobench` benchmark crate. It opts out of the workspace lints because `memmap2::Mmap::map` is `unsafe` by contract, and the opt-out keeps the project-wide forbid intact. Do not use that pattern in production crates.
-- `clippy::pedantic = "warn"` — the pedantic group is on, so expect Clippy to be stricter than its defaults.
-- A small set of pedantic lints stay relaxed on purpose while the public API is pre-1.0: `module_name_repetitions`, `missing_errors_doc`, and `missing_panics_doc`. The workspace `Cargo.toml` documents them. Do not add to the list without a discussion first.
+- Every Clippy lint the workspace enables is an error (`deny`): the default `clippy::all` groups, `clippy::pedantic`, and a chosen set of restriction, nursery and cargo lints. The root `Cargo.toml` lists them in groups, and `clippy.toml` holds their settings. No lint in those groups is relaxed.
+- `unwrap_used`, `expect_used` and `indexing_slicing` apply to shipped code only. A `#[test]` function, a `#[cfg(test)]` module, and an integration-test crate that opens with `#![cfg(test)]` may unwrap, expect and index. Every `tests/*.rs` crate root carries that attribute, except a `harness = false` target, which builds without `cfg(test)`.
+- To add or relax a lint, change the workspace table in its own reviewed change. Do not add to it in passing.
 
-Do not add per-crate lint configuration. A crate that needs a different lint level almost always wants a scoped `#[allow]` on the item instead.
+Do not add per-crate lint configuration or scoped Clippy suppressions. Fix warnings under the shared workspace policy.
 
 ## Naming
 
@@ -162,10 +163,10 @@ pub enum RaftError {
 - Mark public error enums `#[non_exhaustive]`, so a new variant is not a breaking change. Krabka is pre-1.0, but this keeps a `match` on an error honest about the open set.
 - Prefer **focused, leaf error types** for self-contained sub-parsers, instead of the crate-root `Error`. A small decoder that returns the whole crate's error enum leaks unrelated variants into its signature.
 - Use `?` to propagate an error. Convert between error types with `#[from]` or an explicit `map_err`. Do not convert through a string.
-- Avoid `.unwrap()` / `.expect()` on fallible paths in library code. They are acceptable only where an invariant guarantees success. In that case, use `.expect("reason the invariant holds")` so the message documents the invariant. Tests may unwrap freely.
+- Do not call `.unwrap()` or `.expect()` in shipped code; `clippy::unwrap_used` and `clippy::expect_used` reject both. Return an error, use an API that cannot fail, or restructure so that the type carries the invariant. Recover a poisoned `std::sync::Mutex` with `.lock().unwrap_or_else(PoisonError::into_inner)`. Do not swap the call for `panic!`, `unreachable!` or `unwrap_or_else(|| panic!(..))`, which keeps the panic and hides it from the lint. Tests may unwrap freely.
 - Never `panic!` in response to malformed wire input. Decoders return errors. This is a security property, and property tests and fuzzing verify it (see [Wire-Format Safety](#wire-format-safety)).
 
-The workspace lints relax `missing_errors_doc` and `missing_panics_doc`, so the `# Errors` / `# Panics` rustdoc sections are *encouraged where they add value* and no lint enforces them. See the [rustdoc guide](rustdoc_style_guide.md).
+`clippy::pedantic` includes `missing_errors_doc` and `missing_panics_doc`, so a public function that returns `Result` carries an `# Errors` section and one that can panic carries a `# Panics` section. See the [rustdoc guide](rustdoc_style_guide.md).
 
 ## Wire-Format Safety
 

@@ -1,11 +1,15 @@
 //! Partition assignors: the eager `range`, `roundrobin` and `sticky`, and the
 //! incremental `cooperative-sticky` from KIP-429.
 
-pub(crate) mod cooperative_sticky;
-pub(crate) mod range;
-pub(crate) mod round_robin;
+pub mod cooperative_sticky;
+pub mod range;
+pub mod round_robin;
 
-use std::collections::HashMap;
+use std::{
+    cmp,
+    collections::{BTreeMap, HashMap},
+    str::FromStr,
+};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -14,7 +18,7 @@ use crate::builder::DecodedSubscription;
 /// Kafka's `ConsumerPartitionAssignor.RebalanceProtocol`. The order is the
 /// order of preference: a later variant is newer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum RebalanceProtocol {
+pub enum RebalanceProtocol {
     Eager,
     Cooperative,
 }
@@ -32,7 +36,7 @@ pub enum Assignor {
     CooperativeSticky,
 }
 
-impl std::str::FromStr for Assignor {
+impl FromStr for Assignor {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -53,22 +57,18 @@ impl Assignor {
     /// The protocol name in `JoinGroup` and `SyncGroup`.
     pub(crate) fn protocol_name(self) -> &'static str {
         match self {
-            Assignor::Range => "range",
-            Assignor::RoundRobin => "roundrobin",
-            Assignor::Sticky => "sticky",
-            Assignor::CooperativeSticky => "cooperative-sticky",
+            Self::Range => "range",
+            Self::RoundRobin => "roundrobin",
+            Self::Sticky => "sticky",
+            Self::CooperativeSticky => "cooperative-sticky",
         }
     }
 
     /// Kafka's `ConsumerPartitionAssignor.supportedProtocols`.
     fn supported_protocols(self) -> &'static [RebalanceProtocol] {
         match self {
-            Assignor::Range | Assignor::RoundRobin | Assignor::Sticky => {
-                &[RebalanceProtocol::Eager]
-            }
-            Assignor::CooperativeSticky => {
-                &[RebalanceProtocol::Cooperative, RebalanceProtocol::Eager]
-            }
+            Self::Range | Self::RoundRobin | Self::Sticky => &[RebalanceProtocol::Eager],
+            Self::CooperativeSticky => &[RebalanceProtocol::Cooperative, RebalanceProtocol::Eager],
         }
     }
 
@@ -87,9 +87,13 @@ impl Assignor {
 /// `ConsumerCoordinator` uses the newest rebalance protocol that every assignor
 /// supports. A subscribing consumer needs at least one assignor
 /// (`ConsumerCoordinator.poll`).
-pub(crate) fn rebalance_protocol_of(assignors: &[Assignor]) -> Result<RebalanceProtocol, String> {
+pub fn rebalance_protocol_of(assignors: &[Assignor]) -> Result<RebalanceProtocol, String> {
     for (index, assignor) in assignors.iter().enumerate() {
-        if assignors[..index].contains(assignor) {
+        if assignors
+            .iter()
+            .take(index)
+            .any(|earlier| earlier == assignor)
+        {
             return Err(format!(
                 "consumer assignors: duplicate assignor {}",
                 assignor.protocol_name()
@@ -122,24 +126,24 @@ pub struct MemberKey {
 }
 
 impl Ord for MemberKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
         match (&self.group_instance_id, &other.group_instance_id) {
             (Some(a), Some(b)) => a.cmp(b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => cmp::Ordering::Less,
+            (None, Some(_)) => cmp::Ordering::Greater,
             (None, None) => self.member_id.cmp(&other.member_id),
         }
     }
 }
 
 impl PartialOrd for MemberKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 /// One member of a `JoinGroup` response, with its decoded subscription.
-pub(crate) struct GroupMember {
+pub struct GroupMember {
     pub key: MemberKey,
     pub subscription: DecodedSubscription,
 }
@@ -153,7 +157,7 @@ const DEFAULT_GENERATION: i32 = -1;
 /// user data v1), and nothing before its first assignment.
 /// `cooperative-sticky` sends its generation. The other assignors send
 /// nothing.
-pub(crate) fn subscription_user_data(
+pub fn subscription_user_data(
     assignor: Assignor,
     last_assignment: Option<&[(String, i32)]>,
     generation: i32,
@@ -161,8 +165,7 @@ pub(crate) fn subscription_user_data(
     match assignor {
         Assignor::Range | Assignor::RoundRobin => None,
         Assignor::Sticky => last_assignment.map(|partitions| {
-            let mut by_topic: std::collections::BTreeMap<&str, Vec<i32>> =
-                std::collections::BTreeMap::new();
+            let mut by_topic: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
             for (topic, partition) in partitions {
                 by_topic.entry(topic).or_default().push(*partition);
             }
@@ -240,7 +243,7 @@ fn read_topic_partitions(buf: &mut Bytes) -> Option<Vec<(String, i32)>> {
 
 /// Run `assignor` over the members of a `JoinGroup` response, as the group
 /// leader does in Kafka's `ConsumerCoordinator.onLeaderElected`.
-pub(crate) fn assign(
+pub fn assign(
     assignor: Assignor,
     members: &[GroupMember],
     topic_partitions: &HashMap<String, i32>,
@@ -299,6 +302,35 @@ pub(crate) fn assign(
 mod tests {
 
     use super::*;
+
+    /// Kafka's `MemberInfo.compareTo`: static members first, by
+    /// `group.instance.id`, then dynamic members by member id.
+    #[test]
+    fn member_keys_sort_static_members_first() {
+        let key = |member_id: &str, instance: Option<&str>| MemberKey {
+            member_id: member_id.to_owned(),
+            group_instance_id: instance.map(str::to_owned),
+        };
+        let mut keys = vec![
+            key("a-dynamic", None),
+            key("z-static", Some("i-2")),
+            key("b-dynamic", None),
+            key("y-static", Some("i-1")),
+        ];
+        keys.sort();
+        assert2::assert!(
+            keys == vec![
+                key("y-static", Some("i-1")),
+                key("z-static", Some("i-2")),
+                key("a-dynamic", None),
+                key("b-dynamic", None),
+            ]
+        );
+        assert2::assert!(
+            key("a-dynamic", None).partial_cmp(&key("z-static", Some("i-2")))
+                == Some(cmp::Ordering::Greater)
+        );
+    }
 
     #[test]
     fn assignor_values_parse_kafka_names() {

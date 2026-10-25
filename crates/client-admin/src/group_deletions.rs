@@ -92,7 +92,10 @@ impl AdminClient {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
 
     use assert2::assert;
     use krabka_client_core::MockReply;
@@ -265,7 +268,7 @@ mod tests {
         api_key: i16,
         version: i16,
         body: &[u8],
-        _addr: std::net::SocketAddr,
+        _addr: SocketAddr,
     ) -> MockReply {
         if api_key != delete_groups_request::API_KEY {
             return MockReply::Silent;

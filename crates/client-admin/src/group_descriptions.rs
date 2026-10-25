@@ -11,7 +11,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Mutex,
+    sync::{Mutex, PoisonError},
 };
 
 use bytes::{Buf, BufMut};
@@ -19,6 +19,7 @@ use krabka_client_core::{ClientError, CoordinatorEndpoint};
 use krabka_protocol::{
     Decode, Encode, ProtocolError, ProtocolRequest,
     owned::{
+        common::consumer_group_describe_response::assignment::Assignment,
         consumer_group_describe_request::{self, ConsumerGroupDescribeRequest},
         consumer_group_describe_response::{
             DescribedGroup as ConsumerDescribedGroup, Member as ConsumerMember,
@@ -332,7 +333,7 @@ fn consumer_description_outcome(
         ConsumerAnswer::Classic { not_found_message } => {
             classic
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .insert(group_id.clone(), not_found_message);
             classic_keys.push(group_id.clone());
             None
@@ -349,7 +350,7 @@ fn classic_consumer_description_outcome(
     let group_id = group.group_id.clone();
     let not_found_message = classic
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
         .get(&group_id)
         .cloned()
         .flatten();
@@ -389,9 +390,7 @@ pub(crate) fn request_error_outcomes<V>(
 }
 
 /// The partitions of a `ConsumerGroupDescribe` assignment.
-fn consumer_assignment(
-    assignment: krabka_protocol::owned::common::consumer_group_describe_response::assignment::Assignment,
-) -> BTreeSet<(String, i32)> {
+fn consumer_assignment(assignment: Assignment) -> BTreeSet<(String, i32)> {
     assignment_partitions(
         assignment
             .topic_partitions
@@ -619,9 +618,7 @@ impl AdminClient {
         let connection = self.connect_coordinator(&coordinator).await?;
         let node = coordinator_node(&coordinator);
         let (classic_keys, consumer_keys): (Vec<_>, Vec<_>) = {
-            let classic = classic
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let classic = classic.lock().unwrap_or_else(PoisonError::into_inner);
             keys.into_iter().partition(|key| classic.contains_key(key))
         };
         let mut outcomes = BTreeMap::new();
@@ -634,12 +631,11 @@ impl AdminClient {
             .advertised_api_range(consumer_group_describe_request::API_KEY)
             .is_some();
         if !consumer_describe_supported {
-            let mut classic = classic
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut classic = classic.lock().unwrap_or_else(PoisonError::into_inner);
             for key in &consumer_keys {
                 classic.entry(key.clone()).or_insert(None);
             }
+            drop(classic);
             classic_keys.extend(consumer_keys.iter().cloned());
         } else if !consumer_keys.is_empty() {
             let request = ConsumerGroupDescribeRequest::for_groups(consumer_keys.clone(), options);
@@ -652,13 +648,12 @@ impl AdminClient {
                 // Kafka's `handleUnsupportedVersionException` moves each group
                 // to the classic API.
                 Err(ClientError::IncompatibleVersion { .. }) => {
-                    let mut classic = classic
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for key in consumer_keys {
+                    let mut classic = classic.lock().unwrap_or_else(PoisonError::into_inner);
+                    for key in &consumer_keys {
                         classic.entry(key.clone()).or_insert(None);
-                        classic_keys.push(key);
                     }
+                    drop(classic);
+                    classic_keys.extend(consumer_keys);
                 }
                 Err(error) => {
                     let error = AdminError::from(error);
@@ -776,20 +771,19 @@ impl AdminClient {
 /// `DescribeStreamsGroupsHandler.handleResponse` does.
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
 
     use assert2::assert;
     use bytes::BytesMut;
     use krabka_client_core::MockReply;
     use krabka_protocol::owned::{
-        common::consumer_group_describe_response::{
-            assignment::Assignment, topic_partitions::TopicPartitions,
-        },
+        common::consumer_group_describe_response::topic_partitions::TopicPartitions,
         consumer_group_describe_response::ConsumerGroupDescribeResponse,
-        consumer_protocol_assignment::TopicPartition as AssignedTopic,
-        describe_groups_request,
-        describe_groups_response::DescribeGroupsResponse,
-        share_group_describe_request,
+        consumer_protocol_assignment::TopicPartition as AssignedTopic, describe_groups_request,
+        describe_groups_response::DescribeGroupsResponse, share_group_describe_request,
         share_group_describe_response::ShareGroupDescribeResponse,
         streams_group_describe_response::Topology,
     };
@@ -854,7 +848,7 @@ mod tests {
     #[bon::builder]
     async fn admin_group_cluster(
         apis: Vec<ApiVersionRange>,
-        answer: impl FnMut(usize, i16, i16, &[u8], std::net::SocketAddr) -> MockReply + Send + 'static,
+        answer: impl FnMut(usize, i16, i16, &[u8], SocketAddr) -> MockReply + Send + 'static,
     ) -> AdminGroupCluster {
         let cluster = group_cluster()
             .count(1)
@@ -907,11 +901,11 @@ mod tests {
         assert2::assert!(classic_assignment(&bytes) == expected);
     }
 
-    fn node(addr: std::net::SocketAddr, id: i32) -> ClusterNode {
+    fn node(addr: SocketAddr, id: i32) -> ClusterNode {
         node_with_host_port(id, addr.ip().to_string(), i32::from(addr.port()))
     }
 
-    fn nodes(addrs: [std::net::SocketAddr; 2]) -> [ClusterNode; 2] {
+    fn nodes(addrs: [SocketAddr; 2]) -> [ClusterNode; 2] {
         [node(addrs[0], 0), node(addrs[1], 1)]
     }
 
@@ -1103,7 +1097,7 @@ mod tests {
 
     async fn describe_one_group(
         call: DescribeApiCall,
-        admin: &mut AdminClient,
+        admin: &AdminClient,
         options: DescribeGroupsOptions,
     ) -> Option<Result<(), KafkaError>> {
         match call {
@@ -1325,6 +1319,47 @@ mod tests {
         );
     }
 
+    /// Kafka's `handleUnsupportedVersionException`: a coordinator that lists
+    /// `ConsumerGroupDescribe` only at versions this client does not speak
+    /// gets each group through `DescribeGroups`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn describe_consumer_groups_falls_back_when_no_version_is_common() {
+        let AdminGroupCluster { cluster, admin } = admin_group_cluster()
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(consumer_group_describe_request::API_KEY)
+                    .min_version(50)
+                    .max_version(50)
+                    .build(),
+                api_range(describe_groups_request::API_KEY, 5),
+            ])
+            .answer(|_, api_key, version, body, _| {
+                // The fallback sends `DescribeGroups` only.
+                assert!(api_key == describe_groups_request::API_KEY);
+                let groups = describe_groups_ids(body, version)
+                    .iter()
+                    .map(|id| classic_entry(id, 0, "consumer"))
+                    .collect();
+                mock_response(encode_response(&classic_response(groups), version, true))
+            })
+            .call()
+            .await;
+
+        let result = admin
+            .describe_consumer_groups(&["classic"], default_describe_options())
+            .await;
+
+        let first_broker = cluster.addrs[0];
+        let _seen = cluster.stop();
+        let b0 = node(first_broker, 0);
+        assert!(
+            result
+                == maplit::btreemap! {
+                    "classic".to_owned() => Ok(classic_group_description(b0)),
+                }
+        );
+    }
+
     /// Every describe handler retries `COORDINATOR_LOAD_IN_PROGRESS` on the
     /// same coordinator, finds the coordinator again on
     /// `COORDINATOR_NOT_AVAILABLE` and `NOT_COORDINATOR`, and fails every
@@ -1414,11 +1449,11 @@ mod tests {
             })
             .call()
             .await;
-        let mut admin = cluster.admin(krabka_units::secs(5)).await;
+        let admin = cluster.admin(krabka_units::secs(5)).await;
         let options = DescribeGroupsOptions::builder()
             .include_authorized_operations(true)
             .build();
-        let result = describe_one_group(call, &mut admin, options).await;
+        let result = describe_one_group(call, &admin, options).await;
         let seen = cluster.stop();
         let expected_message = match call {
             DescribeApiCall::Classic => None,

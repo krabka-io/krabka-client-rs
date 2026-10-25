@@ -364,6 +364,7 @@ mod tests {
                         } else {
                             0
                         };
+                        drop(loading);
                         DescribeShareGroupOffsetsResponseGroup {
                             topics: if error_code == 0 {
                                 vec![DescribeShareGroupOffsetsResponseTopic {

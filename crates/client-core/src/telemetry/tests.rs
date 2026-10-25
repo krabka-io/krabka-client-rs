@@ -17,7 +17,10 @@ use krabka_protocol::{
     },
     primitives::uuid::Uuid,
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    time::{sleep, timeout},
+};
 
 use super::{
     ClientTelemetryConfig,
@@ -183,13 +186,13 @@ async fn start_broker(mut script: BrokerScript) -> (MockBroker, mpsc::UnboundedR
         get_telemetry_subscriptions_request::API_KEY => {
             let mut body = request_body(frame);
             let request = GetTelemetrySubscriptionsRequest::decode(&mut body, version).unwrap();
-            seen_tx.send(Seen::Subscriptions(request)).ok();
+            let _ = seen_tx.send(Seen::Subscriptions(request));
             Some(flexible_response(&script.subscription))
         }
         push_telemetry_request::API_KEY => {
             let mut body = request_body(frame);
             let request = PushTelemetryRequest::decode(&mut body, version).unwrap();
-            seen_tx.send(seen_push(&request)).ok();
+            let _ = seen_tx.send(seen_push(&request));
             Some(flexible_response(&PushTelemetryResponse {
                 error_code: script.push_errors.pop().unwrap_or(0),
                 ..Default::default()
@@ -197,7 +200,8 @@ async fn start_broker(mut script: BrokerScript) -> (MockBroker, mpsc::UnboundedR
         }
         _ => None,
     })
-    .await;
+    .await
+    .unwrap();
     (broker, seen_rx)
 }
 
@@ -216,7 +220,7 @@ async fn client(broker: &MockBroker, telemetry: Option<ClientTelemetryConfig>) -
 }
 
 async fn next(seen: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {
-    tokio::time::timeout(Duration::from_secs(10), seen.recv())
+    timeout(Duration::from_secs(10), seen.recv())
         .await
         .expect("a telemetry request within 10 s")
         .expect("the broker is running")
@@ -236,9 +240,9 @@ async fn run(
     }
     if count == 0 {
         // Nothing should arrive: give the reporter several push intervals.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
     }
-    tokio::time::timeout(Duration::from_secs(20), client.close_telemetry())
+    timeout(Duration::from_secs(20), client.close_telemetry())
         .await
         .expect("the reporter ends");
     client.close();

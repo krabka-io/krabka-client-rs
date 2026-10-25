@@ -6,17 +6,25 @@
 
 mod stores;
 
-use std::{fmt, path::PathBuf, sync::Arc};
+#[cfg(not(target_family = "wasm"))]
+use std::sync::OnceLock;
+use std::{
+    fmt, io,
+    path::PathBuf,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use krabka_security::ListenerProtocol;
 use rustls::{
     CertificateError, DigitallySignedStruct, SignatureScheme, SupportedProtocolVersion,
     client::{
-        WebPkiServerVerifier,
+        ResolvesClientCert, WebPkiServerVerifier,
         danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     },
-    crypto::CryptoProvider,
-    pki_types::{CertificateDer, ServerName, UnixTime},
+    crypto::{CryptoProvider, KeyProvider, ring::default_provider},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+    sign::CertifiedKey,
+    version,
 };
 use thiserror::Error;
 use tokio_rustls::TlsConnector;
@@ -26,12 +34,14 @@ pub use crate::sasl::SaslCredentials;
 /// Return the hostname from one Kafka `host:port` address.
 #[must_use]
 pub fn connection_target_host(address: &str) -> &str {
-    match address.strip_prefix('[') {
-        Some(bracketed) => bracketed
-            .split_once(']')
-            .map_or(bracketed, |(host, _)| host),
-        None => address.rsplit_once(':').map_or(address, |(host, _)| host),
-    }
+    address.strip_prefix('[').map_or_else(
+        || address.rsplit_once(':').map_or(address, |(host, _)| host),
+        |bracketed| {
+            bracketed
+                .split_once(']')
+                .map_or(bracketed, |(host, _)| host)
+        },
+    )
 }
 
 /// A secret configuration value, such as Kafka's `ssl.key.password`.
@@ -167,8 +177,8 @@ impl TlsVersion {
 
     const fn rustls(self) -> &'static SupportedProtocolVersion {
         match self {
-            Self::Tls12 => &rustls::version::TLS12,
-            Self::Tls13 => &rustls::version::TLS13,
+            Self::Tls12 => &version::TLS12,
+            Self::Tls13 => &version::TLS13,
         }
     }
 }
@@ -184,7 +194,7 @@ pub enum TlsConfigError {
     Read {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     /// A PEM value holds no certificate or no usable private key.
     #[error("invalid PEM: {0}")]
@@ -262,7 +272,7 @@ pub struct TlsConnectorConfig {
 /// settings for each broker, so a clone reuses the configuration while its
 /// settings, other than the server name, stay the same.
 #[derive(Clone, Default)]
-struct BuiltConfig(Arc<std::sync::Mutex<Option<Built>>>);
+struct BuiltConfig(Arc<Mutex<Option<Built>>>);
 
 /// The settings of a build and the configuration that they gave.
 type Built = (TlsConnectorConfig, Arc<rustls::ClientConfig>);
@@ -300,8 +310,7 @@ impl Default for TlsConnectorConfig {
 /// default trust store once.
 #[cfg(not(target_family = "wasm"))]
 fn platform_roots() -> Result<Arc<rustls::RootCertStore>, TlsConfigError> {
-    static ROOTS: std::sync::OnceLock<Result<Arc<rustls::RootCertStore>, String>> =
-        std::sync::OnceLock::new();
+    static ROOTS: OnceLock<Result<Arc<rustls::RootCertStore>, String>> = OnceLock::new();
     ROOTS
         .get_or_init(|| {
             let loaded = rustls_native_certs::load_native_certs();
@@ -398,11 +407,7 @@ impl TlsConnectorConfig {
             built: BuiltConfig::default(),
             ..self.clone()
         };
-        let mut built = self
-            .built
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut built = self.built.0.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((built_settings, config)) = built.as_ref()
             && *built_settings == settings
         {
@@ -410,6 +415,7 @@ impl TlsConnectorConfig {
         }
         let config = self.build()?;
         *built = Some((settings, Arc::clone(&config)));
+        drop(built);
         Ok(TlsConnector::from(config))
     }
 
@@ -432,9 +438,7 @@ impl TlsConnectorConfig {
     /// The process crypto provider, limited to [`Self::cipher_suites`].
     fn crypto_provider(&self) -> Result<CryptoProvider, TlsConfigError> {
         let mut provider = CryptoProvider::get_default()
-            .map_or_else(rustls::crypto::ring::default_provider, |provider| {
-                provider.as_ref().clone()
-            });
+            .map_or_else(default_provider, |provider| provider.as_ref().clone());
         let Some(names) = &self.cipher_suites else {
             return Ok(provider);
         };
@@ -472,7 +476,7 @@ fn cipher_suite(name: &str) -> Result<rustls::CipherSuite, TlsConfigError> {
 /// One client certificate chain and its signing key.
 #[derive(Debug)]
 struct ClientIdentity {
-    key: Arc<rustls::sign::CertifiedKey>,
+    key: Arc<CertifiedKey>,
     /// The DER issuer names of the certificates of the chain.
     issuers: Vec<Vec<u8>>,
 }
@@ -480,8 +484,8 @@ struct ClientIdentity {
 impl ClientIdentity {
     fn new(
         chain: Vec<CertificateDer<'static>>,
-        key: rustls::pki_types::PrivateKeyDer<'static>,
-        key_provider: &dyn rustls::crypto::KeyProvider,
+        key: PrivateKeyDer<'static>,
+        key_provider: &dyn KeyProvider,
     ) -> Result<Self, TlsConfigError> {
         use x509_cert::der::{Decode as _, Encode as _};
 
@@ -497,7 +501,7 @@ impl ClientIdentity {
             .load_private_key(key)
             .map_err(|error| TlsConfigError::PrivateKey(error.to_string()))?;
         Ok(Self {
-            key: Arc::new(rustls::sign::CertifiedKey::new(chain, signing_key)),
+            key: Arc::new(CertifiedKey::new(chain, signing_key)),
             issuers,
         })
     }
@@ -514,12 +518,12 @@ struct IssuerResolver {
     identities: Vec<ClientIdentity>,
 }
 
-impl rustls::client::ResolvesClientCert for IssuerResolver {
+impl ResolvesClientCert for IssuerResolver {
     fn resolve(
         &self,
         root_hint_subjects: &[&[u8]],
         sigschemes: &[SignatureScheme],
-    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+    ) -> Option<Arc<CertifiedKey>> {
         self.identities
             .iter()
             .find(|identity| {
@@ -636,20 +640,16 @@ impl ClientSecurity {
     /// `host` if known. If it knows none of them, it returns `"localhost"`.
     #[must_use]
     pub fn sasl_handshake_host<'a>(&'a self, target_host: Option<&'a str>) -> &'a str {
-        if let Some(h) = self.sasl_host.as_deref() {
-            h
-        } else if let Some(server_name) = self
-            .tls
-            .as_ref()
-            .map(|tls| tls.server_name.as_str())
-            .filter(|name| !name.is_empty())
-        {
-            server_name
-        } else if let Some(h) = target_host {
-            h
-        } else {
-            "localhost"
-        }
+        self.sasl_host
+            .as_deref()
+            .or_else(|| {
+                self.tls
+                    .as_ref()
+                    .map(|tls| tls.server_name.as_str())
+                    .filter(|name| !name.is_empty())
+            })
+            .or(target_host)
+            .unwrap_or("localhost")
     }
 }
 

@@ -35,8 +35,10 @@ use crate::{AdminClient, AdminError, kafka_error_name};
 /// (KIP-373).
 const CREATE_WITH_OWNER_MIN_VERSION: i16 = 3;
 
-/// What [`AdminClient::create_delegation_token`] asks for, as Kafka's
-/// `CreateDelegationTokenOptions`. The default mints a token that the caller
+/// What [`AdminClientLike::create_delegation_token`](crate::AdminClientLike::create_delegation_token) asks for, as Kafka's
+/// `CreateDelegationTokenOptions`.
+///
+/// The default mints a token that the caller
 /// owns, with no renewers and the broker's maximum lifetime.
 #[derive(Debug, Clone, Default, PartialEq, bon::Builder)]
 pub struct CreateDelegationTokenOptions {
@@ -55,7 +57,7 @@ pub struct CreateDelegationTokenOptions {
     pub max_lifetime: Option<Time>,
 }
 
-/// What [`AdminClient::renew_delegation_token`] asks for, as Kafka's
+/// What [`AdminClientLike::renew_delegation_token`](crate::AdminClientLike::renew_delegation_token) asks for, as Kafka's
 /// `RenewDelegationTokenOptions`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, bon::Builder)]
 pub struct RenewDelegationTokenOptions {
@@ -68,7 +70,7 @@ pub struct RenewDelegationTokenOptions {
     pub renew_time_period: Option<Time>,
 }
 
-/// What [`AdminClient::expire_delegation_token`] asks for, as Kafka's
+/// What [`AdminClientLike::expire_delegation_token`](crate::AdminClientLike::expire_delegation_token) asks for, as Kafka's
 /// `ExpireDelegationTokenOptions`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, bon::Builder)]
 pub struct ExpireDelegationTokenOptions {
@@ -80,9 +82,10 @@ pub struct ExpireDelegationTokenOptions {
     pub expiry_time_period: Option<Time>,
 }
 
-/// What [`AdminClient::describe_delegation_token`] asks for, as Kafka's
-/// `DescribeDelegationTokenOptions`. The default describes every token that
-/// the caller may describe.
+/// What [`AdminClientLike::describe_delegation_token`](crate::AdminClientLike::describe_delegation_token) asks for, as Kafka's
+/// `DescribeDelegationTokenOptions`.
+///
+/// The default describes every token that the caller may describe.
 #[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct DescribeDelegationTokenOptions {
     /// The owners whose tokens to describe. `None` sends a null owner list,
@@ -118,25 +121,8 @@ pub struct DelegationToken {
 }
 
 impl AdminClient {
-    /// Creates a delegation token, as Kafka's `createDelegationToken`
-    /// operation does.
-    ///
-    /// The broker does not return the renewers, so the result has the
-    /// renewers of `options`, as Kafka's result does. With an
-    /// [`owner`](CreateDelegationTokenOptions::owner) the client negotiates
-    /// `CreateDelegationToken` v3 or higher, as Kafka's request refuses to
-    /// write the owner fields below v3.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AdminError::Broker`] for a non-zero error code, such as
-    /// `DELEGATION_TOKEN_AUTH_DISABLED` (61),
-    /// `DELEGATION_TOKEN_REQUEST_NOT_ALLOWED` (64),
-    /// `DELEGATION_TOKEN_AUTHORIZATION_FAILED` (65), or
-    /// `INVALID_PRINCIPAL_TYPE` (67). Returns [`AdminError::Transport`] when
-    /// the connection fails, or when an owner is set and the broker does not
-    /// support v3.
-    pub async fn create_delegation_token(
+    /// The call behind [`AdminClientLike::create_delegation_token`](crate::AdminClientLike::create_delegation_token).
+    pub(crate) async fn create_delegation_token_impl(
         &self,
         options: &CreateDelegationTokenOptions,
     ) -> Result<DelegationToken, AdminError> {
@@ -151,17 +137,8 @@ impl AdminClient {
         created_token(response, &options.renewers)
     }
 
-    /// Renews the delegation token with `hmac`, as Kafka's
-    /// `renewDelegationToken` operation does, and returns its new expiry in
-    /// epoch milliseconds.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AdminError::Broker`] for a non-zero error code, such as
-    /// `DELEGATION_TOKEN_NOT_FOUND` (62), `DELEGATION_TOKEN_OWNER_MISMATCH`
-    /// (63), or `DELEGATION_TOKEN_EXPIRED` (66). Returns
-    /// [`AdminError::Transport`] when the connection fails.
-    pub async fn renew_delegation_token(
+    /// The call behind [`AdminClientLike::renew_delegation_token`](crate::AdminClientLike::renew_delegation_token).
+    pub(crate) async fn renew_delegation_token_impl(
         &self,
         hmac: &[u8],
         options: RenewDelegationTokenOptions,
@@ -171,18 +148,8 @@ impl AdminClient {
         Ok(response.expiry_timestamp_ms)
     }
 
-    /// Expires the delegation token with `hmac`, as Kafka's
-    /// `expireDelegationToken` operation does, and returns the expiry that
-    /// the broker set, in epoch milliseconds. A token that expires now gets
-    /// the broker's clock at the time of the request.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AdminError::Broker`] for a non-zero error code, such as
-    /// `DELEGATION_TOKEN_NOT_FOUND` (62), `DELEGATION_TOKEN_OWNER_MISMATCH`
-    /// (63), or `DELEGATION_TOKEN_EXPIRED` (66). Returns
-    /// [`AdminError::Transport`] when the connection fails.
-    pub async fn expire_delegation_token(
+    /// The call behind [`AdminClientLike::expire_delegation_token`](crate::AdminClientLike::expire_delegation_token).
+    pub(crate) async fn expire_delegation_token_impl(
         &self,
         hmac: &[u8],
         options: ExpireDelegationTokenOptions,
@@ -192,16 +159,8 @@ impl AdminClient {
         Ok(response.expiry_timestamp_ms)
     }
 
-    /// Describes the delegation tokens that `options` selects, as Kafka's
-    /// `describeDelegationToken` operation does.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AdminError::Broker`] for a non-zero error code, such as
-    /// `DELEGATION_TOKEN_AUTH_DISABLED` (61) or
-    /// `DELEGATION_TOKEN_REQUEST_NOT_ALLOWED` (64). Returns
-    /// [`AdminError::Transport`] when the connection fails.
-    pub async fn describe_delegation_token(
+    /// The call behind [`AdminClientLike::describe_delegation_token`](crate::AdminClientLike::describe_delegation_token).
+    pub(crate) async fn describe_delegation_token_impl(
         &self,
         options: &DescribeDelegationTokenOptions,
     ) -> Result<Vec<DelegationToken>, AdminError> {
@@ -375,10 +334,14 @@ mod tests {
             renew_delegation_token_response::RenewDelegationTokenResponse,
         },
     };
+    use krabka_units::convert::TimeExt;
 
     use super::*;
-    use crate::partition_leaders::test_support::{
-        ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
+    use crate::{
+        AdminClientLike as _,
+        partition_leaders::test_support::{
+            ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
+        },
     };
 
     fn user(name: &str) -> KafkaPrincipal {
@@ -438,7 +401,8 @@ mod tests {
             }
             _ => None,
         })
-        .await;
+        .await
+        .unwrap();
         (broker, requests)
     }
 
@@ -581,7 +545,7 @@ mod tests {
                 created_response(error_code),
             )
             .await;
-            let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
+            let mut admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
             let result = outcome(admin.create_delegation_token(&options).await);
 
@@ -594,8 +558,8 @@ mod tests {
         }
     }
 
-    /// The `AdminClientLike` methods forward to the inherent calls: each one
-    /// reaches the broker and returns the inherent call's result.
+    /// Each `AdminClientLike` token call reaches the broker and returns the
+    /// result of its `_impl` call.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admin_client_like_forwards_each_token_call() {
         use crate::AdminClientLike;
@@ -736,7 +700,7 @@ mod tests {
                 created_response(0),
             )
             .await;
-            let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
+            let mut admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
             let result = admin
                 .create_delegation_token(
@@ -800,16 +764,14 @@ mod tests {
                 },
             )
             .await;
-            let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
+            let mut admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
             let result = outcome(
                 admin
                     .renew_delegation_token(
                         b"\x01\x02",
                         RenewDelegationTokenOptions::builder()
-                            .maybe_renew_time_period(
-                                renew_time_period.map(krabka_units::convert::TimeExt::millis_i64),
-                            )
+                            .maybe_renew_time_period(renew_time_period.map(TimeExt::millis_i64))
                             .build(),
                     )
                     .await,
@@ -869,16 +831,14 @@ mod tests {
                 },
             )
             .await;
-            let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
+            let mut admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
             let result = outcome(
                 admin
                     .expire_delegation_token(
                         b"\xaa",
                         ExpireDelegationTokenOptions::builder()
-                            .maybe_expiry_time_period(
-                                expiry_time_period.map(krabka_units::convert::TimeExt::millis_i64),
-                            )
+                            .maybe_expiry_time_period(expiry_time_period.map(TimeExt::millis_i64))
                             .build(),
                     )
                     .await,
@@ -983,7 +943,7 @@ mod tests {
                 },
             )
             .await;
-            let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
+            let mut admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
             let result = outcome(
                 admin

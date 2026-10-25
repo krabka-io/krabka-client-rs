@@ -11,17 +11,17 @@ use std::collections::BTreeMap;
 use krabka_protocol::primitives::uuid::Uuid as WireUuid;
 
 /// Kafka's `FetchMetadata.INVALID_SESSION_ID`.
-pub(crate) const INVALID_SESSION_ID: i32 = 0;
+pub const INVALID_SESSION_ID: i32 = 0;
 /// Kafka's `FetchMetadata.INITIAL_EPOCH`.
 const INITIAL_EPOCH: i32 = 0;
 /// Kafka's `FetchMetadata.FINAL_EPOCH`.
-pub(crate) const FINAL_EPOCH: i32 = -1;
+pub const FINAL_EPOCH: i32 = -1;
 /// `FETCH_SESSION_ID_NOT_FOUND`.
 const FETCH_SESSION_ID_NOT_FOUND: i16 = 70;
 
 /// Kafka's `FetchMetadata`: the session id and epoch of the next request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FetchMetadata {
+pub struct FetchMetadata {
     pub session_id: i32,
     pub epoch: i32,
 }
@@ -61,7 +61,7 @@ impl FetchMetadata {
 /// `FetchRequest.PartitionData`; a change of any field makes the partition part
 /// of the next incremental request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SessionPartition {
+pub struct SessionPartition {
     pub topic_id: WireUuid,
     pub fetch_offset: i64,
     pub current_leader_epoch: i32,
@@ -71,7 +71,7 @@ pub(crate) struct SessionPartition {
 
 /// The session fields and partitions of one Fetch request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SessionRequest {
+pub struct SessionRequest {
     pub session_id: i32,
     pub session_epoch: i32,
     /// The partitions to send: all of them in a full request, the new and the
@@ -83,7 +83,7 @@ pub(crate) struct SessionRequest {
 
 /// The fetch session of one broker. Kafka's `FetchSessionHandler`.
 #[derive(Debug)]
-pub(crate) struct FetchSession {
+pub struct FetchSession {
     next: FetchMetadata,
     partitions: BTreeMap<(String, i32), SessionPartition>,
 }
@@ -375,7 +375,7 @@ mod tests {
                 ],
                 vec![
                     request(0, 0, both.clone(), Vec::new()),
-                    request(0, 0, both.clone(), Vec::new()),
+                    request(0, 0, both, Vec::new()),
                 ],
             ),
         ] {

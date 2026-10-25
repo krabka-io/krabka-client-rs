@@ -15,9 +15,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, iter,
 };
 
+use futures_util::future::join_all;
 use krabka_protocol::owned::{
     describe_configs_request::{DescribeConfigsRequest, DescribeConfigsResource},
     describe_configs_response::{
@@ -355,7 +356,7 @@ impl Config {
     }
 }
 
-/// What [`AdminClient::describe_configs`] asks for, as Kafka's
+/// What [`AdminClientLike::describe_configs`](crate::AdminClientLike::describe_configs) asks for, as Kafka's
 /// `DescribeConfigsOptions`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bon::Builder)]
 pub struct DescribeConfigsOptions {
@@ -447,7 +448,7 @@ impl AlterConfigOp {
     }
 }
 
-/// What [`AdminClient::incremental_alter_configs`] asks for, as Kafka's
+/// What [`AdminClientLike::incremental_alter_configs`](crate::AdminClientLike::incremental_alter_configs) asks for, as Kafka's
 /// `AlterConfigsOptions`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bon::Builder)]
 pub struct IncrementalAlterConfigsOptions {
@@ -456,11 +457,11 @@ pub struct IncrementalAlterConfigsOptions {
     pub validate_only: bool,
 }
 
-/// The result of each resource of a [`AdminClient::describe_configs`] call.
+/// The result of each resource of a [`AdminClientLike::describe_configs`](crate::AdminClientLike::describe_configs) call.
 pub type DescribeConfigsResults = BTreeMap<ConfigResource, Result<Config, KafkaError>>;
 
 /// The result of each resource of an
-/// [`AdminClient::incremental_alter_configs`] call.
+/// [`AdminClientLike::incremental_alter_configs`](crate::AdminClientLike::incremental_alter_configs) call.
 pub type AlterConfigsResults = BTreeMap<ConfigResource, Result<(), KafkaError>>;
 
 /// The node that a resource goes to, as `KafkaAdminClient.nodeFor`: the
@@ -723,31 +724,8 @@ fn alter_results<'a>(
 }
 
 impl AdminClient {
-    /// Describes the configs of each resource of `resources`, as Kafka's
-    /// `describeConfigs` operation does.
-    ///
-    /// The client sends one `DescribeConfigs` request to each broker that a
-    /// `BROKER` resource with a broker id or a `BROKER_LOGGER` resource
-    /// names, and one request with every other resource on its connection,
-    /// all at the same time. Each request asks for every config of its
-    /// resources. The result has one entry for each resource:
-    ///
-    /// - Its [`Config`], or the error the broker gave for it, such as
-    ///   `UNKNOWN_TOPIC_OR_PARTITION` (3).
-    /// - `UNKNOWN_SERVER_ERROR` (-1) when the answer has no result for it.
-    /// - The error of its request when that request fails: `REQUEST_TIMED_OUT`
-    ///   (7) at `default.api.timeout.ms` (60 s), or `UNSUPPORTED_VERSION` (35)
-    ///   when the node does not support `DescribeConfigs` v3 and
-    ///   `include_documentation` is set. A broker is found by id in fresh
-    ///   metadata, and a missing broker or a lost connection is tried again
-    ///   until the deadline, as in [`Self::describe_log_dirs`].
-    ///
-    /// # Errors
-    /// Returns [`AdminError::InvalidArgument`], and sends nothing, when the
-    /// name of a `BROKER` resource is neither empty nor a broker id, or the
-    /// name of a `BROKER_LOGGER` resource is not a broker id, as Kafka's
-    /// `nodeFor` throws a `NumberFormatException`.
-    pub async fn describe_configs(
+    /// The call behind [`AdminClientLike::describe_configs`](crate::AdminClientLike::describe_configs).
+    pub(crate) async fn describe_configs_impl(
         &self,
         resources: &[ConfigResource],
         options: DescribeConfigsOptions,
@@ -761,7 +739,7 @@ impl AdminClient {
         }
         let start = self.retry.start();
         let min_version = describe_min_version(options);
-        let answers = futures_util::future::join_all(by_node.iter().map(|(node, asked)| {
+        let answers = join_all(by_node.iter().map(|(node, asked)| {
             let request = describe_request(asked, options);
             async move {
                 let answer = if let Some(node_id) = *node {
@@ -796,31 +774,9 @@ impl AdminClient {
         Ok(answers.into_iter().flatten().collect())
     }
 
-    /// Changes the configs of each resource of `configs`, as Kafka's
-    /// `incrementalAlterConfigs` operation does. With
-    /// [`IncrementalAlterConfigsOptions::validate_only`] the broker
-    /// validates the changes and applies none.
-    ///
-    /// A `BROKER` resource with a broker id goes to that broker, and a
-    /// `BROKER_LOGGER` resource to its broker, each in a request of its own.
-    /// With a controller bootstrap only a `BROKER_LOGGER` resource goes to
-    /// its node. Every other resource goes in one request on the client's
-    /// connection. A `NOT_CONTROLLER` (41) answer, or with a controller
-    /// bootstrap a `NOT_LEADER_OR_FOLLOWER` (6) answer, makes the client find
-    /// the controller again and send the request again until the deadline.
-    /// The result has one entry for each resource:
-    ///
-    /// - `Ok(())`, or the error the broker gave for it, such as
-    ///   `INVALID_CONFIG` (40).
-    /// - `UNKNOWN_SERVER_ERROR` (-1) when the answer has no result for it.
-    /// - The error of its request when that request fails, with
-    ///   `REQUEST_TIMED_OUT` (7) at `default.api.timeout.ms` (60 s).
-    ///
-    /// # Errors
-    /// Returns [`AdminError::InvalidArgument`], and sends nothing, for a
-    /// resource name that [`Self::describe_configs`] refuses.
-    pub async fn incremental_alter_configs(
-        &mut self,
+    /// The call behind [`AdminClientLike::incremental_alter_configs`](crate::AdminClientLike::incremental_alter_configs).
+    pub(crate) async fn incremental_alter_configs_impl(
+        &self,
         configs: &BTreeMap<ConfigResource, Vec<AlterConfigOp>>,
         options: IncrementalAlterConfigsOptions,
     ) -> Result<AlterConfigsResults, AdminError> {
@@ -841,7 +797,7 @@ impl AdminClient {
         let start = self.retry.start();
         let (conn, client_options) = (&self.conn, &self.options);
         let node_answers =
-            futures_util::future::join_all(by_node.iter().map(|(node_id, resource, ops)| {
+            join_all(by_node.iter().map(|(node_id, resource, ops)| {
                 let request = alter_request(&maplit::btreemap! {
                     (*resource).clone() => *ops,
                 }, options);
@@ -882,7 +838,7 @@ impl AdminClient {
                         }
                         attempts += 1;
                     };
-                    alter_results(std::iter::once(*resource), answer)
+                    alter_results(iter::once(*resource), answer)
                 }
             }))
             .await;
@@ -898,7 +854,7 @@ impl AdminClient {
     /// client's connection, sent again after each `NOT_CONTROLLER` answer
     /// until the deadline.
     async fn alter_unified(
-        &mut self,
+        &self,
         resources: &BTreeMap<ConfigResource, &[AlterConfigOp]>,
         options: IncrementalAlterConfigsOptions,
         controllers: bool,

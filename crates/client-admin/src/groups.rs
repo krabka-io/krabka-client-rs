@@ -31,8 +31,12 @@
 //! codes as Apache Kafka's `ListConsumerGroupOffsetsHandler.handleGroupError`
 //! does, until Kafka's default `default.api.timeout.ms` (60 s) elapses.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    iter,
+};
 
+use futures_util::future::join_all;
 use krabka_client_core::{
     AllTopicsOffsetFetch, AuthenticationError, ClientError, Connection, ConnectionOptions,
     CoordinatorKeyType, MembersOnlyLeaveGroup, SaslAuthenticationError, TopicNameOffsetCommit,
@@ -72,6 +76,7 @@ use krabka_protocol::owned::{
         OffsetFetchResponseTopic, OffsetFetchResponseTopics,
     },
 };
+use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 
 use crate::{
     AdminClient, AdminError, KafkaError, format_host_port,
@@ -549,7 +554,7 @@ impl AdminClient {
     }
 
     async fn alter_group_offsets(
-        &mut self,
+        &self,
         update: GroupOffsetUpdate<'_>,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
         self.alter_group_offsets_with_retry(update, self.retry)
@@ -557,7 +562,7 @@ impl AdminClient {
     }
 
     async fn alter_group_offsets_with_retry(
-        &mut self,
+        &self,
         update: GroupOffsetUpdate<'_>,
         retry: RetryPolicy,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
@@ -571,7 +576,7 @@ impl AdminClient {
 
     /// Sends one update attempt, finding the coordinator first when requested.
     async fn alter_group_offsets_attempt(
-        &mut self,
+        &self,
         attempt: GroupOffsetAttempt<'_>,
     ) -> RetryAction<Vec<ConsumerGroupOffsetOutcome>> {
         let GroupOffsetAttempt {
@@ -648,7 +653,7 @@ impl AdminClient {
         options: &ListGroupsOptions,
         retry: RetryPolicy,
     ) -> Result<ListGroupsResult, AdminError> {
-        let start = tokio::time::Instant::now();
+        let start = Instant::now();
         let brokers = self.list_groups_brokers(start, retry).await?;
         let request = ListGroupsRequest {
             states_filter: options
@@ -664,7 +669,7 @@ impl AdminClient {
             ..Default::default()
         };
         let min_version = list_groups_min_version(options);
-        let answers = futures_util::future::join_all(brokers.iter().map(|broker| {
+        let answers = join_all(brokers.iter().map(|broker| {
             list_groups_on_broker(
                 broker,
                 self.options.clone(),
@@ -709,7 +714,7 @@ impl AdminClient {
     /// (`StaleMetadataException`) until the timeout.
     async fn list_groups_brokers(
         &self,
-        start: tokio::time::Instant,
+        start: Instant,
         retry: RetryPolicy,
     ) -> Result<Vec<MetadataResponseBroker>, AdminError> {
         let mut backoff = retry.initial_backoff;
@@ -733,7 +738,7 @@ impl AdminClient {
                     "failed to find brokers to send ListGroups: metadata has no brokers".to_owned(),
                 ));
             }
-            tokio::time::sleep(backoff).await;
+            sleep(backoff).await;
             backoff = backoff.saturating_mul(2).min(retry.max_backoff);
         }
     }
@@ -785,7 +790,7 @@ impl AdminClient {
     }
 
     async fn list_consumer_group_offsets_with_retry(
-        &mut self,
+        &self,
         group: &str,
         retry: RetryPolicy,
     ) -> Result<GroupOffsets, AdminError> {
@@ -796,7 +801,7 @@ impl AdminClient {
     /// is set, the attempt first finds the group coordinator and connects to
     /// it.
     async fn offset_fetch_attempt(
-        &mut self,
+        &self,
         group: &str,
         find_coordinator: bool,
     ) -> RetryAction<GroupOffsets> {
@@ -812,10 +817,7 @@ impl AdminClient {
     /// [`RetryAction::FindCoordinator`], as `AdminApiDriver.onFailure` looks
     /// the coordinator up again after a disconnect. Another failure gives
     /// [`RetryAction::Done`].
-    async fn find_group_coordinator_attempt<T>(
-        &mut self,
-        group: &str,
-    ) -> Result<(), RetryAction<T>> {
+    async fn find_group_coordinator_attempt<T>(&self, group: &str) -> Result<(), RetryAction<T>> {
         match self.reconnect_group_coordinator(group).await {
             Ok(()) => Ok(()),
             Err(AdminError::Transport(ClientError::Server { error_code }))
@@ -829,7 +831,7 @@ impl AdminClient {
         }
     }
 
-    async fn reconnect_group_coordinator(&mut self, group: &str) -> Result<(), AdminError> {
+    async fn reconnect_group_coordinator(&self, group: &str) -> Result<(), AdminError> {
         let response = self
             .conn
             .send(build_find_coordinator(group, CoordinatorKeyType::Group))
@@ -865,7 +867,7 @@ impl AdminClient {
     }
 
     async fn delete_consumer_group_offsets_with_retry(
-        &mut self,
+        &self,
         group: &str,
         partitions: &[(String, i32)],
         retry: RetryPolicy,
@@ -875,7 +877,7 @@ impl AdminClient {
     }
 
     async fn offset_delete_attempt(
-        &mut self,
+        &self,
         group: &str,
         partitions: &[(String, i32)],
         find_coordinator: bool,
@@ -990,7 +992,7 @@ impl AdminClient {
     }
 
     async fn remove_members_from_consumer_group_with_retry(
-        &mut self,
+        &self,
         group: &str,
         members: &[MemberIdentity],
         retry: RetryPolicy,
@@ -999,7 +1001,7 @@ impl AdminClient {
     }
 
     async fn leave_group_attempt(
-        &mut self,
+        &self,
         group: &str,
         members: &[MemberIdentity],
         find_coordinator: bool,
@@ -1088,7 +1090,7 @@ impl AdminClient {
     }
 
     async fn delete_share_group_offsets_with_retry(
-        &mut self,
+        &self,
         group: &str,
         topics: &[String],
         retry: RetryPolicy,
@@ -1099,7 +1101,7 @@ impl AdminClient {
     }
 
     async fn delete_share_group_offsets_attempt(
-        &mut self,
+        &self,
         group: &str,
         topics: &[String],
         find_coordinator: bool,
@@ -1504,7 +1506,7 @@ fn delete_share_group_offsets_retry_action(
         |topic| {
             (
                 topic.topic_name,
-                std::iter::once((topic.error_code, topic.error_message)),
+                iter::once((topic.error_code, topic.error_message)),
             )
         },
         |topic, (code, message)| (topic, kafka_error_if(code, message)),
@@ -1553,7 +1555,7 @@ async fn list_groups_on_broker(
     options: ConnectionOptions,
     request: ListGroupsRequest,
     min_version: i16,
-    start: tokio::time::Instant,
+    start: Instant,
     retry: RetryPolicy,
 ) -> Result<Vec<ListedGroup>, KafkaError> {
     let host_port = format_host_port(&broker.host, broker.port);
@@ -1562,7 +1564,7 @@ async fn list_groups_on_broker(
     let mut connection = None;
     let mut attempts = 0_u32;
     let mut last = None;
-    while tokio::time::Instant::now() < deadline {
+    while Instant::now() < deadline {
         attempts += 1;
         let attempt = list_groups_attempt(
             &mut connection,
@@ -1571,7 +1573,7 @@ async fn list_groups_on_broker(
             request.clone(),
             min_version,
         );
-        match tokio::time::timeout_at(deadline, attempt).await {
+        match timeout_at(deadline, attempt).await {
             Ok(RetryAction::Done(result)) => {
                 return result.map_err(|error| list_groups_kafka_error(&error));
             }
@@ -1592,7 +1594,7 @@ async fn list_groups_on_broker(
             node_id = broker.node_id,
             "ListGroups got a retriable error; retrying"
         );
-        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + backoff)).await;
+        sleep_until(deadline.min(Instant::now() + backoff)).await;
         backoff = backoff.saturating_mul(2).min(retry.max_backoff);
     }
     Err(list_groups_timeout(attempts, last.as_ref()))
@@ -1881,6 +1883,8 @@ fn offset_commit_request(group: &str, offsets: &GroupOffsets) -> TopicNameOffset
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt::Debug,
+        net::SocketAddr,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -1924,6 +1928,7 @@ mod tests {
             sasl_handshake_request,
         },
     };
+    use tokio::{net::TcpListener, runtime, task::JoinHandle, time::timeout};
 
     use super::*;
 
@@ -1974,7 +1979,7 @@ mod tests {
         encode(response, version, true)
     }
 
-    fn broker_port(addr: std::net::SocketAddr) -> i32 {
+    fn broker_port(addr: SocketAddr) -> i32 {
         i32::from(addr.port())
     }
 
@@ -1984,7 +1989,7 @@ mod tests {
         port: i32,
     }
 
-    fn mock_broker_address(addr: std::net::SocketAddr, node_id: i32) -> MockBrokerAddress {
+    fn mock_broker_address(addr: SocketAddr, node_id: i32) -> MockBrokerAddress {
         MockBrokerAddress {
             node_id,
             host: addr.ip().to_string(),
@@ -2003,21 +2008,18 @@ mod tests {
         };
     }
 
-    fn mock_metadata_broker(addr: std::net::SocketAddr, node_id: i32) -> MetadataResponseBroker {
+    fn mock_metadata_broker(addr: SocketAddr, node_id: i32) -> MetadataResponseBroker {
         let broker = mock_broker_address(addr, node_id);
         broker_fields!(MetadataResponseBroker, broker)
     }
 
-    async fn connect_admin(addr: std::net::SocketAddr, message: &'static str) -> AdminClient {
+    async fn connect_admin(addr: SocketAddr, message: &'static str) -> AdminClient {
         AdminClient::connect(&[addr.to_string()])
             .await
             .expect(message)
     }
 
-    fn mock_coordinator_response(
-        addr: std::net::SocketAddr,
-        error_code: i16,
-    ) -> FindCoordinatorResponse {
+    fn mock_coordinator_response(addr: SocketAddr, error_code: i16) -> FindCoordinatorResponse {
         let broker = mock_broker_address(addr, 2);
         let mut response = broker_fields!(FindCoordinatorResponse, broker);
         response.error_code = error_code;
@@ -2039,7 +2041,7 @@ mod tests {
 
     async fn with_incompatible_version<T>(
         case: &'static str,
-        result: impl std::future::Future<Output = Result<T, AdminError>>,
+        result: impl Future<Output = Result<T, AdminError>>,
     ) -> Result<T, (i16, i16, i16, i16, i16)> {
         result
             .await
@@ -2150,6 +2152,7 @@ mod tests {
             _ => None,
         })
         .await
+        .unwrap()
     }
 
     struct GroupAdminConnection {
@@ -2192,8 +2195,8 @@ mod tests {
 
     fn assert_group_version_case<Request, Output>(case: GroupVersionAssertion<Request, Output>)
     where
-        Request: std::fmt::Debug + PartialEq,
-        Output: std::fmt::Debug + PartialEq,
+        Request: Debug + PartialEq,
+        Output: Debug + PartialEq,
     {
         assert!(
             (case.requests, case.result) == (case.expected_requests, case.expected_result),
@@ -2237,17 +2240,12 @@ mod tests {
         respond: Respond,
         action: Action,
     ) where
-        Request: ProtocolRequest
-            + for<'de> Decode<'de>
-            + Clone
-            + PartialEq
-            + std::fmt::Debug
-            + Send
-            + 'static,
-        Output: PartialEq + std::fmt::Debug,
+        Request:
+            ProtocolRequest + for<'de> Decode<'de> + Clone + PartialEq + Debug + Send + 'static,
+        Output: PartialEq + Debug,
         Respond: Fn(&Request, i16) -> Vec<u8> + Copy + Send + Sync + 'static,
         Action: FnOnce(&'static str, AdminClient) -> Fut,
-        Fut: std::future::Future<Output = Output>,
+        Fut: Future<Output = Output>,
     {
         let ranges = case.ranges;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -2268,7 +2266,8 @@ mod tests {
                 }
                 _ => None,
             })
-            .await;
+            .await
+            .unwrap();
         let GroupAdminConnection { bootstrap, admin } =
             connect_group_admin(&coordinator, ranges).await;
         let result = action(case.name, admin).await;
@@ -2579,7 +2578,7 @@ mod tests {
         /// The first `unreachable_answers` `FindCoordinator` answers name
         /// `unreachable`, an address that refuses connections.
         unreachable_answers: usize,
-        unreachable: Option<std::net::SocketAddr>,
+        unreachable: Option<SocketAddr>,
         /// The coordinator does not answer `OffsetCommit`.
         silent_offset_commit: bool,
         /// The first `closed_offset_commits` `OffsetCommit` requests close the
@@ -2588,10 +2587,8 @@ mod tests {
     }
 
     /// An address on which no listener accepts connections.
-    async fn refused_address() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port");
+    async fn refused_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
         listener.local_addr().expect("local address")
     }
 
@@ -2609,7 +2606,7 @@ mod tests {
     /// partition of the request.
     async fn scripted_group_broker(
         script: Arc<Mutex<RetryScript>>,
-        coordinator: Arc<Mutex<Option<std::net::SocketAddr>>>,
+        coordinator: Arc<Mutex<Option<SocketAddr>>>,
     ) -> MockBroker {
         let ranges = GroupRanges {
             offset_commit: (2, 9),
@@ -2620,11 +2617,13 @@ mod tests {
             api_versions_request::API_KEY => Some(api_versions(ranges)),
             offset_commit_request::API_KEY => {
                 let request: OffsetCommitRequest = decode_request(body, version);
-                let mut script = script.lock().expect("script lock");
-                let script = &mut *script;
+                let mut guard = script.lock().expect("script lock");
+                let script = &mut *guard;
                 let error_code =
                     RetryScript::next(&script.offset_commit, &mut script.offset_commit_requests);
-                if script.silent_offset_commit {
+                let silent = script.silent_offset_commit;
+                drop(guard);
+                if silent {
                     return None;
                 }
                 let response = offset_commit_response(&request, |_| error_code);
@@ -2635,8 +2634,8 @@ mod tests {
                 ))
             }
             find_coordinator_request::API_KEY => {
-                let mut script = script.lock().expect("script lock");
-                let script = &mut *script;
+                let mut guard = script.lock().expect("script lock");
+                let script = &mut *guard;
                 let error_code = RetryScript::next(
                     &script.find_coordinator,
                     &mut script.find_coordinator_requests,
@@ -2652,6 +2651,7 @@ mod tests {
                         .expect("coordinator lock")
                         .expect("coordinator address"),
                 };
+                drop(guard);
                 Some(encode(
                     &mock_coordinator_response(addr, error_code),
                     version,
@@ -2659,10 +2659,11 @@ mod tests {
                 ))
             }
             offset_fetch_request::API_KEY => {
-                let mut script = script.lock().expect("script lock");
-                let script = &mut *script;
+                let mut guard = script.lock().expect("script lock");
+                let script = &mut *guard;
                 let error_code =
                     RetryScript::next(&script.offset_fetch, &mut script.offset_fetch_requests);
+                drop(guard);
                 let response = if error_code == 0 {
                     offset_fetch_response(version)
                 } else {
@@ -2682,15 +2683,20 @@ mod tests {
         MockBroker::start_with_replies(move |api_key, version, _, body| {
             if api_key == offset_commit_request::API_KEY {
                 let mut script = closing.lock().expect("script lock");
-                if script.closed_offset_commits > 0 {
+                let close = script.closed_offset_commits > 0;
+                if close {
                     script.closed_offset_commits -= 1;
                     script.offset_commit_requests += 1;
+                }
+                drop(script);
+                if close {
                     return MockReply::Close;
                 }
             }
             handler(api_key, version, body).map_or(MockReply::Silent, MockReply::Respond)
         })
         .await
+        .unwrap()
     }
 
     struct ScriptedGroupCluster {
@@ -2719,7 +2725,7 @@ mod tests {
     async fn run_scripted_call<T, F, Fut>(script: RetryScript, call: F) -> (T, RetryScript)
     where
         F: FnOnce(AdminClient) -> Fut,
-        Fut: std::future::Future<Output = T>,
+        Fut: Future<Output = T>,
     {
         let shared_script = Arc::new(Mutex::new(script));
         let ScriptedGroupCluster {
@@ -2954,7 +2960,7 @@ mod tests {
     }
 
     async fn alter_consumer_offsets_with_retry(
-        mut admin: AdminClient,
+        admin: AdminClient,
         timeout: Duration,
     ) -> Result<Vec<ConsumerGroupOffsetOutcome>, AdminError> {
         let offsets = test_group_offsets();
@@ -3012,53 +3018,50 @@ mod tests {
             RetryApi::Commit => script.offset_commit = case.offset_commit.to_vec(),
         }
 
-        let ((result, within_deadline), script) =
-            run_scripted_call(script, |mut admin| async move {
-                let started = tokio::time::Instant::now();
-                let result = match api {
-                    RetryApi::Fetch => {
-                        let result = admin
-                            .list_consumer_group_offsets_with_retry(
-                                "workers",
-                                test_retry_policy(case.timeout, group_retry_backoff(case.timeout)),
-                            )
-                            .await
-                            .map_err(|error| match error {
-                                AdminError::Broker {
-                                    api: "OffsetFetch",
-                                    code,
-                                    ..
-                                } => RetryExpected::OffsetFetch(code),
-                                AdminError::Transport(ClientError::Server { error_code }) => {
-                                    RetryExpected::FindCoordinator(error_code)
-                                }
-                                AdminError::Transport(ClientError::Timeout(_)) => {
-                                    RetryExpected::Timeout
-                                }
-                                other => panic!("case {}: unexpected error {other:?}", case.name),
-                            });
-                        RetryObservation::Fetch(result)
-                    }
-                    RetryApi::Commit => {
-                        let result = alter_consumer_offsets_with_retry(admin, case.timeout)
-                            .await
-                            .map_err(|error| match error {
-                                AdminError::Transport(ClientError::Server { error_code }) => {
-                                    error_code
-                                }
-                                AdminError::Transport(ClientError::Timeout(_)) => TIMED_OUT,
-                                other => panic!("case {}: unexpected error {other:?}", case.name),
-                            });
-                        RetryObservation::Commit(result)
-                    }
-                };
-                let within_deadline = match api {
-                    RetryApi::Fetch => true,
-                    RetryApi::Commit => started.elapsed() < case.timeout + Duration::from_secs(2),
-                };
-                (result, within_deadline)
-            })
-            .await;
+        let ((result, within_deadline), script) = run_scripted_call(script, |admin| async move {
+            let started = Instant::now();
+            let result = match api {
+                RetryApi::Fetch => {
+                    let result = admin
+                        .list_consumer_group_offsets_with_retry(
+                            "workers",
+                            test_retry_policy(case.timeout, group_retry_backoff(case.timeout)),
+                        )
+                        .await
+                        .map_err(|error| match error {
+                            AdminError::Broker {
+                                api: "OffsetFetch",
+                                code,
+                                ..
+                            } => RetryExpected::OffsetFetch(code),
+                            AdminError::Transport(ClientError::Server { error_code }) => {
+                                RetryExpected::FindCoordinator(error_code)
+                            }
+                            AdminError::Transport(ClientError::Timeout(_)) => {
+                                RetryExpected::Timeout
+                            }
+                            other => panic!("case {}: unexpected error {other:?}", case.name),
+                        });
+                    RetryObservation::Fetch(result)
+                }
+                RetryApi::Commit => {
+                    let result = alter_consumer_offsets_with_retry(admin, case.timeout)
+                        .await
+                        .map_err(|error| match error {
+                            AdminError::Transport(ClientError::Server { error_code }) => error_code,
+                            AdminError::Transport(ClientError::Timeout(_)) => TIMED_OUT,
+                            other => panic!("case {}: unexpected error {other:?}", case.name),
+                        });
+                    RetryObservation::Commit(result)
+                }
+            };
+            let within_deadline = match api {
+                RetryApi::Fetch => true,
+                RetryApi::Commit => started.elapsed() < case.timeout + Duration::from_secs(2),
+            };
+            (result, within_deadline)
+        })
+        .await;
         let rpc_calls = match api {
             RetryApi::Fetch => script.offset_fetch_requests,
             RetryApi::Commit => script.offset_commit_requests,
@@ -3132,7 +3135,7 @@ mod tests {
             ..RetryScript::default()
         };
         let ((result, within_deadline), script) = run_scripted_call(script, |admin| async move {
-            let started = tokio::time::Instant::now();
+            let started = Instant::now();
             let result = alter_consumer_offsets_with_retry(admin, timeout)
                 .await
                 .map(|_| 0_i16)
@@ -3181,7 +3184,8 @@ mod tests {
             }
             _ => None,
         })
-        .await;
+        .await
+        .unwrap();
 
         let bootstrap_group_rpcs = Arc::new(AtomicUsize::new(0));
         let bootstrap =
@@ -3268,24 +3272,26 @@ mod tests {
     /// `ListGroups` request with its version.
     async fn list_groups_broker(
         script: ListGroupsBroker,
-        cluster: Arc<Mutex<Vec<std::net::SocketAddr>>>,
+        cluster: Arc<Mutex<Vec<SocketAddr>>>,
         requests: Arc<Mutex<Vec<(i16, ListGroupsRequest)>>>,
     ) -> MockBroker {
         MockBroker::start_with_replies(move |api_key, version, _, body| {
             MockSaslAnswer::Accept
                 .reply(api_key, version)
+                .unwrap()
                 .unwrap_or_else(|| {
                     list_groups_reply(&script, &cluster, &requests, api_key, version, body)
                         .map_or(MockReply::Silent, MockReply::Respond)
                 })
         })
         .await
+        .unwrap()
     }
 
     /// The reply of a `list_groups_broker` to one request other than SASL.
     fn list_groups_reply(
         script: &ListGroupsBroker,
-        cluster: &Mutex<Vec<std::net::SocketAddr>>,
+        cluster: &Mutex<Vec<SocketAddr>>,
         requests: &Mutex<Vec<(i16, ListGroupsRequest)>>,
         api_key: i16,
         version: i16,
@@ -3335,6 +3341,7 @@ mod tests {
                     },
                 };
                 requests.push((version, request));
+                drop(requests);
                 Some(encode(
                     &response,
                     version,
@@ -3547,6 +3554,43 @@ mod tests {
         assert!((codes, sent.lock().expect("sent lock").len()) == (vec![7], 3));
     }
 
+    /// Kafka's `listGroups` retries a `Metadata` answer without brokers
+    /// (`StaleMetadataException`) with the backoff, and fails the call at the
+    /// deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_groups_fails_when_the_metadata_never_names_a_broker() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let broker = list_groups_broker(
+            groups(&[]),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&sent),
+        )
+        .await;
+        let admin = connect_admin(broker.addr, "admin connects").await;
+
+        let result = admin
+            .list_groups_with_retry(
+                &ListGroupsOptions::builder().build(),
+                list_groups_retry_policy(
+                    Duration::from_millis(50),
+                    Duration::from_millis(5),
+                    u32::MAX,
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string());
+
+        broker.stop();
+        assert!(
+            (result, sent.lock().expect("sent lock").len())
+                == (
+                    Err("protocol: failed to find brokers to send ListGroups: metadata has no brokers"
+                        .to_owned()),
+                    0
+                )
+        );
+    }
+
     fn below(max_version: i16, ids: &[&str]) -> ListGroupsBroker {
         ListGroupsBroker {
             max_version,
@@ -3616,8 +3660,8 @@ mod tests {
             .expect("list_groups succeeds")
     }
 
-    fn block_on_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
-        tokio::runtime::Builder::new_multi_thread()
+    fn block_on_test(future: impl Future<Output = ()> + Send + 'static) {
+        runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
@@ -3675,10 +3719,10 @@ mod tests {
     /// A started `SecuredBroker`. `connections` counts the TCP connections
     /// that it accepts, or the `SaslHandshake` requests that it answers.
     struct StartedSecuredBroker {
-        addr: std::net::SocketAddr,
+        addr: SocketAddr,
         connections: Arc<AtomicUsize>,
         mock: Option<MockBroker>,
-        listener: Option<tokio::task::JoinHandle<()>>,
+        listener: Option<JoinHandle<()>>,
     }
 
     impl SecuredBroker {
@@ -3687,16 +3731,19 @@ mod tests {
             let counter = Arc::clone(&connections);
             match self {
                 Self::Stalls => {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    let listener = TcpListener::bind("127.0.0.1:0")
                         .await
                         .expect("listener binds");
                     let addr = listener.local_addr().expect("listener address");
                     let task = tokio::spawn(async move {
+                        // Hold every accepted connection open, silent, until the
+                        // listener stops.
                         let mut open = Vec::new();
                         while let Ok((stream, _)) = listener.accept().await {
                             counter.fetch_add(1, Ordering::SeqCst);
                             open.push(stream);
                         }
+                        drop(open);
                     });
                     StartedSecuredBroker {
                         addr,
@@ -3712,9 +3759,11 @@ mod tests {
                         }
                         MockSaslAnswer::AuthenticateError(SASL_AUTHENTICATION_FAILED)
                             .reply(api_key, version)
+                            .unwrap()
                             .unwrap_or(MockReply::Silent)
                     })
-                    .await;
+                    .await
+                    .unwrap();
                     StartedSecuredBroker {
                         addr: mock.addr,
                         connections,
@@ -3727,7 +3776,7 @@ mod tests {
 
         /// The error code and message that `list_groups` reports for the
         /// broker at `addr`.
-        fn expected_error(self, addr: std::net::SocketAddr) -> (i16, Option<String>) {
+        fn expected_error(self, addr: SocketAddr) -> (i16, Option<String>) {
             match self {
                 Self::Stalls => (
                     7,
@@ -3816,7 +3865,7 @@ mod tests {
         .await
         .expect("admin connects");
 
-        let outcome = tokio::time::timeout(
+        let outcome = timeout(
             RETRY.timeout * 5,
             admin.list_groups_with_retry(&ListGroupsOptions::builder().build(), RETRY),
         )
@@ -4138,7 +4187,7 @@ mod tests {
         codes: Vec<i16>,
         respond: impl Fn(i16, i16) -> Vec<u8> + Send + Sync + 'static,
     ) -> (AdminClient, MockBroker, Arc<AtomicUsize>) {
-        let coordinator_addr = Arc::new(Mutex::new(None::<std::net::SocketAddr>));
+        let coordinator_addr = Arc::new(Mutex::new(None::<SocketAddr>));
         let addr_in_mock = Arc::clone(&coordinator_addr);
         let script = Arc::new(Mutex::new((codes, 0_usize)));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4149,6 +4198,7 @@ mod tests {
                 let mut guard = script.lock().expect("script lock");
                 let (codes, requests) = &mut *guard;
                 let code = RetryScript::next(codes, requests);
+                drop(guard);
                 Some(respond(code, version))
             } else {
                 match api_key {
@@ -4165,7 +4215,8 @@ mod tests {
                 }
             }
         })
-        .await;
+        .await
+        .unwrap();
         *coordinator_addr.lock().expect("coordinator lock") = Some(broker.addr);
         let admin = connect_admin(broker.addr, "admin connects").await;
         (admin, broker, calls)
@@ -4349,10 +4400,10 @@ mod tests {
         cases: Vec<CoordinatorRetryCase<T>>,
         action: F,
     ) where
-        T: PartialEq + std::fmt::Debug,
+        T: PartialEq + Debug,
         Resp: Fn(i16, i16) -> Vec<u8> + Copy + Send + Sync + 'static,
         F: Fn(AdminClient) -> Fut,
-        Fut: std::future::Future<Output = Result<T, AdminError>>,
+        Fut: Future<Output = Result<T, AdminError>>,
     {
         for case in cases {
             let (admin, broker, calls) =
@@ -4402,7 +4453,7 @@ mod tests {
         mut admin: AdminClient,
     ) -> Result<Vec<(String, Option<KafkaError>)>, AdminError> {
         admin
-            .delete_share_group_offsets("workers", &["orders".to_string()])
+            .delete_share_group_offsets("workers", &["orders".to_owned()])
             .await
     }
 
@@ -4667,7 +4718,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_share_group_offsets_retries_coordinator_errors_as_kafka_does() {
         let respond = delete_share_offsets_response;
-        let outcome = vec![("orders".to_string(), None)];
+        let outcome = vec![("orders".to_owned(), None)];
         let cases = CoordinatorRetryCase::with_authorization_failure(
             CoordinatorRetryCase::with_rebalance_in_progress(&outcome),
         );

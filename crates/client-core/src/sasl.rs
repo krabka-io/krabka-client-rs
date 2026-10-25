@@ -22,11 +22,17 @@ use std::{
     collections::BTreeMap,
     fmt,
     future::Future,
+    io,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
     },
+};
+#[cfg(target_os = "wasi")]
+use std::{
+    fs,
+    future::{Ready, ready},
 };
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -38,16 +44,20 @@ use krabka_protocol::{
     owned::{
         api_versions_request::ApiVersionsRequest, api_versions_response::ApiVersionsResponse,
         sasl_authenticate_request, sasl_authenticate_request::SaslAuthenticateRequest,
-        sasl_authenticate_response::SaslAuthenticateResponse,
+        sasl_authenticate_response::SaslAuthenticateResponse, sasl_handshake_request,
         sasl_handshake_request::SaslHandshakeRequest,
         sasl_handshake_response::SaslHandshakeResponse,
     },
 };
 use krabka_security::SaslMechanism;
 use thiserror::Error;
+#[cfg(not(target_os = "wasi"))]
+use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(all(feature = "gssapi", not(target_family = "wasm")))]
+use tokio::task::spawn_blocking;
 
-use crate::{ClientFrameMax, oauth};
+use crate::{ClientFrameMax, connection::skip_tagged_fields, oauth};
 
 const API_KEY_SASL_HANDSHAKE: i16 = 17;
 const API_KEY_SASL_AUTHENTICATE: i16 = 36;
@@ -167,7 +177,7 @@ fn sasl_versions(response: &ApiVersionsResponse) -> (i16, Option<i16>) {
             .map(|key| key.max_version)
     };
     let handshake = max(API_KEY_SASL_HANDSHAKE).map_or(0, |version| {
-        version.min(krabka_protocol::owned::sasl_handshake_request::MAX_VERSION)
+        version.min(sasl_handshake_request::MAX_VERSION)
     });
     let authenticate = max(API_KEY_SASL_AUTHENTICATE)
         .map(|version| version.min(sasl_authenticate_request::MAX_VERSION));
@@ -312,7 +322,7 @@ pub enum OutboundSaslError {
     /// reset. Kafka's `NetworkClient` keeps a disconnect in the `AUTHENTICATE`
     /// state retriable.
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     /// The client could not encode a request, or a response frame was larger
     /// than the frame limit.
     #[error("codec: {0}")]
@@ -540,15 +550,15 @@ where
 
 /// Read the OAUTHBEARER token file at `path` on the blocking pool.
 #[cfg(not(target_os = "wasi"))]
-async fn read_token_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    tokio::fs::read(path).await
+async fn read_token_file(path: &Path) -> io::Result<Vec<u8>> {
+    fs::read(path).await
 }
 
 /// Read the OAUTHBEARER token file at `path` on the calling thread. WASI has
 /// no threads for a blocking pool, and a token file is small.
 #[cfg(target_os = "wasi")]
-fn read_token_file(path: &Path) -> std::future::Ready<std::io::Result<Vec<u8>>> {
-    std::future::ready(std::fs::read(path))
+fn read_token_file(path: &Path) -> Ready<io::Result<Vec<u8>>> {
+    ready(fs::read(path))
 }
 
 /// Run the RFC 7628 OAUTHBEARER client exchange.
@@ -683,7 +693,7 @@ where
     S: SaslChannel + ?Sized,
 {
     let req = SaslHandshakeRequest {
-        mechanism: mechanism.wire_name().to_string(),
+        mechanism: mechanism.wire_name().to_owned(),
         ..Default::default()
     };
     let mut body = BytesMut::new();
@@ -835,7 +845,7 @@ pub(crate) const GSSAPI_UNAVAILABLE: &str = "this build has no Kerberos client; 
 #[cfg(all(feature = "gssapi", not(target_family = "wasm")))]
 async fn run_gssapi_client<S>(
     stream: &mut S,
-    keytab_path: &std::path::Path,
+    keytab_path: &Path,
     client_principal: &str,
     service_and_server_name: (&str, &str),
     kdc_url: &str,
@@ -857,7 +867,7 @@ where
     // The first step runs the synchronous AS and TGS exchanges with the KDC.
     // A blocking worker runs it, so a slow KDC does not hold the runtime and
     // the connection setup timeout still applies.
-    let mut step = tokio::task::spawn_blocking(move || {
+    let mut step = spawn_blocking(move || {
         let initiator = SspiInitiator::new(&keytab, &client_principal, &target_spn, &kdc_url)
             .map_err(|e| mechanism_failure(format!("GSSAPI initiator init failed: {e}")))?;
         let exchange = GssapiClientExchange::new(Box::new(initiator), GSSAPI_MAX_RECV, None);
@@ -1069,14 +1079,15 @@ where
                 "flexible response missing tagged-fields byte".into(),
             ));
         }
-        cur = crate::connection::skip_tagged_fields(cur)
-            .map_err(|error| unparsable_response(error.to_string()))?;
+        cur = skip_tagged_fields(cur).map_err(|error| unparsable_response(error.to_string()))?;
     }
     Ok(cur.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, future::ready, iter::repeat_with};
+
     use assert2::check;
     use krabka_protocol::owned::{
         sasl_authenticate_response::SaslAuthenticateResponse,
@@ -1084,7 +1095,7 @@ mod tests {
     };
     use krabka_security::{ScramServerExchange, StepResult, hash_scram_password};
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncWriteExt, duplex},
         time::{Duration, timeout},
     };
 
@@ -1139,7 +1150,7 @@ mod tests {
     // flexible SaslAuthenticate v2 uses a v1 response header.
     async fn reply_frame<S>(stream: &mut S, body: &[u8], flex_header: bool) -> Vec<u8>
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         let req_len = stream.read_u32().await.unwrap();
         let mut req = vec![0u8; req_len as usize];
@@ -1165,7 +1176,7 @@ mod tests {
     /// list `SaslHandshake` v0-v1 and `SaslAuthenticate` v0-v2.
     async fn answer_api_versions<S>(stream: &mut S)
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         use api_versions_response::ApiVersion as Advertised;
 
@@ -1263,7 +1274,7 @@ mod tests {
                 ],
             ),
         ] {
-            let (mut client, mut server) = tokio::io::duplex(8192);
+            let (mut client, mut server) = duplex(8192);
             let server_task = tokio::spawn(async move {
                 let mut frames = Vec::new();
                 for _ in 0..3 {
@@ -1428,7 +1439,7 @@ mod tests {
                 SaslHandshakeResponse::default()
                     .encode(&mut out, version.0)
                     .unwrap();
-                return std::future::ready(Ok(out.to_vec()));
+                return ready(Ok(out.to_vec()));
             }
             let mut cursor = body;
             let request = SaslAuthenticateRequest::decode(&mut cursor, version.0).unwrap();
@@ -1438,7 +1449,7 @@ mod tests {
             }
             .encode(&mut out, version.0)
             .unwrap();
-            std::future::ready(Ok(out.to_vec()))
+            ready(Ok(out.to_vec()))
         }
 
         fn token(
@@ -1447,7 +1458,7 @@ mod tests {
             _frame_max: ClientFrameMax,
         ) -> impl Future<Output = Result<SaslAuthenticateResponse, OutboundSaslError>> + Send
         {
-            std::future::ready(Ok(SaslAuthenticateResponse {
+            ready(Ok(SaslAuthenticateResponse {
                 auth_bytes: self.answer(token).into(),
                 ..Default::default()
             }))
@@ -1546,8 +1557,8 @@ mod tests {
     #[test]
     fn sasl_correlation_ids_stay_in_the_reserved_range() {
         let mut corr_id = i32::MAX - 1;
-        let ids = (0..4)
-            .map(|_| next_correlation_id(&mut corr_id))
+        let ids = repeat_with(|| next_correlation_id(&mut corr_id))
+            .take(4)
             .collect::<Vec<_>>();
         check!(
             ids == vec![
@@ -1564,7 +1575,7 @@ mod tests {
     #[cfg(not(all(feature = "gssapi", not(target_family = "wasm"))))]
     #[tokio::test]
     async fn gssapi_without_the_kerberos_client_is_an_unsupported_mechanism() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             answer_api_versions(&mut server).await;
             let mut hs = BytesMut::new();
@@ -1606,14 +1617,14 @@ mod tests {
                     Verdict::Rejected(SaslAuthenticationError::UnsupportedMechanism(format!(
                         "GSSAPI to broker-1.example.com: {GSSAPI_UNAVAILABLE}"
                     ))),
-                    "GSSAPI".to_string(),
+                    "GSSAPI".to_owned(),
                 )
         );
     }
 
     #[tokio::test]
     async fn outbound_plain_completes() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             answer_api_versions(&mut server).await;
             // 1. SaslHandshake v1 → error_code 0 + empty mechanisms.
@@ -1674,9 +1685,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let token_path = dir.path().join("token");
         for token in ["header.payload.", "rotated.token."] {
-            std::fs::write(&token_path, format!("{token}\n")).unwrap();
+            fs::write(&token_path, format!("{token}\n")).unwrap();
             let expected = format!("n,,\x01auth=Bearer {token}\x01\x01").into_bytes();
-            let (mut client, mut server) = tokio::io::duplex(8192);
+            let (mut client, mut server) = duplex(8192);
             let server_task = tokio::spawn(async move {
                 answer_api_versions(&mut server).await;
                 let mut handshake = BytesMut::new();
@@ -1730,8 +1741,8 @@ mod tests {
     async fn outbound_oauthbearer_completes_rfc7628_rejection_exchange() {
         let dir = tempfile::tempdir().unwrap();
         let token_path = dir.path().join("token");
-        std::fs::write(&token_path, "invalid").unwrap();
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        fs::write(&token_path, "invalid").unwrap();
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             answer_api_versions(&mut server).await;
             let mut handshake = BytesMut::new();
@@ -1796,7 +1807,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_sasl_authenticate_increments_correlation_id_and_sends_auth_bytes() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             for (expected_corr, expected_payload) in [
                 (MIN_RESERVED_CORRELATION_ID, b"first".as_ref()),
@@ -1854,7 +1865,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_scram_rejects_broker_error_on_first_round() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             answer_api_versions(&mut server).await;
             let mut hs = BytesMut::new();
@@ -1915,7 +1926,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_scram_rejects_broker_error_on_second_round() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             answer_api_versions(&mut server).await;
             let mut hs = BytesMut::new();
@@ -1935,7 +1946,7 @@ mod tests {
             );
 
             let cred = hash_scram_password(b"p", SaslMechanism::ScramSha256, 4096);
-            let scram_server = ScramServerExchange::new("u".to_string(), cred);
+            let scram_server = ScramServerExchange::new("u".to_owned(), cred);
 
             let first_req_len = server.read_u32().await.unwrap();
             let mut first_req = vec![0u8; first_req_len as usize];
@@ -2002,7 +2013,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_rejects_response_without_correlation_id() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             let req_len = server.read_u32().await.unwrap();
             let mut req = vec![0u8; req_len as usize];
@@ -2038,7 +2049,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_rejects_flexible_response_without_tagged_fields_byte() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             let req_len = server.read_u32().await.unwrap();
             let mut req = vec![0u8; req_len as usize];
@@ -2074,7 +2085,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_uses_the_configured_client_id() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             let req = reply_frame(&mut server, &[], false).await;
             let client_len = usize::try_from(i16::from_be_bytes([req[8], req[9]])).unwrap();
@@ -2102,7 +2113,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_rejects_an_oversized_request_before_writing() {
-        let (mut client, _server) = tokio::io::duplex(8192);
+        let (mut client, _server) = duplex(8192);
         let error = round_trip(
             &mut client,
             ApiKey(API_KEY_SASL_HANDSHAKE),
@@ -2126,7 +2137,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_rejects_an_oversized_response_before_allocating() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             let request_len = server.read_u32().await.unwrap();
             let mut request = vec![0; request_len as usize];
@@ -2279,7 +2290,7 @@ mod tests {
 
     async fn write_response_frame<S>(stream: &mut S, corr_id: i32, body: &[u8], flex_header: bool)
     where
-        S: tokio::io::AsyncWrite + Unpin,
+        S: AsyncWrite + Unpin,
     {
         let mut frame = BytesMut::new();
         frame.put_i32(corr_id);

@@ -30,6 +30,8 @@ use krabka_protocol::{
     primitives::uuid::Uuid,
 };
 
+use crate::builder::{build_init_producer_id_request, send_init_producer_id};
+
 /// The broker-facing operations the sender performs.
 ///
 /// `send_produce` uses [`Client::send_to_connection`] to pin a pool node.
@@ -41,7 +43,7 @@ use krabka_protocol::{
 /// hold a `Box<dyn ProduceTransport>` without leaking generics across the whole
 /// crate.
 #[async_trait]
-pub(crate) trait ProduceTransport: Send + Sync {
+pub trait ProduceTransport: Send + Sync {
     /// Allocate a fresh non-transactional identity after epoch exhaustion.
     async fn init_producer_id(&self) -> Result<InitProducerIdResponse, ClientError>;
 
@@ -181,7 +183,7 @@ fn produce_cap(req: &ProduceRequest, transaction_v2: bool) -> ProduceCap {
 }
 
 /// Production [`ProduceTransport`] backed by a real [`Client`].
-pub(crate) struct ClientTransport {
+pub struct ClientTransport {
     client: Client,
     /// Shared with the `Producer`. `true` when the producer follows
     /// transaction version 2, so a transactional Produce is not capped at
@@ -233,11 +235,7 @@ impl ClientTransport {
 #[async_trait]
 impl ProduceTransport for ClientTransport {
     async fn init_producer_id(&self) -> Result<InitProducerIdResponse, ClientError> {
-        crate::builder::send_init_producer_id(
-            &self.client,
-            &crate::builder::build_init_producer_id_request(),
-        )
-        .await
+        send_init_producer_id(&self.client, &build_init_producer_id_request()).await
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(leader = ?leader), err(level = "debug"))]
@@ -291,7 +289,7 @@ impl ProduceTransport for ClientTransport {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU16, AtomicUsize, Ordering},
     };
 
@@ -403,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn client_transport_allocates_a_fresh_id_without_a_transactional_identity() {
         const CLIENT_ID: &str = "p";
-        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen = Arc::new(Mutex::new(None));
         let requests = Arc::clone(&seen);
         let response = InitProducerIdResponse {
             producer_id: 73,
@@ -429,7 +427,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
             .client_id(CLIENT_ID)
@@ -463,8 +462,8 @@ mod tests {
         // counts connections established to the mock.
         let handshakes = Arc::new(AtomicUsize::new(0));
         let port = Arc::new(AtomicU16::new(0));
-        let h_handshakes = handshakes.clone();
-        let h_port = port.clone();
+        let h_handshakes = Arc::clone(&handshakes);
+        let h_port = Arc::clone(&port);
 
         let mock = MockBroker::start(move |api_key, version, _corr, _body| {
             if api_key == api_versions_request::API_KEY {
@@ -479,7 +478,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         port.store(mock.addr.port(), Ordering::SeqCst);
 
         let client = Client::builder()
@@ -570,7 +570,7 @@ mod tests {
     /// Start a mock broker (id 1) that advertises Produce up to v13 and records
     /// each Produce it decodes.
     async fn produce_recording_broker(
-        seen: Arc<std::sync::Mutex<Vec<SeenProduce>>>,
+        seen: Arc<Mutex<Vec<SeenProduce>>>,
     ) -> (MockBroker, ClientTransport) {
         const CLIENT_ID: &str = "p";
         let port = Arc::new(AtomicU16::new(0));
@@ -612,7 +612,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         port.store(mock.addr.port(), Ordering::SeqCst);
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
@@ -694,7 +695,7 @@ mod tests {
         ];
         for (name, transactional_id, topics, expected) in cases {
             for leader in [Some(1), None] {
-                let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let seen = Arc::new(Mutex::new(Vec::new()));
                 let (mock, transport) = produce_recording_broker(Arc::clone(&seen)).await;
                 transport
                     .send_produce(leader, request(transactional_id, topics.clone()))

@@ -11,14 +11,14 @@ use sha2::{Digest as _, Sha256, Sha512};
 const MIN_ITERATIONS: u32 = 4096;
 
 /// Kafka's `ScramLoginModule.TOKEN_AUTH_CONFIG`.
-pub(crate) const TOKEN_AUTH: &str = "tokenauth";
+pub const TOKEN_AUTH: &str = "tokenauth";
 
 /// The GS2 header of a client with no channel binding and no authorization
 /// id. `c=biws` in the final message is its base64 form.
 const GS2_HEADER: &str = "n,,";
 
 /// A SCRAM exchange before the server-first message.
-pub(crate) struct ClientFirst {
+pub struct ClientFirst {
     mechanism: SaslMechanism,
     password: Vec<u8>,
     nonce: String,
@@ -26,7 +26,7 @@ pub(crate) struct ClientFirst {
 }
 
 /// A SCRAM exchange before the server-final message.
-pub(crate) struct ClientFinal {
+pub struct ClientFinal {
     mechanism: SaslMechanism,
     server_key: Vec<u8>,
     auth_message: String,
@@ -39,21 +39,29 @@ fn sasl_name(username: &str) -> String {
 
 /// A random nonce of printable characters without a comma.
 fn nonce() -> Result<String, String> {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    /// The 26 lower-case letters, then the 10 digits.
+    const ALPHABET_LEN: u8 = 36;
     let mut bytes = [0_u8; 26];
     SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| "no random bytes for the SCRAM nonce".to_owned())?;
     Ok(bytes
         .iter()
-        .map(|byte| char::from(ALPHABET[usize::from(*byte) % ALPHABET.len()]))
+        .map(|byte| {
+            let index = byte % ALPHABET_LEN;
+            char::from(if index < 26 {
+                b'a' + index
+            } else {
+                b'0' + (index - 26)
+            })
+        })
         .collect())
 }
 
 /// Start an exchange: the client-first message, as Kafka's
 /// `ScramMessages.ClientFirstMessage` writes it. A delegation token login adds
 /// the `tokenauth=true` extension.
-pub(crate) fn client_first(
+pub fn client_first(
     mechanism: SaslMechanism,
     username: &str,
     password: &str,
@@ -81,7 +89,7 @@ pub(crate) fn client_first(
 impl ClientFirst {
     /// Read the server-first message and return the client-final message.
     pub(crate) fn step(self, server_first: &[u8]) -> Result<(Vec<u8>, ClientFinal), String> {
-        let server_first = std::str::from_utf8(server_first)
+        let server_first = str::from_utf8(server_first)
             .map_err(|_| "the SCRAM server-first message is not UTF-8".to_owned())?;
         let mut nonce = None;
         let mut salt = None;
@@ -144,7 +152,7 @@ impl ClientFirst {
 impl ClientFinal {
     /// Check the server-final message: an `e=` error, or the server signature.
     pub(crate) fn verify(self, server_final: &[u8]) -> Result<(), String> {
-        let server_final = std::str::from_utf8(server_final)
+        let server_final = str::from_utf8(server_final)
             .map_err(|_| "the SCRAM server-final message is not UTF-8".to_owned())?;
         if let Some(error) = server_final.strip_prefix("e=") {
             return Err(format!(
@@ -266,7 +274,7 @@ mod tests {
         let StepResult::Done(_, server_final) = server.step(&final_message) else {
             panic!("server-final");
         };
-        let mut extended = server_final.clone();
+        let mut extended = server_final;
         extended.extend_from_slice(b",ext=value");
 
         check!(client.verify(&extended).is_ok());

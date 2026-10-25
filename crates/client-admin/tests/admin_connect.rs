@@ -14,14 +14,15 @@
 //!
 //! The broker is a `confluentinc/cp-kafka:6.1.1` container, so the case carries
 //! `#[ignore]`.
+#![cfg(test)]
 
 mod support;
 
 use std::time::Duration;
 
 use assert2::assert;
-use krabka_client_admin::{AdminClient, KafkaError, TopicMetadataEntry};
-use tokio::net::TcpListener;
+use krabka_client_admin::{AdminClient, AdminClientLike as _, KafkaError, TopicMetadataEntry};
+use tokio::{net::TcpListener, time::sleep};
 
 /// Maximum attempts for `connect` while the broker still warms up. With a 1s
 /// pause between attempts this gives ~15s of tolerance.
@@ -104,7 +105,7 @@ async fn connect_with_retry(bootstrap: &[String]) -> AdminClient {
                 tracing::warn!(attempt, "connect failed while the broker warms up: {e}");
                 // A real-time wait on a separate process. The broker publishes
                 // no readiness signal that this side can await.
-                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                sleep(CONNECT_RETRY_DELAY).await;
             }
             Err(e) => panic!(
                 "the second bootstrap entry must succeed although the first refuses, but connect failed after {CONNECT_MAX_ATTEMPTS} attempts: {e}"

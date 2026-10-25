@@ -6,7 +6,7 @@
 //! heartbeat interval, and assignment. It resolves the assignment's topic ids
 //! to names with Metadata, then spawns the background heartbeat loop.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, mem, sync::Arc};
 
 use krabka_client_core::{Client, security, telemetry};
 use krabka_protocol::{
@@ -21,6 +21,7 @@ use krabka_units::{
 use refined_type::rule::GreaterI64;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tracing::field;
 
 use super::{
     coordinator::ShareCoordinatorState,
@@ -73,8 +74,8 @@ impl TryFrom<ByteSize> for ShareConsumerFetchMinBytes {
 
 impl Default for ShareConsumerFetchMinBytes {
     fn default() -> Self {
-        Self::new(DEFAULT_SHARE_CONSUMER_FETCH_MIN.bytes_i32())
-            .expect("default share consumer fetch min bytes is valid")
+        // A positive value, as `new` requires.
+        Self(DEFAULT_SHARE_CONSUMER_FETCH_MIN.bytes_i32())
     }
 }
 
@@ -109,8 +110,8 @@ impl TryFrom<ByteSize> for ShareConsumerFetchMaxBytes {
 
 impl Default for ShareConsumerFetchMaxBytes {
     fn default() -> Self {
-        Self::new(DEFAULT_SHARE_CONSUMER_FETCH_MAX.bytes_i32())
-            .expect("default share consumer fetch max bytes is valid")
+        // A positive value, as `new` requires.
+        Self(DEFAULT_SHARE_CONSUMER_FETCH_MAX.bytes_i32())
     }
 }
 
@@ -137,8 +138,8 @@ impl ShareConsumerFetchMaxRecords {
 
 impl Default for ShareConsumerFetchMaxRecords {
     fn default() -> Self {
-        Self::new(DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS)
-            .expect("default share consumer fetch max records is valid")
+        // A positive value, as `new` requires.
+        Self(DEFAULT_SHARE_CONSUMER_FETCH_MAX_RECORDS)
     }
 }
 
@@ -165,8 +166,8 @@ impl ShareConsumerLeaveHeartbeatTimeout {
 
 impl Default for ShareConsumerLeaveHeartbeatTimeout {
     fn default() -> Self {
-        Self::new(DEFAULT_SHARE_CONSUMER_LEAVE_HEARTBEAT_TIMEOUT)
-            .expect("default share consumer leave-heartbeat timeout is valid")
+        // A positive value, as `new` requires.
+        Self(DEFAULT_SHARE_CONSUMER_LEAVE_HEARTBEAT_TIMEOUT)
     }
 }
 
@@ -257,7 +258,7 @@ fn stage_implicit_accepts(
     prev_delivered: &mut Vec<(WireUuid, i32, i64, i64)>,
     pending_acks: &mut Vec<(WireUuid, i32, i64, i64, i8)>,
 ) {
-    for (tid, partition, first, last) in std::mem::take(prev_delivered) {
+    for (tid, partition, first, last) in mem::take(prev_delivered) {
         pending_acks.push((
             tid,
             partition,
@@ -327,9 +328,9 @@ impl ShareConsumer {
         skip_all,
         fields(
             group_id = %group_id,
-            member_id = tracing::field::Empty,
-            member_epoch = tracing::field::Empty,
-            assigned_partitions = tracing::field::Empty,
+            member_id = field::Empty,
+            member_epoch = field::Empty,
+            assigned_partitions = field::Empty,
         ),
         err(level = "info")
     )]
@@ -337,7 +338,7 @@ impl ShareConsumer {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn start(
         #[builder(into)] bootstrap: String,
-        #[builder(into, default = "krabka-share-consumer".to_string())] client_id: String,
+        #[builder(into, default = "krabka-share-consumer".to_owned())] client_id: String,
         #[builder(into)] group_id: String,
         #[builder(into)] subscribe: Vec<String>,
         #[builder(default = ShareAckMode::Implicit)] ack_mode: ShareAckMode,
@@ -522,7 +523,7 @@ impl ShareConsumer {
         };
         let hb_handle = tokio::spawn(super::coordinator::run(state, shutdown.clone()));
 
-        Ok(ShareConsumer {
+        Ok(Self {
             client,
             group_id,
             member_id,
@@ -622,8 +623,8 @@ impl ShareConsumer {
     /// `timeout`, as Kafka throws an `IllegalStateException` and an
     /// `IllegalArgumentException`.
     ///
-    /// [`ClientError::TelemetryDisabled`]: ClientError::TelemetryDisabled
-    /// [`ClientError::InvalidArgument`]: ClientError::InvalidArgument
+    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
+    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
     pub async fn client_instance_id(
         &self,
         timeout: Time,
@@ -635,11 +636,12 @@ impl ShareConsumer {
 #[cfg(test)]
 mod tests {
     use assert2::check;
+    use krabka_client_core::mock_test_support::recorded_levels;
     use krabka_protocol::tagged_fields::UnknownTaggedFields;
     use krabka_units::millis;
 
     use super::*;
-    use crate::test_support::wire_uuid;
+    use crate::{share::types::ShareAckType, test_support::wire_uuid};
 
     #[test]
     fn leave_heartbeat_timeout_uses_default_and_valid_override() {
@@ -674,7 +676,7 @@ mod tests {
     /// (krabka-io/krabka-broker#1515).
     #[tokio::test]
     async fn a_refused_start_is_recorded_at_its_span_level() {
-        let (result, levels) = krabka_client_core::mock_test_support::recorded_levels(Box::pin(
+        let (result, levels) = recorded_levels(Box::pin(
             ShareConsumer::builder()
                 .bootstrap("invalid.invalid:9092")
                 .group_id("log-level")
@@ -888,16 +890,7 @@ mod tests {
         stage_implicit_accepts(&mut prev, &mut pending);
 
         assert2::assert!(prev.is_empty());
-        assert2::assert!(
-            pending
-                == vec![(
-                    wire_uuid(7),
-                    2,
-                    10,
-                    12,
-                    crate::share::types::ShareAckType::Accept.wire()
-                )]
-        );
+        assert2::assert!(pending == vec![(wire_uuid(7), 2, 10, 12, ShareAckType::Accept.wire())]);
     }
 
     #[tokio::test]

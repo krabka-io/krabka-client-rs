@@ -14,6 +14,7 @@
 use std::{
     fmt, fs,
     future::Future,
+    io,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -24,7 +25,17 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
 };
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use pkcs8::der::pem;
+use ring::{
+    rand::SystemRandom,
+    signature::{self, RsaKeyPair},
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+    sync::Mutex,
+    task::JoinHandle,
+    time::{Instant, sleep, timeout},
+};
 
 use crate::{
     backoff,
@@ -85,7 +96,9 @@ pub trait OAuthBearerTokenProvider: fmt::Debug + Send + Sync {
     }
 }
 
-/// Starts a background task that keeps `provider`'s token fresh by calling
+/// Starts a background task that keeps `provider`'s token fresh.
+///
+/// The task calls
 /// [`OAuthBearerTokenProvider::refresh`] at the time
 /// [`OAuthBearerTokenProvider::refresh_at`] reports, rather than waiting for
 /// the next SASL exchange to notice the cached token needs a refresh. This is
@@ -100,7 +113,7 @@ pub trait OAuthBearerTokenProvider: fmt::Debug + Send + Sync {
 #[must_use]
 pub fn spawn_background_refresh(
     provider: Arc<dyn OAuthBearerTokenProvider>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<JoinHandle<()>> {
     if !provider.background_refresh_enabled() {
         return None;
     }
@@ -115,7 +128,7 @@ pub fn spawn_background_refresh(
                 .await
                 .and_then(|refresh_at| refresh_at.duration_since(SystemTime::now()).ok())
                 .unwrap_or(DEFAULT_LOGIN_RETRY_BACKOFF_MAX);
-            tokio::time::sleep(wait).await;
+            sleep(wait).await;
             result = provider.refresh().await;
         }
     }))
@@ -213,12 +226,14 @@ struct Cached {
 
 /// An OAUTHBEARER token provider that uses the OAuth 2 client credentials
 /// grant, as Kafka's `ClientCredentialsJwtRetriever` with
-/// `ClientSecretRequestFormatter` does. It keeps the token until the refresh
+/// `ClientSecretRequestFormatter` does.
+///
+/// It keeps the token until the refresh
 /// time of Kafka's `ExpiringCredentialRefreshingLogin`, then fetches a new one.
 #[derive(Debug)]
 pub struct ClientCredentialsTokenProvider {
     config: ClientCredentialsConfig,
-    cached: tokio::sync::Mutex<Option<Cached>>,
+    cached: Mutex<Option<Cached>>,
 }
 
 impl ClientCredentialsTokenProvider {
@@ -259,7 +274,7 @@ impl ClientCredentialsTokenProvider {
         }
         Ok(Arc::new(Self {
             config,
-            cached: tokio::sync::Mutex::new(None),
+            cached: Mutex::new(None),
         }))
     }
 
@@ -272,7 +287,7 @@ impl ClientCredentialsTokenProvider {
     ) -> Result<String, String> {
         let token = self.fetch().await?;
         let claims = token_times(&token)?;
-        let refresh_at = self.refresh_at(
+        let refresh_at = self.refresh_time(
             now,
             claims.0.unwrap_or(now),
             claims.1,
@@ -341,7 +356,7 @@ impl ClientCredentialsTokenProvider {
     /// The refresh time of Kafka's
     /// `ExpiringCredentialRefreshingLogin.refreshMs` for a token issued at
     /// `start` and expiring at `expire`, now being `now`.
-    fn refresh_at(
+    fn refresh_time(
         &self,
         now: SystemTime,
         start: SystemTime,
@@ -373,7 +388,9 @@ impl OAuthBearerTokenProvider for ClientCredentialsTokenProvider {
             {
                 return Ok(current.token.clone());
             }
-            self.fetch_into(&mut cached, now).await
+            let token = self.fetch_into(&mut cached, now).await;
+            drop(cached);
+            token
         })
     }
 
@@ -421,7 +438,7 @@ fn expiring_credential_refresh_at(
     unit: f64,
     window: &RefreshWindow,
 ) -> SystemTime {
-    let factor = window.factor + window.jitter * unit;
+    let factor = window.jitter.mul_add(unit, window.factor);
     if now + window.min_period + window.buffer > expire {
         return now
             + expire
@@ -545,14 +562,16 @@ type ClaimMap = serde_json::Map<String, serde_json::Value>;
 
 /// An OAUTHBEARER token provider that uses the OAuth 2 jwt-bearer grant with a
 /// signed client assertion (RFC 7523), as Kafka's `JwtBearerJwtRetriever` with
-/// `JwtBearerRequestFormatter` does. It keeps the token until the refresh time
+/// `JwtBearerRequestFormatter` does.
+///
+/// It keeps the token until the refresh time
 /// of Kafka's `ExpiringCredentialRefreshingLogin`, then fetches a new one.
 pub struct JwtBearerTokenProvider {
     config: JwtBearerConfig,
-    key_pair: ring::signature::RsaKeyPair,
+    key_pair: RsaKeyPair,
     template_header: ClaimMap,
     template_payload: ClaimMap,
-    cached: tokio::sync::Mutex<Option<Cached>>,
+    cached: Mutex<Option<Cached>>,
 }
 
 impl fmt::Debug for JwtBearerTokenProvider {
@@ -622,7 +641,7 @@ impl JwtBearerTokenProvider {
             key_pair,
             template_header,
             template_payload,
-            cached: tokio::sync::Mutex::new(None),
+            cached: Mutex::new(None),
         }))
     }
 
@@ -635,7 +654,7 @@ impl JwtBearerTokenProvider {
     ) -> Result<String, String> {
         let token = self.fetch().await?;
         let claims = token_times(&token)?;
-        let refresh_at = self.refresh_at(
+        let refresh_at = self.refresh_time(
             now,
             claims.0.unwrap_or(now),
             claims.1,
@@ -753,7 +772,7 @@ impl JwtBearerTokenProvider {
     /// The refresh time of Kafka's
     /// `ExpiringCredentialRefreshingLogin.refreshMs` for a token issued at
     /// `start` and expiring at `expire`, now being `now`.
-    fn refresh_at(
+    fn refresh_time(
         &self,
         now: SystemTime,
         start: SystemTime,
@@ -785,7 +804,9 @@ impl OAuthBearerTokenProvider for JwtBearerTokenProvider {
             {
                 return Ok(current.token.clone());
             }
-            self.fetch_into(&mut cached, now).await
+            let token = self.fetch_into(&mut cached, now).await;
+            drop(cached);
+            token
         })
     }
 
@@ -813,16 +834,11 @@ impl OAuthBearerTokenProvider for JwtBearerTokenProvider {
 
 /// Sign `message` with `key_pair`, as `DefaultAssertionCreator` does with
 /// Kafka's `sasl.oauthbearer.assertion.algorithm` `RS256`.
-fn sign_rs256(key_pair: &ring::signature::RsaKeyPair, message: &[u8]) -> Result<Vec<u8>, String> {
-    let rng = ring::rand::SystemRandom::new();
+fn sign_rs256(key_pair: &RsaKeyPair, message: &[u8]) -> Result<Vec<u8>, String> {
+    let rng = SystemRandom::new();
     let mut signature = vec![0_u8; key_pair.public().modulus_len()];
     key_pair
-        .sign(
-            &ring::signature::RSA_PKCS1_SHA256,
-            &rng,
-            message,
-            &mut signature,
-        )
+        .sign(&signature::RSA_PKCS1_SHA256, &rng, message, &mut signature)
         .map_err(|_| "RSA signing failed".to_owned())?;
     Ok(signature)
 }
@@ -830,21 +846,20 @@ fn sign_rs256(key_pair: &ring::signature::RsaKeyPair, message: &[u8]) -> Result<
 /// The one PEM block of `text`, as `(label, DER)`.
 fn pem_block(text: &str) -> Result<(String, Vec<u8>), String> {
     const BEGIN: &str = "-----BEGIN ";
-    let start = text
-        .find(BEGIN)
+    let (_, after_begin) = text
+        .split_once(BEGIN)
         .ok_or_else(|| "no PEM block found".to_owned())?;
-    let block = &text[start..];
-    let label_end = block[BEGIN.len()..]
-        .find("-----")
+    let (label, _) = after_begin
+        .split_once("-----")
         .ok_or_else(|| "unterminated BEGIN line".to_owned())?;
-    let label = block[BEGIN.len()..BEGIN.len() + label_end].to_owned();
+    let label = label.to_owned();
     let end_line = format!("-----END {label}-----");
-    let end = block
-        .find(&end_line)
-        .ok_or_else(|| format!("no END line for {label}"))?
-        + end_line.len();
-    let (_, der) = pkcs8::der::pem::decode_vec(&block.as_bytes()[..end])
-        .map_err(|error| format!("{label}: {error}"))?;
+    let (inside, _) = after_begin
+        .split_once(&end_line)
+        .ok_or_else(|| format!("no END line for {label}"))?;
+    let block = format!("{BEGIN}{inside}{end_line}");
+    let (_, der) =
+        pem::decode_vec(block.as_bytes()).map_err(|error| format!("{label}: {error}"))?;
     Ok((label, der))
 }
 
@@ -864,10 +879,7 @@ fn decrypt_pkcs8(der: &[u8], passphrase: &Password) -> Result<Vec<u8>, String> {
 /// key (`PRIVATE KEY`), a PKCS#8 key encrypted with PBES2
 /// (`ENCRYPTED PRIVATE KEY`, decrypted with `passphrase`), or a PKCS#1 RSA
 /// key (`RSA PRIVATE KEY`).
-fn load_rsa_private_key(
-    path: &Path,
-    passphrase: Option<&Password>,
-) -> Result<ring::signature::RsaKeyPair, String> {
+fn load_rsa_private_key(path: &Path, passphrase: Option<&Password>) -> Result<RsaKeyPair, String> {
     let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let (label, der) = pem_block(&text)?;
     let der = match (label.as_str(), passphrase) {
@@ -890,8 +902,8 @@ fn load_rsa_private_key(
         (other, None) => return Err(format!("unsupported private key format {other:?}")),
     };
     match label.as_str() {
-        "RSA PRIVATE KEY" => ring::signature::RsaKeyPair::from_der(&der),
-        _ => ring::signature::RsaKeyPair::from_pkcs8(&der),
+        "RSA PRIVATE KEY" => RsaKeyPair::from_der(&der),
+        _ => RsaKeyPair::from_pkcs8(&der),
     }
     .map_err(|error| format!("invalid RSA private key: {error}"))
 }
@@ -942,7 +954,7 @@ async fn retry_token_request<'a>(
     retry_backoff_max: Duration,
     mut attempt: impl FnMut() -> Pin<Box<dyn Future<Output = Result<String, Failure>> + Send + 'a>>,
 ) -> Result<String, String> {
-    let started = tokio::time::Instant::now();
+    let started = Instant::now();
     let end = started + retry_backoff_max;
     let mut attempt_number = 0_u32;
     loop {
@@ -953,7 +965,7 @@ async fn retry_token_request<'a>(
             Err(Failure::Retriable(error)) => {
                 let wait = retry_backoff
                     .saturating_mul(2_u32.saturating_pow(attempt_number - 1))
-                    .min(end.saturating_duration_since(tokio::time::Instant::now()));
+                    .min(end.saturating_duration_since(Instant::now()));
                 if wait.is_zero() {
                     return Err(error);
                 }
@@ -962,7 +974,7 @@ async fn retry_token_request<'a>(
                     error = %error,
                     "token endpoint request failed"
                 );
-                tokio::time::sleep(wait).await;
+                sleep(wait).await;
             }
         }
     }
@@ -1070,7 +1082,7 @@ impl Endpoint {
 
 async fn within<F: Future>(limit: Option<Duration>, future: F) -> Result<F::Output, ()> {
     match limit {
-        Some(limit) => tokio::time::timeout(limit, future).await.map_err(|_| ()),
+        Some(limit) => timeout(limit, future).await.map_err(|_| ()),
         None => Ok(future.await),
     }
 }
@@ -1098,7 +1110,7 @@ where
         endpoint.port,
         request.body.len()
     );
-    let io = |error: std::io::Error| Failure::Retriable(format!("token endpoint I/O: {error}"));
+    let io = |error: io::Error| Failure::Retriable(format!("token endpoint I/O: {error}"));
     stream.write_all(head.as_bytes()).await.map_err(io)?;
     stream
         .write_all(request.body.as_bytes())
@@ -1133,12 +1145,9 @@ where
 /// may cut a multibyte character in two, so a decode before the dechunk would
 /// move every later byte offset.
 fn parse_http_response(response: &[u8]) -> Result<(u16, String), String> {
-    let separator = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
+    let (head, body) = split_once_bytes(response, b"\r\n\r\n")
         .ok_or_else(|| "incomplete token endpoint response".to_owned())?;
-    let head = String::from_utf8_lossy(&response[..separator]).into_owned();
-    let body = &response[separator + 4..];
+    let head = String::from_utf8_lossy(head).into_owned();
     let mut lines = head.split("\r\n");
     let status = lines
         .next()
@@ -1165,14 +1174,11 @@ fn parse_http_response(response: &[u8]) -> Result<(u16, String), String> {
 fn dechunk(mut body: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     loop {
-        let line_end = body
-            .windows(2)
-            .position(|window| window == b"\r\n")
+        let (size_line, rest) = split_once_bytes(body, b"\r\n")
             .ok_or_else(|| "invalid chunked token endpoint response".to_owned())?;
-        let size = String::from_utf8_lossy(&body[..line_end]);
+        let size = String::from_utf8_lossy(size_line);
         let size = usize::from_str_radix(size.split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| "invalid chunk size in token endpoint response".to_owned())?;
-        let rest = &body[line_end + 2..];
         if size == 0 {
             return Ok(out);
         }
@@ -1184,17 +1190,26 @@ fn dechunk(mut body: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// The bytes of `haystack` before and after the first `needle`.
+fn split_once_bytes<'a>(haystack: &'a [u8], needle: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
+    let at = haystack
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let (head, rest) = haystack.split_at_checked(at)?;
+    Some((head, rest.get(needle.len()..)?))
+}
+
 fn snippet(body: &str) -> String {
     if body.len() <= MAX_RESPONSE_SNIPPET {
         return body.to_owned();
     }
-    let end = (0..=MAX_RESPONSE_SNIPPET)
-        .rev()
-        .find(|index| body.is_char_boundary(*index))
-        .unwrap_or(0);
+    let head: String = body
+        .char_indices()
+        .take_while(|(index, character)| index + character.len_utf8() <= MAX_RESPONSE_SNIPPET)
+        .map(|(_, character)| character)
+        .collect();
     format!(
-        "{} (trimmed to first {MAX_RESPONSE_SNIPPET} characters out of {} total)",
-        &body[..end],
+        "{head} (trimmed to first {MAX_RESPONSE_SNIPPET} characters out of {} total)",
         body.len()
     )
 }

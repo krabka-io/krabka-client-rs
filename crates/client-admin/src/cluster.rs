@@ -196,7 +196,7 @@ mod tests {
     fn authorized_operations_skip_all_and_unknown_bits() {
         // Bits 0 (UNKNOWN), 1 (ANY), 2 (ALL), 3 (READ), 13 (CREATE_TOKENS)
         // and 20 (no such operation).
-        let bits = 1 | 1 << 1 | 1 << 2 | 1 << 3 | 1 << 13 | 1 << 20;
+        let bits = 1 | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 13) | (1 << 20);
         for (name, bits, expected) in [
             ("omitted", i32::MIN, None),
             ("none", 0, Some(BTreeSet::new())),
@@ -307,7 +307,8 @@ mod tests {
                 }
                 _ => None,
             })
-            .await;
+            .await
+            .unwrap();
             let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
             let result = admin
@@ -355,7 +356,8 @@ mod tests {
             ),
             _ => None,
         })
-        .await;
+        .await
+        .unwrap();
         let admin = fast_admin(broker.addr, krabka_units::secs(5)).await;
 
         let result = admin

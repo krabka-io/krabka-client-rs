@@ -47,7 +47,7 @@ const FATAL_CODE_MIN: i32 = 0x1_0000;
 /// carries no code (a batch that ran out of retries or its routing budget
 /// with no broker answer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AbortableError {
+pub enum AbortableError {
     /// A coordinator, or a Produce response, answered with this code.
     Server(i16),
     /// A batch of the transaction was never acknowledged, and carries no
@@ -65,7 +65,7 @@ pub(crate) enum AbortableError {
 /// `commitTransaction` and `abortTransaction`. The application can only close
 /// the producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FatalError {
+pub enum FatalError {
     /// A newer epoch owns the transactional id (`PRODUCER_FENCED` or
     /// `INVALID_PRODUCER_EPOCH`).
     Fenced,
@@ -98,7 +98,7 @@ impl FatalError {
 /// does not replace it, and a clear does not remove it, as Kafka's
 /// `TransactionManager` allows no transition out of `FATAL_ERROR`.
 #[derive(Debug)]
-pub(crate) struct TxnErrorSlot(AtomicI32);
+pub struct TxnErrorSlot(AtomicI32);
 
 impl Default for TxnErrorSlot {
     fn default() -> Self {
@@ -175,7 +175,7 @@ const fn is_fatal(value: i32) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum TxnState {
+pub enum TxnState {
     /// The caller has not yet called `init_transactions`.
     Uninitialized,
     /// `init_transactions` succeeded, and no txn is in flight.
@@ -485,14 +485,17 @@ pub struct EndTransactionError<T> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
+        iter,
         sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicI16, AtomicU16, Ordering},
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicI16, AtomicU16, AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use bytes::BytesMut;
+    use futures::future::join_all;
     use krabka_client_core::{ClientError, MockBroker};
     use krabka_protocol::{
         Decode, Encode,
@@ -522,6 +525,7 @@ mod tests {
             produce_response::{
                 self, PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
             },
+            sasl_handshake_request,
             txn_offset_commit_request::{
                 self, TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition,
                 TxnOffsetCommitRequestTopic,
@@ -533,8 +537,9 @@ mod tests {
         },
         primitives::uuid::Uuid,
     };
+    use tokio::time;
 
-    use super::{AbortableError, PreparedTransactionState, TxnState};
+    use super::{AbortableError, EndTransactionError, PreparedTransactionState, TxnState};
     use crate::{ProducerRecord, error::ProducerError, producer::Producer};
 
     #[test]
@@ -642,7 +647,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         port_cell.store(mock.addr.port(), Ordering::SeqCst);
 
         let producer = Producer::builder()
@@ -660,6 +666,7 @@ mod tests {
             .init_transactions()
             .await
             .expect("cold coordinator retry succeeds");
+        drop(producer);
         assert2::assert!(attempts.load(Ordering::SeqCst) == 2);
         mock.stop();
     }
@@ -677,7 +684,7 @@ mod tests {
         two_phase_commit_enabled: bool,
     ) -> (MockBroker, Producer) {
         let port_cell = Arc::new(AtomicU16::new(0));
-        let handler_port = port_cell.clone();
+        let handler_port = Arc::clone(&port_cell);
         let next_epoch = Arc::new(AtomicI16::new(3));
         let handler_epoch = Arc::clone(&next_epoch);
         let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
@@ -733,14 +740,15 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         port_cell.store(mock.addr.port(), Ordering::SeqCst);
 
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
             .transactional_id("test-txn")
             .transaction_two_phase_commit_enable(two_phase_commit_enabled)
-            .request_timeout(std::time::Duration::from_millis(100))
+            .request_timeout(Duration::from_millis(100))
             .retry_backoff(Duration::from_millis(1))
             .init_retry_timeout(Duration::from_millis(400))
             .retry_backoff_max(Duration::from_millis(20))
@@ -797,14 +805,17 @@ mod tests {
                     .await
                     .expect("begin_transaction");
 
-                let err = txn
+                let EndTransactionError {
+                    transaction,
+                    source,
+                } = txn
                     .$finish()
                     .await
                     .expect_err("broker reported CONCURRENT_TRANSACTIONS");
-                assert2::assert!(matches!(err.source, ProducerError::ConcurrentTransactions));
+                assert2::assert!(matches!(source, ProducerError::ConcurrentTransactions));
 
                 end_txn_error.store(0, Ordering::SeqCst);
-                err.transaction.$finish().await.expect("retry succeeds");
+                transaction.$finish().await.expect("retry succeeds");
                 mock.stop();
             }
         };
@@ -820,14 +831,17 @@ mod tests {
                     .await
                     .expect("begin_transaction_owned");
 
-                let err = txn
+                let EndTransactionError {
+                    transaction,
+                    source,
+                } = txn
                     .$finish()
                     .await
                     .expect_err("broker reported CONCURRENT_TRANSACTIONS");
-                assert2::assert!(matches!(err.source, ProducerError::ConcurrentTransactions));
+                assert2::assert!(matches!(source, ProducerError::ConcurrentTransactions));
 
                 end_txn_error.store(0, Ordering::SeqCst);
-                err.transaction.$finish().await.expect("retry succeeds");
+                transaction.$finish().await.expect("retry succeeds");
                 mock.stop();
             }
         };
@@ -862,10 +876,13 @@ mod tests {
         let end_txn_error = Arc::new(AtomicI16::new(0));
         let end_txn_silent = Arc::new(AtomicBool::new(true));
         let (mock, producer) =
-            transactional_producer_with_end_txn_timeout(end_txn_error, end_txn_silent.clone())
+            transactional_producer_with_end_txn_timeout(end_txn_error, Arc::clone(&end_txn_silent))
                 .await;
 
-        let error = producer
+        let EndTransactionError {
+            transaction,
+            source,
+        } = producer
             .begin_transaction()
             .await
             .expect("begin transaction")
@@ -874,10 +891,11 @@ mod tests {
             .expect_err(
                 "EndTxn that stays silent past the retry deadline has an uncertain outcome",
             );
-        assert2::assert!(let ProducerError::RecoveryRequired = error.source);
-        drop(error.transaction);
+        assert2::assert!(let ProducerError::RecoveryRequired = source);
+        drop(transaction);
 
-        assert2::assert!(let Err(ProducerError::RecoveryRequired) = producer.begin_transaction().await);
+        let begin = producer.begin_transaction().await.err();
+        assert2::assert!(let Some(ProducerError::RecoveryRequired) = begin);
         let acknowledgement = producer.send(ProducerRecord::default()).await;
         assert2::assert!(
             let Err(ProducerError::RecoveryRequired) =
@@ -945,7 +963,7 @@ mod tests {
     /// The scripted answers for one API, and the number of requests it got.
     #[derive(Debug)]
     struct Script {
-        replies: std::collections::VecDeque<Reply>,
+        replies: VecDeque<Reply>,
         exhausted: Reply,
         requests: usize,
     }
@@ -1017,7 +1035,7 @@ mod tests {
         txn_offset_commit_topics: Vec<(i16, Vec<TxnOffsetCommitRequestTopic>)>,
     }
 
-    type SharedCoordinator = Arc<std::sync::Mutex<Coordinator>>;
+    type SharedCoordinator = Arc<Mutex<Coordinator>>;
 
     /// How a coordinator request ended, in a form that tests can compare.
     #[derive(Debug, PartialEq, Eq)]
@@ -1218,7 +1236,7 @@ mod tests {
     ) -> (MockBroker, Producer, SharedCoordinator) {
         let port_cell = Arc::new(AtomicU16::new(0));
         let handler_port = Arc::clone(&port_cell);
-        let shared = Arc::new(std::sync::Mutex::new(coordinator));
+        let shared = Arc::new(Mutex::new(coordinator));
         let handler_shared = Arc::clone(&shared);
         let (
             add_partitions_range,
@@ -1358,37 +1376,38 @@ mod tests {
                     )),
                 };
             }
-            if api_key == add_partitions_to_txn_request::API_KEY {
-                coordinator.add_partitions_versions.push(version);
-                return match coordinator.add_partitions.next() {
-                    Reply::Silent => None,
-                    Reply::Code(partition_error_code) => {
-                        let response = AddPartitionsToTxnResponse {
-                            results_by_topic_v3_and_below: vec![AddPartitionsToTxnTopicResult {
-                                name: "topic".into(),
-                                results_by_partition: vec![AddPartitionsToTxnPartitionResult {
-                                    partition_index: 0,
-                                    partition_error_code,
-                                    ..Default::default()
-                                }],
+            if api_key != add_partitions_to_txn_request::API_KEY {
+                return None;
+            }
+            coordinator.add_partitions_versions.push(version);
+            match coordinator.add_partitions.next() {
+                Reply::Silent => None,
+                Reply::Code(partition_error_code) => {
+                    let response = AddPartitionsToTxnResponse {
+                        results_by_topic_v3_and_below: vec![AddPartitionsToTxnTopicResult {
+                            name: "topic".into(),
+                            results_by_partition: vec![AddPartitionsToTxnPartitionResult {
+                                partition_index: 0,
+                                partition_error_code,
                                 ..Default::default()
                             }],
                             ..Default::default()
-                        };
-                        let mut buf = BytesMut::new();
-                        if version >= add_partitions_to_txn_response::FLEXIBLE_MIN {
-                            buf.extend_from_slice(&[0]);
-                        }
-                        response
-                            .encode(&mut buf, version)
-                            .expect("encode AddPartitionsToTxn");
-                        Some(buf.to_vec())
+                        }],
+                        ..Default::default()
+                    };
+                    let mut buf = BytesMut::new();
+                    if version >= add_partitions_to_txn_response::FLEXIBLE_MIN {
+                        buf.extend_from_slice(&[0]);
                     }
-                };
+                    response
+                        .encode(&mut buf, version)
+                        .expect("encode AddPartitionsToTxn");
+                    Some(buf.to_vec())
+                }
             }
-            None
         })
-        .await;
+        .await
+        .unwrap();
         port_cell.store(mock.addr.port(), Ordering::SeqCst);
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
@@ -2596,10 +2615,12 @@ mod tests {
             value: Some(bytes::Bytes::from_static(b"v")),
             ..Default::default()
         });
-        let outcome = match tokio::time::timeout(Duration::from_secs(2), send).await {
-            Ok(result) => result.map(drop).map_err(|error| error.to_string()),
-            Err(_) => Err("waited".to_owned()),
-        };
+        let outcome = time::timeout(Duration::from_secs(2), send)
+            .await
+            .map_or_else(
+                |_| Err("waited".to_owned()),
+                |result| result.map(drop).map_err(|error| error.to_string()),
+            );
         mock.stop();
         assert2::assert!(
             outcome
@@ -2642,10 +2663,12 @@ mod tests {
                 value: Some(bytes::Bytes::from_static(b"v")),
                 ..Default::default()
             });
-            let outcome = match tokio::time::timeout(Duration::from_secs(2), send).await {
-                Ok(result) => result.map(drop).map_err(|error| error.to_string()),
-                Err(_) => Err("waited".to_owned()),
-            };
+            let outcome = time::timeout(Duration::from_secs(2), send)
+                .await
+                .map_or_else(
+                    |_| Err("waited".to_owned()),
+                    |result| result.map(drop).map_err(|error| error.to_string()),
+                );
             let actual = PreparedSend {
                 outcome,
                 metadata_requests: coordinator
@@ -2679,18 +2702,18 @@ mod tests {
             .begin_transaction()
             .await
             .expect("begin transaction");
-        let sends = (0..200).map(|_| {
+        let sends = iter::repeat_with(|| {
             producer.enqueue(ProducerRecord {
                 topic: "topic".to_owned(),
                 partition: Some(0),
                 value: Some(bytes::Bytes::from_static(b"v")),
                 ..Default::default()
             })
-        });
-        let enqueued =
-            tokio::time::timeout(Duration::from_secs(10), futures::future::join_all(sends))
-                .await
-                .map(|receivers| receivers.len());
+        })
+        .take(200);
+        let enqueued = time::timeout(Duration::from_secs(10), join_all(sends))
+            .await
+            .map(|receivers| receivers.len());
         mock.stop();
         assert2::assert!(enqueued == Ok(200));
     }
@@ -2708,20 +2731,22 @@ mod tests {
             ..Coordinator::default()
         })
         .await;
-        let transaction = producer
-            .begin_transaction()
-            .await
-            .expect("begin transaction");
-        let record = producer
-            .send(ProducerRecord {
-                topic: "topic".to_owned(),
-                partition: Some(0),
-                value: Some(bytes::Bytes::from_static(b"v")),
-                ..Default::default()
-            })
-            .await;
+        let (record, commit) = {
+            let transaction = producer
+                .begin_transaction()
+                .await
+                .expect("begin transaction");
+            let record = producer
+                .send(ProducerRecord {
+                    topic: "topic".to_owned(),
+                    partition: Some(0),
+                    value: Some(bytes::Bytes::from_static(b"v")),
+                    ..Default::default()
+                })
+                .await;
 
-        let commit = transaction.commit().await;
+            (record, transaction.commit().await)
+        };
         let (commit_result, transaction) = match commit {
             Ok(()) => (TxnResult::Ok, None),
             Err(error) => (TxnResult::from(Err(error.source)), Some(error.transaction)),
@@ -2830,7 +2855,8 @@ mod tests {
                 }
                 None
             })
-            .await;
+            .await
+            .unwrap();
             port_cell.store(mock.addr.port(), Ordering::SeqCst);
             let producer = Producer::builder()
                 .bootstrap(mock.addr.to_string())
@@ -2857,6 +2883,7 @@ mod tests {
                     .map(|entry| (entry.key().clone(), *entry.value()))
                     .collect(),
             };
+            drop(producer);
             let expected = IdentityAfterCommit {
                 identity,
                 sequences,
@@ -3195,17 +3222,21 @@ mod tests {
             (Call::Commit, TxnState::RecoveryRequired),
         ] {
             let (mock, producer, _coordinator) = scripted_producer(Coordinator::default()).await;
-            let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let handshakes = Arc::new(AtomicUsize::new(0));
             let counter = Arc::clone(&handshakes);
             let answer = MockSaslAnswer::AuthenticateError(58);
             let rejecting =
                 MockBroker::start_with_replies(move |api_key, version, _corr, _body| {
-                    if api_key == krabka_protocol::owned::sasl_handshake_request::API_KEY {
+                    if api_key == sasl_handshake_request::API_KEY {
                         counter.fetch_add(1, Ordering::SeqCst);
                     }
-                    answer.reply(api_key, version).unwrap_or(MockReply::Silent)
+                    answer
+                        .reply(api_key, version)
+                        .unwrap()
+                        .unwrap_or(MockReply::Silent)
                 })
-                .await;
+                .await
+                .unwrap();
             let rejecting_client = Client::builder()
                 .bootstrap(rejecting.addr.to_string())
                 .security(ClientSecurity {

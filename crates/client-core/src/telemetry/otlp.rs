@@ -447,7 +447,7 @@ impl<'a> Fields<'a> {
         Err(OtlpDecodeError("varint longer than 10 bytes"))
     }
 
-    fn take(&mut self, len: usize) -> Result<&'a [u8], OtlpDecodeError> {
+    fn take_bytes(&mut self, len: usize) -> Result<&'a [u8], OtlpDecodeError> {
         if self.0.len() < len {
             return Err(OtlpDecodeError("truncated field"));
         }
@@ -463,7 +463,7 @@ impl<'a> Fields<'a> {
             WIRE_VARINT => Value::Varint(self.varint()?),
             WIRE_FIXED64 => {
                 let bytes: [u8; 8] = self
-                    .take(8)?
+                    .take_bytes(8)?
                     .try_into()
                     .map_err(|_| OtlpDecodeError("truncated fixed64"))?;
                 Value::Fixed64(u64::from_le_bytes(bytes))
@@ -471,10 +471,10 @@ impl<'a> Fields<'a> {
             WIRE_LEN => {
                 let len = usize::try_from(self.varint()?)
                     .map_err(|_| OtlpDecodeError("length does not fit"))?;
-                Value::Len(self.take(len)?)
+                Value::Len(self.take_bytes(len)?)
             }
             WIRE_FIXED32 => {
-                self.take(4)?;
+                self.take_bytes(4)?;
                 Value::Fixed32
             }
             _ => return Err(OtlpDecodeError("unsupported wire type")),

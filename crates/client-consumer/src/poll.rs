@@ -2,10 +2,15 @@
 //! advances next-offsets, and returns the decoded records.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    future,
+    future::Future,
+    mem,
+    sync::{Arc, PoisonError},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use futures_util::future::{OptionFuture, join_all};
 use krabka_client_core::VersionBoundedRequest;
 #[cfg(test)]
 use krabka_client_core::mock_test_support;
@@ -31,6 +36,12 @@ use krabka_units::{
     convert::{ByteSizeExt as _, TimeExt as _},
     mebibytes,
 };
+use tokio::{
+    sync::{Notify, oneshot},
+    task::JoinHandle,
+    time::{self, Instant, sleep_until},
+};
+use tracing::field;
 
 #[cfg(test)]
 use crate::poll;
@@ -42,13 +53,14 @@ use crate::{
     consumer,
     consumer::{Consumer, ConsumerRecord, Header, TimestampType},
     control, coordinator,
-    error::ConsumerError,
+    error::{ConsumerError, is_transport_error},
     fetch_buffer::BufferedPartition,
     fetch_session::{
         FINAL_EPOCH, FetchSession, INVALID_SESSION_ID, SessionPartition, SessionRequest,
     },
     offset_wire,
-    position::PartitionPosition,
+    position::{PartitionPosition, with_offsets_and_positions},
+    validate::should_await_validation,
 };
 
 /// Synthetic leader id that means "leader unknown → use the bootstrap
@@ -63,8 +75,8 @@ const UNKNOWN_LEADER_ID: i32 = -1;
 const OFFSET_OUT_OF_RANGE: i16 = 1;
 /// The offset the wire uses for "the broker did not answer this".
 const UNKNOWN_OFFSET: i64 = -1;
-pub(crate) const DEFAULT_FETCH_PARTITION_MAX: ByteSize = mebibytes(1);
-pub(crate) const DEFAULT_FETCH_MAX: ByteSize = mebibytes(50);
+pub const DEFAULT_FETCH_PARTITION_MAX: ByteSize = mebibytes(1);
+pub const DEFAULT_FETCH_MAX: ByteSize = mebibytes(50);
 
 /// One fetchable partition's request fields:
 /// `(partition, fetch_offset, current_leader_epoch, last_fetched_epoch)`.
@@ -93,8 +105,8 @@ fn is_read_committed(isolation_level: IsolationLevel) -> bool {
     isolation_level == IsolationLevel::ReadCommitted
 }
 
-pub(crate) fn is_transient_transport_error(e: &krabka_client_core::ClientError) -> bool {
-    crate::error::is_transport_error(e, true)
+pub fn is_transient_transport_error(e: &krabka_client_core::ClientError) -> bool {
+    is_transport_error(e, true)
 }
 
 fn is_transient_poll_error(e: &ConsumerError) -> bool {
@@ -172,7 +184,7 @@ fn record_offset(base_offset: i64, offset_delta: i32) -> i64 {
 /// Kafka's `DefaultRecordBatch` reads `max_timestamp` as the log append time
 /// when the batch attributes say `LogAppendTime`. `DefaultRecord.readFrom`
 /// then gives that time to every record and ignores the record delta.
-pub(crate) fn record_timestamp(batch: &RecordBatch, record: &Record) -> (i64, TimestampType) {
+pub fn record_timestamp(batch: &RecordBatch, record: &Record) -> (i64, TimestampType) {
     let timestamp_type = TimestampType::from(batch.attributes.timestamp_type());
     let timestamp = match timestamp_type {
         TimestampType::CreateTime => batch.base_timestamp + record.timestamp_delta,
@@ -265,13 +277,13 @@ fn build_fetch_request(
 /// A Fetch that runs in a task, with the fetch offset of each partition that
 /// it asked for.
 struct InFlightFetch {
-    handle: tokio::task::JoinHandle<()>,
+    handle: JoinHandle<()>,
     /// The result of the request. The task sends it before it notifies
     /// `Fetches::completed`, so a waiter that wakes can always take it.
-    result: tokio::sync::oneshot::Receiver<Result<FetchResponse, krabka_client_core::ClientError>>,
+    result: oneshot::Receiver<Result<FetchResponse, krabka_client_core::ClientError>>,
     requested: HashMap<(String, i32), i64>,
     /// The partitions that this Fetch asked from a preferred read replica.
-    from_replica: std::collections::HashSet<(String, i32)>,
+    from_replica: HashSet<(String, i32)>,
 }
 
 /// A Fetch whose task ended: its broker, the fetch offsets it asked for, and
@@ -279,7 +291,7 @@ struct InFlightFetch {
 struct CompletedFetch {
     leader: i32,
     requested: HashMap<(String, i32), i64>,
-    from_replica: std::collections::HashSet<(String, i32)>,
+    from_replica: HashSet<(String, i32)>,
     result: Option<Result<FetchResponse, krabka_client_core::ClientError>>,
 }
 
@@ -290,17 +302,17 @@ struct CompletedFetch {
 /// Fetch, and keeps a `FetchSessionHandler` per broker. A response that arrives
 /// after `poll` returned waits here for the next `poll`.
 #[derive(Default)]
-pub(crate) struct Fetches {
+pub struct Fetches {
     sessions: HashMap<i32, FetchSession>,
     in_flight: HashMap<i32, InFlightFetch>,
     /// The Fetch requests whose result the consumer took from `in_flight` and
     /// did not process yet.
     ready: Vec<CompletedFetch>,
-    completed: Arc<tokio::sync::Notify>,
+    completed: Arc<Notify>,
     /// KIP-392: the replica that a broker named in `preferred_read_replica`,
     /// with the time until which the consumer fetches from it. Kafka's
     /// `SubscriptionState.TopicPartitionState.preferredReadReplica`.
-    preferred_read_replicas: HashMap<(String, i32), (i32, tokio::time::Instant)>,
+    preferred_read_replicas: HashMap<(String, i32), (i32, Instant)>,
 }
 
 impl Fetches {
@@ -313,8 +325,8 @@ impl Fetches {
             };
             let result = match fetch.result.try_recv() {
                 Ok(result) => Some(result),
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => continue,
+                Err(oneshot::error::TryRecvError::Closed) => None,
+                Err(oneshot::error::TryRecvError::Empty) => continue,
             };
             if let Some(fetch) = self.in_flight.remove(&leader) {
                 self.ready.push(CompletedFetch {
@@ -337,29 +349,29 @@ impl Drop for Fetches {
 }
 
 /// `ListOffsets` timestamp that asks for the log end offset.
-pub(crate) const LATEST_TIMESTAMP: i64 = -1;
+pub const LATEST_TIMESTAMP: i64 = -1;
 /// `ListOffsets` timestamp that asks for the log start offset.
-pub(crate) const EARLIEST_TIMESTAMP: i64 = -2;
+pub const EARLIEST_TIMESTAMP: i64 = -2;
 
 /// Placeholder for "reset with `ListOffsets`", resolved before the next Fetch:
 /// the log end, or the offset for the timestamp of `by_duration`.
-pub(crate) const LATEST_SENTINEL: i64 = i64::MAX;
+pub const LATEST_SENTINEL: i64 = i64::MAX;
 
 /// Placeholder for the reset of [`Consumer::seek_to_beginning`], resolved with
 /// `ListOffsets(-2)`: Kafka's `requestOffsetReset(partitions, EARLIEST)`.
 /// `auto_offset_reset = Earliest` plants the same sentinel at build time and
 /// on `OFFSET_OUT_OF_RANGE`, so `position()` never reports an offset before
 /// the round trip resolves the real log start.
-pub(crate) const BEGINNING_SENTINEL: i64 = i64::MAX - 1;
+pub const BEGINNING_SENTINEL: i64 = i64::MAX - 1;
 
 /// Placeholder for the reset of [`Consumer::seek_to_end`]: Kafka's
 /// `requestOffsetReset(partitions, LATEST)`, resolved with `ListOffsets(-1)`.
-pub(crate) const END_SENTINEL: i64 = i64::MAX - 2;
+pub const END_SENTINEL: i64 = i64::MAX - 2;
 
 /// Placeholder for the position of a manually assigned partition: the
 /// committed offset, or a reset when the group has none. Kafka's
 /// `TopicPartitionState.shouldInitialize`.
-pub(crate) const COMMITTED_SENTINEL: i64 = i64::MAX - 3;
+pub const COMMITTED_SENTINEL: i64 = i64::MAX - 3;
 
 /// Placeholder for a partition with no committed offset under
 /// `auto_offset_reset = None`. Kafka never auto-resets under `none`
@@ -369,14 +381,14 @@ pub(crate) const COMMITTED_SENTINEL: i64 = i64::MAX - 3;
 /// planting a `ListOffsets` sentinel. This placeholder is therefore never
 /// resolved by [`Consumer::resolve_reset_sentinels`]: it stays until a commit
 /// or a seek gives the partition a real position.
-pub(crate) const NO_OFFSET_SENTINEL: i64 = i64::MAX - 4;
+pub const NO_OFFSET_SENTINEL: i64 = i64::MAX - 4;
 
 /// Whether `next_offset` is a placeholder that a position update did not
 /// resolve yet: a reset (Kafka's `TopicPartitionState.awaitingReset`), the
 /// committed offset of a new manual assignment, or a partition with no offset
 /// under `auto_offset_reset = None`. Such a partition has no valid position,
 /// so the consumer does not fetch or commit it.
-pub(crate) fn is_reset_sentinel(next_offset: i64) -> bool {
+pub fn is_reset_sentinel(next_offset: i64) -> bool {
     next_offset >= NO_OFFSET_SENTINEL
 }
 
@@ -398,7 +410,7 @@ fn reset_timestamp(policy: AutoOffsetReset, now_ms: i64) -> i64 {
 
 /// Run `future`, or return [`ConsumerError::Wakeup`] when `wakeup` comes
 /// first.
-async fn until_woken<F: std::future::Future>(
+async fn until_woken<F: Future>(
     wakeup: Option<&control::WakeupHandle>,
     future: F,
 ) -> Result<F::Output, ConsumerError> {
@@ -414,8 +426,8 @@ async fn until_woken<F: std::future::Future>(
 
 /// Milliseconds since the Unix epoch.
 fn unix_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
         })
@@ -474,7 +486,7 @@ fn build_offsets_request(
 /// negotiation. When the broker supports only version 0 or 1, the send fails
 /// with `ClientError::IncompatibleVersion` before the request goes out.
 /// Kafka fails with `UnsupportedVersionException` in that case.
-pub(crate) type ReadCommittedListOffsets =
+pub type ReadCommittedListOffsets =
     VersionBoundedRequest<ListOffsetsRequest, 2, { list_offsets_request::MAX_VERSION }>;
 
 /// Group `ListOffsets` partitions by the broker that gets the request.
@@ -615,19 +627,17 @@ impl Consumer {
         fields(
             group_id = %self.group_id,
             timeout_ms = timeout.millis_i64_trunc(),
-            assigned_partitions = tracing::field::Empty,
-            leaders = tracing::field::Empty,
-            records = tracing::field::Empty,
+            assigned_partitions = field::Empty,
+            leaders = field::Empty,
+            records = field::Empty,
         ),
         err(level = "debug")
     )]
     /// # Errors
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn poll(&mut self, timeout: Time) -> Result<Vec<ConsumerRecord>, ConsumerError> {
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(
-                u64::try_from(timeout.millis_i64_trunc()).unwrap_or(0),
-            );
+        let deadline = Instant::now()
+            + Duration::from_millis(u64::try_from(timeout.millis_i64_trunc()).unwrap_or(0));
         // Kafka's `ClassicKafkaConsumer.poll` throws `IllegalStateException`
         // without a subscription.
         if self.subscription.borrow().is_none() && !self.subscription.borrow().manual_assignment {
@@ -658,7 +668,7 @@ impl Consumer {
         tracing::Span::current().record("assigned_partitions", assigned.len());
         if assigned.is_empty() {
             tokio::select! {
-                () = tokio::time::sleep_until(deadline) => return Ok(Vec::new()),
+                () = sleep_until(deadline) => return Ok(Vec::new()),
                 () = wakeup.woken() => return Err(ConsumerError::Wakeup),
             }
         }
@@ -708,7 +718,7 @@ impl Consumer {
     /// callback failed.
     pub(crate) async fn wait_for_rebalance(
         &mut self,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<bool, ConsumerError> {
         // Kafka's `onJoinComplete` keeps the first callback error and throws
         // it after the rebalance step. A failed callback therefore does not
@@ -729,7 +739,7 @@ impl Consumer {
         let joined = loop {
             // A slow callback must not keep this `poll` past its timeout. The
             // next `poll` runs the calls that come later.
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 break false;
             }
             let call = tokio::select! {
@@ -742,7 +752,7 @@ impl Consumer {
                     let _ = joined;
                     break true;
                 }
-                () = tokio::time::sleep_until(deadline) => break false,
+                () = sleep_until(deadline) => break false,
                 // A wakeup ends the wait between two callbacks, never inside
                 // one.
                 () = wakeup.woken() => {
@@ -764,7 +774,7 @@ impl Consumer {
                             let _ = joined;
                             true
                         }
-                        () = tokio::time::sleep_until(deadline) => false,
+                        () = sleep_until(deadline) => false,
                         () = wakeup.woken() => {
                             first_error.get_or_insert(ConsumerError::Wakeup);
                             false
@@ -792,8 +802,7 @@ impl Consumer {
         let ownership_ids = self.commit_identity.lock().await.ownership_ids.clone();
         let paused = self.paused_of(&ownership_ids);
         let assigned_guard = self.assigned.lock().await;
-        let assigned: std::collections::HashSet<(String, i32)> =
-            assigned_guard.iter().cloned().collect();
+        let assigned: HashSet<(String, i32)> = assigned_guard.iter().cloned().collect();
         let mut offsets = self.next_offsets.lock().await;
         let mut positions = self.positions.lock().await;
         let records = self.fetch_buffer.drain(
@@ -815,11 +824,7 @@ impl Consumer {
     /// or for the retry backoff while a partition has no valid position. A
     /// listener call that waits also ends the wait after the retry backoff, so
     /// the next `poll` runs it.
-    async fn wait_without_fetches(
-        &self,
-        assigned: &[(String, i32)],
-        deadline: tokio::time::Instant,
-    ) {
+    async fn wait_without_fetches(&self, assigned: &[(String, i32)], deadline: Instant) {
         let all_positions = {
             let offsets = self.next_offsets.lock().await;
             let positions = self.positions.lock().await;
@@ -835,7 +840,7 @@ impl Consumer {
         let until = if all_positions && self.listener_calls.is_empty() {
             deadline
         } else {
-            deadline.min(tokio::time::Instant::now() + self.retry_policy.initial_backoff)
+            deadline.min(Instant::now() + self.retry_policy.initial_backoff)
         };
         // A rebalance that starts during the wait queues listener calls that
         // this consumer must run, so it ends the wait, as Kafka's
@@ -845,11 +850,11 @@ impl Consumer {
         let rebalance = async {
             // Without a coordinator task nothing changes the flag.
             if rebalance_pending.changed().await.is_err() {
-                std::future::pending::<()>().await;
+                future::pending::<()>().await;
             }
         };
         tokio::select! {
-            () = tokio::time::sleep_until(until) => {}
+            () = sleep_until(until) => {}
             () = rebalance => {}
         }
     }
@@ -876,7 +881,7 @@ impl Consumer {
         // serve them from the offset we committed at revoke time. Snapshot
         // before locking `next_offsets` to keep the coordinator's
         // assigned→next_offsets lock order (avoids deadlock).
-        let still_owned: std::collections::HashSet<(String, i32)> =
+        let still_owned: HashSet<(String, i32)> =
             self.assigned.lock().await.iter().cloned().collect();
 
         let mut fetched: Vec<BufferedPartition> = Vec::new();
@@ -1010,6 +1015,7 @@ impl Consumer {
                                 p.awaiting_validation = true;
                             }
                         }
+                        drop(positions);
                         continue;
                     }
                     FetchPartitionAction::RefreshMetadata => {
@@ -1052,7 +1058,7 @@ impl Consumer {
         // Drop the offsets guard before any `.await`: refreshing metadata is an
         // RPC, and we must never hold a Mutex guard across an await point.
         drop(offsets);
-        let now = tokio::time::Instant::now();
+        let now = Instant::now();
         for (key, replica) in replica_updates {
             match replica {
                 // `TopicPartitionState.updatePreferredReadReplica` restarts the
@@ -1141,7 +1147,7 @@ impl Consumer {
             );
             let client = self.client.clone();
             let completed = Arc::clone(&self.fetches.completed);
-            let (sender, result) = tokio::sync::oneshot::channel();
+            let (sender, result) = oneshot::channel();
             let handle = tokio::spawn(async move {
                 let response = if should_use_bootstrap_leader(leader) {
                     client.send(request).await
@@ -1166,7 +1172,7 @@ impl Consumer {
     /// Wait until a Fetch in flight completes, or until `deadline`. Kafka's
     /// `ClassicKafkaConsumer.pollForFetches` bounds the network wait with the
     /// poll timer and returns as soon as a fetch is available.
-    async fn wait_for_fetches(&mut self, deadline: tokio::time::Instant) {
+    async fn wait_for_fetches(&mut self, deadline: Instant) {
         loop {
             self.fetches.collect_ready();
             if self.fetches.in_flight.is_empty() || !self.fetches.ready.is_empty() {
@@ -1174,7 +1180,7 @@ impl Consumer {
             }
             tokio::select! {
                 () = self.fetches.completed.notified() => {}
-                () = tokio::time::sleep_until(deadline) => return,
+                () = sleep_until(deadline) => return,
             }
         }
     }
@@ -1202,7 +1208,7 @@ impl Consumer {
         let offsets = self.next_offsets.lock().await.clone();
         let mut responses = Vec::new();
         let mut failure = None;
-        for fetch in std::mem::take(&mut self.fetches.ready) {
+        for fetch in mem::take(&mut self.fetches.ready) {
             let leader = fetch.leader;
             let session = self.fetches.sessions.entry(leader).or_default();
             match fetch.result {
@@ -1276,16 +1282,16 @@ impl Consumer {
                 None => session.handle_error(),
             }
         }
-        match failure {
-            Some(error) => Err(error.into()),
-            None => Ok(responses),
+        if let Some(error) = failure {
+            return Err(error.into());
         }
+        Ok(responses)
     }
 
     /// Close the fetch session of each broker. Kafka's `AbstractFetch.close`
     /// sends a Fetch with the session id, epoch `-1` and no partitions to each
     /// broker that holds a session.
-    pub(crate) async fn close_fetch_sessions(&mut self, timeout: std::time::Duration) {
+    pub(crate) async fn close_fetch_sessions(&self, timeout: Duration) {
         let max_wait_ms = consumer::protocol_millis_i32(self.fetch_max_wait);
         let closes: Vec<_> = self
             .fetches
@@ -1317,7 +1323,7 @@ impl Consumer {
                 }
             })
             .collect();
-        let _ = tokio::time::timeout(timeout, futures_util::future::join_all(closes)).await;
+        let _ = time::timeout(timeout, join_all(closes)).await;
     }
 
     pub(crate) async fn group_fetches(&mut self, assigned: &[(String, i32)]) -> FetchByLeader {
@@ -1325,17 +1331,15 @@ impl Consumer {
         let awaiting_callback = self
             .assigned_callback_pending
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let ownership_ids = self.commit_identity.lock().await.ownership_ids.clone();
         let paused = self.paused_of(&ownership_ids);
         let buffered = self.fetch_buffer.buffered_partitions();
         let mut grouped: FetchByLeader = HashMap::new();
-        let now = tokio::time::Instant::now();
+        let now = Instant::now();
         let mut refresh_metadata = false;
-        {
-            let offsets = self.next_offsets.lock().await;
-            let positions = self.positions.lock().await;
+        with_offsets_and_positions(&self.next_offsets, &self.positions, |offsets, positions| {
             for (t, p) in assigned {
                 if awaiting_callback.contains(&(t.clone(), *p)) {
                     continue;
@@ -1411,7 +1415,8 @@ impl Consumer {
                     .or_default()
                     .push((*p, next, pos.leader_epoch, pos.offset_epoch));
             }
-        }
+        })
+        .await;
         if refresh_metadata {
             // The next poll refreshes, as for the other metadata updates of
             // the fetch path.
@@ -1421,10 +1426,7 @@ impl Consumer {
         grouped
     }
 
-    async fn prepare_poll(
-        &mut self,
-        deadline: tokio::time::Instant,
-    ) -> Result<bool, ConsumerError> {
+    async fn prepare_poll(&self, deadline: Instant) -> Result<bool, ConsumerError> {
         // Kafka's consumer raises a fatal `OffsetFetch` error from `poll()`.
         // A rejoin in the coordinator task leaves such an error here.
         if let Some(error) = coordinator::take_poll_error(&self.poll_error) {
@@ -1506,7 +1508,7 @@ impl Consumer {
     pub(crate) async fn update_fetch_positions(
         &self,
         wakeup: Option<&control::WakeupHandle>,
-        deadline: Option<tokio::time::Instant>,
+        deadline: Option<Instant>,
     ) -> Result<bool, ConsumerError> {
         if self.metadata_due().await
             && let Err(error) = until_woken(wakeup, self.refresh_leader_epochs()).await?
@@ -1570,7 +1572,7 @@ impl Consumer {
         // Capture the position now — before `next_offset_after` updates
         // it — so the filter baseline matches the actual fetch offset.
         let fetch_floor = offsets.get(key).copied().unwrap_or(0);
-        let mut records = std::collections::VecDeque::new();
+        let mut records = VecDeque::new();
         // read_committed filtering happens entirely client-side: the
         // broker returns verbatim on-disk bytes (control batches,
         // aborted records and all) plus an `aborted_transactions`
@@ -1580,7 +1582,7 @@ impl Consumer {
         let read_committed = is_read_committed(self.isolation_level);
         // Aborted txns sorted by first_offset; consumed front-to-back
         // as batch offsets advance past each entry's start.
-        let mut aborted: std::collections::VecDeque<(i64, i64)> = if read_committed {
+        let mut aborted: VecDeque<(i64, i64)> = if read_committed {
             let mut v: Vec<(i64, i64)> = part
                 .aborted_transactions
                 .as_deref()
@@ -1591,10 +1593,10 @@ impl Consumer {
             v.sort_unstable();
             v.into()
         } else {
-            std::collections::VecDeque::new()
+            VecDeque::new()
         };
         // producer_ids with a currently-open aborted transaction.
-        let mut aborted_pids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut aborted_pids: HashSet<i64> = HashSet::new();
         for batch in batches {
             // Move every aborted txn that starts at or before this
             // batch into the active set.
@@ -1635,7 +1637,7 @@ impl Consumer {
                 }
                 let (timestamp, timestamp_type) = record_timestamp(batch, r);
                 records.push_back(ConsumerRecord {
-                    topic: topic_name.to_string(),
+                    topic: topic_name.to_owned(),
                     partition: part.partition_index,
                     offset,
                     leader_epoch: batch.partition_leader_epoch,
@@ -1705,7 +1707,7 @@ fn record_readable_end(
 /// This function returns `None` when there are no batches, which leaves the
 /// offset unchanged. The consumer uses it to advance past control and aborted
 /// batches that emit no records, instead of re-fetching them.
-fn next_offset_after(batches: &[krabka_protocol::records::RecordBatch]) -> Option<i64> {
+fn next_offset_after(batches: &[RecordBatch]) -> Option<i64> {
     batches
         .iter()
         .map(|b| b.base_offset + i64::from(b.last_offset_delta) + 1)
@@ -1737,7 +1739,7 @@ impl Consumer {
         name = "consumer.resolve_reset_sentinels",
         level = "debug",
         skip_all,
-        fields(group_id = %self.group_id, sentinels = tracing::field::Empty),
+        fields(group_id = %self.group_id, sentinels = field::Empty),
         err(level = "debug")
     )]
     async fn resolve_reset_sentinels(&self) -> Result<(), ConsumerError> {
@@ -1832,7 +1834,7 @@ impl Consumer {
     /// Returns the error of the `OffsetFetch` request.
     pub(crate) async fn resolve_committed_sentinels(
         &self,
-        deadline: Option<tokio::time::Instant>,
+        deadline: Option<Instant>,
     ) -> Result<(), ConsumerError> {
         let keys = keys_at(&*self.next_offsets.lock().await, COMMITTED_SENTINEL);
         if keys.is_empty() {
@@ -1840,39 +1842,38 @@ impl Consumer {
         }
         // Kafka's `updateFetchPositions` gives the committed offsets the timer
         // of the `poll`.
-        let deadline = deadline
-            .unwrap_or_else(|| tokio::time::Instant::now() + self.default_api_timeout.to_std());
+        let deadline =
+            deadline.unwrap_or_else(|| Instant::now() + self.default_api_timeout.to_std());
         let committed = if self.group_id.is_empty() {
             HashMap::new()
         } else {
             self.committed_until(&keys, deadline).await?
         };
         let reset = consumer::reset_starting_offset(self.auto_offset_reset);
-        let mut offsets = self.next_offsets.lock().await;
-        let mut positions = self.positions.lock().await;
-        for key in keys {
-            let Some(next) = offsets.get_mut(&key) else {
-                continue;
-            };
-            if *next != COMMITTED_SENTINEL {
-                continue;
-            }
-            match committed.get(&key).cloned().flatten() {
-                Some(offset) => {
-                    *next = offset.offset;
-                    let position = positions.entry(key).or_default();
-                    position.offset_epoch = LeaderEpoch(offset.leader_epoch.unwrap_or(-1));
-                    // Kafka's `TopicPartitionState.seekUnvalidated` waits for
-                    // `OffsetForLeaderEpoch` when the committed epoch is older
-                    // than the leader epoch of the metadata.
-                    position.awaiting_validation = crate::validate::should_await_validation(
-                        position.leader_epoch,
-                        position.offset_epoch,
-                    );
+        with_offsets_and_positions(&self.next_offsets, &self.positions, |offsets, positions| {
+            for key in keys {
+                let Some(next) = offsets.get_mut(&key) else {
+                    continue;
+                };
+                if *next != COMMITTED_SENTINEL {
+                    continue;
                 }
-                None => *next = reset,
+                match committed.get(&key).cloned().flatten() {
+                    Some(offset) => {
+                        *next = offset.offset;
+                        let position = positions.entry(key).or_default();
+                        position.offset_epoch = LeaderEpoch(offset.leader_epoch.unwrap_or(-1));
+                        // Kafka's `TopicPartitionState.seekUnvalidated` waits for
+                        // `OffsetForLeaderEpoch` when the committed epoch is older
+                        // than the leader epoch of the metadata.
+                        position.awaiting_validation =
+                            should_await_validation(position.leader_epoch, position.offset_epoch);
+                    }
+                    None => *next = reset,
+                }
             }
-        }
+        })
+        .await;
         Ok(())
     }
 
@@ -1971,7 +1972,7 @@ impl Consumer {
         let result = self.list_offsets(&keys, EARLIEST_TIMESTAMP).await?;
         result.authorization()?;
 
-        if let AutoOffsetReset::None = self.auto_offset_reset {
+        if self.auto_offset_reset == AutoOffsetReset::None {
             if let Some(truncation) = out_of_range_truncation(out_of_range, &result.offsets) {
                 return Err(truncation);
             }
@@ -1983,15 +1984,17 @@ impl Consumer {
         for (key, log_start) in &log_starts {
             offsets.insert(key.clone(), *log_start);
         }
-        if let Some(auto_commit) = &self.auto_commit {
-            auto_commit
-                .reset_polled(
-                    log_starts
-                        .into_iter()
-                        .map(|(key, log_start)| (key, Some(log_start))),
-                )
-                .await;
-        }
+        let reset_polled = self.auto_commit.as_ref().map(|auto_commit| {
+            auto_commit.reset_polled(
+                log_starts
+                    .into_iter()
+                    .map(|(key, log_start)| (key, Some(log_start))),
+            )
+        });
+        // `polled` follows the reset before `next_offsets` unlocks: the lock
+        // order N→AP of the `lock_order_model` test.
+        OptionFuture::from(reset_polled).await;
+        drop(offsets);
         Ok(result.retry)
     }
 }
@@ -2060,7 +2063,7 @@ impl Consumer {
     ) -> Result<(), ConsumerError> {
         let mut offsets = self.next_offsets.lock().await;
         for (key, safe_offset) in truncated {
-            if let AutoOffsetReset::None = self.auto_offset_reset {
+            if self.auto_offset_reset == AutoOffsetReset::None {
                 let fetch_offset = fetch_offset_or_unknown(&offsets, key);
                 return Err(ConsumerError::LogTruncation {
                     topic: key.0.clone(),
@@ -2071,15 +2074,17 @@ impl Consumer {
             }
             offsets.insert(key.clone(), *safe_offset);
         }
-        if let Some(auto_commit) = &self.auto_commit {
-            auto_commit
-                .reset_polled(
-                    truncated
-                        .iter()
-                        .map(|(key, safe_offset)| (key.clone(), Some(*safe_offset))),
-                )
-                .await;
-        }
+        let reset_polled = self.auto_commit.as_ref().map(|auto_commit| {
+            auto_commit.reset_polled(
+                truncated
+                    .iter()
+                    .map(|(key, safe_offset)| (key.clone(), Some(*safe_offset))),
+            )
+        });
+        // `polled` follows the reset before `next_offsets` unlocks: the lock
+        // order N→AP of the `lock_order_model` test.
+        OptionFuture::from(reset_polled).await;
+        drop(offsets);
         Ok(())
     }
 
@@ -2091,7 +2096,7 @@ impl Consumer {
         key: &(String, i32),
         safe_offset: i64,
     ) -> Result<(), ConsumerError> {
-        if let AutoOffsetReset::None = self.auto_offset_reset {
+        if self.auto_offset_reset == AutoOffsetReset::None {
             let fetch_offset = fetch_offset_or_unknown(offsets, key);
             return Err(ConsumerError::LogTruncation {
                 topic: key.0.clone(),
@@ -2228,7 +2233,7 @@ mod offset_advance_tests {
 
     #[test]
     fn poll_helpers_preserve_sentinel_filter_and_record_math_boundaries() {
-        let key = ("topic-a".to_string(), 2);
+        let key = ("topic-a".to_owned(), 2);
         let mut offsets = HashMap::new();
 
         assert2::assert!(fetch_offset_or_unknown(&offsets, &key) == UNKNOWN_FETCH_OFFSET);
@@ -2331,7 +2336,7 @@ mod offset_advance_tests {
     /// topic, and the forgotten partitions by topic.
     #[test]
     fn build_fetch_request_carries_limits_session_partitions_and_forgotten_topics() {
-        let partition = |fetch_offset| crate::fetch_session::SessionPartition {
+        let partition = |fetch_offset| SessionPartition {
             topic_id: id(7),
             fetch_offset,
             current_leader_epoch: 5,
@@ -2414,7 +2419,7 @@ mod offset_advance_tests {
             (EARLIEST_TIMESTAMP, IsolationLevel::ReadUncommitted, 0, 9),
         ] {
             let by_topic =
-                maplit::btreemap! {"topic-a".to_string() => vec![(3, LeaderEpoch(leader_epoch))]};
+                maplit::btreemap! {"topic-a".to_owned() => vec![(3, LeaderEpoch(leader_epoch))]};
             let req = build_offsets_request(by_topic, timestamp, isolation);
 
             check!(
@@ -2449,28 +2454,28 @@ mod offset_advance_tests {
             leader_epoch: LeaderEpoch(leader_epoch),
             ..Default::default()
         };
-        let positions = maplit::hashmap! {("topic-a".to_string(), 0) => position(1, 5), ("topic-a".to_string(), 1) => position(2, 6), ("topic-b".to_string(), 0) => position(1, 3), ("topic-b".to_string(), 1) => position(3, 8)};
+        let positions = maplit::hashmap! {("topic-a".to_owned(), 0) => position(1, 5), ("topic-a".to_owned(), 1) => position(2, 6), ("topic-b".to_owned(), 0) => position(1, 3), ("topic-b".to_owned(), 1) => position(3, 8)};
         let keys = [
-            ("topic-a".to_string(), 0),
-            ("topic-a".to_string(), 1),
-            ("topic-b".to_string(), 0),
-            ("topic-b".to_string(), 1),
-            ("topic-c".to_string(), 0),
+            ("topic-a".to_owned(), 0),
+            ("topic-a".to_owned(), 1),
+            ("topic-b".to_owned(), 0),
+            ("topic-b".to_owned(), 1),
+            ("topic-c".to_owned(), 0),
         ];
         let grouped = group_list_offsets(&keys, &positions, |id| id != 3);
         assert2::assert!(
             grouped
                 == maplit::btreemap! {
                     BOOTSTRAP_LEADER => maplit::btreemap! {
-                        "topic-b".to_string() => vec![(1, LeaderEpoch(8))],
-                        "topic-c".to_string() => vec![(0, LeaderEpoch(-1))],
+                        "topic-b".to_owned() => vec![(1, LeaderEpoch(8))],
+                        "topic-c".to_owned() => vec![(0, LeaderEpoch(-1))],
                     },
                     1 => maplit::btreemap! {
-                        "topic-a".to_string() => vec![(0, LeaderEpoch(5))],
-                        "topic-b".to_string() => vec![(0, LeaderEpoch(3))],
+                        "topic-a".to_owned() => vec![(0, LeaderEpoch(5))],
+                        "topic-b".to_owned() => vec![(0, LeaderEpoch(3))],
                     },
                     2 => maplit::btreemap! {
-                        "topic-a".to_string() => vec![(1, LeaderEpoch(6))],
+                        "topic-a".to_owned() => vec![(1, LeaderEpoch(6))],
                     },
                 }
         );
@@ -2538,9 +2543,9 @@ mod offset_advance_tests {
             }],
             ..Default::default()
         };
-        let requested = [("topic-a".to_string(), 0), ("topic-a".to_string(), 1)];
+        let requested = [("topic-a".to_owned(), 0), ("topic-a".to_owned(), 1)];
         let retry_with_first_offset = ListOffsetsResult {
-            offsets: maplit::hashmap! {("topic-a".to_string(), 0) => 5},
+            offsets: maplit::hashmap! {("topic-a".to_owned(), 0) => 5},
             retry: true,
             unauthorized: BTreeSet::new(),
         };
@@ -2549,7 +2554,7 @@ mod offset_advance_tests {
                 "every partition answered",
                 vec![answer("topic-a", vec![row(0, 0, 5), row(1, 0, 9)])],
                 ListOffsetsResult {
-                    offsets: maplit::hashmap! {("topic-a".to_string(), 0) => 5, ("topic-a".to_string(), 1) => 9},
+                    offsets: maplit::hashmap! {("topic-a".to_owned(), 0) => 5, ("topic-a".to_owned(), 1) => 9},
                     retry: false,
                     unauthorized: BTreeSet::new(),
                 },
@@ -2562,7 +2567,7 @@ mod offset_advance_tests {
             (
                 "a missing row is retried and an unrequested row is ignored",
                 vec![answer("topic-a", vec![row(0, 0, 5), row(2, 0, 3)])],
-                retry_with_first_offset.clone(),
+                retry_with_first_offset,
             ),
             (
                 "an unauthorized answer gives no offsets",
@@ -2570,7 +2575,7 @@ mod offset_advance_tests {
                 ListOffsetsResult {
                     offsets: HashMap::new(),
                     retry: true,
-                    unauthorized: maplit::btreeset! {"topic-a".to_string()},
+                    unauthorized: maplit::btreeset! {"topic-a".to_owned()},
                 },
             ),
         ] {
@@ -2586,11 +2591,11 @@ mod offset_advance_tests {
     fn list_offsets_result_authorization_names_the_unauthorized_topics() {
         let mut result = ListOffsetsResult::default();
         check!(result.authorization().map_err(|e| e.to_string()) == Ok(()));
-        result.unauthorized.insert("topic-a".to_string());
+        result.unauthorized.insert("topic-a".to_owned());
         check!(
             result.authorization().map_err(|e| e.to_string())
                 == Err(ConsumerError::TopicAuthorizationFailed(
-                    maplit::btreeset! {"topic-a".to_string()}
+                    maplit::btreeset! {"topic-a".to_owned()}
                 )
                 .to_string())
         );
@@ -2605,13 +2610,13 @@ mod offset_advance_tests {
     #[test]
     fn out_of_range_positions_uses_the_log_start_and_skips_the_unanswered() {
         let out_of_range = vec![
-            (("topic-a".to_string(), 0), 0),
-            (("topic-a".to_string(), 1), 3),
+            (("topic-a".to_owned(), 0), 0),
+            (("topic-a".to_owned(), 1), 3),
         ];
-        let log_starts = maplit::hashmap! {("topic-a".to_string(), 0) => 5};
+        let log_starts = maplit::hashmap! {("topic-a".to_owned(), 0) => 5};
         assert2::assert!(
             out_of_range_positions(&out_of_range, &log_starts)
-                == vec![(("topic-a".to_string(), 0), 5)]
+                == vec![(("topic-a".to_owned(), 0), 5)]
         );
     }
 
@@ -2624,19 +2629,19 @@ mod offset_advance_tests {
     fn out_of_range_truncation_names_the_first_partition_and_its_log_start() {
         for (answered, expected_safe) in [(true, 5), (false, UNKNOWN_OFFSET)] {
             let log_starts = if answered {
-                maplit::hashmap! {("topic-a".to_string(), 0) => 5}
+                maplit::hashmap! {("topic-a".to_owned(), 0) => 5}
             } else {
                 HashMap::new()
             };
             let out_of_range = vec![
-                (("topic-a".to_string(), 0), 2),
-                (("topic-a".to_string(), 1), 3),
+                (("topic-a".to_owned(), 0), 2),
+                (("topic-a".to_owned(), 1), 3),
             ];
             assert2::assert!(
                 out_of_range_truncation(&out_of_range, &log_starts).map(|e| e.to_string())
                     == Some(
                         ConsumerError::LogTruncation {
-                            topic: "topic-a".to_string(),
+                            topic: "topic-a".to_owned(),
                             partition: 0,
                             fetch_offset: 2,
                             safe_offset: expected_safe,
@@ -2657,9 +2662,9 @@ mod offset_advance_tests {
     #[test]
     fn keys_at_selects_only_the_sentinel_partitions() {
         let mut offsets: HashMap<(String, i32), i64> = HashMap::new();
-        offsets.insert(("topic-a".to_string(), 0), LATEST_SENTINEL);
-        offsets.insert(("topic-a".to_string(), 1), 42);
-        assert2::assert!(keys_at(&offsets, LATEST_SENTINEL) == vec![("topic-a".to_string(), 0)]);
+        offsets.insert(("topic-a".to_owned(), 0), LATEST_SENTINEL);
+        offsets.insert(("topic-a".to_owned(), 1), 42);
+        assert2::assert!(keys_at(&offsets, LATEST_SENTINEL) == vec![("topic-a".to_owned(), 0)]);
     }
 
     #[test]
@@ -2685,10 +2690,10 @@ mod offset_advance_tests {
 }
 
 #[cfg(test)]
-pub(crate) mod partition_error_tests {
+pub mod partition_error_tests {
     use std::{
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicU16, AtomicUsize, Ordering},
         },
         time::Duration,
@@ -2705,14 +2710,18 @@ pub(crate) mod partition_error_tests {
                 PartitionData,
             },
             metadata_request,
-            metadata_response::MetadataResponse,
+            metadata_response::{MetadataResponse, MetadataResponseBroker},
         },
         primitives::uuid::Uuid as WireUuid,
     };
     use krabka_units::secs;
+    use tokio::{
+        sync::watch,
+        time::{sleep, timeout},
+    };
 
     use super::*;
-    use crate::Assignor;
+    use crate::{Assignor, commit::AutoCommit, subscription::shared};
 
     const TOPIC_ID: WireUuid = WireUuid([7; 16]);
 
@@ -2740,6 +2749,7 @@ pub(crate) mod partition_error_tests {
             None
         })
         .await
+        .unwrap()
     }
 
     async fn consumer_on(broker: &MockBroker) -> Consumer {
@@ -2752,14 +2762,10 @@ pub(crate) mod partition_error_tests {
     }
 
     /// A consumer of `group-a` on `client` that owns `orders-0` at offset 5.
-    pub(crate) fn consumer_with_client(client: Client) -> Consumer {
+    pub fn consumer_with_client(client: Client) -> Consumer {
         Consumer::test_builder(client)
             .commit_identity(test_support::orders_partition_commit_identity(1))
-            .subscription(crate::subscription::shared(
-                vec!["orders".into()],
-                None,
-                true,
-            ))
+            .subscription(shared(vec!["orders".into()], None, true))
             .assigned(vec![("orders".into(), 0)])
             .next_offsets(maplit::hashmap! {("orders".into(), 0) => 5})
             .topic_ids(maplit::hashmap! {"orders".into() => TOPIC_ID})
@@ -2816,24 +2822,24 @@ pub(crate) mod partition_error_tests {
     #[tokio::test]
     async fn poll_returns_a_fatal_rejoin_error_once() {
         let broker = metadata_counting_broker(Arc::default()).await;
-        let mut consumer = consumer_on(&broker).await;
-        let topics = maplit::btreeset! {"orders".to_string()};
+        let consumer = consumer_on(&broker).await;
+        let topics = maplit::btreeset! {"orders".to_owned()};
         coordinator::report_rejoin_error(
             &consumer.poll_error,
             ConsumerError::TopicAuthorizationFailed(topics.clone()),
         );
 
         let first = consumer
-            .prepare_poll(tokio::time::Instant::now() + Duration::from_secs(5))
+            .prepare_poll(Instant::now() + Duration::from_secs(5))
             .await
             .map_err(|error| match error {
                 ConsumerError::TopicAuthorizationFailed(topics) => Some(topics),
                 _ => None,
             });
         let second = consumer
-            .prepare_poll(tokio::time::Instant::now() + Duration::from_secs(5))
+            .prepare_poll(Instant::now() + Duration::from_secs(5))
             .await
-            .map_err(|_| None::<std::collections::BTreeSet<String>>);
+            .map_err(|_| None::<BTreeSet<String>>);
 
         broker.stop();
         assert2::assert!((first, second) == (Err(Some(topics)), Ok(true)));
@@ -2847,25 +2853,23 @@ pub(crate) mod partition_error_tests {
     async fn drain_never_returns_records_of_a_partition_revoked_during_the_drain() {
         let broker = metadata_counting_broker(Arc::default()).await;
         let mut consumer = consumer_on(&broker).await;
-        consumer
-            .fetch_buffer
-            .push(crate::fetch_buffer::BufferedPartition {
-                key: ("orders".into(), 0),
-                position: 5,
-                records: std::collections::VecDeque::from([ConsumerRecord {
-                    topic: "orders".into(),
-                    partition: 0,
-                    offset: 5,
-                    leader_epoch: 0,
-                    timestamp: 0,
-                    timestamp_type: crate::TimestampType::CreateTime,
-                    key: None,
-                    value: None,
-                    headers: Vec::new(),
-                }]),
-                next_offset: 6,
-                last_epoch: None,
-            });
+        consumer.fetch_buffer.push(BufferedPartition {
+            key: ("orders".into(), 0),
+            position: 5,
+            records: VecDeque::from([ConsumerRecord {
+                topic: "orders".into(),
+                partition: 0,
+                offset: 5,
+                leader_epoch: 0,
+                timestamp: 0,
+                timestamp_type: crate::TimestampType::CreateTime,
+                key: None,
+                value: None,
+                headers: Vec::new(),
+            }]),
+            next_offset: 6,
+            last_epoch: None,
+        });
         let assigned = Arc::clone(&consumer.assigned);
         let next_offsets = Arc::clone(&consumer.next_offsets);
         // Block the drain between the ownership check and the position update.
@@ -2874,15 +2878,14 @@ pub(crate) mod partition_error_tests {
             let records = consumer.drain_fetch_buffer().await;
             (consumer, records)
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         // The coordinator revokes the partition, if it can take the lock.
-        let revoked = match tokio::time::timeout(Duration::from_millis(50), assigned.lock()).await {
-            Ok(mut owned) => {
+        let revoked = timeout(Duration::from_millis(50), assigned.lock())
+            .await
+            .is_ok_and(|mut owned| {
                 owned.clear();
                 true
-            }
-            Err(_) => false,
-        };
+            });
         drop(offsets_guard);
         let (consumer, records) = drain.await.expect("drain task");
         drop(consumer);
@@ -2940,16 +2943,16 @@ pub(crate) mod partition_error_tests {
             if !owns_partitions {
                 consumer.assigned.lock().await.clear();
             }
-            let pending_sender = tokio::sync::watch::Sender::new(pending);
+            let pending_sender = watch::Sender::new(pending);
             consumer.rebalance_pending = pending_sender.subscribe();
             let completion = join_completes_after.map(|millis| {
                 let pending_sender = pending_sender.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(millis)).await;
+                    sleep(Duration::from_millis(millis)).await;
                     pending_sender.send_replace(false);
                 })
             });
-            let start = tokio::time::Instant::now();
+            let start = Instant::now();
             let joined = consumer
                 .wait_for_rebalance(start + Duration::from_millis(500))
                 .await
@@ -2999,11 +3002,11 @@ pub(crate) mod partition_error_tests {
                 return None;
             }
             fetches_in_mock.fetch_add(1, Ordering::SeqCst);
-            let batch = krabka_protocol::records::RecordBatch {
+            let batch = RecordBatch {
                 base_offset: 5,
                 last_offset_delta: 1199,
                 records: (0..1200)
-                    .map(|offset_delta| krabka_protocol::records::Record {
+                    .map(|offset_delta| Record {
                         offset_delta,
                         value: Some(bytes::Bytes::from_static(b"v")),
                         ..Default::default()
@@ -3017,7 +3020,8 @@ pub(crate) mod partition_error_tests {
             response.responses[0].partitions[0].records = Some(RecordsPayload::V2(vec![batch]));
             Some(encode(&response, version))
         })
-        .await;
+        .await
+        .unwrap();
         let mut consumer = consumer_on(&broker).await;
 
         let mut polls = Vec::new();
@@ -3031,7 +3035,7 @@ pub(crate) mod partition_error_tests {
                     .next_offsets
                     .lock()
                     .await
-                    .get(&("orders".to_string(), 0))
+                    .get(&("orders".to_owned(), 0))
                     .copied(),
             });
         }
@@ -3091,7 +3095,7 @@ pub(crate) mod partition_error_tests {
             let metadata_requests = Arc::new(AtomicUsize::new(0));
             let broker = metadata_counting_broker(Arc::clone(&metadata_requests)).await;
             let mut consumer = consumer_on(&broker).await;
-            let key = ("orders".to_string(), 0);
+            let key = ("orders".to_owned(), 0);
             consumer
                 .positions
                 .lock()
@@ -3099,7 +3103,7 @@ pub(crate) mod partition_error_tests {
                 .entry(key.clone())
                 .or_default()
                 .leader_id = 1;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(5);
             check!(
                 consumer
                     .update_fetch_positions(None, Some(deadline))
@@ -3208,7 +3212,7 @@ pub(crate) mod partition_error_tests {
                     .next_offsets
                     .lock()
                     .await
-                    .get(&("orders".to_string(), 0))
+                    .get(&("orders".to_owned(), 0))
                     .copied(),
             };
 
@@ -3241,7 +3245,7 @@ pub(crate) mod partition_error_tests {
     /// `ListOffsets` is not valid, and `allConsumed` skips it.
     #[tokio::test]
     async fn a_reset_in_poll_moves_the_position_of_the_commit_before_join() {
-        let orders_0 = ("orders".to_string(), 0);
+        let orders_0 = ("orders".to_owned(), 0);
         let cases = [
             (
                 "no reset: the position at the start of poll",
@@ -3284,7 +3288,7 @@ pub(crate) mod partition_error_tests {
             .await;
             leader_port.store(broker.addr.port(), Ordering::SeqCst);
             let mut consumer = consumer_on(&broker).await;
-            let auto_commit = crate::commit::AutoCommit::new(std::time::Duration::from_secs(5));
+            let auto_commit = AutoCommit::new(Duration::from_secs(5));
             consumer.auto_commit = Some(auto_commit.clone());
             // The start of `poll` records the positions. The interval has not
             // passed, so it sends no commit.
@@ -3349,7 +3353,7 @@ pub(crate) mod partition_error_tests {
 
     /// The `ListOffsets` requests that the mock brokers decoded, with the
     /// name of the broker that received each one and the request version.
-    type SentListOffsets = Arc<std::sync::Mutex<Vec<(&'static str, i16, ListOffsetsRequest)>>>;
+    type SentListOffsets = Arc<Mutex<Vec<(&'static str, i16, ListOffsetsRequest)>>>;
 
     /// The response bytes for a `ListOffsets` request at `version` with one
     /// `orders-0` row.
@@ -3410,14 +3414,12 @@ pub(crate) mod partition_error_tests {
                     .topic_id(TOPIC_ID.0)
                     .leader_id(LEADER_ID)
                     .leader_epoch(LEADER_EPOCH)
-                    .brokers(vec![
-                        krabka_protocol::owned::metadata_response::MetadataResponseBroker {
-                            node_id: LEADER_ID,
-                            host: "127.0.0.1".into(),
-                            port: i32::from(leader_port.load(Ordering::SeqCst)),
-                            ..Default::default()
-                        },
-                    ])
+                    .brokers(vec![MetadataResponseBroker {
+                        node_id: LEADER_ID,
+                        host: "127.0.0.1".into(),
+                        port: i32::from(leader_port.load(Ordering::SeqCst)),
+                        ..Default::default()
+                    }])
                     .build();
                 return Some(encode(&metadata, version));
             }
@@ -3431,6 +3433,7 @@ pub(crate) mod partition_error_tests {
             None
         })
         .await
+        .unwrap()
     }
 
     /// The `ListOffsets` request that the consumer sends for `orders-0`.
@@ -3456,7 +3459,7 @@ pub(crate) mod partition_error_tests {
     #[derive(Debug, PartialEq)]
     enum PollFailure {
         /// `ConsumerError::TopicAuthorizationFailed` with its topics.
-        TopicAuthorizationFailed(std::collections::BTreeSet<String>),
+        TopicAuthorizationFailed(BTreeSet<String>),
         /// `ClientError::IncompatibleVersion` as
         /// `(api_key, broker_min, broker_max, client_min, client_max)`.
         IncompatibleVersion(i16, i16, i16, i16, i16),
@@ -3577,20 +3580,19 @@ pub(crate) mod partition_error_tests {
                     .await
                     .insert(("orders".into(), 0), LATEST_SENTINEL);
                 consumer
-                    .prepare_poll(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .prepare_poll(Instant::now() + Duration::from_secs(5))
                     .await
                     .map(|_| ())
             }
             Reset::ByOneHour => {
-                consumer.auto_offset_reset =
-                    AutoOffsetReset::ByDuration(std::time::Duration::from_hours(1));
+                consumer.auto_offset_reset = AutoOffsetReset::ByDuration(Duration::from_hours(1));
                 consumer
                     .next_offsets
                     .lock()
                     .await
                     .insert(("orders".into(), 0), LATEST_SENTINEL);
                 consumer
-                    .prepare_poll(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .prepare_poll(Instant::now() + Duration::from_secs(5))
                     .await
                     .map(|_| ())
             }
@@ -3604,8 +3606,7 @@ pub(crate) mod partition_error_tests {
             Reset::SeekToBeginning | Reset::SeekToEnd => {
                 // Kafka's `seekToBeginning` and `seekToEnd` ignore
                 // `auto.offset.reset`.
-                consumer.auto_offset_reset =
-                    AutoOffsetReset::ByDuration(std::time::Duration::from_hours(1));
+                consumer.auto_offset_reset = AutoOffsetReset::ByDuration(Duration::from_hours(1));
                 consumer.default_api_timeout = krabka_units::millis(300);
                 let reset = if matches!(exchange.reset, Reset::SeekToBeginning) {
                     consumer.seek_to_beginning(&[]).await
@@ -3628,7 +3629,7 @@ pub(crate) mod partition_error_tests {
                 .next_offsets
                 .lock()
                 .await
-                .get(&("orders".to_string(), 0))
+                .get(&("orders".to_owned(), 0))
                 .copied(),
         };
 
@@ -3700,7 +3701,7 @@ pub(crate) mod partition_error_tests {
                 ListOffsetsOutcome {
                     requests: latest_request(1),
                     result: Err(PollFailure::TopicAuthorizationFailed(
-                        maplit::btreeset! {"orders".to_string()},
+                        maplit::btreeset! {"orders".to_owned()},
                     )),
                     metadata_requests: 1,
                     metadata_update_requested: false,
@@ -3814,8 +3815,8 @@ pub(crate) mod partition_error_tests {
         let actual = [
             AutoOffsetReset::Latest,
             AutoOffsetReset::None,
-            AutoOffsetReset::ByDuration(std::time::Duration::from_hours(1)),
-            AutoOffsetReset::ByDuration(std::time::Duration::from_millis(1500)),
+            AutoOffsetReset::ByDuration(Duration::from_hours(1)),
+            AutoOffsetReset::ByDuration(Duration::from_millis(1500)),
         ]
         .map(|policy| reset_timestamp(policy, now));
         assert2::assert!(actual == [-1, -1, now - 3_600_000, now - 1500]);
@@ -3970,19 +3971,19 @@ pub(crate) mod partition_error_tests {
 /// Record batch timestamp cases that the classic and the share consumer tests
 /// share.
 #[cfg(test)]
-pub(crate) mod timestamp_cases {
+pub mod timestamp_cases {
     use bytes::Bytes;
     use consumer::TimestampType;
     use krabka_protocol::records::{Attributes, Record, RecordBatch};
 
     use crate::consumer;
 
-    pub(crate) const BASE_OFFSET: i64 = 5;
-    pub(crate) const LEADER_EPOCH: i32 = 3;
-    pub(crate) const VALUES: [&[u8]; 2] = [b"v0", b"v1"];
+    pub const BASE_OFFSET: i64 = 5;
+    pub const LEADER_EPOCH: i32 = 3;
+    pub const VALUES: [&[u8]; 2] = [b"v0", b"v1"];
 
     /// One batch with two records and the timestamps Kafka gives them.
-    pub(crate) struct TimestampCase {
+    pub struct TimestampCase {
         pub(crate) name: &'static str,
         pub(crate) attributes: Attributes,
         pub(crate) base_timestamp: i64,
@@ -3991,7 +3992,7 @@ pub(crate) mod timestamp_cases {
         pub(crate) expected: [(i64, TimestampType); 2],
     }
 
-    pub(crate) const CASES: [TimestampCase; 3] = [
+    pub const CASES: [TimestampCase; 3] = [
         TimestampCase {
             name: "create time adds the delta to the base timestamp",
             attributes: Attributes(0),
@@ -4027,7 +4028,7 @@ pub(crate) mod timestamp_cases {
         },
     ];
 
-    pub(crate) fn batch(case: &TimestampCase) -> RecordBatch {
+    pub fn batch(case: &TimestampCase) -> RecordBatch {
         RecordBatch {
             base_offset: BASE_OFFSET,
             partition_leader_epoch: LEADER_EPOCH,
@@ -4058,7 +4059,7 @@ pub(crate) mod timestamp_cases {
 mod fetch_path_tests {
     use std::{
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicU16, Ordering},
         },
         time::Duration,
@@ -4083,8 +4084,13 @@ mod fetch_path_tests {
     };
     use krabka_units::{millis, secs};
     use test_support::RecordingListener;
+    use tokio::{
+        sync::watch,
+        time::{sleep, timeout},
+    };
 
     use super::*;
+    use crate::rebalance_listener::AssignedCallbackGate;
 
     const TOPIC_ID: WireUuid = WireUuid([7; 16]);
 
@@ -4105,7 +4111,7 @@ mod fetch_path_tests {
 
     /// The Fetch requests that the mock brokers received: `(broker id,
     /// request)`.
-    type SentFetches = Arc<std::sync::Mutex<Vec<(i32, FetchRequest)>>>;
+    type SentFetches = Arc<Mutex<Vec<(i32, FetchRequest)>>>;
 
     fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
         let mut buf = bytes::BytesMut::new();
@@ -4124,8 +4130,8 @@ mod fetch_path_tests {
             let node_id = i32::try_from(index).expect("index") + 1;
             let ports_in_mock = Arc::clone(&ports);
             let sent = Arc::clone(sent);
-            let answers = std::sync::Mutex::new(answers.clone().into_iter());
-            let last = std::sync::Mutex::new(FetchAnswer::Silent);
+            let answers = Mutex::new(answers.clone().into_iter());
+            let last = Mutex::new(FetchAnswer::Silent);
             let broker = MockBroker::start(move |api_key, version, _corr_id, mut body| {
                 if api_key == api_versions_request::API_KEY {
                     let versions = mock_test_support::api_versions_response_ranges([
@@ -4173,8 +4179,9 @@ mod fetch_path_tests {
                     body.advance(client_id_len);
                     let request = FetchRequest::decode(&mut body, version).expect("decode fetch");
                     sent.lock().expect("sent lock").push((node_id, request));
+                    let answer = answers.lock().expect("answers lock").next();
                     let mut last = last.lock().expect("last lock");
-                    if let Some(answer) = answers.lock().expect("answers lock").next() {
+                    if let Some(answer) = answer {
                         *last = answer;
                     }
                     return match *last {
@@ -4220,7 +4227,8 @@ mod fetch_path_tests {
                 }
                 None
             })
-            .await;
+            .await
+            .unwrap();
             ports[index].store(broker.addr.port(), Ordering::SeqCst);
             brokers.push(broker);
         }
@@ -4311,11 +4319,11 @@ mod fetch_path_tests {
         let brokers = start_brokers(&[silent.clone(), silent.clone(), silent], &sent).await;
         let mut consumer = consumer_on(&brokers).await;
         consumer.refresh_leader_epochs().await.expect("metadata");
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let records = consumer.poll(millis(300)).await.expect("poll");
         let elapsed = started.elapsed();
         // Let the requests reach the brokers.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         let mut leaders: Vec<i32> = sent
             .lock()
             .expect("sent lock")
@@ -4344,12 +4352,12 @@ mod fetch_path_tests {
             brokers,
             mut consumer,
         } = two_partition_fetch_setup().await;
-        let gate = crate::rebalance_listener::AssignedCallbackGate::new(
+        let gate = AssignedCallbackGate::new(
             &consumer.assigned_callback_pending,
             &[("orders".to_owned(), 0)],
         );
         consumer.poll(millis(200)).await.expect("poll");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         let leaders = |sent: &SentFetches| {
             let mut leaders: Vec<i32> = sent
                 .lock()
@@ -4363,7 +4371,7 @@ mod fetch_path_tests {
         let waiting = leaders(&sent);
         drop(gate);
         consumer.poll(millis(200)).await.expect("poll");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         let after = leaders(&sent);
         drop(consumer);
         stop(brokers);
@@ -4452,14 +4460,14 @@ mod fetch_path_tests {
             .await
             .expect("pause");
         consumer.poll(millis(200)).await.expect("poll");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         let paused = fetched(&sent);
         consumer
             .resume(&[("orders".to_owned(), 0)])
             .await
             .expect("resume");
         consumer.poll(millis(200)).await.expect("poll");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         let resumed = fetched(&sent);
         let unowned = consumer
             .position("orders", 9)
@@ -4495,7 +4503,7 @@ mod fetch_path_tests {
             .pause(&[("orders".to_owned(), 0)])
             .await
             .expect("pause");
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let records = consumer.poll(millis(300)).await.expect("poll").len();
         let waited = started.elapsed() >= Duration::from_millis(250);
         let fetches = sent.lock().expect("sent lock").len();
@@ -4518,10 +4526,10 @@ mod fetch_path_tests {
             .map_err(|error| error.to_string());
         let handle = consumer.wakeup_handle();
         let waker = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
             handle.wakeup();
         });
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let blocked = consumer
             .poll(secs(10))
             .await
@@ -4561,7 +4569,8 @@ mod fetch_path_tests {
                 )
             })
         })
-        .await;
+        .await
+        .unwrap();
         let client = Client::builder()
             .bootstrap(silent.addr.to_string())
             .request_timeout(secs(30))
@@ -4571,10 +4580,10 @@ mod fetch_path_tests {
         let mut consumer = poll::partition_error_tests::consumer_with_client(client);
         let handle = consumer.wakeup_handle();
         let waker = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
             handle.wakeup();
         });
-        let polled = tokio::time::timeout(Duration::from_secs(5), consumer.poll(secs(10)))
+        let polled = timeout(Duration::from_secs(5), consumer.poll(secs(10)))
             .await
             .map(|result| {
                 result
@@ -4606,15 +4615,15 @@ mod fetch_path_tests {
             .pause(&[("orders".to_owned(), 0)])
             .await
             .expect("pause");
-        let (pending, pending_rx) = tokio::sync::watch::channel(false);
+        let (pending, pending_rx) = watch::channel(false);
         consumer.rebalance_pending = pending_rx;
         let rebalance = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
             pending.send_replace(true);
             // Keep the sender, as the coordinator task does.
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            sleep(Duration::from_secs(10)).await;
         });
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         consumer.poll(secs(5)).await.expect("poll");
         let ended_early = started.elapsed() < Duration::from_secs(2);
         rebalance.abort();
@@ -4656,7 +4665,7 @@ mod fetch_path_tests {
             .lock()
             .await
             .insert(("orders".to_owned(), 0), COMMITTED_SENTINEL);
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let result = consumer
             .poll(millis(200))
             .await
@@ -4681,13 +4690,13 @@ mod fetch_path_tests {
             &sent,
         )
         .await;
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
         let mut consumer = Consumer::builder()
             .bootstrap(brokers[0].addr.to_string())
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .rebalance_listener(Box::new(
                 RecordingListener::builder()
-                    .calls(std::sync::Arc::clone(&calls))
+                    .calls(Arc::clone(&calls))
                     .build(),
             ))
             .build()
@@ -4853,14 +4862,14 @@ mod fetch_path_tests {
                         consumer.poll(secs(2)).await.expect("poll");
                         // The fetch sessions of the two brokers are independent;
                         // wait until the Fetch of this poll is recorded.
-                        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                        let _ = timeout(Duration::from_secs(2), async {
                             while sent.lock().expect("sent lock").len() == before {
-                                tokio::time::sleep(Duration::from_millis(5)).await;
+                                sleep(Duration::from_millis(5)).await;
                             }
                         })
                         .await;
                     }
-                    WaitForExpiry => tokio::time::sleep(Duration::from_millis(400)).await,
+                    WaitForExpiry => sleep(Duration::from_millis(400)).await,
                 }
             }
             let requests: Vec<(i32, String)> = sent
@@ -4971,7 +4980,7 @@ mod fetch_path_tests {
         let sent = SentFetches::default();
         let brokers = start_brokers(&[vec![FetchAnswer::Silent]], &sent).await;
         let mut consumer = consumer_on(&brokers).await;
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let completed = Arc::clone(&consumer.fetches.completed);
         consumer.fetches.in_flight.insert(
             -1,
@@ -4980,14 +4989,14 @@ mod fetch_path_tests {
                     let _ = tx.send(Ok(FetchResponse::default()));
                     completed.notify_one();
                     // The task ends late.
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    sleep(Duration::from_secs(3)).await;
                 }),
                 result: rx,
                 requested: HashMap::new(),
-                from_replica: std::collections::HashSet::new(),
+                from_replica: HashSet::new(),
             },
         );
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         consumer
             .wait_for_fetches(started + Duration::from_secs(2))
             .await;
@@ -5007,7 +5016,7 @@ mod fetch_path_tests {
         let mut consumer = consumer_on(&brokers).await;
         consumer.auto_offset_reset = AutoOffsetReset::Latest;
         let key = ("orders".to_owned(), 0);
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         consumer.fetches.in_flight.insert(
             2,
             InFlightFetch {
@@ -5052,14 +5061,14 @@ mod fetch_path_tests {
         let sent = SentFetches::default();
         let brokers = start_brokers(&[vec![FetchAnswer::Silent]], &sent).await;
         let mut consumer = consumer_on(&brokers).await;
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         consumer.fetches.in_flight.insert(
             -1,
             InFlightFetch {
                 handle: tokio::spawn(async {}),
                 result: rx,
                 requested: maplit::hashmap! {("orders".to_owned(), 0) => 5},
-                from_replica: std::collections::HashSet::new(),
+                from_replica: HashSet::new(),
             },
         );
         // A seek moves the position while the Fetch is in flight.
@@ -5068,10 +5077,10 @@ mod fetch_path_tests {
             .lock()
             .await
             .insert(("orders".to_owned(), 0), 40);
-        let record = krabka_protocol::records::RecordBatch {
+        let record = RecordBatch {
             base_offset: 5,
             last_offset_delta: 0,
-            records: vec![krabka_protocol::records::Record {
+            records: vec![Record {
                 offset_delta: 0,
                 value: Some(bytes::Bytes::from_static(b"old")),
                 ..Default::default()
@@ -5093,7 +5102,7 @@ mod fetch_path_tests {
         }))
         .expect("send response");
         consumer
-            .wait_for_fetches(tokio::time::Instant::now() + Duration::from_secs(5))
+            .wait_for_fetches(Instant::now() + Duration::from_secs(5))
             .await;
         let topic_ids = consumer.topic_ids.lock().await.clone();
         let responses = consumer
@@ -5126,8 +5135,8 @@ mod fetch_path_tests {
     /// `fetch_offset` of every `Fetch` request it decodes.
     async fn no_committed_offset_broker(
         list_offsets_offset: i64,
-        list_offsets_timestamps: Arc<std::sync::Mutex<Vec<i64>>>,
-        fetch_offsets: Arc<std::sync::Mutex<Vec<i64>>>,
+        list_offsets_timestamps: Arc<Mutex<Vec<i64>>>,
+        fetch_offsets: Arc<Mutex<Vec<i64>>>,
     ) -> MockBroker {
         use krabka_protocol::owned::{
             list_offsets_request::FLEXIBLE_MIN,
@@ -5207,6 +5216,7 @@ mod fetch_path_tests {
             None
         })
         .await
+        .unwrap()
     }
 
     /// A consumer of `group-a`, assigned `orders-0` with no committed offset:
@@ -5276,8 +5286,8 @@ mod fetch_path_tests {
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for case in cases {
-            let list_offsets_timestamps: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
-            let fetch_offsets: Arc<std::sync::Mutex<Vec<i64>>> = Arc::default();
+            let list_offsets_timestamps: Arc<Mutex<Vec<i64>>> = Arc::default();
+            let fetch_offsets: Arc<Mutex<Vec<i64>>> = Arc::default();
             let broker = no_committed_offset_broker(
                 40,
                 Arc::clone(&list_offsets_timestamps),

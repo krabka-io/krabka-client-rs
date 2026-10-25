@@ -5,9 +5,11 @@
 //! routes each dialed `host:port` to a local listener that a test
 //! registered. A dial to a host name that does not resolve, or to an address
 //! that no machine answers, can thus connect only through the connector.
+#![cfg(test)]
 
 use std::{
     collections::HashMap,
+    future::{pending, ready},
     io::{self, Read as _},
     net::{SocketAddr, TcpListener},
     sync::{
@@ -34,7 +36,11 @@ use krabka_protocol::{
     },
 };
 use krabka_units::millis;
-use tokio::{io::AsyncWriteExt as _, net::TcpStream};
+use tokio::{
+    io::AsyncWriteExt as _,
+    net::{self, TcpStream},
+    time::{Instant, sleep, timeout},
+};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 // Where the router sends a dial.
@@ -70,7 +76,7 @@ impl Connector for RouterConnector {
         Box::pin(async move {
             match route {
                 Some(Route::Listener(target)) => TcpStream::connect(target).await,
-                Some(Route::Stall) => std::future::pending().await,
+                Some(Route::Stall) => pending().await,
                 None => Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     format!("no route to {}:{}", key.0, key.1),
@@ -85,7 +91,7 @@ struct Refusing;
 
 impl Connector for Refusing {
     fn connect(&self, _host: &str, _port: u16) -> ConnectFuture {
-        Box::pin(std::future::ready(Err(io::Error::other(
+        Box::pin(ready(Err(io::Error::other(
             "the refused connector is in use",
         ))))
     }
@@ -134,7 +140,7 @@ fn api_versions() -> ApiVersionsResponse {
 // Answer each `ApiVersions` request on the first connection to `listener`.
 async fn serve_api_versions(listener: TcpListener) {
     listener.set_nonblocking(true).unwrap();
-    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let listener = net::TcpListener::from_std(listener).unwrap();
     let (stream, _) = listener.accept().await.unwrap();
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
     while let Some(Ok(request)) = framed.next().await {
@@ -209,14 +215,14 @@ async fn a_stalled_connector_blocks_neither_the_runtime_nor_the_deadlines() {
         let ticks = Arc::clone(&ticks);
         async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                sleep(Duration::from_millis(10)).await;
                 ticks.fetch_add(1, Ordering::Relaxed);
             }
         }
     });
-    let started = tokio::time::Instant::now();
+    let started = Instant::now();
 
-    let dialed = tokio::time::timeout(
+    let dialed = timeout(
         Duration::from_millis(100),
         dial("stalled.connector.test", 9092, SocketOptions::default()),
     )

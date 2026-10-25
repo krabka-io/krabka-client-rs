@@ -11,17 +11,8 @@ use crate::{
 };
 
 impl AdminClient {
-    /// Unregisters one broker from the active `KRaft` controller.
-    ///
-    /// Kafka's `KafkaAdminClient.unregisterBroker` retries
-    /// `REQUEST_TIMED_OUT` (7) with the retry backoff until the call deadline
-    /// (`default.api.timeout.ms`, 60 s), and fails at once on every other
-    /// code, `NOT_CONTROLLER` (41) too. This call does the same.
-    ///
-    /// # Errors
-    /// Returns a transport, protocol, or broker error. At the deadline it
-    /// gives `REQUEST_TIMED_OUT` (7).
-    pub async fn unregister_broker(&mut self, broker_id: i32) -> Result<(), AdminError> {
+    /// The call behind [`AdminClientLike::unregister_broker`](crate::AdminClientLike::unregister_broker).
+    pub(crate) async fn unregister_broker_impl(&self, broker_id: i32) -> Result<(), AdminError> {
         self.unregister_broker_with_retry(broker_id, self.retry)
             .await
     }
@@ -46,7 +37,7 @@ impl AdminClient {
     }
 
     async fn unregister_broker_with_retry(
-        &mut self,
+        &self,
         broker_id: i32,
         policy: RetryPolicy,
     ) -> Result<(), AdminError> {
@@ -69,7 +60,7 @@ impl AdminClient {
     }
 
     async fn unregister_controller_with_retry(
-        &mut self,
+        &self,
         controller_id: i32,
         policy: RetryPolicy,
     ) -> Result<(), AdminError> {
@@ -261,6 +252,7 @@ mod tests {
             Some(body.to_vec())
         })
         .await
+        .unwrap()
     }
 
     /// Kafka's `unregisterBroker` and `unregisterController` retry
@@ -299,7 +291,7 @@ mod tests {
             ] {
                 let sent = Arc::new(Mutex::new(Vec::new()));
                 let broker = unregister_mock(call, codes, Arc::clone(&sent)).await;
-                let mut admin = AdminClient::connect(&[broker.addr.to_string()])
+                let admin = AdminClient::connect(&[broker.addr.to_string()])
                     .await
                     .expect("admin connects");
                 let backoff = if timeout == LONG {
