@@ -1319,6 +1319,47 @@ mod tests {
         );
     }
 
+    /// Kafka's `handleUnsupportedVersionException`: a coordinator that lists
+    /// `ConsumerGroupDescribe` only at versions this client does not speak
+    /// gets each group through `DescribeGroups`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn describe_consumer_groups_falls_back_when_no_version_is_common() {
+        let AdminGroupCluster { cluster, admin } = admin_group_cluster()
+            .apis(vec![
+                ApiVersionRange::builder()
+                    .api_key(consumer_group_describe_request::API_KEY)
+                    .min_version(50)
+                    .max_version(50)
+                    .build(),
+                api_range(describe_groups_request::API_KEY, 5),
+            ])
+            .answer(|_, api_key, version, body, _| {
+                // The fallback sends `DescribeGroups` only.
+                assert!(api_key == describe_groups_request::API_KEY);
+                let groups = describe_groups_ids(body, version)
+                    .iter()
+                    .map(|id| classic_entry(id, 0, "consumer"))
+                    .collect();
+                mock_response(encode_response(&classic_response(groups), version, true))
+            })
+            .call()
+            .await;
+
+        let result = admin
+            .describe_consumer_groups(&["classic"], default_describe_options())
+            .await;
+
+        let first_broker = cluster.addrs[0];
+        let _seen = cluster.stop();
+        let b0 = node(first_broker, 0);
+        assert!(
+            result
+                == maplit::btreemap! {
+                    "classic".to_owned() => Ok(classic_group_description(b0)),
+                }
+        );
+    }
+
     /// Every describe handler retries `COORDINATOR_LOAD_IN_PROGRESS` on the
     /// same coordinator, finds the coordinator again on
     /// `COORDINATOR_NOT_AVAILABLE` and `NOT_COORDINATOR`, and fails every

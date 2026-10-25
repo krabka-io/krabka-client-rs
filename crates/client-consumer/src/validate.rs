@@ -301,6 +301,71 @@ mod tests {
         }
     }
 
+    fn answer(leader_epoch: i32, end_offset: i64, error_code: i16) -> EpochEndOffset {
+        EpochEndOffset {
+            partition: 0,
+            leader_epoch,
+            end_offset,
+            error_code,
+        }
+    }
+
+    /// `apply_epoch_answer` applies an `OffsetForLeaderEpoch` answer for a
+    /// position at offset 100, epoch 2, asked with leader epoch 3.
+    #[test]
+    fn epoch_answers_update_the_position_or_report_truncation() {
+        for (name, position, answer, expected_position, expected_truncation) in [
+            (
+                "the partition moved away",
+                None,
+                answer(2, 150, 0),
+                None,
+                None,
+            ),
+            (
+                "metadata moved past the asked leader epoch",
+                Some(pos(2, 4, true)),
+                answer(2, 150, 0),
+                Some(pos(2, 4, true)),
+                None,
+            ),
+            (
+                "an error answer keeps the partition flagged",
+                Some(pos(2, 3, true)),
+                answer(-1, -1, 74),
+                Some(pos(2, -1, true)),
+                None,
+            ),
+            (
+                "a consistent answer validates the position",
+                Some(pos(2, 3, true)),
+                answer(3, 150, 0),
+                Some(pos(3, 3, false)),
+                None,
+            ),
+            (
+                "an epoch that ends below the offset is a truncation",
+                Some(pos(2, 3, true)),
+                answer(2, 80, 0),
+                Some(pos(2, 3, false)),
+                Some(80),
+            ),
+        ] {
+            let mut position = position;
+            let truncation = apply_epoch_answer(
+                position.as_mut(),
+                &answer,
+                100,
+                LeaderEpoch(2),
+                LeaderEpoch(3),
+            );
+            check!(
+                (position, truncation) == (expected_position, expected_truncation),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn leader_epoch_update_marks_only_real_advances_with_consumed_epoch() {
         let mut p = pos(2, 2, false);

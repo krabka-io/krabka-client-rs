@@ -4552,6 +4552,26 @@ mod retry_tests {
 
         assert_retried_until_deadline(&r, &calls);
     }
+
+    /// A request without coordinator details cannot find the coordinator
+    /// again, so `run_with_refind` refuses it.
+    #[tokio::test]
+    async fn run_with_refind_needs_coordinator_details() {
+        let result = CoordinatorRetryRequest::builder()
+            .retry(CoordinatorRetryPolicy {
+                timeout: Duration::from_secs(1),
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            })
+            .code(|code: &i16| *code)
+            .make(|| async { Ok(0_i16) })
+            .build()
+            .run_with_refind()
+            .await;
+
+        assert2::assert!(let Err(ConsumerError::IllegalState(message)) = result);
+        check!(message == "refind request requires coordinator details");
+    }
 }
 
 #[cfg(test)]

@@ -629,6 +629,7 @@ mod tests {
     use krabka_protocol::{
         Decode, Encode, UnknownTaggedFields,
         owned::{
+            alter_user_scram_credentials_request,
             alter_user_scram_credentials_response::{
                 AlterUserScramCredentialsResponse, AlterUserScramCredentialsResult,
             },
@@ -840,6 +841,105 @@ mod tests {
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
             }
         );
+    }
+
+    /// The SCRAM-SHA-512 and SCRAM-SHA-256 calls send their own mechanism
+    /// (2 and 1, KIP-554) for each upsertion and deletion, and map the result
+    /// of each user.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alter_user_scram_credentials_sends_the_mechanism_of_the_call() {
+        for (name, sha512, wire_mechanism) in [("SHA-512", true, 2_i8), ("SHA-256", false, 1)] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&seen);
+            let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
+                if api_key == api_versions_request::API_KEY {
+                    return Some(api_versions_response(
+                        alter_user_scram_credentials_request::API_KEY,
+                        0,
+                    ));
+                }
+                if api_key != alter_user_scram_credentials_request::API_KEY {
+                    return None;
+                }
+                let mut body = request_body_after_header(body, true);
+                let request = AlterUserScramCredentialsRequest::decode(&mut body, version)
+                    .expect("alter SCRAM request decodes");
+                captured.lock().expect("request capture lock").extend(
+                    request
+                        .upsertions
+                        .iter()
+                        .map(|upsertion| (upsertion.name.clone(), upsertion.mechanism))
+                        .chain(
+                            request
+                                .deletions
+                                .iter()
+                                .map(|deletion| (deletion.name.clone(), deletion.mechanism)),
+                        ),
+                );
+                let mut response = vec![0];
+                response.extend(encode_at(
+                    &AlterUserScramCredentialsResponse {
+                        results: vec![
+                            AlterUserScramCredentialsResult {
+                                user: "alice".into(),
+                                ..Default::default()
+                            },
+                            AlterUserScramCredentialsResult {
+                                user: "bob".into(),
+                                error_code: 69,
+                                error_message: Some("no credential".into()),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    version,
+                ));
+                Some(response)
+            })
+            .await
+            .unwrap();
+            let mut admin = AdminClient::connect(&[mock.addr.to_string()])
+                .await
+                .expect("admin connects to mock broker");
+            let upsertions = [ScramUpsertion {
+                username: "alice".into(),
+                password: "secret".into(),
+                iterations: DEFAULT_SCRAM_ITERATIONS,
+            }];
+            let deletions = [ScramDeletion {
+                username: "bob".into(),
+            }];
+
+            let outcomes = if sha512 {
+                admin
+                    .alter_user_scram_credentials_sha512(&upsertions, &deletions)
+                    .await
+            } else {
+                admin
+                    .alter_user_scram_credentials_sha256(&upsertions, &deletions)
+                    .await
+            }
+            .expect("alter SCRAM response maps");
+
+            mock.stop();
+            let outcomes = outcomes
+                .into_iter()
+                .map(|outcome| (outcome.username, outcome.error.map(|error| error.code)))
+                .collect::<Vec<_>>();
+            let sent = seen.lock().expect("request capture lock").clone();
+            check!(
+                (outcomes, sent)
+                    == (
+                        vec![("alice".to_owned(), None), ("bob".to_owned(), Some(69))],
+                        vec![
+                            ("alice".to_owned(), wire_mechanism),
+                            ("bob".to_owned(), wire_mechanism),
+                        ],
+                    ),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

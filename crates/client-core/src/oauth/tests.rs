@@ -1,4 +1,5 @@
 use std::{
+    future,
     io::Write as _,
     sync::{
         Mutex,
@@ -691,4 +692,36 @@ fn background_refresh_is_on_by_default_and_can_be_turned_off() {
     })
     .unwrap();
     check!(!jwt_bearer_off.background_refresh_enabled());
+}
+
+/// Kafka's `HttpJwtRetriever.formatErrorMessage` keeps a short response
+/// body, and trims a long one to its first 1000 characters, here without
+/// splitting a character.
+#[test]
+fn snippet_keeps_a_short_body_and_trims_a_long_one() {
+    let short = "a".repeat(MAX_RESPONSE_SNIPPET);
+    let long = format!(
+        "{}é{}",
+        "a".repeat(MAX_RESPONSE_SNIPPET - 1),
+        "b".repeat(10)
+    );
+    check!(
+        (snippet(&short), snippet(&long))
+            == (
+                short.clone(),
+                format!(
+                    "{} (trimmed to first 1000 characters out of 1011 total)",
+                    "a".repeat(MAX_RESPONSE_SNIPPET - 1)
+                ),
+            )
+    );
+}
+
+/// `within` bounds a step by its limit, and without a limit it waits.
+#[tokio::test]
+async fn within_bounds_a_step_by_its_limit() {
+    let bounded = within(Some(Duration::from_millis(1)), future::pending::<()>()).await;
+    let in_time = within(Some(Duration::from_secs(5)), async { 7 }).await;
+    let unbounded = within(None, async { 8 }).await;
+    check!((bounded, in_time, unbounded) == (Err(()), Ok(7), Ok(8)));
 }

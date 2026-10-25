@@ -1001,6 +1001,69 @@ mod tests {
         assert2::assert!(actual == wanted);
     }
 
+    /// Kafka's `clientInstanceId` fails for a consumer whose client does not
+    /// push metrics.
+    #[tokio::test]
+    async fn client_instance_id_needs_metrics_push() {
+        let broker = query_broker(None, 0, 5, SentRequests::default()).await;
+        let client = Client::builder()
+            .bootstrap(broker.addr.to_string())
+            .build()
+            .await
+            .expect("client");
+        let consumer = consumer_with_client(client);
+
+        let id = consumer
+            .client_instance_id(millis(100))
+            .await
+            .map_err(|error| error.to_string());
+
+        broker.stop();
+        assert2::assert!(
+            id == Err(
+                "client: Telemetry is not enabled. Set config `enable.metrics.push` to `true`."
+                    .to_owned()
+            )
+        );
+    }
+
+    /// A retriable error sends the query again after a backoff until
+    /// `default.api.timeout.ms`, as Kafka's `fetchOffsetsByTimes` and
+    /// `getTopicMetadata` do: a `NOT_LEADER_OR_FOLLOWER` (6) row of every
+    /// `ListOffsets` answer, and a `LEADER_NOT_AVAILABLE` (5) topic of every
+    /// `Metadata` answer.
+    #[tokio::test]
+    async fn retriable_errors_retry_until_the_api_timeout() {
+        let sent = SentRequests::default();
+        let offsets_broker =
+            query_broker(Some(|_, _| (6, -1, -1, -1)), 0, 5, Arc::clone(&sent)).await;
+        let metadata_broker = query_broker(None, 5, 5, SentRequests::default()).await;
+        let mut answers = Vec::new();
+        for broker in [&offsets_broker, &metadata_broker] {
+            let client = Client::builder()
+                .bootstrap(broker.addr.to_string())
+                .request_timeout(secs(30))
+                .build()
+                .await
+                .expect("client");
+            let mut consumer = consumer_with_client(client);
+            consumer.default_api_timeout = millis(300);
+            let answer = if answers.is_empty() {
+                consumer
+                    .end_offsets(&[("orders".to_owned(), 0)])
+                    .await
+                    .map(|_| ())
+            } else {
+                consumer.list_topics().await.map(|_| ())
+            };
+            answers.push(matches!(answer, Err(ConsumerError::Timeout { .. })));
+        }
+        offsets_broker.stop();
+        metadata_broker.stop();
+        let list_offsets_requests = sent.lock().expect("sent lock").len();
+        assert2::assert!((answers, list_offsets_requests > 1) == (vec![true, true], true));
+    }
+
     /// Kafka's `TopicMetadataFetcher.getTopicMetadata`: an unauthorized topic
     /// and an invalid topic fail, an unknown topic is left out, a retriable
     /// error sends the request again, and a replica that the broker list does

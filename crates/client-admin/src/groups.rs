@@ -3554,6 +3554,43 @@ mod tests {
         assert!((codes, sent.lock().expect("sent lock").len()) == (vec![7], 3));
     }
 
+    /// Kafka's `listGroups` retries a `Metadata` answer without brokers
+    /// (`StaleMetadataException`) with the backoff, and fails the call at the
+    /// deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_groups_fails_when_the_metadata_never_names_a_broker() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let broker = list_groups_broker(
+            groups(&[]),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&sent),
+        )
+        .await;
+        let admin = connect_admin(broker.addr, "admin connects").await;
+
+        let result = admin
+            .list_groups_with_retry(
+                &ListGroupsOptions::builder().build(),
+                list_groups_retry_policy(
+                    Duration::from_millis(50),
+                    Duration::from_millis(5),
+                    u32::MAX,
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string());
+
+        broker.stop();
+        assert!(
+            (result, sent.lock().expect("sent lock").len())
+                == (
+                    Err("protocol: failed to find brokers to send ListGroups: metadata has no brokers"
+                        .to_owned()),
+                    0
+                )
+        );
+    }
+
     fn below(max_version: i16, ids: &[&str]) -> ListGroupsBroker {
         ListGroupsBroker {
             max_version,

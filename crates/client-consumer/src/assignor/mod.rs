@@ -303,6 +303,35 @@ mod tests {
 
     use super::*;
 
+    /// Kafka's `MemberInfo.compareTo`: static members first, by
+    /// `group.instance.id`, then dynamic members by member id.
+    #[test]
+    fn member_keys_sort_static_members_first() {
+        let key = |member_id: &str, instance: Option<&str>| MemberKey {
+            member_id: member_id.to_owned(),
+            group_instance_id: instance.map(str::to_owned),
+        };
+        let mut keys = vec![
+            key("a-dynamic", None),
+            key("z-static", Some("i-2")),
+            key("b-dynamic", None),
+            key("y-static", Some("i-1")),
+        ];
+        keys.sort();
+        assert2::assert!(
+            keys == vec![
+                key("y-static", Some("i-1")),
+                key("z-static", Some("i-2")),
+                key("a-dynamic", None),
+                key("b-dynamic", None),
+            ]
+        );
+        assert2::assert!(
+            key("a-dynamic", None).partial_cmp(&key("z-static", Some("i-2")))
+                == Some(cmp::Ordering::Greater)
+        );
+    }
+
     #[test]
     fn assignor_values_parse_kafka_names() {
         let actual = [

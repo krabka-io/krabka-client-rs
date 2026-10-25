@@ -229,7 +229,7 @@ mod tests {
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
-            offset_fetch_request,
+            list_offsets_request, offset_fetch_request,
             offset_fetch_response::{
                 OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
             },
@@ -467,6 +467,68 @@ mod tests {
             (committed, in_time)
                 == (
                     Err("timeout: the last committed offsets could not be determined".to_owned()),
+                    true
+                )
+        );
+    }
+
+    /// Kafka's `position` gives up at `default.api.timeout.ms` when the reset
+    /// of the partition gets no `ListOffsets` answer.
+    #[tokio::test]
+    async fn position_returns_by_the_api_timeout_when_the_reset_gets_no_answer() {
+        let mock = MockBroker::start(|api_key, _version, _corr_id, _body| {
+            (api_key == api_versions_request::API_KEY).then(|| {
+                encode(
+                    &ApiVersionsResponse {
+                        api_keys: [
+                            (api_versions_request::API_KEY, 0, 3),
+                            (list_offsets_request::API_KEY, 1, 7),
+                        ]
+                        .into_iter()
+                        .map(|(api_key, min_version, max_version)| ApiVersion {
+                            api_key,
+                            min_version,
+                            max_version,
+                            ..Default::default()
+                        })
+                        .collect(),
+                        ..Default::default()
+                    },
+                    0,
+                )
+            })
+        })
+        .await
+        .unwrap();
+        let client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .request_timeout(secs(30))
+            .build()
+            .await
+            .expect("client");
+        let mut consumer = consumer_with_client(client);
+        consumer.default_api_timeout = krabka_units::millis(200);
+        consumer
+            .next_offsets
+            .lock()
+            .await
+            .insert(("orders".to_owned(), 0), BEGINNING_SENTINEL);
+        let started = Instant::now();
+
+        let position = consumer
+            .position("orders", 0)
+            .await
+            .map_err(|error| error.to_string());
+
+        let in_time = started.elapsed() < Duration::from_secs(5);
+        mock.stop();
+        assert2::assert!(
+            (position, in_time)
+                == (
+                    Err(
+                        "timeout: the position for partition orders-0 could not be determined"
+                            .to_owned()
+                    ),
                     true
                 )
         );

@@ -587,6 +587,35 @@ mod tests {
 
     use super::{test_support::orders_metadata, *};
 
+    /// A broker error keeps its code for every partition of the call, and any
+    /// other failure becomes `UNKNOWN_SERVER_ERROR` with its message.
+    #[test]
+    fn call_error_keeps_a_broker_code_and_wraps_other_failures() {
+        let broker = AdminError::Broker {
+            api: "ListOffsets",
+            code: 29,
+            name: "TOPIC_AUTHORIZATION_FAILED",
+            message: Some("denied".to_owned()),
+        };
+        let other = AdminError::Protocol("bad frame".to_owned());
+
+        assert2::assert!(
+            (call_error(&broker), call_error(&other))
+                == (
+                    KafkaError {
+                        code: 29,
+                        name: "TOPIC_AUTHORIZATION_FAILED",
+                        message: Some("denied".to_owned()),
+                    },
+                    KafkaError {
+                        code: UNKNOWN_SERVER_ERROR,
+                        name: "UNKNOWN_SERVER_ERROR",
+                        message: Some("protocol: bad frame".to_owned()),
+                    },
+                )
+        );
+    }
+
     #[test]
     fn lookup_classifies_each_metadata_answer_as_kafka_does() {
         let addr: SocketAddr = "127.0.0.1:9092".parse().expect("address");

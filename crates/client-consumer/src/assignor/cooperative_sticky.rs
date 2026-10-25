@@ -720,6 +720,27 @@ mod tests {
         assert2::assert!(out == current(&[("m1", &[("t", 0)]), ("m2", &[]), ("m3", &[])]));
     }
 
+    /// A later claim of a higher generation takes the partition from an
+    /// earlier claim of a lower one.
+    #[test]
+    fn prepopulate_replaces_an_earlier_lower_generation_claim() {
+        let topic_parts = topic_parts(&[("t", 1)]);
+        let subs = subs(&[("m1", &["t"]), ("m2", &["t"])]);
+        let gens = maplit::btreemap! {"m1".to_owned() => 5, "m2".to_owned() => 4};
+
+        let out = prepopulate_current_assignments(
+            &[
+                ("m2".to_owned(), topics(&["t"]), tp(&[("t", 0)]), 4),
+                ("m1".to_owned(), topics(&["t"]), tp(&[("t", 0)]), 5),
+            ],
+            &subs,
+            &gens,
+            &topic_parts,
+        );
+
+        assert2::assert!(out == current(&[("m1", &[("t", 0)]), ("m2", &[])]));
+    }
+
     #[test]
     fn general_assign_chooses_least_loaded_subscriber() {
         let out = general_assign(

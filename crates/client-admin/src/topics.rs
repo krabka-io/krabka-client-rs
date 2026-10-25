@@ -2734,6 +2734,89 @@ mod tests {
         );
     }
 
+    /// The `AdminClientLike` topic calls reach the controller under the timeout
+    /// of their options. `delete_records` sends nothing for no partition, and
+    /// gives a partition of a topic that the metadata does not name
+    /// `UNKNOWN_TOPIC_OR_PARTITION` (3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_client_like_topic_calls_reach_the_controller() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let controller =
+            scripted_controller(vec![answer(&[("a", 0)])], Arc::clone(&requests)).await;
+        let mut admin = AdminClient::connect(&[controller.addr.to_string()])
+            .await
+            .expect("admin connects");
+        let options = TopicMutationOptions::with_timeout(krabka_units::secs(5));
+
+        let deleted = observe(
+            admin
+                .delete_topics(&["a"], options)
+                .await
+                .expect("delete_topics"),
+        );
+        let grown = observe(
+            admin
+                .create_partitions(
+                    &[CreatePartitionsOp {
+                        name: "a".to_owned(),
+                        new_total_count: 2,
+                        ..Default::default()
+                    }],
+                    options,
+                )
+                .await
+                .expect("create_partitions"),
+        );
+        let no_records = admin
+            .delete_records(&[], krabka_units::secs(5))
+            .await
+            .expect("delete_records of nothing");
+        let unknown_topic = admin
+            .delete_records(
+                &[DeleteRecordsOp {
+                    topic: "missing".to_owned(),
+                    partition: 0,
+                    offset: 10,
+                }],
+                krabka_units::secs(5),
+            )
+            .await
+            .expect("delete_records of a missing topic");
+        let assignments = admin
+            .describe_partition_assignments(&["missing"])
+            .await
+            .expect("describe_partition_assignments");
+
+        controller.stop();
+        let sent = requests
+            .lock()
+            .expect("requests lock")
+            .iter()
+            .map(|(names, timeout_ms)| (names.clone(), *timeout_ms <= 5_000))
+            .collect::<Vec<_>>();
+        assert2::assert!(
+            (deleted, grown, sent)
+                == (
+                    vec![("a".to_owned(), 0, false)],
+                    vec![("a".to_owned(), 0, false)],
+                    vec![(vec!["a".to_owned()], true), (vec!["a".to_owned()], true)],
+                )
+        );
+        assert2::assert!(
+            (no_records, unknown_topic, assignments)
+                == (
+                    Vec::new(),
+                    vec![DeleteRecordsOutcome {
+                        topic: "missing".to_owned(),
+                        partition: 0,
+                        error_code: 3,
+                        low_watermark: -1,
+                    }],
+                    Vec::new(),
+                )
+        );
+    }
+
     fn assert_send<T: Send>(_: T) {}
 
     /// A caller can spawn every controller call on a multi-thread runtime.

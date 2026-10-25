@@ -1136,6 +1136,9 @@ async fn close_producer(role: &Role, producer: Arc<Producer>) {
 }
 
 #[cfg(test)]
+mod mock_tests;
+
+#[cfg(test)]
 mod tests {
     /// The `ListOffsets` timestamps are Kafka's own sentinels. A wrong sign
     /// asks the broker for a real timestamp instead of the first or the last

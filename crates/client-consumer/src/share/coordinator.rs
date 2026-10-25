@@ -258,16 +258,16 @@ mod tests {
     use std::{
         mem,
         sync::{
-            Arc,
+            Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
-    use bytes::BytesMut;
+    use bytes::{Buf as _, BytesMut};
     use krabka_client_core::MockBroker;
     use krabka_protocol::{
-        Encode,
+        Decode as _, Encode,
         owned::{
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
@@ -354,6 +354,52 @@ mod tests {
 
         mock.stop();
         assert2::assert!(requests.load(Ordering::SeqCst) == 1);
+    }
+
+    /// `run` stops at shutdown with its leave heartbeat (epoch -1), and a
+    /// rejoining heartbeat carries the subscription, as the broker needs it
+    /// on a fresh join.
+    #[tokio::test]
+    async fn run_leaves_at_shutdown_and_a_rejoin_sends_the_subscription() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let observed = Arc::clone(&requests);
+        let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
+            if api_key == api_versions_request::API_KEY {
+                return Some(api_versions_for_share_leave());
+            }
+            let client_id_len = usize::try_from(body.get_i16()).expect("client id length");
+            body.advance(client_id_len + 1);
+            let request =
+                ShareGroupHeartbeatRequest::decode(&mut body, version).expect("decode heartbeat");
+            observed
+                .lock()
+                .expect("requests lock")
+                .push((request.member_epoch, request.subscribed_topic_names));
+            None
+        })
+        .await
+        .unwrap();
+        let mut state = state().await;
+        state.client = Client::builder()
+            .bootstrap(mock.addr.to_string())
+            .request_timeout(krabka_units::secs(5))
+            .build()
+            .await
+            .expect("client");
+        state.leave_heartbeat_timeout = krabka_units::millis(37);
+
+        let _ = timeout(Duration::from_millis(100), heartbeat_once(&state, true)).await;
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let stopped = timeout(Duration::from_secs(2), run(state, shutdown))
+            .await
+            .is_ok();
+
+        mock.stop();
+        let requests = requests.lock().expect("requests lock").clone();
+        assert2::assert!(stopped);
+        assert2::assert!(requests.first() == Some(&(3, Some(vec!["topic-a".to_owned()]))));
+        assert2::assert!(requests.last() == Some(&(-1, None)));
     }
 
     async fn state() -> ShareCoordinatorState {

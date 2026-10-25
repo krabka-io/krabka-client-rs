@@ -1685,11 +1685,56 @@ mod tests {
 
 #[cfg(test)]
 mod secured_tests {
+    use assert2::check;
+    use krabka_protocol::Encode as _;
     use krabka_security::ListenerProtocol;
     use security::{ClientSecurity, SaslCredentials};
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// A TLS protocol without a TLS config, and a SASL protocol without
+    /// credentials, are inconsistent policies, and the connect fails before
+    /// any handshake.
+    #[tokio::test]
+    async fn connect_secured_rejects_a_policy_without_its_material() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut messages = Vec::new();
+        for protocol in [ListenerProtocol::Ssl, ListenerProtocol::SaslPlaintext] {
+            let security = ClientSecurity {
+                protocol,
+                tls: None,
+                sasl: None,
+                sasl_host: None,
+            };
+            let result =
+                Connection::connect_secured(addr, ConnectionOptions::default(), &security).await;
+            messages.push(result.err().map(|error| error.to_string()));
+        }
+        check!(
+            messages
+                == vec![
+                    Some("I/O: TLS protocol without tls config".to_owned()),
+                    Some("I/O: SASL protocol without credentials".to_owned()),
+                ]
+        );
+    }
+
+    /// An `ApiVersions` response with bytes after its end is invalid at its
+    /// own version and at version 0.
+    #[test]
+    fn api_versions_response_with_trailing_bytes_is_invalid() {
+        let mut body = BytesMut::new();
+        api_versions_response::ApiVersionsResponse::default()
+            .encode(&mut body, 0)
+            .unwrap();
+        body.put_u8(0xff);
+
+        let result = decode_api_versions_response(&body, 0).map_err(|error| error.to_string());
+
+        check!(result == Err("I/O: ApiVersions response v0 has 1 bytes after its end".to_owned()));
+    }
 
     // A SASL_PLAINTEXT connect drives the handshake then ApiVersions.
     // The fake broker answers SaslHandshake(0), SaslAuthenticate(0),
