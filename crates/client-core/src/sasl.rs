@@ -797,6 +797,18 @@ where
     Ok(())
 }
 
+/// Whether this build of krabka-client-core has the Kerberos client.
+///
+/// This is the crate's own `gssapi` feature, not `krabka-security/gssapi`:
+/// Cargo can turn the second on for another dependency while this crate's
+/// handshake still has no GSSAPI path.
+pub(crate) const GSSAPI_CLIENT: bool = cfg!(all(feature = "gssapi", not(target_family = "wasm")));
+
+/// Whether this build can authenticate with `mechanism`.
+pub(crate) fn mechanism_supported(mechanism: SaslMechanism) -> bool {
+    mechanism != SaslMechanism::Gssapi || GSSAPI_CLIENT
+}
+
 /// Why a GSSAPI credential fails in a build without the Kerberos client.
 pub(crate) const GSSAPI_UNAVAILABLE: &str = "this build has no Kerberos client; turn on the \
      `gssapi` feature of krabka-client-core (or of the admin, consumer or producer crate) on a \
