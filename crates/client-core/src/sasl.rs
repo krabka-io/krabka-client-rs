@@ -29,6 +29,11 @@ use std::{
         atomic::{AtomicI64, Ordering},
     },
 };
+#[cfg(target_os = "wasi")]
+use std::{
+    fs,
+    future::{Ready, ready},
+};
 
 use bytes::{Buf, BufMut, BytesMut};
 use krabka_ids::{ApiKey, ApiVersion};
@@ -46,16 +51,10 @@ use krabka_protocol::{
 };
 use krabka_security::SaslMechanism;
 use thiserror::Error;
-#[cfg(target_os = "wasi")]
-use std::{
-    fs,
-    future::{Ready, ready},
-};
-
 #[cfg(not(target_os = "wasi"))]
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "gssapi", not(target_family = "wasm")))]
 use tokio::task::spawn_blocking;
 
 use crate::{ClientFrameMax, connection::skip_tagged_fields, oauth};
@@ -1576,7 +1575,7 @@ mod tests {
     #[cfg(not(all(feature = "gssapi", not(target_family = "wasm"))))]
     #[tokio::test]
     async fn gssapi_without_the_kerberos_client_is_an_unsupported_mechanism() {
-        let (mut client, mut server) = tokio::io::duplex(8192);
+        let (mut client, mut server) = duplex(8192);
         let server_task = tokio::spawn(async move {
             answer_api_versions(&mut server).await;
             let mut hs = BytesMut::new();
@@ -1618,7 +1617,7 @@ mod tests {
                     Verdict::Rejected(SaslAuthenticationError::UnsupportedMechanism(format!(
                         "GSSAPI to broker-1.example.com: {GSSAPI_UNAVAILABLE}"
                     ))),
-                    "GSSAPI".to_string(),
+                    "GSSAPI".to_owned(),
                 )
         );
     }

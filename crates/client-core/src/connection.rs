@@ -339,13 +339,13 @@ impl ConnectionOptions {
             .security
             .as_ref()
             .and_then(|security| security.sasl.as_ref())
-            .map(crate::sasl::SaslCredentials::mechanism)
-            && !crate::sasl::mechanism_supported(mechanism)
+            .map(sasl::SaslCredentials::mechanism)
+            && !sasl::mechanism_supported(mechanism)
         {
             return Err(format!(
                 "SASL/{}: {}",
                 mechanism.wire_name(),
-                crate::sasl::GSSAPI_UNAVAILABLE
+                sasl::GSSAPI_UNAVAILABLE
             ));
         }
         Ok(())
@@ -1526,9 +1526,9 @@ mod tests {
             username: "u".into(),
             password: "p".into(),
         });
-        let want_gssapi = crate::sasl::GSSAPI_CLIENT
+        let want_gssapi = sasl::GSSAPI_CLIENT
             .then_some(())
-            .ok_or_else(|| format!("SASL/GSSAPI: {}", crate::sasl::GSSAPI_UNAVAILABLE));
+            .ok_or_else(|| format!("SASL/GSSAPI: {}", sasl::GSSAPI_UNAVAILABLE));
         assert!((gssapi.validate(), plain.validate()) == (want_gssapi, Ok(())));
     }
 

@@ -128,10 +128,7 @@ async fn reverse_lookup(ip: IpAddr, dns_timeout: ClientDnsTimeout) -> Option<Str
 
 /// WebAssembly has no reverse lookup, so no address has a host name.
 #[cfg(target_family = "wasm")]
-fn reverse_lookup(
-    _ip: IpAddr,
-    _dns_timeout: ClientDnsTimeout,
-) -> Ready<Option<String>> {
+fn reverse_lookup(_ip: IpAddr, _dns_timeout: ClientDnsTimeout) -> Ready<Option<String>> {
     ready(None)
 }
 
