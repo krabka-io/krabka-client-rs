@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -399,6 +399,40 @@ pub(crate) struct TopicMetadata {
     pub topic_id: krabka_protocol::primitives::uuid::Uuid,
 }
 
+/// The partition count and id of each topic that the producer tracks, shared
+/// by the application's sends, the sender task and the metadata refresh.
+///
+/// The lock is a synchronous mutex, as Kafka's `ProducerMetadata` guards its
+/// state with `synchronized`. The sender task keeps every in-flight Produce as
+/// a sub-future that it polls only from its `select!`. With an async mutex, a
+/// send that was polled once while the application held the lock waited in the
+/// mutex queue, and the unlock handed the lock to it. The sender body then
+/// waited for the same lock in its next drain, and never returned to the
+/// `select!` that would poll the send: the producer stopped. A synchronous
+/// guard cannot be held across an `.await` (Clippy's `await_holding_lock`), so
+/// every holder runs to its unlock without yielding, and no unpolled future can
+/// hold or queue for the lock.
+#[derive(Debug, Default)]
+pub(crate) struct MetadataCache(SyncMutex<HashMap<String, TopicMetadata>>);
+
+impl MetadataCache {
+    /// Lock the cache. Never hold the guard across an `.await`.
+    pub(crate) fn lock(&self) -> SyncMutexGuard<'_, HashMap<String, TopicMetadata>> {
+        // A poisoned lock means that a thread panicked while it held the
+        // guard. Every holder makes single map lookups, inserts, removes and
+        // field stores, so the map stays whole after such a panic, and each
+        // entry is metadata that the next refresh corrects anyway. The cache
+        // stays usable rather than failing every later send.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl From<HashMap<String, TopicMetadata>> for MetadataCache {
+    fn from(topics: HashMap<String, TopicMetadata>) -> Self {
+        Self(SyncMutex::new(topics))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProducerIdentity {
     /// Shared with the sender so ID rotation remains observable.
@@ -484,7 +518,7 @@ pub struct Producer {
     pub(crate) max_request_size: usize,
     #[allow(dead_code)]
     pub(crate) max_in_flight: usize,
-    pub(crate) metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
+    pub(crate) metadata_cache: Arc<MetadataCache>,
     /// The metadata refreshes that concurrent sends share while they wait for
     /// a topic. See `MetadataWait`.
     pub(crate) metadata_refresh: Arc<MetadataRefresh>,

@@ -1,7 +1,6 @@
 //! `Producer::builder()`: the `bon`-generated builder for `Producer::start`.
 
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering},
@@ -917,7 +916,7 @@ struct ProducerRuntime {
     wake_tx: mpsc::Sender<sender::DrainIntent>,
     shutdown: CancellationToken,
     state: Arc<AtomicU8>,
-    metadata_cache: Arc<Mutex<HashMap<String, producer::TopicMetadata>>>,
+    metadata_cache: Arc<producer::MetadataCache>,
     metadata_refresh: Arc<metadata_wait::MetadataRefresh>,
     partition_leaders: Arc<DashMap<(String, i32), i32>>,
     accumulators: crate::accumulator::AccumulatorMap,
@@ -966,7 +965,7 @@ fn spawn_producer_runtime(client: &Client, inputs: RuntimeInputs<'_>) -> Produce
     let (wake_tx, wake_rx) = mpsc::channel(SENDER_WAKE_CHANNEL_CAPACITY);
     let shutdown = CancellationToken::new();
     let state = Arc::new(AtomicU8::new(0));
-    let metadata_cache = Arc::new(Mutex::new(HashMap::new()));
+    let metadata_cache = Arc::new(producer::MetadataCache::default());
     let partition_leaders = Arc::new(DashMap::new());
     let accumulators = Arc::new(DashMap::new());
     let next_seq = Arc::new(DashMap::new());
