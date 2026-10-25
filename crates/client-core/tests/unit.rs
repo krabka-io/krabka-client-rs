@@ -5,6 +5,7 @@
 //! behave correctly without any JVM dependency.
 //!
 //! Run with: `cargo test -p krabka-client-core --features mock --test unit`
+#![cfg(test)]
 
 use assert2::{assert, check};
 use bytes::BytesMut;
@@ -97,7 +98,8 @@ async fn connect_negotiates_api_versions() {
         assert!(api_key == api_versions_request::API_KEY);
         Some(api_versions_response_v0())
     })
-    .await;
+    .await
+    .unwrap();
 
     let conn = Connection::connect(mock.addr, ConnectionOptions::default())
         .await
@@ -128,7 +130,8 @@ async fn timeout_when_handler_silent() {
         // Return None to drop the request; the client's request timeout fires.
         None
     })
-    .await;
+    .await
+    .unwrap();
 
     let opts = ConnectionOptions {
         request_timeout: krabka_units::millis(200),
@@ -161,7 +164,8 @@ async fn round_trip_metadata_request() {
         }
         None
     })
-    .await;
+    .await
+    .unwrap();
 
     let conn = Connection::connect(mock.addr, ConnectionOptions::default())
         .await
@@ -201,7 +205,8 @@ async fn concurrent_sends_get_correct_responses() {
         }
         None
     })
-    .await;
+    .await
+    .unwrap();
 
     let conn = Connection::connect(mock.addr, ConnectionOptions::default())
         .await
@@ -279,7 +284,8 @@ async fn client_refresh_metadata_populates_pool() {
         }
         None
     })
-    .await;
+    .await
+    .unwrap();
 
     let client = krabka_client_core::Client::builder()
         .bootstrap(mock.addr.to_string())

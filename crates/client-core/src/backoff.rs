@@ -2,7 +2,10 @@
 
 use std::{
     hash::{BuildHasher, RandomState},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -40,7 +43,7 @@ impl ExponentialBackoff {
         let initial_ms = (initial.secs_f64() * 1000.0).min(max_ms);
         let multiplier = f64::from(multiplier);
         let exp_max = if max_ms > initial_ms {
-            (max_ms / initial_ms.max(1.0)).ln() / multiplier.ln()
+            (max_ms / initial_ms.max(1.0)).log(multiplier)
         } else {
             0.0
         };
@@ -77,7 +80,7 @@ impl ExponentialBackoff {
         let factor = if self.jitter < f64::MIN_POSITIVE {
             1.0
         } else {
-            (1.0 - self.jitter) + unit * 2.0 * self.jitter
+            (unit * 2.0).mul_add(self.jitter, 1.0 - self.jitter)
         };
         // Kafka truncates the jittered value to whole milliseconds.
         millis_duration((factor * term).trunc().min(self.max_ms))
@@ -89,13 +92,13 @@ fn millis_duration(milliseconds: f64) -> Duration {
 }
 
 /// A random value in `0..bound`, or 0 for a `bound` of 0.
-pub(crate) fn random_below(bound: usize) -> usize {
+pub fn random_below(bound: usize) -> usize {
     let bound = u128::try_from(bound).unwrap_or(u128::MAX);
     usize::try_from((u128::from(random_bits()) * bound) >> 32).unwrap_or(0)
 }
 
 /// A random value in `[0, 1)`.
-pub(crate) fn random_unit() -> f64 {
+pub fn random_unit() -> f64 {
     f64::from(random_bits()) / 4_294_967_296.0
 }
 
@@ -103,7 +106,7 @@ pub(crate) fn random_unit() -> f64 {
 /// counter with a random process key is enough.
 fn random_bits() -> u32 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    static KEY: std::sync::OnceLock<RandomState> = std::sync::OnceLock::new();
+    static KEY: OnceLock<RandomState> = OnceLock::new();
     let hash = KEY
         .get_or_init(RandomState::new)
         .hash_one(COUNTER.fetch_add(1, Ordering::Relaxed));

@@ -39,7 +39,7 @@
 //! never negative, because the format has no null string. An absent member is
 //! the empty string, and it encodes as the two bytes `00 00`.
 
-use std::{fmt, str::FromStr};
+use std::{fmt, str, str::FromStr};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -134,7 +134,11 @@ pub enum RecordError {
 /// a name longer than [`MAX_ROLE_LEN`]. A `Role` value is proof that the name
 /// is well formed, so this type does not implement `From<String>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Role(String);
+pub struct Role {
+    name: String,
+    /// The `i16` byte length that the frozen layout writes before the name.
+    wire_length: i16,
+}
 
 impl Role {
     /// Parses a role name.
@@ -145,20 +149,23 @@ impl Role {
     /// [`RecordError::TooLong`] when `role` holds more than [`MAX_ROLE_LEN`]
     /// bytes.
     pub fn new(role: &str) -> Result<Self, RecordError> {
-        check_name(role, ROLE_FIELD, MAX_ROLE_LEN)?;
-        Ok(Self(role.to_owned()))
+        let wire_length = check_name(role, ROLE_FIELD, MAX_ROLE_LEN)?;
+        Ok(Self {
+            name: role.to_owned(),
+            wire_length,
+        })
     }
 
     /// The role name.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.name
     }
 }
 
 impl fmt::Display for Role {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.name)
     }
 }
 
@@ -171,7 +178,11 @@ impl fmt::Display for Role {
 /// and an id longer than [`MAX_MEMBER_ID_LEN`]. A `MemberId` value is proof
 /// that the id is well formed, so this type does not implement `From<String>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct MemberId(String);
+pub struct MemberId {
+    id: String,
+    /// The `i16` byte length that the frozen layout writes before the id.
+    wire_length: i16,
+}
 
 impl MemberId {
     /// Parses a member id.
@@ -182,36 +193,41 @@ impl MemberId {
     /// Returns [`RecordError::TooLong`] when `member` holds more than
     /// [`MAX_MEMBER_ID_LEN`] bytes.
     pub fn new(member: &str) -> Result<Self, RecordError> {
-        check_name(member, MEMBER_FIELD, MAX_MEMBER_ID_LEN)?;
-        Ok(Self(member.to_owned()))
+        let wire_length = check_name(member, MEMBER_FIELD, MAX_MEMBER_ID_LEN)?;
+        Ok(Self {
+            id: member.to_owned(),
+            wire_length,
+        })
     }
 
     /// The member id.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.id
     }
 }
 
 impl fmt::Display for MemberId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.id)
     }
 }
 
-/// Rejects an empty name and a name past `bound`.
-fn check_name(name: &str, field: &'static str, bound: usize) -> Result<(), RecordError> {
+/// Rejects an empty name and a name past `bound`, and returns the `i16` byte
+/// length of an accepted name.
+fn check_name(name: &str, field: &'static str, bound: usize) -> Result<i16, RecordError> {
     if name.is_empty() {
         return Err(RecordError::Empty { field });
     }
+    let too_long = || RecordError::TooLong {
+        field,
+        length: name.len(),
+        bound,
+    };
     if name.len() > bound {
-        return Err(RecordError::TooLong {
-            field,
-            length: name.len(),
-            bound,
-        });
+        return Err(too_long());
     }
-    Ok(())
+    i16::try_from(name.len()).map_err(|_error| too_long())
 }
 
 /// The quorum-minted proof that one member holds a role.
@@ -415,16 +431,19 @@ pub enum CoordinationRecord {
 /// `key.member` holds, because the frozen layout gives a lease no member.
 #[must_use]
 pub fn encode_key(key: &CoordinationKey) -> Bytes {
-    let member = match key.kind {
-        RecordKind::Registration => key.member.as_ref().map_or("", MemberId::as_str),
-        RecordKind::Lease => "",
+    let (member, member_length) = match key.kind {
+        RecordKind::Registration => key
+            .member
+            .as_ref()
+            .map_or(("", 0), |member| (member.as_str(), member.wire_length)),
+        RecordKind::Lease => ("", 0),
     };
     let role = key.role.as_str();
     let mut buffer = BytesMut::with_capacity(8 + role.len() + member.len());
     buffer.put_i16(RECORD_VERSION);
     buffer.put_i16(key.kind.code());
-    put_string(&mut buffer, role);
-    put_string(&mut buffer, member);
+    put_string(&mut buffer, role, key.role.wire_length);
+    put_string(&mut buffer, member, member_length);
     buffer.freeze()
 }
 
@@ -436,18 +455,18 @@ pub fn encode_key(key: &CoordinationKey) -> Bytes {
 pub fn encode_value(record: &CoordinationRecord) -> Option<Bytes> {
     match record {
         CoordinationRecord::Registration(registration) => {
-            let member = registration.member.as_str();
-            let mut buffer = BytesMut::with_capacity(12 + member.len());
+            let member = &registration.member;
+            let mut buffer = BytesMut::with_capacity(12 + member.as_str().len());
             buffer.put_i16(RECORD_VERSION);
-            put_string(&mut buffer, member);
+            put_string(&mut buffer, member.as_str(), member.wire_length);
             buffer.put_i64(registration.registered_at);
             Some(buffer.freeze())
         }
         CoordinationRecord::Lease(lease) => {
-            let member = lease.member.as_str();
-            let mut buffer = BytesMut::with_capacity(30 + member.len());
+            let member = &lease.member;
+            let mut buffer = BytesMut::with_capacity(30 + member.as_str().len());
             buffer.put_i16(RECORD_VERSION);
-            put_string(&mut buffer, member);
+            put_string(&mut buffer, member.as_str(), member.wire_length);
             buffer.put_i64(lease.token.producer_id());
             buffer.put_i16(lease.token.producer_epoch());
             buffer.put_i64(lease.granted_at);
@@ -550,10 +569,11 @@ fn decode_lease(bytes: &[u8]) -> Result<Lease, RecordError> {
     })
 }
 
-/// Writes one string as an `i16` byte length and then UTF-8 bytes.
-fn put_string(buffer: &mut BytesMut, value: &str) {
-    let length = i16::try_from(value.len())
-        .expect("Role::new and MemberId::new reject a name longer than 249 bytes");
+/// Writes one string as its `i16` byte length `length` and then UTF-8 bytes.
+///
+/// [`Role::new`] and [`MemberId::new`] compute `length` when they accept a
+/// name.
+fn put_string(buffer: &mut BytesMut, value: &str, length: i16) {
     buffer.put_i16(length);
     buffer.put_slice(value.as_bytes());
 }
@@ -596,6 +616,14 @@ impl<'a> Reader<'a> {
         )))
     }
 
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], RecordError> {
+        let Some((head, rest)) = self.data.split_first_chunk::<N>() else {
+            return Err(self.truncated());
+        };
+        self.data = rest;
+        Ok(*head)
+    }
+
     fn take(&mut self, count: usize) -> Result<&'a [u8], RecordError> {
         let Some((head, rest)) = self.data.split_at_checked(count) else {
             return Err(self.truncated());
@@ -605,13 +633,11 @@ impl<'a> Reader<'a> {
     }
 
     fn i16(&mut self) -> Result<i16, RecordError> {
-        let bytes = self.take(2)?;
-        Ok(i16::from_be_bytes(bytes.try_into().expect("two bytes")))
+        Ok(i16::from_be_bytes(self.take_array()?))
     }
 
     fn i64(&mut self) -> Result<i64, RecordError> {
-        let bytes = self.take(8)?;
-        Ok(i64::from_be_bytes(bytes.try_into().expect("eight bytes")))
+        Ok(i64::from_be_bytes(self.take_array()?))
     }
 
     /// Reads one string. A negative length is malformed, and the `i16` length
@@ -625,7 +651,7 @@ impl<'a> Reader<'a> {
             ))
         })?;
         let bytes = self.take(length)?;
-        std::str::from_utf8(bytes).map_err(|_error| {
+        str::from_utf8(bytes).map_err(|_error| {
             self.malformed(format!(
                 "non-UTF-8 string in coordination state {}",
                 self.part
@@ -649,7 +675,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use assert2::{assert, check};
-    use proptest::prelude::*;
+    use proptest::{collection, prelude::*};
 
     use super::*;
 
@@ -1034,7 +1060,7 @@ mod tests {
         /// The decoders read bytes off the network, so no input may panic.
         #[test]
         fn a_decoder_never_panics_on_arbitrary_bytes(
-            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+            bytes in collection::vec(any::<u8>(), 0..64),
         ) {
             let _ = decode_key(&bytes);
             let _ = decode_value(RecordKind::Registration, Some(&bytes));

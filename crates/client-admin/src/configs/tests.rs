@@ -1,6 +1,10 @@
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    slice,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU16, Ordering},
+    },
 };
 
 use krabka_client_core::{MockBroker, MockReply};
@@ -14,8 +18,11 @@ use krabka_protocol::owned::{
 };
 
 use super::*;
-use crate::partition_leaders::test_support::{
-    ApiVersionRange, api_versions, decode_request, encode_response, fast_admin, refused_address,
+use crate::{
+    AdminClientLike as _,
+    partition_leaders::test_support::{
+        ApiVersionRange, api_versions, decode_request, encode_response, fast_admin, refused_address,
+    },
 };
 
 const LONG: krabka_units::Time = krabka_units::secs(5);
@@ -646,6 +653,7 @@ async fn cluster_broker(
                     .count();
                 let answer = (script.alter)(broker_id, earlier, &request);
                 received.push(Received::Alter(broker_id, request));
+                drop(received);
                 encode_response(&answer, version, flexible)
             }
             _ => return MockReply::Silent,
@@ -653,6 +661,7 @@ async fn cluster_broker(
         MockReply::Respond(reply)
     })
     .await
+    .unwrap()
 }
 
 fn describe_wire(
@@ -736,16 +745,8 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
             both.clone(),
             both_options,
             vec![
-                Received::Describe(
-                    1,
-                    4,
-                    describe_wire(std::slice::from_ref(&orders), true, true),
-                ),
-                Received::Describe(
-                    2,
-                    4,
-                    describe_wire(std::slice::from_ref(&broker_2), true, true),
-                ),
+                Received::Describe(1, 4, describe_wire(slice::from_ref(&orders), true, true)),
+                Received::Describe(2, 4, describe_wire(slice::from_ref(&broker_2), true, true)),
             ],
             maplit::btreemap! {
                 orders.clone() => Ok(answered_by(1)),
@@ -761,7 +762,7 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
             vec![Received::Describe(
                 1,
                 1,
-                describe_wire(std::slice::from_ref(&orders), true, false),
+                describe_wire(slice::from_ref(&orders), true, false),
             )],
             // v1 carries no type or documentation: each reads as its schema
             // default, `UNKNOWN` and "", as in Kafka.
@@ -794,7 +795,7 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
             vec![Received::Describe(
                 1,
                 4,
-                describe_wire(std::slice::from_ref(&orders), false, false),
+                describe_wire(slice::from_ref(&orders), false, false),
             )],
             maplit::btreemap! {
                 orders.clone() => Ok(answered_by(1)),
@@ -803,7 +804,7 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
         ),
     ] {
         let timeout = if broker_2_down { SHORT } else { LONG };
-        let cluster = Cluster::start(ECHO, broker_2_down, describe_max, timeout).await;
+        let mut cluster = Cluster::start(ECHO, broker_2_down, describe_max, timeout).await;
         let result = cluster
             .admin
             .describe_configs(&resources, options)
@@ -819,7 +820,7 @@ async fn describe_configs_routes_each_resource_as_kafka_does() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn describe_configs_refuses_a_broker_name_that_is_not_an_id() {
-    let cluster = Cluster::start(ECHO, false, 4, LONG).await;
+    let mut cluster = Cluster::start(ECHO, false, 4, LONG).await;
     let result = cluster
         .admin
         .describe_configs(
@@ -1011,10 +1012,10 @@ async fn incremental_alter_configs_through_controllers_routes_as_kafka_does() {
 
     let received = Arc::new(Mutex::new(Vec::new()));
     let handler_received = Arc::clone(&received);
-    let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let port = Arc::new(AtomicU16::new(0));
     let handler_port = Arc::clone(&port);
     let controller = MockBroker::start_with_replies(move |api_key, version, _, body| {
-        let own_port = i32::from(handler_port.load(std::sync::atomic::Ordering::SeqCst));
+        let own_port = i32::from(handler_port.load(Ordering::SeqCst));
         let reply = match api_key {
             api_versions_request::API_KEY => api_versions()
                 .apis(vec![
@@ -1055,14 +1056,16 @@ async fn incremental_alter_configs_through_controllers_routes_as_kafka_does() {
                 };
                 let answer = alter_answer(&request, code);
                 received.push(request);
+                drop(received);
                 encode_response(&answer, version, flexible)
             }
             _ => return MockReply::Silent,
         };
         MockReply::Respond(reply)
     })
-    .await;
-    port.store(controller.addr.port(), std::sync::atomic::Ordering::SeqCst);
+    .await
+    .unwrap();
+    port.store(controller.addr.port(), Ordering::SeqCst);
     let mut admin = AdminClient::connect_controller_with_config(
         &[controller.addr.to_string()],
         crate::AdminClientConfig {

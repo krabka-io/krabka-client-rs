@@ -12,9 +12,12 @@
 //! request works regardless of what the broker negotiated. The parser flattens
 //! an `OffsetFetch` response across either shape.
 
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    iter,
+};
 
-pub(crate) use krabka_client_core::TopicNameOffsetFetch;
+pub use krabka_client_core::TopicNameOffsetFetch;
 use krabka_protocol::{
     owned::{
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
@@ -59,7 +62,7 @@ use crate::{
 /// the field is not on the wire. Kafka's `OffsetFetchRequest.Builder` also
 /// drops the flag there (`throwIfStableOffsetsUnsupported`), because
 /// `internal.throw.on.fetch.stable.offset.unsupported` defaults to `false`.
-pub(crate) fn build_offset_fetch(
+pub fn build_offset_fetch(
     group_id: &str,
     by_topic: &HashMap<String, Vec<i32>>,
 ) -> TopicNameOffsetFetch {
@@ -80,10 +83,10 @@ pub(crate) fn build_offset_fetch(
         })
         .collect();
     TopicNameOffsetFetch::new(OffsetFetchRequest {
-        group_id: group_id.to_string(),
+        group_id: group_id.to_owned(),
         topics: Some(legacy_topics),
         groups: vec![OffsetFetchRequestGroup {
-            group_id: group_id.to_string(),
+            group_id: group_id.to_owned(),
             topics: Some(group_topics),
             ..Default::default()
         }],
@@ -96,7 +99,7 @@ pub(crate) fn build_offset_fetch(
 /// committed_offset, committed_leader_epoch)` tuples.
 ///
 /// v8 and v9 data lives in `groups`, and v0-7 data lives in `topics`.
-pub(crate) fn parse_offset_fetch(resp: &OffsetFetchResponse) -> Vec<(String, i32, i64, i32)> {
+pub fn parse_offset_fetch(resp: &OffsetFetchResponse) -> Vec<(String, i32, i64, i32)> {
     let mut out = Vec::new();
     if resp.groups.is_empty() {
         for t in &resp.topics {
@@ -173,7 +176,7 @@ fn append_topic_errors<'a, P: OffsetFetchPartitionData>(
 /// `-1` or an error has no committed offset.
 ///
 /// v8 and v9 data lives in `groups`, and v0-7 data lives in `topics`.
-pub(crate) fn parse_committed_offsets(
+pub fn parse_committed_offsets(
     resp: &OffsetFetchResponse,
 ) -> HashMap<(String, i32), Option<OffsetAndMetadata>> {
     let committed = |error_code: i16, offset: i64, leader_epoch: i32, metadata: &Option<String>| {
@@ -232,7 +235,7 @@ const UNKNOWN_TOPIC_ID: i16 = 100;
 /// (`onResponse`, `onFailure` and `onSuccess`) and
 /// `CommitRequestManager.fetchOffsetsWithRetries`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum OffsetFetchAction {
+pub enum OffsetFetchAction {
     /// Use the committed offsets in the response.
     Complete,
     /// A partition answered 3 or 100. Send the request again until the
@@ -269,8 +272,8 @@ pub(crate) enum OffsetFetchAction {
 ///
 /// v8 and v9 data lives in `groups`, and v0-7 data lives in the top-level
 /// fields.
-pub(crate) fn classify_offset_fetch(resp: &OffsetFetchResponse) -> OffsetFetchAction {
-    let group_error = std::iter::once(resp.error_code)
+pub fn classify_offset_fetch(resp: &OffsetFetchResponse) -> OffsetFetchAction {
+    let group_error = iter::once(resp.error_code)
         .chain(resp.groups.iter().map(|g| g.error_code))
         .find(|code| *code != 0);
     if let Some(code) = group_error {
@@ -296,7 +299,7 @@ pub(crate) fn classify_offset_fetch(resp: &OffsetFetchResponse) -> OffsetFetchAc
                 unknown_topic.get_or_insert(code);
             }
             TOPIC_AUTHORIZATION_FAILED => {
-                unauthorized_topics.insert(topic.to_string());
+                unauthorized_topics.insert(topic.to_owned());
             }
             UNSTABLE_OFFSET_COMMIT => unstable = true,
             code => return OffsetFetchAction::Fatal(code),
@@ -324,7 +327,7 @@ fn classify_group_error(code: i16) -> OffsetFetchAction {
 
 /// Whether Apache Kafka's `common/protocol/Errors` maps `code` to an exception
 /// that extends `RetriableException`.
-pub(crate) fn is_retriable_error(code: i16) -> bool {
+pub fn is_retriable_error(code: i16) -> bool {
     matches!(
         code,
         2 | 3
@@ -362,14 +365,14 @@ pub(crate) fn is_retriable_error(code: i16) -> bool {
 }
 
 /// An `OffsetCommit` request that names its topics, capped at v9.
-pub(crate) use krabka_client_core::TopicNameOffsetCommit;
+pub use krabka_client_core::TopicNameOffsetCommit;
 
 /// Build the `topics` for an `OffsetCommit`.
 ///
 /// Each topic has its name and no topic id, as in Kafka's
 /// `ConsumerCoordinator.sendOffsetCommitRequest`. `offsets` maps `(topic,
 /// partition)` to `(committed_offset, committed_leader_epoch)`.
-pub(crate) fn build_commit_topics(
+pub fn build_commit_topics(
     offsets: HashMap<(String, i32), OffsetAndMetadata>,
 ) -> Vec<OffsetCommitRequestTopic> {
     let mut by_topic: HashMap<String, Vec<(i32, OffsetAndMetadata)>> = HashMap::new();
@@ -398,7 +401,7 @@ pub(crate) fn build_commit_topics(
 /// Build the `topic_id → name` reverse map from the consumer's `name →
 /// topic_id` table. The fetch path uses it to resolve `Fetch` v13+ responses,
 /// which name each topic by id only.
-pub(crate) fn id_to_name(topic_ids: &HashMap<String, WireUuid>) -> HashMap<WireUuid, String> {
+pub fn id_to_name(topic_ids: &HashMap<String, WireUuid>) -> HashMap<WireUuid, String> {
     topic_ids.iter().map(|(n, id)| (*id, n.clone())).collect()
 }
 
@@ -419,24 +422,24 @@ mod tests {
     #[test]
     fn build_offset_fetch_populates_legacy_and_groups() {
         let mut by_topic = HashMap::new();
-        by_topic.insert("t".to_string(), vec![0, 1]);
+        by_topic.insert("t".to_owned(), vec![0, 1]);
 
         let req = build_offset_fetch("g", &by_topic);
         // Legacy single-group fields (v0-7) AND v8+ groups[] by topic name.
         assert2::assert!(
             req == TopicNameOffsetFetch::new(OffsetFetchRequest {
-                group_id: "g".to_string(),
+                group_id: "g".to_owned(),
                 topics: Some(vec![OffsetFetchRequestTopic {
-                    name: "t".to_string(),
+                    name: "t".to_owned(),
                     partition_indexes: vec![0, 1],
                     unknown_tagged_fields: UnknownTaggedFields(vec![]),
                 }]),
                 groups: vec![OffsetFetchRequestGroup {
-                    group_id: "g".to_string(),
+                    group_id: "g".to_owned(),
                     member_id: None,
                     member_epoch: -1,
                     topics: Some(vec![OffsetFetchRequestTopics {
-                        name: "t".to_string(),
+                        name: "t".to_owned(),
                         topic_id: WireUuid::ZERO,
                         partition_indexes: vec![0, 1],
                         unknown_tagged_fields: UnknownTaggedFields(vec![]),
@@ -530,7 +533,7 @@ mod tests {
             TopicAuthorizationFailed,
         };
         let topics = |names: &[&str]| {
-            TopicAuthorizationFailed(names.iter().map(|name| (*name).to_string()).collect())
+            TopicAuthorizationFailed(names.iter().map(|name| (*name).to_owned()).collect())
         };
         for (name, response, expected) in [
             ("no error", grouped(0, &[(1, 0), (2, 0)]), Complete),
@@ -664,7 +667,7 @@ mod tests {
             ..Default::default()
         };
         let out = parse_offset_fetch(&resp);
-        assert2::assert!(out == vec![("t".to_string(), 3, 42, -1)]);
+        assert2::assert!(out == vec![("t".to_owned(), 3, 42, -1)]);
     }
 
     #[test]
@@ -683,14 +686,14 @@ mod tests {
             ..Default::default()
         };
         let out = parse_offset_fetch(&resp);
-        assert2::assert!(out == vec![("legacy".to_string(), 1, 11, -1)]);
+        assert2::assert!(out == vec![("legacy".to_owned(), 1, 11, -1)]);
     }
 
     #[test]
     fn build_commit_topics_names_each_topic() {
         let mut offsets = HashMap::new();
         offsets.insert(
-            ("t".to_string(), 3),
+            ("t".to_owned(), 3),
             OffsetAndMetadata {
                 offset: 100,
                 leader_epoch: Some(5),
@@ -701,7 +704,7 @@ mod tests {
         assert2::assert!(
             topics
                 == vec![OffsetCommitRequestTopic {
-                    name: "t".to_string(),
+                    name: "t".to_owned(),
                     topic_id: WireUuid::ZERO,
                     partitions: vec![OffsetCommitRequestPartition {
                         partition_index: 3,
@@ -718,8 +721,8 @@ mod tests {
     #[test]
     fn id_to_name_inverts_the_map() {
         let mut ids = HashMap::new();
-        ids.insert("t".to_string(), wire_uuid(7));
+        ids.insert("t".to_owned(), wire_uuid(7));
         let inv = id_to_name(&ids);
-        assert2::assert!(inv.get(&wire_uuid(7)) == Some(&"t".to_string()));
+        assert2::assert!(inv.get(&wire_uuid(7)) == Some(&"t".to_owned()));
     }
 }

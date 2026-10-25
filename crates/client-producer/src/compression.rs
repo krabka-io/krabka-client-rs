@@ -49,11 +49,11 @@ impl Compression {
     #[must_use]
     pub(crate) fn compression_type(self) -> krabka_compression::CompressionType {
         match self {
-            Compression::None => krabka_compression::CompressionType::None,
-            Compression::Gzip => krabka_compression::CompressionType::Gzip,
-            Compression::Snappy => krabka_compression::CompressionType::Snappy,
-            Compression::Lz4 => krabka_compression::CompressionType::Lz4,
-            Compression::Zstd => krabka_compression::CompressionType::Zstd,
+            Self::None => krabka_compression::CompressionType::None,
+            Self::Gzip => krabka_compression::CompressionType::Gzip,
+            Self::Snappy => krabka_compression::CompressionType::Snappy,
+            Self::Lz4 => krabka_compression::CompressionType::Lz4,
+            Self::Zstd => krabka_compression::CompressionType::Zstd,
         }
     }
 
@@ -62,11 +62,11 @@ impl Compression {
     #[must_use]
     pub fn attribute_bits(self) -> i16 {
         match self {
-            Compression::None => 0,
-            Compression::Gzip => 1,
-            Compression::Snappy => 2,
-            Compression::Lz4 => 3,
-            Compression::Zstd => 4,
+            Self::None => 0,
+            Self::Gzip => 1,
+            Self::Snappy => 2,
+            Self::Lz4 => 3,
+            Self::Zstd => 4,
         }
     }
 
@@ -199,6 +199,7 @@ fn invalid_level(name: &str, level: i32, message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use krabka_units::convert::ByteSizeExt;
 
     use super::*;
 
@@ -313,7 +314,7 @@ mod tests {
         let decoded = krabka_compression::decompress(
             CompressionType::Gzip,
             &compressed,
-            krabka_units::convert::ByteSizeExt::from_bytes(u64::MAX),
+            ByteSizeExt::from_bytes(u64::MAX),
         )
         .unwrap();
         assert2::assert!(decoded.as_ref() == raw);

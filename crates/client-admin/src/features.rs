@@ -157,13 +157,10 @@ pub type UpdateFeaturesResults = BTreeMap<String, Result<(), KafkaError>>;
 
 /// `base` with the call deadline `timeout`, when set.
 fn call_policy(timeout: Option<Time>, base: RetryPolicy) -> RetryPolicy {
-    match timeout {
-        Some(timeout) => RetryPolicy {
-            timeout: Duration::from_millis(u64::try_from(timeout.millis_i64()).unwrap_or(0)),
-            ..base
-        },
-        None => base,
-    }
+    timeout.map_or(base, |timeout| RetryPolicy {
+        timeout: Duration::from_millis(u64::try_from(timeout.millis_i64()).unwrap_or(0)),
+        ..base
+    })
 }
 
 /// The `UpdateFeatures` request of `updates`, as `KafkaAdminClient`'s
@@ -306,12 +303,8 @@ impl AdminClient {
         }
     }
 
-    /// Finalize `metadata.version` at `level` through `UpdateFeatures`.
-    ///
-    /// # Errors
-    /// Returns a transport, protocol, or broker error when Kafka rejects the
-    /// requested level.
-    pub async fn update_metadata_version(
+    /// The call behind [`AdminClientLike::update_metadata_version`](crate::AdminClientLike::update_metadata_version).
+    pub(crate) async fn update_metadata_version_impl(
         &mut self,
         level: i16,
         upgrade_type: UpgradeType,
@@ -401,10 +394,7 @@ fn update_results(
             );
             continue;
         }
-        let outcome = match kafka_error_if(result.error_code, result.error_message) {
-            Some(error) => Err(error),
-            None => Ok(()),
-        };
+        let outcome = kafka_error_if(result.error_code, result.error_message).map_or(Ok(()), Err);
         results.insert(result.feature, outcome);
     }
     for feature in updates.keys() {
@@ -439,8 +429,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::partition_leaders::test_support::{
-        ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
+    use crate::{
+        AdminClientLike as _,
+        partition_leaders::test_support::{
+            ApiVersionRange, api_versions, decode_request, encode_response, fast_admin,
+        },
+        retry::REQUEST_TIMED_OUT,
     };
 
     fn update(level: i16, upgrade_type: UpgradeType) -> FeatureUpdate {
@@ -626,6 +620,7 @@ mod tests {
             _ => None,
         })
         .await
+        .unwrap()
     }
 
     /// The whole `UpdateFeatures` request that reaches the controller, for
@@ -738,7 +733,8 @@ mod tests {
                     .call()
             })
         })
-        .await;
+        .await
+        .unwrap();
         let mut admin = AdminClient::connect(&[broker.addr.to_string()])
             .await
             .expect("admin connects");
@@ -819,6 +815,7 @@ mod tests {
             _ => MockReply::Silent,
         })
         .await
+        .unwrap()
     }
 
     /// `describe_features` asks the node of the client's connection, or the
@@ -873,7 +870,7 @@ mod tests {
             matches!(
                 unknown,
                 Err(AdminError::Broker {
-                    code: crate::retry::REQUEST_TIMED_OUT,
+                    code: REQUEST_TIMED_OUT,
                     ..
                 })
             ),
@@ -911,7 +908,8 @@ mod tests {
             )),
             _ => None,
         })
-        .await;
+        .await
+        .unwrap();
         let mut admin = AdminClient::connect(&[broker.addr.to_string()])
             .await
             .expect("admin connects");

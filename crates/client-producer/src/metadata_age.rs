@@ -16,7 +16,7 @@ use std::{
 
 use dashmap::DashMap;
 use krabka_client_core::Client;
-use tokio::time::Instant;
+use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -35,7 +35,7 @@ pub const DEFAULT_PRODUCER_METADATA_MAX_IDLE: Duration = Duration::from_mins(5);
 pub const MIN_PRODUCER_METADATA_MAX_IDLE: Duration = Duration::from_secs(5);
 
 /// The state that the periodic refresh reads and updates.
-pub(crate) struct MetadataAge {
+pub struct MetadataAge {
     client: Client,
     max_age: Duration,
     max_idle: Duration,
@@ -55,7 +55,7 @@ pub(crate) struct MetadataAge {
 /// # Errors
 /// Returns [`ProducerError::InvalidConfig`] for a value below 5 s, as Kafka's
 /// `ProducerConfig` defines `metadata.max.idle.ms` with `atLeast(5000)`.
-pub(crate) fn validate_metadata_max_idle(max_idle: Duration) -> Result<(), ProducerError> {
+pub fn validate_metadata_max_idle(max_idle: Duration) -> Result<(), ProducerError> {
     if max_idle < MIN_PRODUCER_METADATA_MAX_IDLE {
         return Err(ProducerError::InvalidConfig(format!(
             "metadata_max_idle must be at least 5 s, got {max_idle:?}"
@@ -132,7 +132,7 @@ impl MetadataAge {
             tokio::select! {
                 () = shutdown.cancelled() => return,
                 () = self.producer_dropped.cancelled() => return,
-                () = tokio::time::sleep_until(last + self.max_age) => {}
+                () = time::sleep_until(last + self.max_age) => {}
             }
             if topics
                 .last_refreshed()
@@ -151,7 +151,7 @@ impl MetadataAge {
                     tracing::debug!(error = %error, "periodic producer metadata refresh failed");
                     tokio::select! {
                         () = shutdown.cancelled() => return,
-                        () = tokio::time::sleep(backoff) => {}
+                        () = time::sleep(backoff) => {}
                     }
                     backoff = backoff.saturating_mul(2).min(self.retry_backoff_max);
                 }
@@ -229,11 +229,12 @@ mod tests {
                 MetadataResponseTopic,
             },
         },
+        primitives::uuid::Uuid,
     };
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::{Producer, producer::TopicMetadata};
+    use crate::{Producer, accumulator::Accumulator, producer::TopicMetadata};
 
     const TOPIC: &str = "orders";
     const CLIENT_ID: &str = "metadata-age-test";
@@ -325,7 +326,8 @@ mod tests {
             response.encode(&mut buf, version).unwrap();
             Some(buf.to_vec())
         })
-        .await;
+        .await
+        .unwrap();
         port.store(mock.addr.port(), Ordering::SeqCst);
         ChangingBroker {
             mock,
@@ -404,7 +406,7 @@ mod tests {
                 Change::Partitions(count) => broker.partitions.store(count, Ordering::SeqCst),
                 Change::Leader(leader) => broker.leader.store(leader, Ordering::SeqCst),
             }
-            tokio::time::sleep(wait).await;
+            time::sleep(wait).await;
             let held = Held {
                 partitions: producer
                     .metadata_cache
@@ -442,6 +444,13 @@ mod tests {
         InFlight,
     }
 
+    /// An accumulator that holds one queued record.
+    fn accumulator_with_one_record() -> Accumulator {
+        let mut accumulator = Accumulator::new(1024);
+        let _ = accumulator.append(None, Some("v".into()), Vec::new(), 0, None, None);
+        accumulator
+    }
+
     /// Run a periodic refresh with a 300 ms age and a 200 ms idle time for
     /// 500 ms, then drop the producer's `MetadataRefresh`.
     async fn idle_expiry(idle: Idle) -> AfterIdle {
@@ -459,7 +468,7 @@ mod tests {
         let metadata_cache = Arc::new(MetadataCache::from(
             maplit::hashmap! {TOPIC.to_owned() => TopicMetadata {
                 num_partitions: 4,
-                topic_id: krabka_protocol::primitives::uuid::Uuid::ZERO,
+                topic_id: Uuid::ZERO,
             }},
         ));
         let partition_leaders = Arc::new(DashMap::from_iter([((TOPIC.to_owned(), 0), 1)]));
@@ -468,9 +477,10 @@ mod tests {
         match idle {
             Idle::NoRecords => {}
             Idle::QueuedRecord => {
-                let mut accumulator = crate::accumulator::Accumulator::new(1024);
-                let _ = accumulator.append(None, Some("v".into()), Vec::new(), 0, None, None);
-                accumulators.insert((TOPIC.to_owned(), 0), Arc::new(Mutex::new(accumulator)));
+                accumulators.insert(
+                    (TOPIC.to_owned(), 0),
+                    Arc::new(Mutex::new(accumulator_with_one_record())),
+                );
             }
             Idle::InFlight => in_flight.store(1, Ordering::SeqCst),
         }
@@ -483,12 +493,10 @@ mod tests {
                 .with_queues((&accumulators, &in_flight))
                 .run(CancellationToken::new()),
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        time::sleep(Duration::from_millis(500)).await;
         // The producer drops its `MetadataRefresh` when it drops.
         drop(metadata_refresh);
-        let task_finished = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .is_ok();
+        let task_finished = time::timeout(Duration::from_secs(1), task).await.is_ok();
         let last_request = broker.requests.lock().unwrap().last().cloned();
         let observed = AfterIdle {
             last_request,
@@ -551,14 +559,15 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_max_idle_below_five_seconds_is_rejected() {
-        let result = Producer::builder()
+        let error = Producer::builder()
             .bootstrap("unused.invalid:9092")
             .metadata_max_idle(Duration::from_millis(4999))
             .build()
-            .await;
+            .await
+            .err();
         check!(matches!(
-            result,
-            Err(crate::ProducerError::InvalidConfig(message))
+            error,
+            Some(ProducerError::InvalidConfig(message))
                 if message == "metadata_max_idle must be at least 5 s, got 4.999s"
         ));
     }

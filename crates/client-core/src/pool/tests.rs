@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    io,
+    net::{self, IpAddr},
     sync::{
         Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -98,7 +100,7 @@ impl BrokerConnector for RecordingConnector {
         if self.refused.lock().unwrap().contains(&addr) {
             return Err(ClientError::Connect {
                 addr,
-                source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                source: io::Error::from(io::ErrorKind::ConnectionRefused),
             });
         }
         Ok(StubConn {
@@ -113,7 +115,7 @@ impl BrokerConnector for RecordingConnector {
         self.resolves.fetch_add(1, Ordering::SeqCst);
         let known = self.hosts.lock().unwrap().get(host).cloned();
         Ok(known.unwrap_or_else(|| {
-            host.parse::<std::net::IpAddr>()
+            host.parse::<IpAddr>()
                 .map(|ip| vec![SocketAddr::new(ip, port)])
                 .unwrap_or_default()
         }))
@@ -681,7 +683,7 @@ async fn a_connection_the_pool_cannot_give_is_recorded_at_debug() {
 #[tokio::test]
 async fn a_refused_tcp_dial_records_no_error() {
     let closed = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap()
     };
     let pool = BrokerPool::new(vec![closed], ConnectionOptions::default());

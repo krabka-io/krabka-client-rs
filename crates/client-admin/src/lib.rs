@@ -16,7 +16,9 @@
 use std::{
     any::Any,
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    io,
+    net::SocketAddr,
+    sync::{Arc, Mutex, PoisonError},
 };
 
 #[cfg(test)]
@@ -30,9 +32,15 @@ use krabka_client_core::{
     },
     transport,
 };
-use krabka_protocol::owned::{metadata_request, metadata_response};
+use krabka_protocol::owned::{
+    describe_cluster_response::DescribeClusterResponse, metadata_request, metadata_response,
+};
 use krabka_units::{Time, convert::TimeExt as _};
 use thiserror::Error;
+use tokio::{
+    sync::RwLock,
+    time::{Instant, timeout},
+};
 
 pub mod brokers;
 pub mod cluster;
@@ -175,8 +183,11 @@ pub use users::{
 /// which needs unique access.
 #[async_trait::async_trait]
 pub trait AdminClientLike: Send {
-    /// Finalize `metadata.version` at `level` with `upgrade_type`, as
-    /// [`AdminClient::update_metadata_version`] does.
+    /// Finalize `metadata.version` at `level` through `UpdateFeatures`.
+    ///
+    /// # Errors
+    /// Returns a transport, protocol, or broker error when Kafka rejects the
+    /// requested level.
     async fn update_metadata_version(
         &mut self,
         _level: i16,
@@ -187,14 +198,29 @@ pub trait AdminClientLike: Send {
             "UpdateFeatures is not implemented by this admin client".into(),
         ))
     }
-    /// Read committed metadata-quorum membership.
+    /// Return the live `__cluster_metadata` partition-zero quorum view.
+    ///
+    /// # Errors
+    /// Returns a transport, protocol, or Kafka error from `DescribeQuorum`.
     async fn describe_metadata_quorum(&mut self) -> Result<MetadataQuorum, AdminError> {
         Err(AdminError::Protocol(
             "DescribeQuorum is not implemented by this admin client".into(),
         ))
     }
-    /// Remove one exact metadata-quorum voter identity. `cluster_id` is
-    /// Kafka's `RemoveRaftVoterOptions.clusterId`.
+    /// Remove one exact node and directory identity from the metadata quorum,
+    /// as Kafka's `removeRaftVoter` operation does.
+    ///
+    /// `cluster_id` is Kafka's `RemoveRaftVoterOptions.clusterId`, the
+    /// cluster ID string as `meta.properties` holds it; `None` sends a null
+    /// cluster ID, which the controller does not check.
+    ///
+    /// `NOT_CONTROLLER` (41) makes the client find the controller again and
+    /// resend the request with the backoff until `default.api.timeout.ms`
+    /// (60 s), as Kafka's `handleNotControllerError` does.
+    ///
+    /// # Errors
+    /// Returns a transport, protocol, or Kafka error from `RemoveRaftVoter`,
+    /// and `REQUEST_TIMED_OUT` (7) at the deadline.
     async fn remove_raft_voter(
         &mut self,
         _cluster_id: Option<&str>,
@@ -205,14 +231,36 @@ pub trait AdminClientLike: Send {
             "RemoveRaftVoter is not implemented by this admin client".into(),
         ))
     }
+    /// Metadata for the named topics. Pass an empty slice to fetch all
+    /// topics, per Kafka semantics.
+    ///
+    /// # Errors
+    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     async fn metadata(&mut self, topics: &[&str]) -> Result<TopicMetadata, AdminError>;
+    /// Converges every partition of `topic` to `replication_factor` through
+    /// `AlterPartitionReassignments`.
+    ///
+    /// Existing replicas are retained where possible. Added replicas rotate
+    /// across the broker list, and decreases preserve the leading replica
+    /// order. An existing reassignment is never overwritten.
+    ///
+    /// # Errors
+    /// Returns an error when the factor is invalid for the live broker set,
+    /// metadata cannot be read, Kafka rejects a reassignment, or transport I/O
+    /// fails.
     async fn reconcile_topic_replication_factor(
         &mut self,
         topic: &str,
         replication_factor: i32,
         timeout: Time,
     ) -> Result<TopicReplicationStatus, AdminError>;
-    /// Read exact replica membership without changing broker state.
+    /// Returns current replica membership for every selected partition.
+    ///
+    /// Pass an empty topic slice to inspect the whole cluster before broker
+    /// evacuation.
+    ///
+    /// # Errors
+    /// Returns a transport or protocol error.
     async fn describe_partition_assignments(
         &mut self,
         _topics: &[&str],
@@ -221,7 +269,12 @@ pub trait AdminClientLike: Send {
             "Describe partition assignments is not implemented by this admin client".into(),
         ))
     }
-    /// List active reassignments for the selected partitions.
+    /// Lists active partition reassignments and their replica membership.
+    ///
+    /// An empty filter lists every active reassignment.
+    ///
+    /// # Errors
+    /// Returns a transport, protocol, or top-level broker error.
     async fn list_partition_reassignments(
         &mut self,
         _partitions: &BTreeMap<String, Vec<i32>>,
@@ -231,7 +284,12 @@ pub trait AdminClientLike: Send {
             "ListPartitionReassignments is not implemented by this admin client".into(),
         ))
     }
-    /// Submit exact replica assignments, or cancel them with `None`.
+    /// Submits exact replica lists; `None` cancels an active reassignment.
+    /// A reassignment may change a partition's replication factor, Kafka's
+    /// default; [`AdminClient::alter_partition_assignments_with`] can refuse that.
+    ///
+    /// # Errors
+    /// Returns a transport, protocol, or top-level broker error.
     async fn alter_partition_assignments(
         &mut self,
         _assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
@@ -241,68 +299,225 @@ pub trait AdminClientLike: Send {
             "AlterPartitionReassignments is not implemented by this admin client".into(),
         ))
     }
-    /// Remove a broker registration through the active controller.
+    /// Unregisters one broker from the active `KRaft` controller.
+    ///
+    /// Kafka's `KafkaAdminClient.unregisterBroker` retries
+    /// `REQUEST_TIMED_OUT` (7) with the retry backoff until the call deadline
+    /// (`default.api.timeout.ms`, 60 s), and fails at once on every other
+    /// code, `NOT_CONTROLLER` (41) too. This call does the same.
+    ///
+    /// # Errors
+    /// Returns a transport, protocol, or broker error. At the deadline it
+    /// gives `REQUEST_TIMED_OUT` (7).
     async fn unregister_broker(&mut self, _broker_id: i32) -> Result<(), AdminError> {
         Err(AdminError::Protocol(
             "UnregisterBroker is not implemented by this admin client".into(),
         ))
     }
+    /// Creates topics through the active controller, as Kafka's
+    /// `KafkaAdminClient.createTopics` does.
+    ///
+    /// The call retries until the deadline of `options`:
+    ///
+    /// - `NOT_CONTROLLER` (41) for any topic: find the controller again, wait
+    ///   for the backoff, and send every topic that has no outcome again
+    ///   (`handleNotControllerError`). With controller bootstrap,
+    ///   `NOT_LEADER_OR_FOLLOWER` (6) does the same.
+    /// - `THROTTLING_QUOTA_EXCEEDED` (89): when
+    ///   [`TopicMutationOptions::retry_on_quota_violation`] is set, wait for the
+    ///   throttle time of the response and send only the throttled topics
+    ///   again. A topic that has an outcome is not sent again.
+    ///
+    /// At the deadline a throttled topic keeps code 89, with the throttle time
+    /// that remains. Another topic without an outcome gets
+    /// `REQUEST_TIMED_OUT` (7). The outcomes keep the order of `specs`.
+    ///
+    /// # Errors
+    /// Returns an error when configuration is invalid, protocol encoding fails, or transport I/O fails.
     async fn create_topics(
         &mut self,
         specs: &[CreateTopicSpec],
         options: TopicMutationOptions,
     ) -> Result<Vec<CreateTopicOutcome>, AdminError>;
+    /// Deletes topics through the active controller, as Kafka's
+    /// `KafkaAdminClient.deleteTopics` does. The call retries
+    /// `NOT_CONTROLLER` (41) and `THROTTLING_QUOTA_EXCEEDED` (89) as
+    /// [`AdminClientLike::create_topics`] does.
+    ///
+    /// # Errors
+    /// Returns an error when configuration is invalid, protocol encoding fails, or transport I/O fails.
     async fn delete_topics(
         &mut self,
         names: &[&str],
         options: TopicMutationOptions,
     ) -> Result<Vec<DeleteTopicOutcome>, AdminError>;
+    /// Adds partitions through the active controller, as Kafka's
+    /// `KafkaAdminClient.createPartitions` does. The call retries
+    /// `NOT_CONTROLLER` (41) and `THROTTLING_QUOTA_EXCEEDED` (89) as
+    /// [`AdminClientLike::create_topics`] does.
+    ///
+    /// # Errors
+    /// Returns an error when configuration is invalid, protocol encoding fails, or transport I/O fails.
     async fn create_partitions(
         &mut self,
         ops: &[CreatePartitionsOp],
         options: TopicMutationOptions,
     ) -> Result<Vec<CreatePartitionsOutcome>, AdminError>;
+    /// Deletes records below each requested partition offset.
+    ///
+    /// `offset == -1` follows Kafka `DeleteRecords` semantics and truncates to
+    /// the partition high watermark. The returned `low_watermark` is the
+    /// broker's resulting log-start offset for that partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AdminError`] when metadata lookup, leader routing, transport,
+    /// or protocol handling fails. Kafka partition-level failures remain in the
+    /// returned [`DeleteRecordsOutcome::error_code`].
     async fn delete_records(
         &mut self,
         ops: &[DeleteRecordsOp],
         timeout: Time,
     ) -> Result<Vec<DeleteRecordsOutcome>, AdminError>;
+    /// Describes the configs of each resource of `resources`, as Kafka's
+    /// `describeConfigs` operation does.
+    ///
+    /// The client sends one `DescribeConfigs` request to each broker that a
+    /// `BROKER` resource with a broker id or a `BROKER_LOGGER` resource
+    /// names, and one request with every other resource on its connection,
+    /// all at the same time. Each request asks for every config of its
+    /// resources. The result has one entry for each resource:
+    ///
+    /// - Its [`Config`], or the error the broker gave for it, such as
+    ///   `UNKNOWN_TOPIC_OR_PARTITION` (3).
+    /// - `UNKNOWN_SERVER_ERROR` (-1) when the answer has no result for it.
+    /// - The error of its request when that request fails: `REQUEST_TIMED_OUT`
+    ///   (7) at `default.api.timeout.ms` (60 s), or `UNSUPPORTED_VERSION` (35)
+    ///   when the node does not support `DescribeConfigs` v3 and
+    ///   `include_documentation` is set. A broker is found by id in fresh
+    ///   metadata, and a missing broker or a lost connection is tried again
+    ///   until the deadline, as in [`AdminClient::describe_log_dirs`].
+    ///
+    /// # Errors
+    /// Returns [`AdminError::InvalidArgument`], and sends nothing, when the
+    /// name of a `BROKER` resource is neither empty nor a broker id, or the
+    /// name of a `BROKER_LOGGER` resource is not a broker id, as Kafka's
+    /// `nodeFor` throws a `NumberFormatException`.
     async fn describe_configs(
         &mut self,
         resources: &[ConfigResource],
         options: DescribeConfigsOptions,
     ) -> Result<DescribeConfigsResults, AdminError>;
+    /// Changes the configs of each resource of `configs`, as Kafka's
+    /// `incrementalAlterConfigs` operation does. With
+    /// [`IncrementalAlterConfigsOptions::validate_only`] the broker
+    /// validates the changes and applies none.
+    ///
+    /// A `BROKER` resource with a broker id goes to that broker, and a
+    /// `BROKER_LOGGER` resource to its broker, each in a request of its own.
+    /// With a controller bootstrap only a `BROKER_LOGGER` resource goes to
+    /// its node. Every other resource goes in one request on the client's
+    /// connection. A `NOT_CONTROLLER` (41) answer, or with a controller
+    /// bootstrap a `NOT_LEADER_OR_FOLLOWER` (6) answer, makes the client find
+    /// the controller again and send the request again until the deadline.
+    /// The result has one entry for each resource:
+    ///
+    /// - `Ok(())`, or the error the broker gave for it, such as
+    ///   `INVALID_CONFIG` (40).
+    /// - `UNKNOWN_SERVER_ERROR` (-1) when the answer has no result for it.
+    /// - The error of its request when that request fails, with
+    ///   `REQUEST_TIMED_OUT` (7) at `default.api.timeout.ms` (60 s).
+    ///
+    /// # Errors
+    /// Returns [`AdminError::InvalidArgument`], and sends nothing, for a
+    /// resource name that [`Self::describe_configs`] refuses.
     async fn incremental_alter_configs(
         &mut self,
         configs: &BTreeMap<ConfigResource, Vec<AlterConfigOp>>,
         options: IncrementalAlterConfigsOptions,
     ) -> Result<AlterConfigsResults, AdminError>;
+    /// Upserts SCRAM-SHA-512 credentials, deletes them, or both, in a single
+    /// call.
+    ///
+    /// `upsertions` carry plaintext passwords. The function generates a fresh
+    /// 16-byte salt per row and computes the KIP-554 wire `salted_password`
+    /// (PBKDF2-HMAC-SHA-512) client-side with
+    /// `krabka_security::pbkdf2_salted`. The broker never sees the raw
+    /// password.
+    ///
+    /// # Errors
+    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     async fn alter_user_scram_credentials_sha512(
         &mut self,
         upsertions: &[ScramUpsertion],
         deletions: &[ScramDeletion],
     ) -> Result<Vec<ScramUserOutcome>, AdminError>;
     /// SCRAM-SHA-256 sibling of
-    /// [`Self::alter_user_scram_credentials_sha512`]. The operator
-    /// calls this when a `KafkaUser.spec.authentication.type ==
-    /// scram-sha-256`.
+    /// [`Self::alter_user_scram_credentials_sha512`].
+    ///
+    /// The iteration counts, the salt generation, and the salted-password
+    /// derivation are identical to the SHA-512 path. Only the mechanism wire
+    /// byte and the HMAC algorithm differ.
+    ///
+    /// # Errors
+    ///
+    /// Same as `_sha512`: returns [`AdminError::Protocol`] when the
+    /// system RNG fails, otherwise propagates the broker's
+    /// per-username outcome rows.
     async fn alter_user_scram_credentials_sha256(
         &mut self,
         upsertions: &[ScramUpsertion],
         deletions: &[ScramDeletion],
     ) -> Result<Vec<ScramUserOutcome>, AdminError>;
+    /// Lists ACLs that match `filter`.
+    ///
+    /// The broker's response is resource-grouped on the wire, with one block
+    /// per `(resource_type, resource_name, pattern_type)`. This method
+    /// flattens it back into `AclEntry` rows for the diff.
+    ///
+    /// # Errors
+    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     async fn describe_acls(&mut self, filter: &AclEntryFilter)
     -> Result<Vec<AclEntry>, AdminError>;
+    /// Creates the supplied ACLs.
+    ///
+    /// # Errors
+    /// Returns [`AdminError::InvalidArgument`], before anything is sent, for
+    /// an entry whose pattern type is [`PatternType::Match`]: Kafka's
+    /// `ResourcePattern` refuses `patternType must not be MATCH`. Otherwise
+    /// returns an error when protocol encoding fails, the broker rejects the
+    /// request, or transport I/O fails.
     async fn create_acls(
         &mut self,
         creations: &[AclEntry],
     ) -> Result<Vec<CreateAclOutcome>, AdminError>;
+    /// Deletes every ACL that matches any of `filters`.
+    ///
+    /// Each filter's response surfaces the matched ACL set, so callers can
+    /// confirm that the deletion converged on the expected rows.
+    ///
+    /// # Errors
+    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     async fn delete_acls(
         &mut self,
         filters: &[AclEntryFilter],
     ) -> Result<Vec<DeleteAclFilterOutcome>, AdminError>;
+    /// Reads the quotas of the user entity `{user: username}`.
+    ///
+    /// The filter is strict on the single component `("user", username)`, as
+    /// `ClientQuotaFilter.containsOnly`: an entry whose entity also has a
+    /// `client-id` does not match.
+    ///
+    /// # Errors
+    /// See [`AdminClient::describe_client_quotas`].
     async fn describe_user_quotas(&mut self, username: &str)
     -> Result<UserQuotaConfig, AdminError>;
+    /// Applies `ops` to the user entity `{user: username}`. Returns the
+    /// error the broker gave for the entity, or `None` on success. No
+    /// request is sent for an empty `ops`.
+    ///
+    /// # Errors
+    /// See [`AdminClient::alter_client_quotas`].
     async fn alter_user_quotas(
         &mut self,
         username: &str,
@@ -312,22 +527,71 @@ pub trait AdminClientLike: Send {
 
     // ── delegation-token RPCs (KIP-48) ────────────────────────────────
     //
-    // Each method mirrors the inherent method of the same name in
+    // Each method runs the `_impl` call of the same name in
     // `delegation_tokens.rs`.
+
+    /// Creates a delegation token, as Kafka's `createDelegationToken`
+    /// operation does.
+    ///
+    /// The broker does not return the renewers, so the result has the
+    /// renewers of `options`, as Kafka's result does. With an
+    /// [`owner`](CreateDelegationTokenOptions::owner) the client negotiates
+    /// `CreateDelegationToken` v3 or higher, as Kafka's request refuses to
+    /// write the owner fields below v3.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::Broker`] for a non-zero error code, such as
+    /// `DELEGATION_TOKEN_AUTH_DISABLED` (61),
+    /// `DELEGATION_TOKEN_REQUEST_NOT_ALLOWED` (64),
+    /// `DELEGATION_TOKEN_AUTHORIZATION_FAILED` (65), or
+    /// `INVALID_PRINCIPAL_TYPE` (67). Returns [`AdminError::Transport`] when
+    /// the connection fails, or when an owner is set and the broker does not
+    /// support v3.
     async fn create_delegation_token(
         &mut self,
         options: &CreateDelegationTokenOptions,
     ) -> Result<DelegationToken, AdminError>;
+    /// Renews the delegation token with `hmac`, as Kafka's
+    /// `renewDelegationToken` operation does, and returns its new expiry in
+    /// epoch milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::Broker`] for a non-zero error code, such as
+    /// `DELEGATION_TOKEN_NOT_FOUND` (62), `DELEGATION_TOKEN_OWNER_MISMATCH`
+    /// (63), or `DELEGATION_TOKEN_EXPIRED` (66). Returns
+    /// [`AdminError::Transport`] when the connection fails.
     async fn renew_delegation_token(
         &mut self,
         hmac: &[u8],
         options: RenewDelegationTokenOptions,
     ) -> Result<i64, AdminError>;
+    /// Expires the delegation token with `hmac`, as Kafka's
+    /// `expireDelegationToken` operation does, and returns the expiry that
+    /// the broker set, in epoch milliseconds. A token that expires now gets
+    /// the broker's clock at the time of the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::Broker`] for a non-zero error code, such as
+    /// `DELEGATION_TOKEN_NOT_FOUND` (62), `DELEGATION_TOKEN_OWNER_MISMATCH`
+    /// (63), or `DELEGATION_TOKEN_EXPIRED` (66). Returns
+    /// [`AdminError::Transport`] when the connection fails.
     async fn expire_delegation_token(
         &mut self,
         hmac: &[u8],
         options: ExpireDelegationTokenOptions,
     ) -> Result<i64, AdminError>;
+    /// Describes the delegation tokens that `options` selects, as Kafka's
+    /// `describeDelegationToken` operation does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::Broker`] for a non-zero error code, such as
+    /// `DELEGATION_TOKEN_AUTH_DISABLED` (61) or
+    /// `DELEGATION_TOKEN_REQUEST_NOT_ALLOWED` (64). Returns
+    /// [`AdminError::Transport`] when the connection fails.
     async fn describe_delegation_token(
         &mut self,
         options: &DescribeDelegationTokenOptions,
@@ -342,11 +606,11 @@ impl AdminClientLike for AdminClient {
         upgrade_type: UpgradeType,
         timeout: Time,
     ) -> Result<MetadataVersionUpdate, AdminError> {
-        AdminClient::update_metadata_version(self, level, upgrade_type, timeout).await
+        Self::update_metadata_version_impl(self, level, upgrade_type, timeout).await
     }
 
     async fn describe_metadata_quorum(&mut self) -> Result<MetadataQuorum, AdminError> {
-        AdminClient::describe_metadata_quorum(self).await
+        Self::describe_metadata_quorum_impl(self).await
     }
 
     async fn remove_raft_voter(
@@ -355,11 +619,11 @@ impl AdminClientLike for AdminClient {
         node_id: i32,
         directory_id: uuid::Uuid,
     ) -> Result<(), AdminError> {
-        AdminClient::remove_raft_voter(self, cluster_id, node_id, directory_id).await
+        Self::remove_raft_voter_impl(self, cluster_id, node_id, directory_id).await
     }
 
     async fn metadata(&mut self, topics: &[&str]) -> Result<TopicMetadata, AdminError> {
-        AdminClient::metadata(self, topics).await
+        Self::metadata_impl(self, topics).await
     }
     async fn reconcile_topic_replication_factor(
         &mut self,
@@ -367,111 +631,111 @@ impl AdminClientLike for AdminClient {
         replication_factor: i32,
         timeout: Time,
     ) -> Result<TopicReplicationStatus, AdminError> {
-        AdminClient::reconcile_topic_replication_factor(self, topic, replication_factor, timeout)
+        Self::reconcile_topic_replication_factor_impl(self, topic, replication_factor, timeout)
             .await
     }
     async fn describe_partition_assignments(
         &mut self,
         topics: &[&str],
     ) -> Result<Vec<PartitionAssignment>, AdminError> {
-        AdminClient::describe_partition_assignments(self, topics).await
+        Self::describe_partition_assignments_impl(self, topics).await
     }
     async fn list_partition_reassignments(
         &mut self,
         partitions: &BTreeMap<String, Vec<i32>>,
         timeout: Time,
     ) -> Result<Vec<PartitionAssignment>, AdminError> {
-        AdminClient::list_partition_reassignments(self, partitions, timeout).await
+        Self::list_partition_reassignments_impl(self, partitions, timeout).await
     }
     async fn alter_partition_assignments(
         &mut self,
         assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
         timeout: Time,
     ) -> Result<Vec<PartitionAssignmentOutcome>, AdminError> {
-        AdminClient::alter_partition_assignments(self, assignments, timeout).await
+        Self::alter_partition_assignments_impl(self, assignments, timeout).await
     }
     async fn unregister_broker(&mut self, broker_id: i32) -> Result<(), AdminError> {
-        AdminClient::unregister_broker(self, broker_id).await
+        Self::unregister_broker_impl(self, broker_id).await
     }
     async fn create_topics(
         &mut self,
         specs: &[CreateTopicSpec],
         options: TopicMutationOptions,
     ) -> Result<Vec<CreateTopicOutcome>, AdminError> {
-        AdminClient::create_topics(self, specs, options).await
+        Self::create_topics_impl(self, specs, options).await
     }
     async fn delete_topics(
         &mut self,
         names: &[&str],
         options: TopicMutationOptions,
     ) -> Result<Vec<DeleteTopicOutcome>, AdminError> {
-        AdminClient::delete_topics(self, names, options).await
+        Self::delete_topics_impl(self, names, options).await
     }
     async fn create_partitions(
         &mut self,
         ops: &[CreatePartitionsOp],
         options: TopicMutationOptions,
     ) -> Result<Vec<CreatePartitionsOutcome>, AdminError> {
-        AdminClient::create_partitions(self, ops, options).await
+        Self::create_partitions_impl(self, ops, options).await
     }
     async fn delete_records(
         &mut self,
         ops: &[DeleteRecordsOp],
         timeout: Time,
     ) -> Result<Vec<DeleteRecordsOutcome>, AdminError> {
-        AdminClient::delete_records(self, ops, timeout).await
+        Self::delete_records_impl(self, ops, timeout).await
     }
     async fn describe_configs(
         &mut self,
         resources: &[ConfigResource],
         options: DescribeConfigsOptions,
     ) -> Result<DescribeConfigsResults, AdminError> {
-        AdminClient::describe_configs(self, resources, options).await
+        Self::describe_configs_impl(self, resources, options).await
     }
     async fn incremental_alter_configs(
         &mut self,
         configs: &BTreeMap<ConfigResource, Vec<AlterConfigOp>>,
         options: IncrementalAlterConfigsOptions,
     ) -> Result<AlterConfigsResults, AdminError> {
-        AdminClient::incremental_alter_configs(self, configs, options).await
+        Self::incremental_alter_configs_impl(self, configs, options).await
     }
     async fn alter_user_scram_credentials_sha512(
         &mut self,
         upsertions: &[ScramUpsertion],
         deletions: &[ScramDeletion],
     ) -> Result<Vec<ScramUserOutcome>, AdminError> {
-        AdminClient::alter_user_scram_credentials_sha512(self, upsertions, deletions).await
+        Self::alter_user_scram_credentials_sha512_impl(self, upsertions, deletions).await
     }
     async fn alter_user_scram_credentials_sha256(
         &mut self,
         upsertions: &[ScramUpsertion],
         deletions: &[ScramDeletion],
     ) -> Result<Vec<ScramUserOutcome>, AdminError> {
-        AdminClient::alter_user_scram_credentials_sha256(self, upsertions, deletions).await
+        Self::alter_user_scram_credentials_sha256_impl(self, upsertions, deletions).await
     }
     async fn describe_acls(
         &mut self,
         filter: &AclEntryFilter,
     ) -> Result<Vec<AclEntry>, AdminError> {
-        AdminClient::describe_acls(self, filter).await
+        Self::describe_acls_impl(self, filter).await
     }
     async fn create_acls(
         &mut self,
         creations: &[AclEntry],
     ) -> Result<Vec<CreateAclOutcome>, AdminError> {
-        AdminClient::create_acls(self, creations).await
+        Self::create_acls_impl(self, creations).await
     }
     async fn delete_acls(
         &mut self,
         filters: &[AclEntryFilter],
     ) -> Result<Vec<DeleteAclFilterOutcome>, AdminError> {
-        AdminClient::delete_acls(self, filters).await
+        Self::delete_acls_impl(self, filters).await
     }
     async fn describe_user_quotas(
         &mut self,
         username: &str,
     ) -> Result<UserQuotaConfig, AdminError> {
-        AdminClient::describe_user_quotas(self, username).await
+        Self::describe_user_quotas_impl(self, username).await
     }
     async fn alter_user_quotas(
         &mut self,
@@ -479,34 +743,34 @@ impl AdminClientLike for AdminClient {
         ops: &[QuotaOp],
         validate_only: bool,
     ) -> Result<Option<KafkaError>, AdminError> {
-        AdminClient::alter_user_quotas(self, username, ops, validate_only).await
+        Self::alter_user_quotas_impl(self, username, ops, validate_only).await
     }
 
     async fn create_delegation_token(
         &mut self,
         options: &CreateDelegationTokenOptions,
     ) -> Result<DelegationToken, AdminError> {
-        AdminClient::create_delegation_token(self, options).await
+        Self::create_delegation_token_impl(self, options).await
     }
     async fn renew_delegation_token(
         &mut self,
         hmac: &[u8],
         options: RenewDelegationTokenOptions,
     ) -> Result<i64, AdminError> {
-        AdminClient::renew_delegation_token(self, hmac, options).await
+        Self::renew_delegation_token_impl(self, hmac, options).await
     }
     async fn expire_delegation_token(
         &mut self,
         hmac: &[u8],
         options: ExpireDelegationTokenOptions,
     ) -> Result<i64, AdminError> {
-        AdminClient::expire_delegation_token(self, hmac, options).await
+        Self::expire_delegation_token_impl(self, hmac, options).await
     }
     async fn describe_delegation_token(
         &mut self,
         options: &DescribeDelegationTokenOptions,
     ) -> Result<Vec<DelegationToken>, AdminError> {
-        AdminClient::describe_delegation_token(self, options).await
+        Self::describe_delegation_token_impl(self, options).await
     }
 }
 
@@ -528,7 +792,7 @@ pub enum AdminError {
     Connect {
         tried: usize,
         #[source]
-        source: Option<Box<AdminError>>,
+        source: Option<Box<Self>>,
     },
     /// A setting of [`AdminClientConfig`] is invalid, as Kafka raises a
     /// `ConfigException` when it builds the admin client.
@@ -586,12 +850,12 @@ async fn lookup_first<F, I>(
     host_port: &str,
     dns_timeout: krabka_client_core::ClientDnsTimeout,
     lookup: F,
-) -> Result<std::net::SocketAddr, AdminError>
+) -> Result<SocketAddr, AdminError>
 where
-    F: std::future::Future<Output = std::io::Result<I>>,
-    I: IntoIterator<Item = std::net::SocketAddr>,
+    F: Future<Output = io::Result<I>>,
+    I: IntoIterator<Item = SocketAddr>,
 {
-    let addrs = tokio::time::timeout(dns_timeout.time().to_std(), lookup)
+    let addrs = timeout(dns_timeout.time().to_std(), lookup)
         .await
         .map_err(|_| {
             AdminError::Protocol(format!(
@@ -654,14 +918,14 @@ struct ConnectedTarget {
 
 /// One controller connection with KIP-919/KIP-1102 bootstrap recovery.
 pub(crate) struct RecoveringConnection {
-    inner: tokio::sync::RwLock<Arc<Connection>>,
+    inner: RwLock<Arc<Connection>>,
     bootstrap_addrs: Vec<String>,
     options: ConnectionOptions,
     strategy: MetadataRecoveryStrategy,
     trigger: MetadataRecoveryRebootstrapTrigger,
     target: BootstrapTarget,
     known_addrs: Mutex<Vec<String>>,
-    first_metadata_attempt: Mutex<Option<tokio::time::Instant>>,
+    first_metadata_attempt: Mutex<Option<Instant>>,
 }
 
 impl RecoveringConnection {
@@ -675,7 +939,7 @@ impl RecoveringConnection {
         known_addrs: Vec<String>,
     ) -> Self {
         Self {
-            inner: tokio::sync::RwLock::new(Arc::new(connection)),
+            inner: RwLock::new(Arc::new(connection)),
             bootstrap_addrs,
             options,
             strategy,
@@ -882,7 +1146,7 @@ impl RecoveringConnection {
         let known_addrs = self
             .known_addrs
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let mut last_error = None;
         for host_port in &known_addrs {
@@ -914,7 +1178,7 @@ impl RecoveringConnection {
         *self
             .known_addrs
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = addrs;
+            .unwrap_or_else(PoisonError::into_inner) = addrs;
     }
 
     fn observe_cluster_endpoints<T: Any>(&self, response: &T) {
@@ -933,9 +1197,7 @@ impl RecoveringConnection {
             return;
         }
         if self.target == BootstrapTarget::Controllers
-            && let Some(cluster) = (response as &dyn Any).downcast_ref::<
-                krabka_protocol::owned::describe_cluster_response::DescribeClusterResponse,
-            >()
+            && let Some(cluster) = (response as &dyn Any).downcast_ref::<DescribeClusterResponse>()
         {
             let endpoints = cluster
                 .brokers
@@ -967,8 +1229,8 @@ impl RecoveringConnection {
         }
         self.first_metadata_attempt
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_or_insert_with(tokio::time::Instant::now);
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(Instant::now);
     }
 
     fn response_requires_rebootstrap<T: Any>(response: &T) -> bool {
@@ -990,7 +1252,7 @@ impl RecoveringConnection {
             && self
                 .first_metadata_attempt
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .is_some_and(|started| started.elapsed() >= self.trigger.time().to_std())
     }
 
@@ -1007,7 +1269,7 @@ impl RecoveringConnection {
         *self
             .first_metadata_attempt
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
@@ -1039,14 +1301,13 @@ where
 impl AdminClient {
     /// The connection options of Kafka's admin client defaults with the
     /// supplied security policy and a generated `adminclient-<n>` client id.
-    fn opts(security: Option<security::ClientSecurity>) -> ConnectionOptions {
-        AdminClientConfig {
+    fn opts(security: Option<security::ClientSecurity>) -> Result<ConnectionOptions, AdminError> {
+        Ok(AdminClientConfig {
             security,
             ..AdminClientConfig::default()
         }
-        .resolve()
-        .expect("the default admin client configuration is valid")
-        .connection
+        .resolve()?
+        .connection)
     }
 
     /// Connects with Kafka's `AdminClientConfig` settings. Each call of the
@@ -1112,7 +1373,7 @@ impl AdminClient {
         bootstrap_addrs: &[String],
         security: Option<security::ClientSecurity>,
     ) -> Result<Self, AdminError> {
-        Self::connect_with_options(bootstrap_addrs, Self::opts(security)).await
+        Self::connect_with_options(bootstrap_addrs, Self::opts(security)?).await
     }
 
     /// Connects with the supplied security and DNS deadline, and keeps the
@@ -1126,7 +1387,7 @@ impl AdminClient {
         security: Option<security::ClientSecurity>,
         dns_timeout: krabka_client_core::ClientDnsTimeout,
     ) -> Result<Self, AdminError> {
-        let mut options = Self::opts(security);
+        let mut options = Self::opts(security)?;
         options.dns_timeout = dns_timeout;
         Self::connect_with_options(bootstrap_addrs, options).await
     }
@@ -1187,7 +1448,7 @@ impl AdminClient {
         bootstrap_controllers: &[String],
         security: Option<security::ClientSecurity>,
     ) -> Result<Self, AdminError> {
-        Self::connect_controller_with_options(bootstrap_controllers, Self::opts(security)).await
+        Self::connect_controller_with_options(bootstrap_controllers, Self::opts(security)?).await
     }
 
     /// Controller-bootstrap variant of [`Self::connect_with_options`].
@@ -1430,7 +1691,7 @@ impl AdminClient {
 
     /// Replaces the underlying connection. The `NOT_CONTROLLER` retry path
     /// uses it internally to reconnect to the current controller.
-    pub(crate) async fn reconnect(&mut self, host_port: &str) -> Result<(), AdminError> {
+    pub(crate) async fn reconnect(&self, host_port: &str) -> Result<(), AdminError> {
         let opts = self.options.clone();
         self.conn
             .replace(Self::connect_one(host_port, opts).await?)
@@ -1439,7 +1700,7 @@ impl AdminClient {
     }
 
     #[cfg(test)]
-    pub(crate) async fn reconnect_bootstrap(&mut self) -> Result<(), AdminError> {
+    pub(crate) async fn reconnect_bootstrap(&self) -> Result<(), AdminError> {
         let opts = self.options.clone();
         let mut last_error = None;
         for host_port in &self.bootstrap_addrs {
@@ -1632,11 +1893,14 @@ pub(crate) fn kafka_error_name(code: i16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::pending,
+        hint,
         sync::{
             Arc, Mutex,
             atomic::{AtomicU16, AtomicUsize, Ordering},
         },
         time::Duration,
+        vec,
     };
 
     use bytes::{BufMut, BytesMut};
@@ -1662,14 +1926,16 @@ mod tests {
     use security::{ClientSecurity, SaslCredentials};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
+        task::yield_now,
+        time::sleep,
     };
     use tokio_util::sync::CancellationToken;
 
     use super::*;
 
     struct ObservedAdminBroker {
-        addr: std::net::SocketAddr,
+        addr: SocketAddr,
         shutdown: CancellationToken,
         connections: Arc<AtomicUsize>,
         sasl_handshakes: Arc<AtomicUsize>,
@@ -1742,7 +2008,7 @@ mod tests {
                                     (body, true)
                                 }
                                 api_versions_request::API_KEY => {
-                                    tokio::time::sleep(api_versions_delay).await;
+                                    sleep(api_versions_delay).await;
                                     let mut body = BytesMut::new();
                                     ApiVersionsResponse {
                                         error_code: 0,
@@ -1824,7 +2090,7 @@ mod tests {
     }
 
     struct ObservedController {
-        addr: std::net::SocketAddr,
+        addr: SocketAddr,
         connections: Arc<AtomicUsize>,
         endpoint_types: Arc<Mutex<Vec<i8>>>,
     }
@@ -1960,7 +2226,7 @@ mod tests {
     }
 
     async fn metadata_times_out_with_custom_request_timeout(admin: &mut AdminClient) {
-        let result = tokio::time::timeout(Duration::from_secs(2), admin.metadata(&[]))
+        let result = timeout(Duration::from_secs(2), admin.metadata(&[]))
             .await
             .expect("custom request timeout fires");
         assert2::assert!(result.is_err());
@@ -2038,10 +2304,10 @@ mod tests {
         bytes.to_vec()
     }
 
-    async fn wait_for_admin_mock_closed(addr: std::net::SocketAddr) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while tokio::net::TcpStream::connect(addr).await.is_ok() {
-                tokio::task::yield_now().await;
+    async fn wait_for_admin_mock_closed(addr: SocketAddr) {
+        timeout(Duration::from_secs(10), async {
+            while TcpStream::connect(addr).await.is_ok() {
+                yield_now().await;
             }
         })
         .await
@@ -2261,7 +2527,7 @@ mod tests {
             e == KafkaError {
                 code: 36,
                 name: "TOPIC_ALREADY_EXISTS",
-                message: Some("dup".to_string()),
+                message: Some("dup".to_owned()),
             }
         );
     }
@@ -2282,16 +2548,15 @@ mod tests {
         };
         // 127.0.0.1:1 has no listener; the secured connect must fail —
         // proving the security arg is threaded (not a type error).
-        let res = AdminClient::connect_secured(&["127.0.0.1:1".to_string()], Some(security)).await;
+        let res = AdminClient::connect_secured(&["127.0.0.1:1".to_owned()], Some(security)).await;
         assert2::assert!(res.is_err());
     }
 
     #[tokio::test(start_paused = true)]
     async fn dns_lookup_stops_at_connection_option_deadline() {
         let timeout = ClientDnsTimeout::new(Time::from_millis(37)).expect("positive timeout");
-        let started = tokio::time::Instant::now();
-        let pending =
-            std::future::pending::<std::io::Result<std::vec::IntoIter<std::net::SocketAddr>>>();
+        let started = Instant::now();
+        let pending = pending::<io::Result<vec::IntoIter<SocketAddr>>>();
 
         let result = lookup_first("broker.invalid:9092", timeout, pending).await;
 
@@ -2312,7 +2577,7 @@ mod tests {
         metadata_times_out_with_custom_request_timeout(&mut admin).await;
 
         let slow = ObservedAdminBroker::start(Duration::from_millis(300)).await;
-        let result = tokio::time::timeout(
+        let result = timeout(
             Duration::from_secs(1),
             AdminClient::connect_with_options(&[slow.addr.to_string()], custom_admin_options()),
         )
@@ -2400,8 +2665,8 @@ mod tests {
     async fn admin_metadata_uses_a_learned_broker_after_the_only_seed_retires() {
         let healthy_port = Arc::new(AtomicU16::new(0));
         let healthy_calls = Arc::new(AtomicUsize::new(0));
-        let h_port = healthy_port.clone();
-        let h_calls = healthy_calls.clone();
+        let h_port = Arc::clone(&healthy_port);
+        let h_calls = Arc::clone(&healthy_calls);
         let healthy = MockBroker::start(move |api_key, version, _correlation_id, _body| {
             if api_key == api_versions_request::API_KEY {
                 return Some(admin_mock_api_versions());
@@ -2416,10 +2681,11 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         healthy_port.store(healthy.addr.port(), Ordering::SeqCst);
 
-        let advertised_port = healthy_port.clone();
+        let advertised_port = Arc::clone(&healthy_port);
         let seed = MockBroker::start(move |api_key, version, _correlation_id, _body| {
             if api_key == api_versions_request::API_KEY {
                 return Some(admin_mock_api_versions());
@@ -2427,7 +2693,8 @@ mod tests {
             (api_key == metadata_request::API_KEY)
                 .then(|| metadata_mock_response(version, 7, advertised_port.load(Ordering::SeqCst)))
         })
-        .await;
+        .await
+        .unwrap();
         let admin = AdminClient::connect(&[seed.addr.to_string()])
             .await
             .expect("admin connects to its seed");
@@ -2460,7 +2727,8 @@ mod tests {
             (api_key == api_versions_request::API_KEY)
                 .then(|| admin_mock_api_versions_with_describe_cluster(1))
         })
-        .await;
+        .await
+        .unwrap();
         let admin = AdminClient::connect(&[broker.addr.to_string()])
             .await
             .expect("admin connects");
@@ -2564,7 +2832,7 @@ mod tests {
         assert2::assert!(controller.observed_custom_security_and_id());
         assert_custom_connect_timeout_is_stored(&admin);
         metadata_times_out_with_custom_request_timeout(&mut admin).await;
-        let result = tokio::time::timeout(
+        let result = timeout(
             Duration::from_secs(1),
             admin.reconnect(&slow.addr.to_string()),
         )
@@ -2582,7 +2850,7 @@ mod tests {
         let slow = ObservedAdminBroker::start(Duration::from_millis(300)).await;
         let live = ObservedAdminBroker::start(Duration::ZERO).await;
         let bootstrap = [slow.addr.to_string(), live.addr.to_string()];
-        let mut admin = tokio::time::timeout(
+        let mut admin = timeout(
             Duration::from_secs(1),
             AdminClient::connect_with_options(&bootstrap, custom_admin_options()),
         )
@@ -2590,7 +2858,7 @@ mod tests {
         .expect("custom initial timeout advances to next bootstrap")
         .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), admin.reconnect_bootstrap())
+        timeout(Duration::from_secs(1), admin.reconnect_bootstrap())
             .await
             .expect("custom reconnect timeout advances to next bootstrap")
             .unwrap();
@@ -2605,7 +2873,7 @@ mod tests {
 
     #[test]
     fn existing_connectors_keep_admin_defaults() {
-        let options = AdminClient::opts(None);
+        let options = AdminClient::opts(None).unwrap();
 
         assert2::assert!(options.client_id.starts_with("adminclient-"));
         assert2::assert!(options.socket_connection_setup_timeout == secs(10));
@@ -2623,6 +2891,6 @@ mod tests {
             drop(client.unregister_broker(7));
         }
 
-        std::hint::black_box(compile_calls as fn(&mut dyn AdminClientLike));
+        hint::black_box(compile_calls as fn(&mut dyn AdminClientLike));
     }
 }

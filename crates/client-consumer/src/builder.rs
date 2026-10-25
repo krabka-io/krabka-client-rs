@@ -2,6 +2,8 @@
 //! payloads, plus the [`AutoOffsetReset`] and [`IsolationLevel`] enums that
 //! [`Consumer::builder`] uses.
 
+use std::{collections::BTreeMap, str::FromStr, time::Duration};
+
 use bytes::{Bytes, BytesMut};
 
 /// What to do when a partition has no committed offset. Kafka's
@@ -23,10 +25,10 @@ pub enum AutoOffsetReset {
     /// Start from the first offset whose timestamp is at or after now minus
     /// this duration (KIP-1106, `by_duration:<ISO-8601 duration>`).
     /// `Consumer::poll` resolves it with `ListOffsets(timestamp)`.
-    ByDuration(std::time::Duration),
+    ByDuration(Duration),
 }
 
-impl std::str::FromStr for AutoOffsetReset {
+impl FromStr for AutoOffsetReset {
     type Err = String;
 
     /// Parse Kafka's `auto.offset.reset` values: `earliest`, `latest`, `none`
@@ -40,20 +42,18 @@ impl std::str::FromStr for AutoOffsetReset {
             "by_duration" => {
                 Err("<:duration> part is missing in by_duration auto offset reset strategy.".into())
             }
-            _ => match value.strip_prefix("by_duration:") {
-                Some(duration) => parse_iso_duration(duration).map(Self::ByDuration),
-                None => Err(format!("Unknown auto offset reset strategy: {value}")),
-            },
+            _ => value.strip_prefix("by_duration:").map_or_else(
+                || Err(format!("Unknown auto offset reset strategy: {value}")),
+                |duration| parse_iso_duration(duration).map(Self::ByDuration),
+            ),
         }
     }
 }
 
 /// Split the text before `unit` from the front of `part`.
 fn duration_component(part: &str, unit: char) -> (Option<&str>, &str) {
-    match part.find(unit) {
-        Some(end) => (Some(&part[..end]), &part[end + 1..]),
-        None => (None, part),
-    }
+    part.split_once(unit)
+        .map_or((None, part), |(number, rest)| (Some(number), rest))
 }
 
 /// A decimal integer with an optional sign that fits `i64`, as Java's
@@ -70,25 +70,24 @@ fn duration_integer(number: &str) -> Option<i128> {
 /// on overflow.
 fn add_duration_part(nanos: i128, value: i128, unit_seconds: i128) -> Option<i128> {
     const NANOS_PER_SECOND: i128 = 1_000_000_000;
-    value
+    let part = value
         .checked_mul(unit_seconds)?
-        .checked_mul(NANOS_PER_SECOND)
-        .and_then(|part| nanos.checked_add(part))
+        .checked_mul(NANOS_PER_SECOND)?;
+    nanos.checked_add(part)
 }
 
 /// Parse an ISO-8601 duration as Java's `Duration.parse` does:
 /// `[-+]P[nD][T[nH][nM][n[.fffffffff]S]]`, case-insensitive, each number with
 /// an optional sign. `by_duration` rejects a negative result.
-fn parse_iso_duration(text: &str) -> Result<std::time::Duration, String> {
+fn parse_iso_duration(text: &str) -> Result<Duration, String> {
     const NANOS_PER_SECOND: i128 = 1_000_000_000;
     let invalid =
         || "Unable to parse duration string in by_duration offset reset strategy.".to_owned();
     let upper = text.to_ascii_uppercase();
-    let (negative, rest) = match upper.as_bytes().first() {
-        Some(b'-') => (true, &upper[1..]),
-        Some(b'+') => (false, &upper[1..]),
-        _ => (false, upper.as_str()),
-    };
+    let (negative, rest) = upper.strip_prefix('-').map_or_else(
+        || (false, upper.strip_prefix('+').unwrap_or(upper.as_str())),
+        |rest| (true, rest),
+    );
     let rest = rest.strip_prefix('P').ok_or_else(invalid)?;
     let (date, time) = match rest.split_once('T') {
         Some((date, time)) => (date, Some(time)),
@@ -158,7 +157,7 @@ fn parse_iso_duration(text: &str) -> Result<std::time::Duration, String> {
     let seconds = i64::try_from(nanos / NANOS_PER_SECOND).map_err(|_| invalid())?;
     let seconds = u64::try_from(seconds).map_err(|_| invalid())?;
     let subsec = u32::try_from(nanos % NANOS_PER_SECOND).map_err(|_| invalid())?;
-    Ok(std::time::Duration::new(seconds, subsec))
+    Ok(Duration::new(seconds, subsec))
 }
 
 /// Controls which records are visible to this consumer.
@@ -178,7 +177,7 @@ pub enum IsolationLevel {
     ReadCommitted,
 }
 
-impl std::str::FromStr for IsolationLevel {
+impl FromStr for IsolationLevel {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -196,8 +195,8 @@ impl IsolationLevel {
     /// Returns the `i8` wire encoding that the `Fetch` request uses.
     pub(crate) fn wire(self) -> i8 {
         match self {
-            IsolationLevel::ReadUncommitted => 0,
-            IsolationLevel::ReadCommitted => 1,
+            Self::ReadUncommitted => 0,
+            Self::ReadCommitted => 1,
         }
     }
 }
@@ -205,7 +204,7 @@ impl IsolationLevel {
 // ── subscription / assignment codec (ConsumerProtocol v3) ─────────────────
 
 use krabka_protocol::{
-    Decode, Encode, UnknownTaggedFields,
+    Decode, Encode, ProtocolError, UnknownTaggedFields,
     owned::{
         consumer_protocol_assignment::{
             ConsumerProtocolAssignment, TopicPartition as AssignTopicPartition,
@@ -219,8 +218,8 @@ use krabka_protocol::{
 const SUBSCRIPTION_WIRE_VERSION: i16 = 3;
 const ASSIGNMENT_WIRE_VERSION: i16 = 3;
 
-#[derive(Debug, PartialEq)]
-pub(crate) struct DecodedSubscription {
+#[derive(Debug, PartialEq, Eq)]
+pub struct DecodedSubscription {
     pub topics: Vec<String>,
     pub owned: Vec<(String, i32)>,
     pub generation_id: i32,
@@ -231,9 +230,8 @@ pub(crate) struct DecodedSubscription {
     pub user_data: Option<Bytes>,
 }
 
-fn group_by_topic(pairs: &[(String, i32)]) -> std::collections::BTreeMap<&str, Vec<i32>> {
-    let mut by_topic: std::collections::BTreeMap<&str, Vec<i32>> =
-        std::collections::BTreeMap::new();
+fn group_by_topic(pairs: &[(String, i32)]) -> BTreeMap<&str, Vec<i32>> {
+    let mut by_topic: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
     for (t, p) in pairs {
         by_topic.entry(t.as_str()).or_default().push(*p);
     }
@@ -241,10 +239,9 @@ fn group_by_topic(pairs: &[(String, i32)]) -> std::collections::BTreeMap<&str, V
 }
 
 fn peek_version(bytes: &[u8]) -> i16 {
-    if bytes.len() < 2 {
-        return 0;
-    }
-    i16::from_be_bytes([bytes[0], bytes[1]])
+    bytes
+        .first_chunk()
+        .map_or(0, |version| i16::from_be_bytes(*version))
 }
 
 fn empty_subscription() -> DecodedSubscription {
@@ -260,20 +257,23 @@ fn empty_subscription() -> DecodedSubscription {
 /// Encode a `ConsumerProtocolSubscription` v3 as Kafka's
 /// `ConsumerProtocol.serializeSubscription` does: sorted topics, and owned
 /// partitions sorted by topic and partition.
-pub(crate) fn encode_subscription(
+///
+/// # Errors
+/// Returns an error when the subscription does not encode.
+pub fn encode_subscription(
     topics: &[String],
     owned: &[(String, i32)],
     generation_id: i32,
     rack_id: Option<&str>,
     user_data: Option<Bytes>,
-) -> Bytes {
+) -> Result<Bytes, ProtocolError> {
     use bytes::BufMut;
     let owned_partitions: Vec<SubTopicPartition> = group_by_topic(owned)
         .into_iter()
         .map(|(topic, mut partitions)| {
             partitions.sort_unstable();
             SubTopicPartition {
-                topic: topic.to_string(),
+                topic: topic.to_owned(),
                 partitions,
                 unknown_tagged_fields: UnknownTaggedFields::default(),
             }
@@ -286,17 +286,16 @@ pub(crate) fn encode_subscription(
         user_data,
         owned_partitions,
         generation_id,
-        rack_id: rack_id.map(str::to_string),
+        rack_id: rack_id.map(str::to_owned),
         unknown_tagged_fields: UnknownTaggedFields::default(),
     };
     let mut buf = BytesMut::with_capacity(2 + msg.encoded_len(SUBSCRIPTION_WIRE_VERSION));
     buf.put_i16(SUBSCRIPTION_WIRE_VERSION);
-    msg.encode(&mut buf, SUBSCRIPTION_WIRE_VERSION)
-        .expect("ConsumerProtocolSubscription encode");
-    buf.freeze()
+    msg.encode(&mut buf, SUBSCRIPTION_WIRE_VERSION)?;
+    Ok(buf.freeze())
 }
 
-pub(crate) fn decode_subscription(bytes: &[u8]) -> DecodedSubscription {
+pub fn decode_subscription(bytes: &[u8]) -> DecodedSubscription {
     let Some(payload) = bytes.get(2..) else {
         return empty_subscription();
     };
@@ -320,12 +319,16 @@ pub(crate) fn decode_subscription(bytes: &[u8]) -> DecodedSubscription {
     }
 }
 
-pub(crate) fn encode_assignment(partitions: &[(String, i32)]) -> Bytes {
+/// Encode a `ConsumerProtocolAssignment` v3 of `partitions`.
+///
+/// # Errors
+/// Returns an error when the assignment does not encode.
+pub fn encode_assignment(partitions: &[(String, i32)]) -> Result<Bytes, ProtocolError> {
     use bytes::BufMut;
     let assigned_partitions: Vec<AssignTopicPartition> = group_by_topic(partitions)
         .into_iter()
         .map(|(topic, partitions)| AssignTopicPartition {
-            topic: topic.to_string(),
+            topic: topic.to_owned(),
             partitions,
             unknown_tagged_fields: UnknownTaggedFields::default(),
         })
@@ -337,12 +340,11 @@ pub(crate) fn encode_assignment(partitions: &[(String, i32)]) -> Bytes {
     };
     let mut buf = BytesMut::with_capacity(2 + msg.encoded_len(ASSIGNMENT_WIRE_VERSION));
     buf.put_i16(ASSIGNMENT_WIRE_VERSION);
-    msg.encode(&mut buf, ASSIGNMENT_WIRE_VERSION)
-        .expect("ConsumerProtocolAssignment encode");
-    buf.freeze()
+    msg.encode(&mut buf, ASSIGNMENT_WIRE_VERSION)?;
+    Ok(buf.freeze())
 }
 
-pub(crate) fn decode_assignment(bytes: &[u8]) -> Vec<(String, i32)> {
+pub fn decode_assignment(bytes: &[u8]) -> Vec<(String, i32)> {
     let Some(payload) = bytes.get(2..) else {
         return Vec::new();
     };
@@ -504,7 +506,8 @@ mod tests {
             5,
             None,
             Some(Bytes::from_static(&[0, 0, 0, 5])),
-        );
+        )
+        .unwrap();
         assert2::assert!(
             decode_subscription(&s)
                 == DecodedSubscription {
@@ -519,14 +522,14 @@ mod tests {
 
     #[test]
     fn subscription_round_trip() {
-        let s = encode_subscription(&["t1".into(), "t2".into()], &[], -1, None, None);
+        let s = encode_subscription(&["t1".into(), "t2".into()], &[], -1, None, None).unwrap();
         let decoded = decode_subscription(&s);
         assert2::assert!(decoded.topics == vec!["t1", "t2"]);
     }
 
     #[test]
     fn subscription_empty_round_trip() {
-        let s = encode_subscription(&[], &[], -1, None, None);
+        let s = encode_subscription(&[], &[], -1, None, None).unwrap();
         let decoded = decode_subscription(&s);
         assert2::assert!(
             decoded
@@ -543,18 +546,18 @@ mod tests {
     #[test]
     fn subscription_v3_owned_partitions_round_trip() {
         let owned = vec![("t".into(), 0), ("t".into(), 1), ("u".into(), 0)];
-        let s = encode_subscription(&["t".into(), "u".into()], &owned, -1, None, None);
+        let s = encode_subscription(&["t".into(), "u".into()], &owned, -1, None, None).unwrap();
         let decoded = decode_subscription(&s);
-        let mut got = decoded.owned.clone();
+        let mut got = decoded.owned;
         got.sort();
-        let mut want = owned.clone();
+        let mut want = owned;
         want.sort();
         assert2::assert!(got == want);
     }
 
     #[test]
     fn subscription_v3_generation_and_rack_round_trip() {
-        let s = encode_subscription(&["t".into()], &[], 42, Some("rack-a"), None);
+        let s = encode_subscription(&["t".into()], &[], 42, Some("rack-a"), None).unwrap();
         let decoded = decode_subscription(&s);
         assert2::assert!(
             decoded
@@ -584,7 +587,7 @@ mod tests {
         assert2::assert!(
             decoded
                 == DecodedSubscription {
-                    topics: vec!["t1".to_string()],
+                    topics: vec!["t1".to_owned()],
                     owned: Vec::new(),
                     generation_id: -1,
                     rack_id: None,
@@ -595,22 +598,22 @@ mod tests {
 
     #[test]
     fn assignment_round_trip() {
-        let s = encode_assignment(&[("t".into(), 0), ("t".into(), 1), ("u".into(), 0)]);
+        let s = encode_assignment(&[("t".into(), 0), ("t".into(), 1), ("u".into(), 0)]).unwrap();
         let mut decoded = decode_assignment(&s);
         decoded.sort();
         assert2::assert!(
             decoded
                 == vec![
-                    ("t".to_string(), 0),
-                    ("t".to_string(), 1),
-                    ("u".to_string(), 0)
+                    ("t".to_owned(), 0),
+                    ("t".to_owned(), 1),
+                    ("u".to_owned(), 0)
                 ]
         );
     }
 
     #[test]
     fn assignment_empty_round_trip() {
-        let s = encode_assignment(&[]);
+        let s = encode_assignment(&[]).unwrap();
         let decoded = decode_assignment(&s);
         assert2::assert!(decoded.is_empty());
     }

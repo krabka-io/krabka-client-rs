@@ -12,6 +12,7 @@
 //! ```text
 //! cargo test -p krabka-client-admin --test groups -- --ignored --nocapture
 //! ```
+#![cfg(test)]
 
 mod support;
 
@@ -55,11 +56,10 @@ async fn lists_groups_and_committed_offsets() {
         .expect("list_groups")
         .all()
         .expect("every broker lists its groups");
-    let group_ids = groups
-        .iter()
-        .map(|listing| listing.group_id.clone())
-        .collect::<Vec<_>>();
-    assert!(group_ids.contains(&group), "{groups:?}");
+    assert!(
+        groups.iter().any(|listing| listing.group_id == group),
+        "{groups:?}"
+    );
 
     let offsets = admin
         .list_consumer_group_offsets(&group)
@@ -89,6 +89,7 @@ async fn produce_one(bootstrap: &str, topic: &str) {
         .expect("produce record");
 
     producer.flush().await.expect("flush");
+    drop(producer);
 }
 
 /// Poll until at least one record arrives, or fail at the deadline.

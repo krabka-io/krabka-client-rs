@@ -3,7 +3,11 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     future::Future,
-    sync::{Arc, atomic::Ordering},
+    mem, panic,
+    sync::{
+        Arc, Mutex as StdMutex, PoisonError,
+        atomic::{AtomicI32, Ordering},
+    },
     time::Duration,
 };
 
@@ -14,7 +18,12 @@ use krabka_protocol::owned::{
     offset_commit_response::OffsetCommitResponse,
 };
 use krabka_units::convert;
-use tokio::sync::Mutex;
+use tokio::{
+    sync::Mutex,
+    task::JoinHandle,
+    time::{Instant, sleep, sleep_until, timeout_at},
+};
+use tracing::field;
 
 #[cfg(test)]
 use crate::test_support;
@@ -27,6 +36,7 @@ use crate::{
     },
     error::ConsumerError,
     offset_wire::{TopicNameOffsetCommit, build_commit_topics},
+    poll::is_reset_sentinel,
     position::PartitionPosition,
 };
 
@@ -87,7 +97,7 @@ impl OffsetAndMetadata {
 }
 
 /// The commits of fetch positions, as `(offset, leader_epoch)` pairs.
-pub(crate) fn position_commits(
+pub fn position_commits(
     offsets: HashMap<(String, i32), (i64, i32)>,
 ) -> HashMap<(String, i32), OffsetAndMetadata> {
     offsets
@@ -116,25 +126,43 @@ fn commit_offsets(
         .collect()
 }
 
-/// Check the offsets of [`Consumer::commit_offsets_sync`].
+/// Raise each position in `polled` to the one in `sent` of a newer ownership
+/// or a higher offset. [`AutoCommit::record_sent`] holds the lock of `polled`.
+fn merge_sent_positions(
+    polled: &mut ConsumedPositions,
+    sent: impl IntoIterator<Item = ((String, i32), ConsumedPosition)>,
+) {
+    for (partition, position) in sent {
+        let known = polled.entry(partition).or_insert(position);
+        if known.ownership_id != position.ownership_id || known.offset < position.offset {
+            *known = position;
+        }
+    }
+}
+
+/// Check the offsets of [`Consumer::commit_offsets_sync`], and pair each
+/// with the ownership id of its partition in `assigned`.
 ///
 /// Kafka's `OffsetAndMetadata` rejects a negative offset. Kafka accepts any
 /// other offset, also one past the consumed position.
-fn validate_selected_offsets(
-    offsets: &HashMap<(String, i32), OffsetAndMetadata>,
+fn selected_offsets_with_ownership(
+    offsets: HashMap<(String, i32), OffsetAndMetadata>,
     assigned: &HashMap<(String, i32), u64>,
-) -> Result<(), ConsumerError> {
-    for ((topic, partition), offset) in offsets {
+) -> Result<PendingOffsets, ConsumerError> {
+    let mut pending = HashMap::with_capacity(offsets.len());
+    for (partition, offset) in offsets {
         if offset.offset < 0 {
             return Err(ConsumerError::InvalidOffset(offset.offset));
         }
-        if !assigned.contains_key(&(topic.clone(), *partition)) {
+        let Some(&ownership_id) = assigned.get(&partition) else {
+            let (topic, partition) = partition;
             return Err(ConsumerError::IllegalState(format!(
                 "cannot commit unassigned partition {topic}-{partition}"
             )));
-        }
+        };
+        pending.insert(partition, (offset, ownership_id));
     }
-    Ok(())
+    Ok(pending)
 }
 
 /// Take the offsets of an asynchronous commit.
@@ -177,15 +205,11 @@ pub type OffsetCommitCallback =
     Box<dyn FnOnce(&HashMap<(String, i32), OffsetAndMetadata>, Result<(), &ConsumerError>) + Send>;
 
 /// The callbacks of the asynchronous commits that wait for the next snapshot.
-pub(crate) type OffsetCommitCallbacks = Arc<std::sync::Mutex<Vec<OffsetCommitCallback>>>;
+pub type OffsetCommitCallbacks = Arc<StdMutex<Vec<OffsetCommitCallback>>>;
 
 /// Take the callbacks that the next asynchronous commit snapshot covers.
 fn take_callbacks(callbacks: &OffsetCommitCallbacks) -> Vec<OffsetCommitCallback> {
-    std::mem::take(
-        &mut *callbacks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
+    mem::take(&mut *callbacks.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 /// The result that an asynchronous commit gives to its callbacks.
@@ -277,14 +301,14 @@ fn commit_timeout(timeout: Duration, cause: Option<ConsumerError>) -> ConsumerEr
 
 #[derive(Clone, Copy)]
 struct CommitDeadline {
-    expires_at: tokio::time::Instant,
+    expires_at: Instant,
     timeout: Duration,
 }
 
 impl CommitDeadline {
     fn after(timeout: Duration) -> Self {
         Self {
-            expires_at: tokio::time::Instant::now() + timeout,
+            expires_at: Instant::now() + timeout,
             timeout,
         }
     }
@@ -293,7 +317,7 @@ impl CommitDeadline {
     where
         F: Future<Output = Result<(), ConsumerError>>,
     {
-        tokio::time::timeout_at(self.expires_at, commit)
+        timeout_at(self.expires_at, commit)
             .await
             .unwrap_or_else(|_elapsed| Err(commit_timeout(self.timeout, None)))
     }
@@ -301,7 +325,7 @@ impl CommitDeadline {
 
 /// Build the `OffsetCommit` request of a commit. The request names each
 /// topic, so the version is v9 or lower. See [`TopicNameOffsetCommit`].
-pub(crate) fn build_commit_request(
+pub fn build_commit_request(
     group_id: String,
     generation_id_or_member_epoch: i32,
     member_id: String,
@@ -484,7 +508,7 @@ fn retain_continuously_owned(
 
 /// The committable position of one owned partition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ConsumedPosition {
+pub struct ConsumedPosition {
     pub offset: i64,
     pub leader_epoch: i32,
     /// The ownership that the position belongs to. A commit sends the position
@@ -493,19 +517,22 @@ pub(crate) struct ConsumedPosition {
 }
 
 /// Committable positions, keyed like `Consumer::next_offsets`.
-pub(crate) type ConsumedPositions = HashMap<(String, i32), ConsumedPosition>;
+pub type ConsumedPositions = HashMap<(String, i32), ConsumedPosition>;
+
+/// The offsets of a commit, each with the ownership id of its partition.
+pub type PendingOffsets = HashMap<(String, i32), (OffsetAndMetadata, u64)>;
 
 /// Whether `next_offset` is a fetch position that Kafka can commit.
 ///
 /// A reset sentinel is a reset that `poll` has not resolved yet. Kafka's
 /// `SubscriptionState.allConsumed` skips a partition without a valid position.
 fn has_valid_position(next_offset: i64) -> bool {
-    next_offset >= 0 && !crate::poll::is_reset_sentinel(next_offset)
+    next_offset >= 0 && !is_reset_sentinel(next_offset)
 }
 
 /// Kafka's `SubscriptionState.allConsumed`: the position and leader epoch of
 /// each owned partition that has a valid position.
-pub(crate) fn all_consumed(
+pub fn all_consumed(
     ownership_ids: &HashMap<(String, i32), u64>,
     next_offsets: &HashMap<(String, i32), i64>,
     positions: &HashMap<(String, i32), PartitionPosition>,
@@ -605,7 +632,7 @@ enum RecordSent {
 
 /// How an automatic commit ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AutoCommitOutcome {
+pub enum AutoCommitOutcome {
     Committed,
     /// Kafka's `RetriableCommitFailedException`: the coordinator is loading,
     /// moved or timed out, the topic is unknown, or the connection failed.
@@ -679,7 +706,7 @@ impl PartitionCommitError {
 /// `markCoordinatorUnknown`, so the consumer finds the coordinator again and
 /// the commit is retriable. A partition with a final error or a rebalance
 /// error takes precedence, as in [`auto_commit_outcome`].
-pub(crate) fn names_moved_coordinator(response: &OffsetCommitResponse) -> bool {
+pub fn names_moved_coordinator(response: &OffsetCommitResponse) -> bool {
     PartitionCommitError::of_response(response) == PartitionCommitError::CoordinatorUnknown
 }
 
@@ -694,7 +721,7 @@ pub(crate) fn names_moved_coordinator(response: &OffsetCommitResponse) -> bool {
 /// fatal error precedence, so the result does not depend on that order. The
 /// commit before a `JoinGroup` then does not retry until the rebalance timeout
 /// when a partition can never commit.
-pub(crate) fn auto_commit_outcome(
+pub fn auto_commit_outcome(
     result: &Result<OffsetCommitResponse, ConsumerError>,
 ) -> AutoCommitOutcome {
     match result {
@@ -724,12 +751,12 @@ pub(crate) fn auto_commit_outcome(
 /// Kafka's `enable.auto.commit` state for one consumer. The consumer and its
 /// coordinator task share it.
 #[derive(Clone, Debug)]
-pub(crate) struct AutoCommit {
+pub struct AutoCommit {
     /// Kafka's `auto.commit.interval.ms`.
     interval: Duration,
     /// When the next interval commit from `poll` is due. Kafka's
     /// `ConsumerCoordinator.nextAutoCommitTimer`.
-    next_due: Arc<Mutex<tokio::time::Instant>>,
+    next_due: Arc<Mutex<Instant>>,
     /// The positions at the start of the latest `poll`, raised to each offset
     /// that a commit sent after that `poll` for the same ownership.
     ///
@@ -750,7 +777,7 @@ impl AutoCommit {
     pub(crate) fn new(interval: Duration) -> Self {
         Self {
             interval,
-            next_due: Arc::new(Mutex::new(tokio::time::Instant::now() + interval)),
+            next_due: Arc::new(Mutex::new(Instant::now() + interval)),
             polled: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -792,19 +819,13 @@ impl AutoCommit {
         &self,
         sent: impl IntoIterator<Item = ((String, i32), ConsumedPosition)>,
     ) {
-        let mut polled = self.polled.lock().await;
-        for (partition, position) in sent {
-            let known = polled.entry(partition).or_insert(position);
-            if known.ownership_id != position.ownership_id || known.offset < position.offset {
-                *known = position;
-            }
-        }
+        merge_sent_positions(&mut *self.polled.lock().await, sent);
     }
 
     /// Start the interval again. Kafka's `onJoinComplete` resets
     /// `nextAutoCommitTimer` after each assignment.
     pub(crate) async fn restart_interval(&self) {
-        *self.next_due.lock().await = tokio::time::Instant::now() + self.interval;
+        *self.next_due.lock().await = Instant::now() + self.interval;
     }
 
     /// The `(offset, leader_epoch)` of each position of the latest `poll`
@@ -823,7 +844,7 @@ struct CommitRoute {
     client: krabka_client_core::Client,
     group_id: String,
     group_instance_id: Option<String>,
-    coordinator_id: Arc<std::sync::atomic::AtomicI32>,
+    coordinator_id: Arc<AtomicI32>,
     retry_policy: coordinator::CoordinatorRetryPolicy,
 }
 
@@ -922,7 +943,7 @@ impl Consumer {
         let (identity, consumed) = self.consumed_positions().await;
         auto_commit.polled.lock().await.clone_from(&consumed);
         let mut next_due = auto_commit.next_due.lock().await;
-        let now = tokio::time::Instant::now();
+        let now = Instant::now();
         if now < *next_due {
             return;
         }
@@ -959,7 +980,7 @@ impl Consumer {
                         ?result,
                         "asynchronous auto commit failed with a retriable error"
                     );
-                    *next_due.lock().await = tokio::time::Instant::now() + retry_backoff;
+                    *next_due.lock().await = Instant::now() + retry_backoff;
                 }
                 AutoCommitOutcome::Failed => {
                     tracing::warn!(
@@ -982,7 +1003,7 @@ impl Consumer {
     /// `deadline`. Kafka's `ConsumerCoordinator.close` polls while
     /// `pendingAsyncCommits > 0 && timer.notExpired()` and invokes the
     /// completed callbacks.
-    pub(crate) async fn wait_for_async_commits(&self, deadline: tokio::time::Instant) {
+    pub(crate) async fn wait_for_async_commits(&self, deadline: Instant) {
         let wait = async {
             loop {
                 if self.commit_async_state.load(Ordering::Acquire) == ASYNC_COMMIT_IDLE {
@@ -990,10 +1011,10 @@ impl Consumer {
                 }
                 // The worker holds the lock while it snapshots and sends.
                 drop(self.commit_serialization.lock().await);
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                sleep(Duration::from_millis(1)).await;
             }
         };
-        if tokio::time::timeout_at(deadline, wait).await.is_err() {
+        if timeout_at(deadline, wait).await.is_err() {
             tracing::warn!(
                 group = %self.group_id,
                 "asynchronous commits were still pending when the close timeout expired"
@@ -1001,7 +1022,7 @@ impl Consumer {
         }
     }
 
-    pub(crate) async fn auto_commit_on_close(&self, deadline: tokio::time::Instant) {
+    pub(crate) async fn auto_commit_on_close(&self, deadline: Instant) {
         if self.auto_commit.is_none() {
             return;
         }
@@ -1029,7 +1050,7 @@ impl Consumer {
             self.commit_pending_offsets(pending, RecordSent::BeforeSend, retry_deadline)
                 .await
         };
-        match tokio::time::timeout_at(deadline, commit).await {
+        match timeout_at(deadline, commit).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(group = %self.group_id, %error, "synchronous auto commit on close failed");
@@ -1051,7 +1072,7 @@ impl Consumer {
         name = "consumer.commit_sync",
         level = "debug",
         skip_all,
-        fields(commit_context = ?commit_trace_context(self), partitions = tracing::field::Empty),
+        fields(commit_context = ?commit_trace_context(self), partitions = field::Empty),
         err(level = "debug")
     )]
     /// # Errors
@@ -1141,14 +1162,7 @@ impl Consumer {
             let pending = {
                 let identity = self.commit_identity.lock().await;
                 self.ensure_active_group(&identity)?;
-                validate_selected_offsets(&offsets, &identity.ownership_ids)?;
-                offsets
-                    .into_iter()
-                    .map(|(partition, offset)| {
-                        let ownership_id = identity.ownership_ids[&partition];
-                        (partition, (offset, ownership_id))
-                    })
-                    .collect::<HashMap<_, _>>()
+                selected_offsets_with_ownership(offsets, &identity.ownership_ids)?
             };
 
             self.commit_pending_offsets(pending, RecordSent::AfterAck, deadline)
@@ -1175,7 +1189,7 @@ impl Consumer {
             || self
                 .coordinator_handle
                 .as_ref()
-                .is_some_and(tokio::task::JoinHandle::is_finished)
+                .is_some_and(JoinHandle::is_finished)
         {
             return Err(ConsumerError::CommitFailed);
         }
@@ -1202,7 +1216,7 @@ impl Consumer {
     /// `maybeWrapAsTimeoutException` of the last error.
     async fn commit_pending_offsets(
         &self,
-        mut pending: HashMap<(String, i32), (OffsetAndMetadata, u64)>,
+        mut pending: PendingOffsets,
         record: RecordSent,
         deadline: CommitDeadline,
     ) -> Result<(), ConsumerError> {
@@ -1239,7 +1253,7 @@ impl Consumer {
                     if is_retriable_transport_error(&error)
                         || matches!(error, ClientError::Timeout(_)) =>
                 {
-                    if tokio::time::Instant::now() >= deadline.expires_at {
+                    if Instant::now() >= deadline.expires_at {
                         return Err(commit_timeout(
                             deadline.timeout,
                             Some(ConsumerError::Client(error)),
@@ -1293,7 +1307,7 @@ impl Consumer {
                     {
                         return Ok(());
                     }
-                    if tokio::time::Instant::now() >= deadline.expires_at {
+                    if Instant::now() >= deadline.expires_at {
                         return Err(commit_timeout(
                             deadline.timeout,
                             Some(ConsumerError::Server(code)),
@@ -1361,9 +1375,9 @@ impl Consumer {
     /// past its retry `deadline`. Return whether time is left for the next
     /// attempt. Kafka's `commitOffsetsSync` does `timer.sleep(backoff)` and
     /// then sends again only while `timer.notExpired()`.
-    async fn sleep_before_retry(&self, backoff: Duration, deadline: tokio::time::Instant) -> bool {
-        tokio::time::sleep_until((tokio::time::Instant::now() + backoff).min(deadline)).await;
-        tokio::time::Instant::now() < deadline
+    async fn sleep_before_retry(&self, backoff: Duration, deadline: Instant) -> bool {
+        sleep_until((Instant::now() + backoff).min(deadline)).await;
+        Instant::now() < deadline
     }
 
     /// Find the group coordinator again, within the time that is left of a
@@ -1371,9 +1385,9 @@ impl Consumer {
     /// `commitOffsetsSync` does this in `coordinatorUnknownAndUnreadySync` after
     /// `markCoordinatorUnknown`. If the lookup fails, the next attempt uses the
     /// last known coordinator.
-    async fn find_coordinator_again(&self, deadline: tokio::time::Instant) {
+    async fn find_coordinator_again(&self, deadline: Instant) {
         let retry_policy = coordinator::CoordinatorRetryPolicy {
-            timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
+            timeout: deadline.saturating_duration_since(Instant::now()),
             ..self.retry_policy
         };
         match find_coordinator(&self.client, &self.group_id, retry_policy).await {
@@ -1476,7 +1490,7 @@ impl Consumer {
         self.require_group_id()?;
         self.commit_async_callbacks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .push(Box::new(callback));
         self.schedule_commit_async();
         Ok(())
@@ -1564,10 +1578,10 @@ impl Consumer {
                         // A panic in one callback must not stop the worker in
                         // the running state, which would disable later
                         // asynchronous commits.
-                        let call = std::panic::AssertUnwindSafe(|| {
+                        let call = panic::AssertUnwindSafe(|| {
                             callback(&sent, result.as_ref().copied());
                         });
-                        if std::panic::catch_unwind(call).is_err() {
+                        if panic::catch_unwind(call).is_err() {
                             tracing::error!("an offset commit callback panicked");
                         }
                     }
@@ -1606,7 +1620,9 @@ impl Consumer {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicI32, AtomicUsize},
+        error::Error,
+        future,
+        sync::atomic::{AtomicBool, AtomicI32, AtomicUsize},
         time::Duration,
     };
 
@@ -1629,8 +1645,15 @@ mod tests {
         primitives::uuid::Uuid,
     };
     use krabka_units::secs;
+    use tokio::{
+        sync::{Notify, oneshot},
+        task::yield_now,
+        time,
+        time::{advance, timeout},
+    };
 
     use super::*;
+    use crate::subscription::shared;
 
     fn response(errors: &[i16]) -> OffsetCommitResponse {
         OffsetCommitResponse {
@@ -1664,9 +1687,9 @@ mod tests {
     }
 
     async fn wait_for_async_commit_idle(consumer: &Consumer, timeout: Duration) {
-        tokio::time::timeout(timeout, async {
+        time::timeout(timeout, async {
             while consumer.commit_async_state.load(Ordering::Acquire) != ASYNC_COMMIT_IDLE {
-                tokio::task::yield_now().await;
+                yield_now().await;
             }
         })
         .await
@@ -1753,8 +1776,8 @@ mod tests {
     struct SelectedCommitConsumerStart<F> {
         #[builder(default = commit_identity(7, "member-a"))]
         commit_identity: Arc<Mutex<CommitIdentity>>,
-        #[builder(default = Arc::new(tokio::sync::Notify::new()))]
-        assignment_changed: Arc<tokio::sync::Notify>,
+        #[builder(default = Arc::new(Notify::new()))]
+        assignment_changed: Arc<Notify>,
         #[builder(default = Arc::new(AtomicI32::new(7)))]
         generation: Arc<AtomicI32>,
         #[builder(default = Arc::new(AtomicUsize::new(0)))]
@@ -1768,7 +1791,7 @@ mod tests {
         consumer: Consumer,
         mock: MockBroker,
         requests: Arc<AtomicUsize>,
-        seen_offsets: Arc<std::sync::Mutex<Vec<(i32, i64)>>>,
+        seen_offsets: Arc<StdMutex<Vec<(i32, i64)>>>,
     }
 
     impl<F> SelectedCommitConsumerStart<F>
@@ -1788,11 +1811,13 @@ mod tests {
             let generation_in_mock = Arc::clone(&generation);
             let changed_in_mock = Arc::clone(&assignment_changed);
             let requests_in_mock = Arc::clone(&requests);
-            let seen_offsets = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen_offsets = Arc::new(StdMutex::new(Vec::new()));
             let seen_offsets_in_mock = Arc::clone(&seen_offsets);
             let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
                 if api_key == api_versions_request::API_KEY {
-                    return Some(group_api_versions(offset_commit_request::API_KEY, (2, 2)));
+                    return Some(
+                        group_api_versions(offset_commit_request::API_KEY, (2, 2)).unwrap(),
+                    );
                 }
                 if api_key != offset_commit_request::API_KEY {
                     return None;
@@ -1836,7 +1861,8 @@ mod tests {
                     Some(test_support::encode_protocol_response(&response, version))
                 }
             })
-            .await;
+            .await
+            .unwrap();
             let consumer = commit_consumer(
                 CommitConsumerStart::builder()
                     .mock(&mock)
@@ -1873,7 +1899,7 @@ mod tests {
         let requests_in_mock = Arc::clone(&requests);
         let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
             if api_key == api_versions_request::API_KEY {
-                return Some(group_api_versions(offset_commit_request::API_KEY, (2, 2)));
+                return Some(group_api_versions(offset_commit_request::API_KEY, (2, 2)).unwrap());
             }
             if api_key != offset_commit_request::API_KEY {
                 return None;
@@ -1888,7 +1914,8 @@ mod tests {
                 version,
             ))
         })
-        .await;
+        .await
+        .unwrap();
         AutoCommitCoordinator { mock, requests }
     }
 
@@ -1899,8 +1926,8 @@ mod tests {
     struct CommitConsumerStart<'a> {
         mock: &'a MockBroker,
         commit_identity: Arc<Mutex<CommitIdentity>>,
-        #[builder(default = Arc::new(tokio::sync::Notify::new()))]
-        assignment_changed: Arc<tokio::sync::Notify>,
+        #[builder(default = Arc::new(Notify::new()))]
+        assignment_changed: Arc<Notify>,
         #[builder(default = Arc::new(AtomicI32::new(7)))]
         generation: Arc<AtomicI32>,
     }
@@ -1939,7 +1966,7 @@ mod tests {
     /// `commitSync(offsets)` accepts an offset past the consumed position.
     #[test]
     fn selected_offset_validation_follows_kafka() {
-        let assigned = maplit::hashmap! {("topic".to_string(), 2) => 1};
+        let assigned = maplit::hashmap! {("topic".to_owned(), 2) => 1};
 
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
@@ -1959,8 +1986,8 @@ mod tests {
             ("at the position", ("topic", 2), 11, None),
             ("past the position", ("topic", 2), 100, None),
         ] {
-            let offsets = maplit::hashmap! {(partition.0.to_string(), partition.1) => OffsetAndMetadata::new(offset)};
-            let result = validate_selected_offsets(&offsets, &assigned).err();
+            let offsets = maplit::hashmap! {(partition.0.to_owned(), partition.1) => OffsetAndMetadata::new(offset)};
+            let result = selected_offsets_with_ownership(offsets, &assigned).err();
             actual.push((name, result.map(|error| error.to_string())));
             wanted.push((name, expected.map(str::to_owned)));
         }
@@ -2184,7 +2211,7 @@ mod tests {
         .await;
         let interval = Duration::from_hours(1);
         consumer.auto_commit = Some(AutoCommit::new(interval));
-        tokio::time::advance(interval).await;
+        advance(interval).await;
 
         let busy = consumer.commit_serialization.lock().await;
         consumer.maybe_auto_commit_async().await;
@@ -2219,13 +2246,13 @@ mod tests {
         // timeout.
         let ticker = tokio::spawn(async {
             loop {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                sleep(Duration::from_millis(1)).await;
             }
         });
 
         let mut sent = Vec::new();
         for advance in [interval, Duration::ZERO, backoff, Duration::ZERO] {
-            tokio::time::advance(advance).await;
+            time::advance(advance).await;
             consumer.maybe_auto_commit_async().await;
             drop(consumer.commit_serialization.lock().await);
             sent.push(coordinator.requests.load(Ordering::SeqCst));
@@ -2256,10 +2283,10 @@ mod tests {
             rejoin_on_poll: false,
         }));
         let offsets = Arc::new(Mutex::new(
-            maplit::hashmap! {("alpha".to_string(), 0) => 10, ("alpha".to_string(), 1) => 20},
+            maplit::hashmap! {("alpha".to_owned(), 0) => 10, ("alpha".to_owned(), 1) => 20},
         ));
         let positions = Arc::new(Mutex::new(
-            maplit::hashmap! {("alpha".to_string(), 1) => PartitionPosition {
+            maplit::hashmap! {("alpha".to_owned(), 1) => PartitionPosition {
                 offset_epoch: krabka_ids::LeaderEpoch(7),
                 ..Default::default()
             }},
@@ -2269,7 +2296,7 @@ mod tests {
         assert2::assert!(
             snapshot
                 == (
-                    maplit::hashmap! {("alpha".to_string(), 0) => OffsetAndMetadata::new(10), ("alpha".to_string(), 1) => OffsetAndMetadata {
+                    maplit::hashmap! {("alpha".to_owned(), 0) => OffsetAndMetadata::new(10), ("alpha".to_owned(), 1) => OffsetAndMetadata {
                         offset: 20,
                         leader_epoch: Some(7),
                         metadata: String::new(),
@@ -2281,20 +2308,18 @@ mod tests {
 
     #[test]
     fn build_commit_request_preserves_group_member_generation_and_topics() {
-        let topics = vec![
-            krabka_protocol::owned::offset_commit_request::OffsetCommitRequestTopic {
-                name: "topic".into(),
-                topic_id: Uuid::ZERO,
-                partitions: vec![OffsetCommitRequestPartition {
-                    partition_index: 3,
-                    committed_offset: 99,
-                    committed_leader_epoch: 5,
-                    committed_metadata: Some(String::new()),
-                    unknown_tagged_fields: UnknownTaggedFields::default(),
-                }],
+        let topics = vec![OffsetCommitRequestTopic {
+            name: "topic".into(),
+            topic_id: Uuid::ZERO,
+            partitions: vec![OffsetCommitRequestPartition {
+                partition_index: 3,
+                committed_offset: 99,
+                committed_leader_epoch: 5,
+                committed_metadata: Some(String::new()),
                 unknown_tagged_fields: UnknownTaggedFields::default(),
-            },
-        ];
+            }],
+            unknown_tagged_fields: UnknownTaggedFields::default(),
+        }];
 
         let req = build_commit_request(
             "group-a".into(),
@@ -2481,13 +2506,13 @@ mod tests {
                 "fenced instance id after a rejoin already moved the generation on",
                 &[82][..],
                 rejoined,
-                Err(rebalance_in_progress.clone()),
+                Err(rebalance_in_progress),
             ),
             (
                 "fenced instance id after a rejoin and a task stop",
                 &[82][..],
                 rejoined_and_stopped,
-                Err(commit_failed.clone()),
+                Err(commit_failed),
             ),
         ] {
             actual.push((
@@ -2528,7 +2553,7 @@ mod tests {
 
     struct OffsetCommitCoordinator {
         mock: MockBroker,
-        requests: Arc<std::sync::Mutex<Vec<VersionedOffsetCommit>>>,
+        requests: Arc<StdMutex<Vec<VersionedOffsetCommit>>>,
     }
 
     impl OffsetCommitCoordinatorOptions {
@@ -2541,14 +2566,17 @@ mod tests {
                 max_version,
                 error_code,
             } = self;
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let requests = Arc::new(StdMutex::new(Vec::new()));
             let requests_in_mock = Arc::clone(&requests);
             let mock = MockBroker::start(move |api_key, version, _corr_id, mut body| {
                 if api_key == api_versions_request::API_KEY {
-                    return Some(group_api_versions(
-                        offset_commit_request::API_KEY,
-                        (min_version, max_version),
-                    ));
+                    return Some(
+                        group_api_versions(
+                            offset_commit_request::API_KEY,
+                            (min_version, max_version),
+                        )
+                        .unwrap(),
+                    );
                 }
                 if api_key != offset_commit_request::API_KEY {
                     return None;
@@ -2575,7 +2603,8 @@ mod tests {
                 body.extend(test_support::encode_protocol_response(&response, version));
                 Some(body)
             })
-            .await;
+            .await
+            .unwrap();
             OffsetCommitCoordinator { mock, requests }
         }
     }
@@ -2704,7 +2733,7 @@ mod tests {
     fn described(error: &ConsumerError) -> (String, Option<String>) {
         (
             error.to_string(),
-            std::error::Error::source(error).map(ToString::to_string),
+            Error::source(error).map(ToString::to_string),
         )
     }
 
@@ -2896,7 +2925,7 @@ mod tests {
                 vec![Codes(&[("orders", 82)])],
                 false,
                 RETRY,
-                (Err(fenced.clone()), 1, 0),
+                (Err(fenced), 1, 0),
             ),
             (
                 "fenced instance id is a stale artifact of an already-completed rejoin",
@@ -2924,7 +2953,7 @@ mod tests {
                 vec![Codes(&[("orders", 25)])],
                 false,
                 RETRY,
-                (Err(commit_failed.clone()), 1, 0),
+                (Err(commit_failed), 1, 0),
             ),
             (
                 "unknown member id is a stale artifact of an already-completed rejoin",
@@ -2945,7 +2974,7 @@ mod tests {
                 vec![Codes(&[("orders", 27)]), Codes(&[])],
                 true,
                 RETRY,
-                (Err(rebalance_in_progress.clone()), 1, 0),
+                (Err(rebalance_in_progress), 1, 0),
             ),
         ]
     }
@@ -2999,7 +3028,7 @@ mod tests {
             ownership_ids: maplit::hashmap! {("orders".into(), 0) => 1, ("payments".into(), 0) => 2},
             rejoin_on_poll: false,
         }));
-        let assignment_changed = Arc::new(tokio::sync::Notify::new());
+        let assignment_changed = Arc::new(Notify::new());
         let offset_commits = Arc::new(AtomicUsize::new(0));
         let find_coordinators = Arc::new(AtomicUsize::new(0));
         let identity_in_mock = Arc::clone(&identity);
@@ -3009,9 +3038,9 @@ mod tests {
         let mock = MockBroker::start_with_replies(move |api_key, version, _corr_id, mut body| {
             let mut buffer = bytes::BytesMut::new();
             match api_key {
-                api_versions_request::API_KEY => {
-                    MockReply::Respond(group_api_versions(offset_commit_request::API_KEY, (7, 7)))
-                }
+                api_versions_request::API_KEY => MockReply::Respond(
+                    group_api_versions(offset_commit_request::API_KEY, (7, 7)).unwrap(),
+                ),
                 find_coordinator_request::API_KEY => {
                     find_coordinators_in_mock.fetch_add(1, Ordering::SeqCst);
                     FindCoordinatorResponse::default()
@@ -3052,7 +3081,8 @@ mod tests {
                 _ => MockReply::Silent,
             }
         })
-        .await;
+        .await
+        .unwrap();
         let mut consumer = commit_consumer(
             CommitConsumerStart::builder()
                 .mock(&mock)
@@ -3073,15 +3103,15 @@ mod tests {
 
         let held = consumer.commit_serialization.lock().await;
         let release = async move {
-            tokio::time::sleep(commit_lock_held).await;
+            sleep(commit_lock_held).await;
             drop(held);
         };
         let (result, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(10), consumer.commit_sync()),
+            timeout(Duration::from_secs(10), consumer.commit_sync()),
             release,
         );
         let result = result
-            .map_err(|_| ("commit never finished".to_string(), None))
+            .map_err(|_| ("commit never finished".to_owned(), None))
             .and_then(|result| result.map_err(|error| described(&error)));
 
         mock.stop();
@@ -3101,13 +3131,14 @@ mod tests {
     async fn commit_sync_times_out_near_default_api_timeout_despite_a_silent_broker() {
         let mock = MockBroker::start(move |api_key, _version, _corr_id, _body| {
             if api_key == api_versions_request::API_KEY {
-                return Some(group_api_versions(offset_commit_request::API_KEY, (7, 7)));
+                return Some(group_api_versions(offset_commit_request::API_KEY, (7, 7)).unwrap());
             }
             // Every other request, including `OffsetCommit`, gets no reply at
             // all: the broker is up but never answers.
             None
         })
-        .await;
+        .await
+        .unwrap();
 
         let mut consumer = commit_consumer(
             CommitConsumerStart::builder()
@@ -3126,8 +3157,8 @@ mod tests {
             .unwrap();
         consumer.default_api_timeout = krabka_units::millis(200);
 
-        let started = tokio::time::Instant::now();
-        let result = tokio::time::timeout(Duration::from_secs(5), consumer.commit_sync())
+        let started = Instant::now();
+        let result = timeout(Duration::from_secs(5), consumer.commit_sync())
             .await
             .expect("commit_sync must return on its own well before the test's own timeout");
         let elapsed = started.elapsed();
@@ -3178,49 +3209,51 @@ mod tests {
                 Commit::All,
                 TaskState::Stopping,
                 true,
-                (Err(commit_failed.to_string()), 0),
+                (Err(commit_failed.to_owned()), 0),
             ),
             (
                 "commit sync while the task waits for a poll after a fence",
                 Commit::All,
                 TaskState::Fenced,
                 false,
-                (Err(commit_failed.to_string()), 0),
+                (Err(commit_failed.to_owned()), 0),
             ),
             (
                 "selected commit while the task waits for a poll after a fence",
                 Commit::Selected,
                 TaskState::Fenced,
                 false,
-                (Err(commit_failed.to_string()), 0),
+                (Err(commit_failed.to_owned()), 0),
             ),
             (
                 "commit sync after the task stops",
                 Commit::All,
                 TaskState::Stopped,
                 true,
-                (Err(commit_failed.to_string()), 0),
+                (Err(commit_failed.to_owned()), 0),
             ),
             (
                 "commit sync after a fence cleared the assignment",
                 Commit::All,
                 TaskState::Stopped,
                 false,
-                (Err(commit_failed.to_string()), 0),
+                (Err(commit_failed.to_owned()), 0),
             ),
             (
                 "selected commit after the task stops",
                 Commit::Selected,
                 TaskState::Stopped,
                 true,
-                (Err(commit_failed.to_string()), 0),
+                (Err(commit_failed.to_owned()), 0),
             ),
         ] {
             let requests = Arc::new(AtomicUsize::new(0));
             let requests_in_mock = Arc::clone(&requests);
             let mock = MockBroker::start(move |api_key, version, _corr_id, _body| {
                 if api_key == api_versions_request::API_KEY {
-                    return Some(group_api_versions(offset_commit_request::API_KEY, (2, 2)));
+                    return Some(
+                        group_api_versions(offset_commit_request::API_KEY, (2, 2)).unwrap(),
+                    );
                 }
                 if api_key != offset_commit_request::API_KEY {
                     return None;
@@ -3231,7 +3264,8 @@ mod tests {
                     version,
                 ))
             })
-            .await;
+            .await
+            .unwrap();
             let identity = commit_identity(7, "member-a");
             if !owned {
                 identity.lock().await.ownership_ids.clear();
@@ -3247,17 +3281,15 @@ mod tests {
             )
             .await;
             let task = match task_state {
-                TaskState::Running | TaskState::Fenced => {
-                    tokio::spawn(std::future::pending::<()>())
-                }
+                TaskState::Running | TaskState::Fenced => tokio::spawn(future::pending::<()>()),
                 TaskState::Stopping => {
                     consumer.coordinator_shutdown.cancel();
-                    tokio::spawn(std::future::pending::<()>())
+                    tokio::spawn(future::pending::<()>())
                 }
                 TaskState::Stopped => {
                     let task = tokio::spawn(async {});
                     while !task.is_finished() {
-                        tokio::task::yield_now().await;
+                        yield_now().await;
                     }
                     task
                 }
@@ -3274,7 +3306,7 @@ mod tests {
                         .await,
                 }
             };
-            let result = tokio::time::timeout(Duration::from_secs(5), commit_future)
+            let result = timeout(Duration::from_secs(5), commit_future)
                 .await
                 .unwrap_or_else(|_| panic!("case {name}: commit never finished"))
                 .map_err(|error| error.to_string());
@@ -3303,12 +3335,9 @@ mod tests {
             .start()
             .await;
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            selected_commit(&consumer, 12),
-        )
-        .await
-        .expect("commit does not wait for a rejoin");
+        let result = timeout(Duration::from_secs(2), selected_commit(&consumer, 12))
+            .await
+            .expect("commit does not wait for a rejoin");
 
         mock.stop();
         assert2::assert!(
@@ -3369,7 +3398,7 @@ mod tests {
     #[tokio::test]
     async fn selected_commit_uses_live_member_id_even_without_a_retry() {
         let identity = commit_identity(8, "member-new");
-        let seen_new_member = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_new_member = Arc::new(AtomicBool::new(false));
         let seen_in_mock = Arc::clone(&seen_new_member);
         let SelectedCommitConsumer { consumer, mock, .. } = SelectedCommitConsumerStart::builder()
             .commit_identity(identity)
@@ -3460,7 +3489,7 @@ mod tests {
                     .await
             })
         };
-        tokio::task::yield_now().await;
+        yield_now().await;
         let newer = {
             let consumer = Arc::clone(&consumer);
             tokio::spawn(async move {
@@ -3471,7 +3500,7 @@ mod tests {
                     .await
             })
         };
-        tokio::task::yield_now().await;
+        yield_now().await;
         drop(blocker);
 
         let older_error = older
@@ -3510,11 +3539,11 @@ mod tests {
         for _ in 0..100 {
             consumer.commit_async().expect("commit_async");
         }
-        tokio::task::yield_now().await;
+        yield_now().await;
         assert2::assert!(consumer.commit_async_state.load(Ordering::Acquire) == ASYNC_COMMIT_DIRTY);
         drop(blocker);
 
-        wait_for_async_commit_idle(&consumer, std::time::Duration::from_secs(2)).await;
+        wait_for_async_commit_idle(&consumer, Duration::from_secs(2)).await;
         mock.stop();
 
         assert2::assert!(requests.load(Ordering::SeqCst) == 1);
@@ -3532,7 +3561,7 @@ mod tests {
     }
 
     /// The `OffsetCommit` requests that [`recording_coordinator`] received.
-    type SentCommits = Arc<std::sync::Mutex<Vec<VersionedOffsetCommit>>>;
+    type SentCommits = Arc<StdMutex<Vec<VersionedOffsetCommit>>>;
 
     /// A coordinator that records each `OffsetCommit` v7 request and answers
     /// each partition with `error_code`.
@@ -3698,13 +3727,13 @@ mod tests {
         ] {
             let CallbackCommitFixture { consumer, mock, .. } =
                 callback_commit_fixture(error_code).await;
-            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (tx, rx) = oneshot::channel();
             consumer
                 .commit_async_with_callback(move |offsets, result| {
                     let _ = tx.send((offsets.clone(), result.map_err(ToString::to_string)));
                 })
                 .expect("commit_async_with_callback");
-            let completed = tokio::time::timeout(Duration::from_secs(5), rx)
+            let completed = timeout(Duration::from_secs(5), rx)
                 .await
                 .expect("callback runs")
                 .expect("callback sends");
@@ -3713,7 +3742,7 @@ mod tests {
             wanted.push((
                 name,
                 (
-                    maplit::hashmap! {("topic".to_string(), 0) => OffsetAndMetadata::new(12)},
+                    maplit::hashmap! {("topic".to_owned(), 0) => OffsetAndMetadata::new(12)},
                     expected.map_err(str::to_owned),
                 ),
             ));
@@ -3731,13 +3760,13 @@ mod tests {
             sent,
         } = callback_commit_fixture(0).await;
         consumer.next_offsets.lock().await.clear();
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         consumer
             .commit_async_with_callback(move |offsets, result| {
                 let _ = tx.send((offsets.clone(), result.map_err(ToString::to_string)));
             })
             .expect("commit_async_with_callback");
-        let completed = tokio::time::timeout(Duration::from_secs(5), rx)
+        let completed = timeout(Duration::from_secs(5), rx)
             .await
             .expect("callback runs")
             .expect("callback sends");
@@ -3757,7 +3786,7 @@ mod tests {
             (
                 "acknowledged",
                 0,
-                maplit::hashmap! {("topic".to_string(), 0) => (100, 4)},
+                maplit::hashmap! {("topic".to_owned(), 0) => (100, 4)},
             ),
             ("metadata too large", 12, HashMap::new()),
         ] {
@@ -3790,13 +3819,13 @@ mod tests {
             .commit_async_with_callback(|_, _| panic!("callback panics"))
             .expect("commit_async_with_callback");
         wait_for_async_commit_idle(&consumer, Duration::from_secs(5)).await;
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         consumer
             .commit_async_with_callback(move |_, result| {
                 let _ = tx.send(result.map_err(ToString::to_string));
             })
             .expect("commit_async_with_callback");
-        let second = tokio::time::timeout(Duration::from_secs(5), rx).await;
+        let second = timeout(Duration::from_secs(5), rx).await;
         mock.stop();
         assert2::assert!(let Ok(Ok(Ok(()))) = second);
     }
@@ -3816,11 +3845,11 @@ mod tests {
                 .build(),
         )
         .await;
-        consumer.subscription = crate::subscription::shared(Vec::new(), None, true);
+        consumer.subscription = shared(Vec::new(), None, true);
         consumer
             .subscription
             .send_modify(|subscription| subscription.manual_assignment = true);
-        let result = tokio::time::timeout(Duration::from_secs(5), selected_commit(&consumer, 12))
+        let result = timeout(Duration::from_secs(5), selected_commit(&consumer, 12))
             .await
             .map(|result| result.map_err(|error| error.to_string()));
         mock.stop();

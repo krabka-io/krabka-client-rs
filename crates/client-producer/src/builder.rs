@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use krabka_client_core::{
     Client, ClientDnsTimeout, ClientError, ClientFrameMax, ConnectionDispatchQueueCapacity,
     DEFAULT_CLIENT_DNS_TIMEOUT, DEFAULT_CLIENT_FRAME_MAX,
-    DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY, telemetry,
+    DEFAULT_CONNECTION_DISPATCH_QUEUE_CAPACITY, security::ClientSecurity, telemetry,
 };
 use krabka_protocol::{
     Encode, ProtocolError, ProtocolRequest,
@@ -27,10 +27,15 @@ use krabka_units::{
     convert::{StdDurationExt as _, TimeExt as _},
 };
 use refined_type::rule::{GreaterI32, GreaterUsize, MinMaxU128, MinMaxUsize};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::{
+    sync::{Mutex, Notify, mpsc},
+    task::JoinHandle,
+    time::{self, Instant},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    accumulator::AccumulatorMap,
     buffer_pool::BufferPool,
     compression::{
         Compression, CompressionLevels, DEFAULT_PRODUCER_COMPRESSION_GZIP_LEVEL,
@@ -39,13 +44,14 @@ use crate::{
     error::ProducerError,
     metadata_age::{
         DEFAULT_PRODUCER_METADATA_MAX_AGE, DEFAULT_PRODUCER_METADATA_MAX_IDLE, MetadataAge,
+        validate_metadata_max_idle,
     },
     metadata_wait,
     partitioner::{BuiltInPartitioner, Partitioner, PartitionerConfig},
     producer,
     producer::{Acks, Producer, ProducerIdentity, SocketBuffers},
     sender,
-    transactional::{TxnErrorSlot, TxnState},
+    transactional::{PreparedTransactionState, TxnErrorSlot, TxnState},
     transport::ClientTransport,
     txn_retry::{self, CoordinatorAttempt, TxnRequestDecision},
 };
@@ -217,8 +223,9 @@ impl ProducerFlushTimeout {
 }
 
 impl Default for ProducerFlushTimeout {
+    /// [`DEFAULT_PRODUCER_FLUSH_TIMEOUT`], which [`Self::new`] accepts.
     fn default() -> Self {
-        Self::new(DEFAULT_PRODUCER_FLUSH_TIMEOUT).expect("default producer flush timeout is valid")
+        Self(DEFAULT_PRODUCER_FLUSH_TIMEOUT)
     }
 }
 
@@ -298,14 +305,15 @@ impl ProducerThroughputPolicy {
 }
 
 impl Default for ProducerThroughputPolicy {
+    /// The `DEFAULT_PRODUCER_*` settings, which [`Self::new`] accepts.
     fn default() -> Self {
-        Self::new(
-            DEFAULT_PRODUCER_COMPRESSION,
-            DEFAULT_PRODUCER_LINGER,
-            DEFAULT_PRODUCER_BATCH_BYTES,
-            DEFAULT_PRODUCER_MAX_IN_FLIGHT,
-        )
-        .expect("default producer throughput policy is valid")
+        Self {
+            compression: DEFAULT_PRODUCER_COMPRESSION,
+            linger: DEFAULT_PRODUCER_LINGER,
+            linger_ms: protocol_milliseconds(DEFAULT_PRODUCER_LINGER),
+            batch_bytes: DEFAULT_PRODUCER_BATCH_BYTES,
+            max_in_flight: DEFAULT_PRODUCER_MAX_IN_FLIGHT,
+        }
     }
 }
 
@@ -410,16 +418,16 @@ impl ProducerRetryPolicy {
 }
 
 impl Default for ProducerRetryPolicy {
+    /// The `DEFAULT_PRODUCER_*` timings, which [`Self::new`] accepts.
     fn default() -> Self {
-        Self::new(
-            DEFAULT_PRODUCER_REQUEST_TIMEOUT,
-            DEFAULT_PRODUCER_RETRIES,
-            DEFAULT_PRODUCER_RETRY_BACKOFF,
-            DEFAULT_PRODUCER_RETRY_BACKOFF_MAX,
-            DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT,
-            DEFAULT_PRODUCER_TRANSACTION_TIMEOUT,
-        )
-        .expect("default producer retry policy is valid")
+        Self {
+            request_timeout: DEFAULT_PRODUCER_REQUEST_TIMEOUT,
+            retries: DEFAULT_PRODUCER_RETRIES,
+            retry_backoff: DEFAULT_PRODUCER_RETRY_BACKOFF,
+            retry_backoff_max: DEFAULT_PRODUCER_RETRY_BACKOFF_MAX,
+            init_retry_timeout: DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT,
+            transaction_timeout: DEFAULT_PRODUCER_TRANSACTION_TIMEOUT,
+        }
     }
 }
 
@@ -494,13 +502,16 @@ fn validated_protocol_duration(value: Duration, name: &str) -> Result<Duration, 
     Ok(value)
 }
 
+/// The whole milliseconds of `value`, at most `i32::MAX`. The policy
+/// constructors accept only durations in that range, so the value of a
+/// validated duration is exact.
 fn protocol_milliseconds(value: Duration) -> i32 {
-    i32::try_from(value.as_millis()).expect("validated protocol duration")
+    i32::try_from(value.as_millis()).unwrap_or(i32::MAX)
 }
 
 // cargo-mutants: protocol-default InitProducerId shape, so `-> Default` is equivalent.
 #[cfg_attr(test, mutants::skip)]
-pub(crate) fn build_init_producer_id_request() -> InitProducerIdRequest {
+pub fn build_init_producer_id_request() -> InitProducerIdRequest {
     InitProducerIdRequest {
         transactional_id: None,
         transaction_timeout_ms: 0,
@@ -533,19 +544,18 @@ fn resolve_idempotence(
     transactional_id: Option<&str>,
 ) -> Result<bool, ProducerError> {
     let configured = enable_idempotence.is_some();
-    let mut enabled = enable_idempotence.unwrap_or(true);
-    if enabled {
-        let mut disable = false;
-        if retries == 0 {
+    let enabled = if enable_idempotence.unwrap_or(true) {
+        let retries_disable = retries == 0;
+        if retries_disable {
             if configured {
                 return Err(ProducerError::InvalidConfig(
                     "Must set retries to non-zero when using the idempotent producer.".to_owned(),
                 ));
             }
             tracing::info!("Idempotence will be disabled because retries is set to 0.");
-            disable = true;
         }
-        if acks != Acks::All {
+        let acks_disable = acks != Acks::All;
+        if acks_disable {
             if configured {
                 return Err(ProducerError::InvalidConfig(
                     "Must set acks to all in order to use the idempotent producer. \
@@ -557,7 +567,6 @@ fn resolve_idempotence(
                 acks = ?acks,
                 "Idempotence will be disabled because acks is not set to all."
             );
-            disable = true;
         }
         if max_in_flight > MAX_IN_FLIGHT_FOR_IDEMPOTENCE {
             return Err(ProducerError::InvalidConfig(format!(
@@ -565,8 +574,10 @@ fn resolve_idempotence(
                  at most {MAX_IN_FLIGHT_FOR_IDEMPOTENCE}. Current value is {max_in_flight}."
             )));
         }
-        enabled = !disable;
-    }
+        !(retries_disable || acks_disable)
+    } else {
+        false
+    };
     if !enabled && transactional_id.is_some() {
         return Err(ProducerError::InvalidConfig(
             "Cannot set a transactional_id without also enabling idempotence.".to_owned(),
@@ -582,12 +593,16 @@ fn resolve_idempotence(
 /// `producer-<transactional_id>`, or `producer-<n>` from a process-wide
 /// sequence.
 fn resolve_client_id(client_id: Option<String>, transactional_id: Option<&str>) -> String {
-    client_id.unwrap_or_else(|| match transactional_id {
-        Some(transactional_id) => format!("producer-{transactional_id}"),
-        None => format!(
-            "producer-{}",
-            PRODUCER_CLIENT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ),
+    client_id.unwrap_or_else(|| {
+        transactional_id.map_or_else(
+            || {
+                format!(
+                    "producer-{}",
+                    PRODUCER_CLIENT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                )
+            },
+            |transactional_id| format!("producer-{transactional_id}"),
+        )
     })
 }
 
@@ -611,7 +626,7 @@ fn producer_identity_from_init(init: &InitProducerIdResponse) -> Result<(i64, i1
 /// A request that carries a two-phase-commit field needs v6, which holds those
 /// fields. Every other request negotiates a released version, which is v5 at
 /// most. See [`StableInitProducerId`].
-pub(crate) async fn send_init_producer_id(
+pub async fn send_init_producer_id(
     client: &Client,
     request: &InitProducerIdRequest,
 ) -> Result<InitProducerIdResponse, ClientError> {
@@ -642,22 +657,22 @@ pub(crate) async fn send_init_producer_id(
 /// `error_code != 0` handling runs. If the final attempt disconnected, it
 /// surfaces the transport error instead.
 #[tracing::instrument(level = "info", skip_all, err(level = "info"))]
-pub(crate) async fn init_producer_id_with_retry(
+pub async fn init_producer_id_with_retry(
     client: &Client,
     request: InitProducerIdRequest,
     retry_timeout: Time,
     initial_backoff: Time,
     max_backoff: Time,
 ) -> Result<InitProducerIdResponse, ProducerError> {
-    let deadline = tokio::time::Instant::now()
+    let deadline = Instant::now()
         .checked_add(retry_timeout.to_std())
         .ok_or_else(|| {
             ProducerError::InvalidConfig("producer-ID retry timeout is too large".to_owned())
         })?;
     let mut backoff = initial_backoff.to_std();
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let response = tokio::time::timeout(remaining, send_init_producer_id(client, &request))
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let response = time::timeout(remaining, send_init_producer_id(client, &request))
             .await
             .map_err(|_| ProducerError::Client(ClientError::Timeout(retry_timeout)))?;
         let (attempt, last_outcome) = match response {
@@ -669,7 +684,7 @@ pub(crate) async fn init_producer_id_with_retry(
         else {
             return last_outcome.map_err(ProducerError::Client);
         };
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return last_outcome.map_err(ProducerError::Client);
         }
@@ -677,8 +692,8 @@ pub(crate) async fn init_producer_id_with_retry(
             client.reconnect_bootstrap().await;
         }
         let sleep_for = backoff.min(remaining);
-        tokio::time::sleep(sleep_for).await;
-        if tokio::time::Instant::now() >= deadline {
+        time::sleep(sleep_for).await;
+        if Instant::now() >= deadline {
             return last_outcome.map_err(ProducerError::Client);
         }
         backoff = next_backoff(backoff, max_backoff.to_std());
@@ -795,7 +810,7 @@ fn resolve_producer_config(
         raw.transactional_id,
     )?;
     let client_id = resolve_client_id(raw.client_id, raw.transactional_id);
-    crate::metadata_age::validate_metadata_max_idle(raw.metadata_max_idle)?;
+    validate_metadata_max_idle(raw.metadata_max_idle)?;
     let transaction_timeout = resolve_transaction_timeout(
         raw.transaction_two_phase_commit_enable,
         raw.transaction_timeout,
@@ -919,7 +934,7 @@ struct ProducerRuntime {
     metadata_cache: Arc<producer::MetadataCache>,
     metadata_refresh: Arc<metadata_wait::MetadataRefresh>,
     partition_leaders: Arc<DashMap<(String, i32), i32>>,
-    accumulators: crate::accumulator::AccumulatorMap,
+    accumulators: AccumulatorMap,
     next_seq: Arc<DashMap<(String, i32), i32>>,
     partitioner: Arc<BuiltInPartitioner>,
     flush_notify: Arc<Notify>,
@@ -931,10 +946,10 @@ struct ProducerRuntime {
     txn_recovery_generation: Arc<AtomicU64>,
     txn_guard_generation: Arc<AtomicU64>,
     txn_pid_epoch: Arc<Mutex<(i64, i16)>>,
-    prepared_transaction_state: Arc<Mutex<Option<crate::transactional::PreparedTransactionState>>>,
+    prepared_transaction_state: Arc<Mutex<Option<PreparedTransactionState>>>,
     txn_error: Arc<TxnErrorSlot>,
     transaction_v2: Arc<AtomicBool>,
-    sender_handle: tokio::task::JoinHandle<()>,
+    sender_handle: JoinHandle<()>,
 }
 
 /// Build the shared state of a [`ProducerRuntime`] and spawn the metadata-age
@@ -1209,7 +1224,7 @@ impl Producer {
         #[builder(into)] transactional_id: Option<String>,
         transaction_timeout: Option<Duration>,
         #[builder(default)] transaction_two_phase_commit_enable: bool,
-        security: Option<krabka_client_core::security::ClientSecurity>,
+        security: Option<ClientSecurity>,
         #[builder(default = true)] enable_metrics_push: bool,
     ) -> Result<Self, ProducerError> {
         let telemetry = producer_telemetry(enable_metrics_push, transactional_id.as_deref());
@@ -1358,7 +1373,7 @@ impl Producer {
             },
         );
 
-        Ok(Producer {
+        Ok(Self {
             client,
             client_id,
             security,
@@ -1429,14 +1444,13 @@ impl Producer {
 #[cfg(test)]
 mod security_arg_tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     };
 
     use bytes::BytesMut;
     use krabka_client_core::{
-        MockBroker,
-        security::{ClientSecurity, SaslCredentials},
+        MockBroker, mock_test_support::recorded_levels, security::SaslCredentials,
     };
     use krabka_protocol::{
         Decode,
@@ -1455,6 +1469,34 @@ mod security_arg_tests {
         let mut bytes = BytesMut::new();
         response.encode(&mut bytes, 0).expect("encode response");
         bytes.to_vec()
+    }
+
+    /// Each `Default` builds the value that its validating constructor builds
+    /// from the same `DEFAULT_PRODUCER_*` settings.
+    #[test]
+    fn the_defaults_pass_their_own_validation() {
+        assert2::assert!(
+            ProducerFlushTimeout::new(DEFAULT_PRODUCER_FLUSH_TIMEOUT)
+                == Ok(ProducerFlushTimeout::default())
+        );
+        assert2::assert!(
+            ProducerThroughputPolicy::new(
+                DEFAULT_PRODUCER_COMPRESSION,
+                DEFAULT_PRODUCER_LINGER,
+                DEFAULT_PRODUCER_BATCH_BYTES,
+                DEFAULT_PRODUCER_MAX_IN_FLIGHT,
+            ) == Ok(ProducerThroughputPolicy::default())
+        );
+        assert2::assert!(
+            ProducerRetryPolicy::new(
+                DEFAULT_PRODUCER_REQUEST_TIMEOUT,
+                DEFAULT_PRODUCER_RETRIES,
+                DEFAULT_PRODUCER_RETRY_BACKOFF,
+                DEFAULT_PRODUCER_RETRY_BACKOFF_MAX,
+                DEFAULT_PRODUCER_INIT_RETRY_TIMEOUT,
+                DEFAULT_PRODUCER_TRANSACTION_TIMEOUT,
+            ) == Ok(ProducerRetryPolicy::default())
+        );
     }
 
     #[test]
@@ -1889,7 +1931,8 @@ mod security_arg_tests {
                 })
             })
         })
-        .await;
+        .await
+        .unwrap();
         let bootstrap = mock.addr.to_string();
         let five_ms = Duration::from_millis(5);
         let acks_error = "Must set acks to all in order to use the idempotent producer. \
@@ -2129,30 +2172,35 @@ mod security_arg_tests {
         // build issues an InitProducerId, which must fail at connect —
         // proving the security arg is threaded (not a type error). A lazy
         // (non-idempotent) build would not connect, so keep idempotence on.
-        let res = Producer::builder()
+        let failed = Producer::builder()
             .bootstrap("127.0.0.1:1")
-            .request_timeout(std::time::Duration::from_millis(500))
+            .request_timeout(Duration::from_millis(500))
             .security(security)
             .build()
-            .await;
-        assert2::assert!(res.is_err());
+            .await
+            .is_err();
+        assert2::assert!(failed);
     }
 
     #[tokio::test]
     async fn producer_builder_uses_request_timeout_for_initial_connect_handshake() {
-        let mock = MockBroker::start(|_api_key, _version, _corr_id, _body| None).await;
+        let mock = MockBroker::start(|_api_key, _version, _corr_id, _body| None)
+            .await
+            .unwrap();
 
         let build = Producer::builder()
             .bootstrap(mock.addr.to_string())
             .request_timeout(Duration::from_millis(100))
             .build();
-        let res = tokio::time::timeout(Duration::from_millis(500), build).await;
+        let res = time::timeout(Duration::from_millis(500), build)
+            .await
+            .map(Result::err);
 
         mock.stop();
 
         let err = res
             .expect("producer build should not retain the 30s connect timeout")
-            .expect_err("silent broker must time out during build");
+            .expect("silent broker must time out during build");
         assert2::assert!(matches!(
             err,
             ProducerError::Client(ClientError::Timeout(d))
@@ -2177,7 +2225,8 @@ mod security_arg_tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
 
         let build = Producer::builder()
             .bootstrap(mock.addr.to_string())
@@ -2186,7 +2235,7 @@ mod security_arg_tests {
             .retry_backoff_max(Duration::from_millis(10))
             .init_retry_timeout(Duration::from_millis(100))
             .build();
-        let error = tokio::time::timeout(Duration::from_millis(500), build)
+        let error = time::timeout(Duration::from_millis(500), build)
             .await
             .expect("configured init retry timeout must bound the build")
             .expect_err("cold coordinator must remain an error");
@@ -2234,7 +2283,8 @@ mod security_arg_tests {
                 }
                 None
             })
-            .await;
+            .await
+            .unwrap();
             let client = Client::builder()
                 .bootstrap(mock.addr.to_string())
                 .request_timeout(millis(100))
@@ -2299,7 +2349,7 @@ mod security_arg_tests {
             ("two-phase commit, broker max 6", two_phase, 6, 6),
         ];
         for (name, request, broker_max, expected_version) in cases {
-            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::new(StdMutex::new(Vec::new()));
             let handler_seen = Arc::clone(&seen);
             let mock = MockBroker::start(move |api_key, version, _corr_id, body| {
                 if api_key == api_versions_request::API_KEY {
@@ -2333,7 +2383,8 @@ mod security_arg_tests {
                 }
                 None
             })
-            .await;
+            .await
+            .unwrap();
             let client = Client::builder()
                 .bootstrap(mock.addr.to_string())
                 .client_id(CLIENT_ID)
@@ -2364,7 +2415,8 @@ mod security_arg_tests {
             (api_key == api_versions_request::API_KEY)
                 .then(|| encode_v0(&ApiVersionsResponse::default()))
         })
-        .await;
+        .await
+        .unwrap();
 
         let build = Producer::builder()
             .bootstrap(mock.addr.to_string())
@@ -2373,7 +2425,7 @@ mod security_arg_tests {
             .retry_backoff_max(Duration::from_millis(1))
             .init_retry_timeout(Duration::from_millis(10))
             .build();
-        let error = tokio::time::timeout(Duration::from_millis(200), build)
+        let error = time::timeout(Duration::from_millis(200), build)
             .await
             .expect("init retry timeout must bound an in-flight request")
             .expect_err("unresponsive InitProducerId must time out");
@@ -2496,15 +2548,16 @@ mod security_arg_tests {
     }
 
     #[tokio::test]
-    async fn producer_builder_accepts_a_distinct_dns_timeout() {
-        let producer = Producer::builder()
+    async fn producer_builder_accepts_a_distinct_dns_timeout() -> Result<(), ProducerError> {
+        Producer::builder()
             .bootstrap("127.0.0.1:1")
             .dns_timeout(millis(37))
             .enable_idempotence(false)
             .build()
             .await
-            .expect("valid DNS timeout");
-        producer.close().await.expect("close producer");
+            .expect("valid DNS timeout")
+            .close()
+            .await
     }
 
     /// `send.buffer.bytes` and `receive.buffer.bytes` reach the options that
@@ -2529,34 +2582,51 @@ mod security_arg_tests {
                 (None, None),
             ),
         ] {
-            let producer = Producer::builder()
-                .bootstrap("127.0.0.1:1")
-                .enable_idempotence(false)
-                .maybe_send_buffer(send)
-                .maybe_receive_buffer(receive)
-                .build()
-                .await
-                .expect("valid socket buffers");
-
-            let options = producer.client.connection_options();
+            let (options, socket_buffers) = socket_buffers_and_close(
+                Producer::builder()
+                    .bootstrap("127.0.0.1:1")
+                    .enable_idempotence(false)
+                    .maybe_send_buffer(send)
+                    .maybe_receive_buffer(receive)
+                    .build()
+                    .await
+                    .expect("valid socket buffers"),
+            )
+            .await
+            .expect("close producer");
+            assert2::assert!(options == expected, "case {name}");
             assert2::assert!(
-                (options.send_buffer, options.receive_buffer) == expected,
-                "case {name}"
-            );
-            assert2::assert!(
-                producer.socket_buffers
+                socket_buffers
                     == producer::SocketBuffers {
                         send: expected.0,
                         receive: expected.1,
                     },
                 "case {name}"
             );
-            producer.close().await.expect("close producer");
         }
     }
 
+    /// The socket buffers of `producer`: the ones its client's connection
+    /// options carry, and the ones it keeps itself. The producer is closed.
+    async fn socket_buffers_and_close(
+        producer: Producer,
+    ) -> Result<
+        (
+            (Option<ByteSize>, Option<ByteSize>),
+            producer::SocketBuffers,
+        ),
+        ProducerError,
+    > {
+        let options = producer.client.connection_options();
+        let observed = (
+            (options.send_buffer, options.receive_buffer),
+            producer.socket_buffers,
+        );
+        producer.close().await.map(|()| observed)
+    }
+
     #[tokio::test]
-    async fn producer_builder_carries_client_resource_policy() {
+    async fn producer_builder_carries_client_resource_policy() -> Result<(), ProducerError> {
         let producer = Producer::builder()
             .bootstrap("127.0.0.1:1")
             .dispatch_queue_capacity(7)
@@ -2568,7 +2638,7 @@ mod security_arg_tests {
 
         assert2::assert!(producer.dispatch_queue_capacity.get() == 7);
         assert2::assert!(producer.frame_max.size() == krabka_units::kibibytes(32));
-        producer.close().await.expect("close producer");
+        producer.close().await
     }
 
     #[tokio::test]
@@ -2655,7 +2725,7 @@ mod security_arg_tests {
     /// (krabka-io/krabka-broker#1515).
     #[tokio::test]
     async fn a_build_that_cannot_connect_records_no_error() {
-        let (result, levels) = krabka_client_core::mock_test_support::recorded_levels(Box::pin(
+        let (result, levels) = recorded_levels(Box::pin(
             Producer::builder()
                 .bootstrap("127.0.0.1:1")
                 .request_timeout(Duration::from_millis(500))

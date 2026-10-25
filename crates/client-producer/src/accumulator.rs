@@ -17,11 +17,11 @@ use crate::{
     record::{Header, RecordMetadata},
 };
 
-pub(crate) type AccumulatorMap = Arc<DashMap<(String, i32), Arc<Mutex<Accumulator>>>>;
+pub type AccumulatorMap = Arc<DashMap<(String, i32), Arc<Mutex<Accumulator>>>>;
 
 /// A record waiting inside an in-progress batch.
 #[derive(Debug)]
-pub(crate) struct PendingRecord {
+pub struct PendingRecord {
     pub offset_delta: i32,
     pub timestamp_ms: i64,
     pub key: Option<Bytes>,
@@ -33,7 +33,7 @@ pub(crate) struct PendingRecord {
 /// One in-progress `RecordBatch`. The sender wraps it into a Kafka
 /// `RecordBatch` at flush time and assigns `base_sequence`.
 #[derive(Debug)]
-pub(crate) struct InProgressBatch {
+pub struct InProgressBatch {
     /// Recovery generation captured when transactional records were accepted.
     /// A batch is never allowed to cross a transaction recovery boundary.
     pub transaction_generation: Option<u64>,
@@ -68,7 +68,7 @@ impl InProgressBatch {
 
 /// One accumulator per (topic, partition).
 #[derive(Debug)]
-pub(crate) struct Accumulator {
+pub struct Accumulator {
     /// `None` until the first append. The sender pops the in-progress batch
     /// into `ready` when it flushes, and rotates the partitioner sticky where
     /// that applies.
@@ -81,7 +81,7 @@ pub(crate) struct Accumulator {
 }
 
 /// Result of [`Accumulator::try_append`].
-pub(crate) struct AppendResult {
+pub struct AppendResult {
     pub receiver: oneshot::Receiver<Result<RecordMetadata, ProducerError>>,
     /// A new current batch (and therefore a new linger deadline) was created.
     /// This is also true when the previous current batch rolled into `ready`.
@@ -128,13 +128,10 @@ impl Accumulator {
     /// Tell if a record of `record_size` bytes starts a new batch, which
     /// needs buffer memory.
     pub fn needs_new_batch(&self, record_size: usize, transaction_generation: Option<u64>) -> bool {
-        match &self.current {
-            None => true,
-            Some(b) => {
-                b.transaction_generation != transaction_generation
-                    || (b.size_bytes + record_size > self.batch_size && !b.is_empty())
-            }
-        }
+        self.current.as_ref().is_none_or(|b| {
+            b.transaction_generation != transaction_generation
+                || (b.size_bytes + record_size > self.batch_size && !b.is_empty())
+        })
     }
 
     /// Append a record with no buffer memory for a new batch.
@@ -179,22 +176,24 @@ impl Accumulator {
     ) -> AppendResult {
         let record_size = approx_record_size(key.as_deref(), value.as_deref(), &headers);
         let need_new_batch = self.needs_new_batch(record_size, transaction_generation);
-
-        if need_new_batch {
-            if let Some(prev) = self.current.take() {
-                self.ready.push_back(prev);
-            }
-            let mut batch = InProgressBatch::new(transaction_generation);
-            batch.memory = memory;
-            self.current = Some(batch);
-        }
-
-        let batch = self
-            .current
-            .as_mut()
-            .expect("current set above when need_new_batch was true");
-
         let (tx, rx) = oneshot::channel();
+        let result = AppendResult {
+            receiver: rx,
+            wakes_sender: need_new_batch,
+        };
+
+        let batch = match &mut self.current {
+            Some(batch) if !need_new_batch => batch,
+            current => {
+                if let Some(prev) = current.take() {
+                    self.ready.push_back(prev);
+                }
+                let mut batch = InProgressBatch::new(transaction_generation);
+                batch.memory = memory;
+                current.insert(batch)
+            }
+        };
+
         let offset_delta = i32::try_from(batch.records.len()).unwrap_or(i32::MAX);
         batch.records.push(PendingRecord {
             offset_delta,
@@ -205,10 +204,7 @@ impl Accumulator {
             ack: tx,
         });
         batch.size_bytes += record_size;
-        AppendResult {
-            receiver: rx,
-            wakes_sender: need_new_batch,
-        }
+        result
     }
 
     /// Tell if no batch of the partition can take more records.
@@ -260,11 +256,7 @@ impl Accumulator {
 
 /// Approximate the size of a record: 8 bytes of overhead, the key, the value
 /// and the headers.
-pub(crate) fn approx_record_size(
-    key: Option<&[u8]>,
-    value: Option<&[u8]>,
-    headers: &[Header],
-) -> usize {
+pub fn approx_record_size(key: Option<&[u8]>, value: Option<&[u8]>, headers: &[Header]) -> usize {
     let mut n = 8usize; // varint overhead estimate
     n += key.map_or(0, <[u8]>::len) + 4;
     n += value.map_or(0, <[u8]>::len) + 4;
@@ -291,7 +283,7 @@ const MAX_RECORD_OVERHEAD: usize = 21;
 /// `DefaultRecordBatch.estimateBatchSizeUpperBound`: the batch header, the
 /// largest record overhead, and `DefaultRecord.sizeOf` of the key, the value
 /// and the headers. A null key, value or header value takes one varint byte.
-pub(crate) fn record_size_upper_bound(
+pub fn record_size_upper_bound(
     key: Option<&[u8]>,
     value: Option<&[u8]>,
     headers: &[Header],
@@ -331,14 +323,15 @@ mod tests {
     fn first_append_creates_batch() {
         let mut a = Accumulator::new(1024);
         let _ = a.try_append(None, Some(Bytes::from_static(b"hi")), vec![], 0, None);
-        let current = a.current.as_ref().expect("append creates current batch");
-        check!(
+        let current = a.current.as_ref().map(|current| {
             (
                 current.records.len(),
                 current.is_empty(),
-                current.size_bytes
-            ) == (1, false, approx_record_size(None, Some(b"hi"), &[]))
-        );
+                current.size_bytes,
+            )
+        });
+        drop(a);
+        check!(current == Some((1, false, approx_record_size(None, Some(b"hi"), &[]))));
     }
 
     #[test]
@@ -347,17 +340,13 @@ mod tests {
         let mut a = Accumulator::new(record_size * 2 - 1);
         let _ = a.try_append(None, Some(Bytes::from(vec![0u8; 32])), vec![], 0, None);
         let _ = a.try_append(None, Some(Bytes::from(vec![0u8; 32])), vec![], 0, None);
+        let ready = a.ready.len();
         let current = a
             .current
             .as_ref()
-            .expect("second record starts a new batch");
-        check!(
-            (
-                a.ready.len(),
-                current.records.len(),
-                current.records[0].offset_delta
-            ) == (1, 1, 0)
-        );
+            .map(|current| (current.records.len(), current.records[0].offset_delta));
+        drop(a);
+        check!((ready, current) == (1, Some((1, 0))));
     }
 
     #[test]
@@ -368,16 +357,17 @@ mod tests {
         let _ = a.try_append(None, Some(Bytes::from(vec![0u8; 32])), vec![], 0, None);
         let _ = a.try_append(None, Some(Bytes::from(vec![0u8; 32])), vec![], 0, None);
 
-        let current = a.current.as_ref().unwrap();
-        check!(
+        let ready_is_empty = a.ready.is_empty();
+        let current = a.current.as_ref().map(|current| {
             (
-                a.ready.is_empty(),
                 current.records.len(),
                 current.records[0].offset_delta,
                 current.records[1].offset_delta,
                 current.size_bytes,
-            ) == (true, 2, 0, 1, record_size * 2)
-        );
+            )
+        });
+        drop(a);
+        check!((ready_is_empty, current) == (true, Some((2, 0, 1, record_size * 2))));
     }
 
     #[test]
@@ -385,7 +375,9 @@ mod tests {
         let mut a = Accumulator::new(1024);
         let _ = a.try_append(None, Some(Bytes::from_static(b"x")), vec![], 0, None);
         a.seal_current();
-        assert2::assert!((a.current.is_none(), a.ready.len()) == (true, 1));
+        let sealed = (a.current.is_none(), a.ready.len());
+        drop(a);
+        assert2::assert!(sealed == (true, 1));
     }
 
     #[test]
@@ -395,8 +387,10 @@ mod tests {
 
         assert2::assert!(a.current.as_ref().unwrap().is_empty());
         a.seal_current();
+        let sealed = (a.current.is_none(), a.ready.is_empty());
+        drop(a);
 
-        assert2::assert!((a.current.is_none(), a.ready.is_empty()) == (true, true));
+        assert2::assert!(sealed == (true, true));
     }
 
     /// Each row is Kafka's `AbstractRecords.estimateSizeInBytesUpperBound`

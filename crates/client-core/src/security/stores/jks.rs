@@ -5,7 +5,7 @@
 
 use pkcs8::{
     AlgorithmIdentifierRef, ObjectIdentifier,
-    der::{Decode, Reader, SliceReader, asn1::OctetStringRef},
+    der::{self, Decode, Reader, SliceReader, asn1::OctetStringRef},
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha1::{Digest, Sha1};
@@ -80,7 +80,10 @@ impl JksStore {
             let mut hash = Sha1::new();
             hash.update(password_bytes(password));
             hash.update(DIGEST_WHITENER);
-            hash.update(&data[..signed_len]);
+            let signed = data
+                .get(..signed_len)
+                .ok_or_else(|| jks_error("truncated JKS store"))?;
+            hash.update(signed);
             if hash.finalize().as_slice() != digest {
                 return Err(jks_error(
                     "keystore password was incorrect (the store digest does not match)",
@@ -134,13 +137,13 @@ fn password_bytes(password: &Password) -> Vec<u8> {
 /// The encrypted data is a 20-byte salt, the key XOR a SHA-1 key stream, and
 /// a 20-byte SHA-1 check of the password and the key.
 fn recover_key(protected_key: &[u8], password: &Password) -> Result<Vec<u8>, TlsConfigError> {
-    let invalid = |error: pkcs8::der::Error| jks_error(&format!("invalid protected key: {error}"));
+    let invalid = |error: der::Error| jks_error(&format!("invalid protected key: {error}"));
     let mut reader = SliceReader::new(protected_key).map_err(invalid)?;
     let (oid, encrypted) = reader
         .sequence(|body| {
             let algorithm = AlgorithmIdentifierRef::decode(body)?;
             let data = <&OctetStringRef>::decode(body)?;
-            Ok::<_, pkcs8::der::Error>((algorithm.oid, data.as_bytes().to_vec()))
+            Ok::<_, der::Error>((algorithm.oid, data.as_bytes().to_vec()))
         })
         .map_err(invalid)?;
     if oid != KEY_PROTECTOR_OID {
@@ -187,22 +190,28 @@ impl<'a> Input<'a> {
         let end = self
             .offset
             .checked_add(len)
-            .filter(|end| *end <= self.data.len())
             .ok_or_else(|| jks_error("truncated JKS store"))?;
-        let bytes = &self.data[self.offset..end];
+        let bytes = self
+            .data
+            .get(self.offset..end)
+            .ok_or_else(|| jks_error("truncated JKS store"))?;
         self.offset = end;
         Ok(bytes)
     }
 
+    /// The next `N` bytes.
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], TlsConfigError> {
+        <[u8; N]>::try_from(self.bytes(N)?).map_err(|_| jks_error("truncated JKS store"))
+    }
+
     fn u32(&mut self) -> Result<u32, TlsConfigError> {
-        let bytes = self.bytes(4)?;
-        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        Ok(u32::from_be_bytes(self.array()?))
     }
 
     /// A `DataInputStream.readUTF` value. The reader skips the text.
     fn utf(&mut self) -> Result<(), TlsConfigError> {
-        let bytes = self.bytes(2)?;
-        self.bytes(usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))?;
+        let len = u16::from_be_bytes(self.array()?);
+        self.bytes(usize::from(len))?;
         Ok(())
     }
 

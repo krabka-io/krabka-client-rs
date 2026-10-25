@@ -12,20 +12,23 @@
 
 use std::{sync::Arc, time::Duration};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time,
+};
 
 use crate::error::ProducerError;
 
 /// The bytes that one batch holds. Dropping the reservation gives the bytes
 /// back to the pool and wakes the oldest waiting send.
 #[derive(Debug)]
-pub(crate) struct MemoryReservation {
+pub struct MemoryReservation {
     _permit: OwnedSemaphorePermit,
 }
 
 /// A fixed amount of memory, handed out in the order of the requests.
 #[derive(Debug)]
-pub(crate) struct BufferPool {
+pub struct BufferPool {
     total: usize,
     poolable: usize,
     free: Arc<Semaphore>,
@@ -84,7 +87,7 @@ impl BufferPool {
                 ))
             })?;
         let acquire = Arc::clone(&self.free).acquire_many_owned(permits);
-        match tokio::time::timeout(max_time_to_block, acquire).await {
+        match time::timeout(max_time_to_block, acquire).await {
             Ok(Ok(permit)) => Ok(MemoryReservation { _permit: permit }),
             // The pool never closes its semaphore.
             Ok(Err(_)) | Err(_) => Err(ProducerError::BufferExhausted {
@@ -100,6 +103,8 @@ impl BufferPool {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{task, time::Instant};
+
     use super::*;
 
     const MIB: usize = 1024 * 1024;
@@ -112,7 +117,7 @@ mod tests {
     }
 
     async fn allocation(pool: &BufferPool, size: usize, max_block: Duration) -> Allocation {
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let outcome = pool
             .allocate(size, max_block)
             .await
@@ -189,20 +194,20 @@ mod tests {
         let waiter = |size: usize| {
             let pool = Arc::clone(&pool);
             tokio::spawn(async move {
-                let started = tokio::time::Instant::now();
+                let started = Instant::now();
                 let reservation = pool.allocate(size, Duration::from_secs(1)).await;
                 let waited = started.elapsed();
                 // The batch holds its memory for a while before it completes.
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                time::sleep(Duration::from_millis(50)).await;
                 (waited, reservation.map(drop).is_ok())
             })
         };
         let large = waiter(2 * MIB);
-        tokio::task::yield_now().await;
+        task::yield_now().await;
         let small = waiter(MIB);
-        tokio::task::yield_now().await;
+        task::yield_now().await;
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        time::sleep(Duration::from_millis(100)).await;
         drop(held);
         let large = large.await.expect("large waiter");
         let small = small.await.expect("small waiter");

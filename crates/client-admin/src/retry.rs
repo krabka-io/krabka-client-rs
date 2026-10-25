@@ -11,13 +11,14 @@ use std::{future::Future, time::Duration};
 
 use krabka_client_core::ClientError;
 use krabka_units::{Time, convert::TimeExt as _};
-use tokio::time::Instant;
+use ring::rand::SystemRandom;
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 use crate::{AdminClient, AdminError, KafkaError, kafka_error_name};
 
 /// The retry limits of one admin call.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct RetryPolicy {
+pub struct RetryPolicy {
     /// The call does not start another attempt after this time elapses.
     pub(crate) timeout: Duration,
     /// The wait before the first retry (`retry.backoff.ms`).
@@ -36,7 +37,7 @@ pub(crate) struct RetryPolicy {
 /// `retry.backoff.ms` (100), `retry.backoff.max.ms` (1000) and a jitter of
 /// 0.2, from `AdminClientConfig` and `CommonClientConfigs`.
 #[cfg(test)]
-pub(crate) const KAFKA_ADMIN_RETRY: RetryPolicy = RetryPolicy {
+pub const KAFKA_ADMIN_RETRY: RetryPolicy = RetryPolicy {
     timeout: Duration::from_mins(1),
     initial_backoff: Duration::from_millis(100),
     max_backoff: Duration::from_secs(1),
@@ -57,18 +58,18 @@ impl RetryPolicy {
         if max <= initial {
             return Duration::from_secs_f64(initial / 1000.0);
         }
-        let exp_max = (max / initial.max(1.0)).ln() / RETRY_BACKOFF_EXP_BASE.ln();
+        let exp_max = (max / initial.max(1.0)).log(RETRY_BACKOFF_EXP_BASE);
         // `initial * 2^exp_max` is `max`. Use `max` there, so that a rounding
         // error of `powf` does not give a wait below the maximum.
         let term = if f64::from(attempts) >= exp_max {
             max
         } else {
-            initial * RETRY_BACKOFF_EXP_BASE.powf(f64::from(attempts))
+            initial * f64::from(attempts).exp2()
         };
         let factor = if self.jitter <= 0.0 {
             1.0
         } else {
-            (1.0 - self.jitter) + random * 2.0 * self.jitter
+            (random * 2.0).mul_add(self.jitter, 1.0 - self.jitter)
         };
         // Kafka truncates the wait to whole milliseconds.
         Duration::from_secs_f64((factor * term).floor().min(max) / 1000.0)
@@ -89,7 +90,7 @@ fn jitter_random() -> f64 {
     use ring::rand::SecureRandom as _;
 
     let mut bytes = [0_u8; 4];
-    if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
+    if SystemRandom::new().fill(&mut bytes).is_err() {
         return 0.5;
     }
     f64::from(u32::from_be_bytes(bytes)) / (f64::from(u32::MAX) + 1.0)
@@ -97,7 +98,7 @@ fn jitter_random() -> f64 {
 
 /// The deadline and retry count of one running admin call.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RetryDeadline {
+pub struct RetryDeadline {
     policy: RetryPolicy,
     deadline: Instant,
     retries: u32,
@@ -135,7 +136,7 @@ impl RetryDeadline {
         &self,
         attempt: impl Future<Output = RetryAction<T>>,
     ) -> RetryAction<T> {
-        tokio::time::timeout_at(self.deadline, attempt)
+        timeout_at(self.deadline, attempt)
             .await
             .unwrap_or_else(|_| {
                 RetryAction::Done(Err(AdminError::Transport(ClientError::Timeout(
@@ -147,7 +148,7 @@ impl RetryDeadline {
     /// Run `attempt`, but not past the call deadline. Returns `None` when the
     /// deadline passes first.
     pub(crate) async fn bounded<F: Future>(&self, attempt: F) -> Option<F::Output> {
-        tokio::time::timeout_at(self.deadline, attempt).await.ok()
+        timeout_at(self.deadline, attempt).await.ok()
     }
 
     /// The time that remains until the deadline, in whole milliseconds, as
@@ -159,7 +160,7 @@ impl RetryDeadline {
 
     /// Wait until `wait` elapses, but not past the deadline.
     pub(crate) async fn sleep(&self, wait: Duration) {
-        tokio::time::sleep_until(self.deadline.min(Instant::now() + wait)).await;
+        sleep_until(self.deadline.min(Instant::now() + wait)).await;
     }
 
     /// The number of retries that the call has started.
@@ -171,7 +172,7 @@ impl RetryDeadline {
     pub(crate) async fn backoff(&mut self) {
         let wait = self.policy.backoff_with(self.retries, jitter_random());
         self.retries = self.retries.saturating_add(1);
-        tokio::time::sleep_until(self.deadline.min(Instant::now() + wait)).await;
+        sleep_until(self.deadline.min(Instant::now() + wait)).await;
     }
 }
 
@@ -181,7 +182,7 @@ impl RetryDeadline {
 /// `NetworkClient` reports each as a disconnect, and `AdminApiDriver.onFailure`
 /// finds the coordinator again after a disconnect. A rejected authentication
 /// is not such an error.
-pub(crate) fn is_connection_failure(error: &AdminError) -> bool {
+pub fn is_connection_failure(error: &AdminError) -> bool {
     matches!(
         error,
         AdminError::Transport(
@@ -198,7 +199,7 @@ pub(crate) fn is_connection_failure(error: &AdminError) -> bool {
 /// The retry action after `error` on a connection to, or a request on, a
 /// coordinator: find the coordinator again after a connection failure, and
 /// stop after every other error.
-pub(crate) fn connection_failure_action<T>(error: AdminError) -> RetryAction<T> {
+pub fn connection_failure_action<T>(error: AdminError) -> RetryAction<T> {
     if is_connection_failure(&error) {
         RetryAction::FindCoordinator(Err(error))
     } else {
@@ -207,12 +208,12 @@ pub(crate) fn connection_failure_action<T>(error: AdminError) -> RetryAction<T> 
 }
 
 /// `REQUEST_TIMED_OUT`: Kafka's `TimeoutException`.
-pub(crate) const REQUEST_TIMED_OUT: i16 = 7;
+pub const REQUEST_TIMED_OUT: i16 = 7;
 
 /// The error of a call past its deadline, as Kafka's
 /// `Call.handleTimeoutFailure` gives a `TimeoutException` that names the
 /// attempts and the last retriable error.
-pub(crate) fn call_timeout_error(api: &str, attempts: u32, last: &str) -> KafkaError {
+pub fn call_timeout_error(api: &str, attempts: u32, last: &str) -> KafkaError {
     KafkaError {
         code: REQUEST_TIMED_OUT,
         name: kafka_error_name(REQUEST_TIMED_OUT),
@@ -230,7 +231,7 @@ pub(crate) fn call_timeout_error(api: &str, attempts: u32, last: &str) -> KafkaE
 /// refreshed controller until its deadline. Past the deadline the call fails
 /// with `REQUEST_TIMED_OUT` (7).
 #[derive(Debug)]
-pub(crate) struct ControllerRetry {
+pub struct ControllerRetry {
     api: &'static str,
     deadline: RetryDeadline,
     attempts: u32,
@@ -259,10 +260,10 @@ impl ControllerRetry {
         &self,
         attempt: impl Future<Output = Result<T, AdminError>>,
     ) -> Result<T, AdminError> {
-        match self.deadline.bounded(attempt).await {
-            Some(result) => result,
-            None => Err(self.timeout_error("the request was in flight at the deadline")),
-        }
+        self.deadline
+            .bounded(attempt)
+            .await
+            .unwrap_or_else(|| Err(self.timeout_error("the request was in flight at the deadline")))
     }
 
     /// Handle a `NOT_CONTROLLER` answer: find the controller again and wait
@@ -270,7 +271,7 @@ impl ControllerRetry {
     /// deadline has passed, and a rejected authentication of the refresh.
     pub(crate) async fn after_not_controller(
         &mut self,
-        admin: &mut AdminClient,
+        admin: &AdminClient,
     ) -> Result<(), AdminError> {
         self.bounded(admin.refresh_controller_after_not_controller())
             .await?;
@@ -315,9 +316,7 @@ impl AdminClient {
     /// Find the active controller after a `NOT_CONTROLLER` answer. Only a
     /// rejected authentication is an error. Kafka's `ControllerNodeProvider`
     /// keeps the call pending while the metadata names no controller.
-    pub(crate) async fn refresh_controller_after_not_controller(
-        &mut self,
-    ) -> Result<(), AdminError> {
+    pub(crate) async fn refresh_controller_after_not_controller(&self) -> Result<(), AdminError> {
         match self.refresh_controller_connection().await {
             Err(error) if error.is_authentication_failure() => Err(error),
             Err(error) => {
@@ -331,7 +330,7 @@ impl AdminClient {
 
 /// What a coordinator call does after one attempt.
 #[derive(Debug)]
-pub(crate) enum RetryAction<T> {
+pub enum RetryAction<T> {
     /// Return this result.
     Done(Result<T, AdminError>),
     /// Send the request again to the same coordinator. When the call deadline
@@ -353,7 +352,7 @@ pub(crate) enum RetryAction<T> {
 /// The loop lives in the caller, not in a closure, so that the future of the
 /// call stays `Send`.
 #[derive(Debug)]
-pub(crate) struct CoordinatorRetry {
+pub struct CoordinatorRetry {
     deadline: RetryDeadline,
     find_coordinator: bool,
 }
@@ -421,6 +420,8 @@ impl CoordinatorRetry {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::pending, io, net::SocketAddr};
+
     use assert2::assert;
 
     use super::*;
@@ -476,8 +477,8 @@ mod tests {
             SameCoordinator,
             FindCoordinator,
         }
-        let addr: std::net::SocketAddr = "127.0.0.1:9092".parse().unwrap();
-        let io = || std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        let addr: SocketAddr = "127.0.0.1:9092".parse().unwrap();
+        let io = || io::Error::new(io::ErrorKind::ConnectionReset, "reset");
         let cases = [
             (
                 "connect",
@@ -548,7 +549,7 @@ mod tests {
             ..KAFKA_ADMIN_RETRY
         });
         let started = Instant::now();
-        let action = retry.run(std::future::pending::<RetryAction<()>>()).await;
+        let action = retry.run(pending::<RetryAction<()>>()).await;
         assert!(started.elapsed() == Duration::from_millis(50));
         assert!(matches!(
             action,

@@ -25,6 +25,7 @@
 #![allow(dead_code)]
 
 use std::{
+    process,
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
@@ -38,6 +39,7 @@ use testcontainers::{ContainerAsync, ContainerRequest, runners::AsyncRunner};
 // `testcontainers_modules::kafka` re-exports `confluent::*`, so the bare
 // `Kafka` here is the Confluent module's container type.
 use testcontainers_modules::kafka::{KAFKA_PORT, Kafka};
+use tokio::time;
 
 /// The deadline for a container to start, which includes the image pull.
 pub const CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(2);
@@ -60,7 +62,7 @@ pub fn init_tracing() {
 pub fn unique(prefix: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{}-{n}", std::process::id())
+    format!("{prefix}-{}-{n}", process::id())
 }
 
 /// A running Kafka container and the address a client bootstraps from.
@@ -99,7 +101,7 @@ pub async fn start_kafka() -> KafkaBroker {
 
 /// Start a Kafka container built from a caller-configured image.
 pub async fn start_kafka_with(image: ContainerRequest<Kafka>) -> KafkaBroker {
-    let container = tokio::time::timeout(CONTAINER_START_TIMEOUT, image.start())
+    let container = time::timeout(CONTAINER_START_TIMEOUT, image.start())
         .await
         .expect("kafka container start timed out")
         .expect("kafka container failed to start");
@@ -135,7 +137,7 @@ pub async fn bootstrap_client(bootstrap: &str) -> Client {
                 // separate process and publishes no readiness signal this
                 // side can await.
                 tracing::warn!(attempt, "broker is still warming up; retrying");
-                tokio::time::sleep(BOOTSTRAP_RETRY_DELAY).await;
+                time::sleep(BOOTSTRAP_RETRY_DELAY).await;
             }
             Err(e) => panic!("bootstrap ApiVersions failed with non-retryable error: {e}"),
         }

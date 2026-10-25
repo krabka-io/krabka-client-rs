@@ -63,7 +63,7 @@ fn build_request(
     OffsetForLeaderEpochRequest {
         replica_id: -1,
         topics: vec![OffsetForLeaderTopic {
-            topic: topic.to_string(),
+            topic: topic.to_owned(),
             partitions: vec![OffsetForLeaderPartition {
                 partition,
                 current_leader_epoch,
@@ -142,7 +142,7 @@ mod tests {
             req == OffsetForLeaderEpochRequest {
                 replica_id: -1,
                 topics: vec![OffsetForLeaderTopic {
-                    topic: "orders".to_string(),
+                    topic: "orders".to_owned(),
                     partitions: vec![OffsetForLeaderPartition {
                         partition: 2,
                         current_leader_epoch: 17,

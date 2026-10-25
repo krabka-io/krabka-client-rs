@@ -7,9 +7,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicI64, AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use super::otlp::{
@@ -186,10 +187,10 @@ impl ClientMetrics {
         self.lock().remove(key);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<MetricKey, Registered>> {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<MetricKey, Registered>> {
         self.registered
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn snapshot(&self) -> Vec<(MetricKey, Registered)> {
@@ -201,9 +202,9 @@ impl ClientMetrics {
 }
 
 /// Nanoseconds since the Unix epoch.
-pub(crate) fn unix_nanos_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+pub fn unix_nanos_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok())
         .unwrap_or(0)
@@ -251,7 +252,7 @@ impl NetworkMetrics {
 
 /// The network metrics of one open connection.
 #[derive(Debug)]
-pub(crate) struct ConnectionMetrics(NetworkMetrics);
+pub struct ConnectionMetrics(NetworkMetrics);
 
 impl ConnectionMetrics {
     /// A request of `frame_len` bytes went out. Kafka counts the size prefix
@@ -285,7 +286,7 @@ impl Drop for ConnectionMetrics {
 /// Which metrics a subscription asks for
 /// (`ClientTelemetryUtils.getSelectorFromRequestedMetrics`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum MetricSelector {
+pub enum MetricSelector {
     /// An empty `requested_metrics`.
     NoMetrics,
     /// A `requested_metrics` of one `*`.
@@ -315,7 +316,7 @@ impl MetricSelector {
 /// The metrics of one push in OTLP form, with the state that delta
 /// temporality needs (Kafka's `KafkaMetricsCollector` and its ledger).
 #[derive(Debug)]
-pub(crate) struct Collector {
+pub struct Collector {
     metrics: ClientMetrics,
     resource: Resource,
     /// The time and value of each sum at the last delta push.

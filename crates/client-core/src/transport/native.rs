@@ -3,7 +3,7 @@
 use std::{io, net::SocketAddr};
 
 use krabka_units::{ByteSize, convert::ByteSizeExt as _};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
 
 use super::{SocketOptions, resolve_host};
 
@@ -15,7 +15,7 @@ pub async fn connect(host: &str, port: u16, options: SocketOptions) -> io::Resul
 
 /// Resolve `host` at `port` with the operating system resolver.
 pub async fn resolve_name(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    Ok(tokio::net::lookup_host((host, port)).await?.collect())
+    Ok(lookup_host((host, port)).await?.collect())
 }
 
 /// Connect to each of `addresses` in turn, as tokio's `TcpStream::connect`
@@ -45,7 +45,7 @@ async fn connect_address(address: SocketAddr, options: SocketOptions) -> io::Res
         .connect(address)
         .await?;
     if options.nodelay {
-        stream.set_nodelay(true).ok();
+        let _ = stream.set_nodelay(true);
     }
     Ok(stream)
 }
@@ -73,6 +73,8 @@ fn buffer_size(size: ByteSize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::net;
+
     use assert2::check;
     use krabka_units::kibibytes;
     use tokio::net::TcpListener;
@@ -82,7 +84,7 @@ mod tests {
 
     // A local address with no listener, which refuses a connection.
     fn refusing_address() -> SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap()
     }
 

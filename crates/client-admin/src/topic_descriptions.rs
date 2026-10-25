@@ -7,7 +7,10 @@
 //! and falls back to `Metadata` when the peer does not support it, as Kafka's
 //! `KafkaAdminClient` does.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+};
 
 use krabka_client_core::ClientError;
 use krabka_protocol::{
@@ -349,7 +352,7 @@ impl DescribePages {
 
     /// Fails every unfinished topic with `error`.
     fn fail(mut self, error: &KafkaError) -> TopicDescriptions<String> {
-        let unfinished = std::mem::take(&mut self.pending)
+        let unfinished = mem::take(&mut self.pending)
             .into_iter()
             .chain(self.partial.take().map(|partial| partial.name));
         for name in unfinished {
@@ -507,19 +510,13 @@ fn descriptions_by_id(ids: &BTreeSet<Uuid>, response: MetadataResponse) -> Topic
         .collect::<BTreeMap<_, _>>();
     ids.iter()
         .map(|id| {
-            let result = match topics.remove(id) {
-                Some(mut topic) => match topic.name.take() {
-                    Some(name) => Ok(description_from_metadata(&topic, name, &nodes)),
-                    None => Err(topic_error(
-                        UNKNOWN_TOPIC_ID,
-                        format!("TopicId {id} not found."),
-                    )),
-                },
-                None => Err(topic_error(
-                    UNKNOWN_TOPIC_ID,
-                    format!("TopicId {id} not found."),
-                )),
-            };
+            let result = topics
+                .remove(id)
+                .and_then(|mut topic| {
+                    let name = topic.name.take()?;
+                    Some(description_from_metadata(&topic, name, &nodes))
+                })
+                .ok_or_else(|| topic_error(UNKNOWN_TOPIC_ID, format!("TopicId {id} not found.")));
             (*id, result)
         })
         .collect()
@@ -654,7 +651,7 @@ impl AdminClient {
         };
         match response {
             Ok(response) => {
-                let pending = std::mem::take(&mut pages.pending);
+                let pending = mem::take(&mut pages.pending);
                 for (name, result) in descriptions_by_name(&pending, response) {
                     pages.out.entry(name).or_insert(result);
                 }
@@ -991,7 +988,8 @@ mod tests {
                 ),
                 describe_topic_partitions_request::API_KEY => {
                     received.push(Received::Pages(decode_request(body, version, true)));
-                    match pages.lock().expect("pages lock").next() {
+                    let answer = pages.lock().expect("pages lock").next();
+                    match answer {
                         Some(Answer::Page(page)) => encode_response(&page, version, true),
                         Some(Answer::Close) => return MockReply::Close,
                         None => return MockReply::Silent,
@@ -1007,6 +1005,7 @@ mod tests {
                 }
                 _ => return MockReply::Silent,
             };
+            drop(received);
             MockReply::Respond(reply)
         })
         .await;
@@ -1231,7 +1230,9 @@ mod tests {
                 let mut requests = handler_requests.lock().expect("requests lock");
                 let request: MetadataRequest = decode_request(body, version, true);
                 requests.push(request);
-                if close_first && requests.len() == 1 {
+                let first = requests.len() == 1;
+                drop(requests);
+                if close_first && first {
                     return MockReply::Close;
                 }
                 MockReply::Respond(encode_response(

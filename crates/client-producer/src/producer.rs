@@ -3,11 +3,12 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::{
         Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::BufMut;
@@ -38,11 +39,12 @@ use krabka_protocol::{
 };
 use krabka_units::{ByteSize, Time, convert::TimeExt};
 use tokio::{
-    sync::{Mutex, Notify},
+    sync::{Mutex, MutexGuard, Notify, mpsc},
     task::JoinHandle,
+    time::{self, Instant},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
+use tracing::{Instrument as _, field};
 
 use crate::{
     accumulator::{
@@ -247,9 +249,9 @@ fn transaction_v2_enabled(features: &krabka_client_core::FinalizedFeatures) -> b
 
 /// The deadline and the backoff of the retries of one coordinator request.
 struct CoordinatorRetry {
-    deadline: tokio::time::Instant,
-    backoff: std::time::Duration,
-    max_backoff: std::time::Duration,
+    deadline: Instant,
+    backoff: Duration,
+    max_backoff: Duration,
 }
 
 impl CoordinatorRetry {
@@ -257,15 +259,13 @@ impl CoordinatorRetry {
     /// passed. The wait doubles up to the maximum backoff. A wait that reaches
     /// the deadline gives `false`, so no attempt starts after it.
     async fn wait(&mut self) -> bool {
-        let remaining = self
-            .deadline
-            .saturating_duration_since(tokio::time::Instant::now());
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return false;
         }
-        tokio::time::sleep(self.backoff.min(remaining)).await;
+        time::sleep(self.backoff.min(remaining)).await;
         self.backoff = self.backoff.saturating_mul(2).min(self.max_backoff);
-        tokio::time::Instant::now() < self.deadline
+        Instant::now() < self.deadline
     }
 }
 
@@ -377,26 +377,26 @@ impl Acks {
     #[must_use]
     pub fn wire(self) -> i16 {
         match self {
-            Acks::Zero => 0,
-            Acks::One => 1,
-            Acks::All => -1,
+            Self::Zero => 0,
+            Self::One => 1,
+            Self::All => -1,
         }
     }
 }
 
 /// Tri-state lifecycle.
-pub(crate) const STATE_ACTIVE: u8 = 0;
-pub(crate) const STATE_FENCED: u8 = 1;
-pub(crate) const STATE_CLOSED: u8 = 2;
+pub const STATE_ACTIVE: u8 = 0;
+pub const STATE_FENCED: u8 = 1;
+pub const STATE_CLOSED: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TopicMetadata {
+pub struct TopicMetadata {
     pub num_partitions: i32,
     /// Topic UUID. Produce v13+ needs it, because that version encodes only
     /// the `topic_id` on the wire. Zero, `Uuid::ZERO`, is a valid sentinel that
     /// means "not yet known". For older wire versions the broker falls back to
     /// the `name` field.
-    pub topic_id: krabka_protocol::primitives::uuid::Uuid,
+    pub topic_id: Uuid,
 }
 
 /// The partition count and id of each topic that the producer tracks, shared
@@ -413,7 +413,7 @@ pub(crate) struct TopicMetadata {
 /// every holder runs to its unlock without yielding, and no unpolled future can
 /// hold or queue for the lock.
 #[derive(Debug, Default)]
-pub(crate) struct MetadataCache(SyncMutex<HashMap<String, TopicMetadata>>);
+pub struct MetadataCache(SyncMutex<HashMap<String, TopicMetadata>>);
 
 impl MetadataCache {
     /// Lock the cache. Never hold the guard across an `.await`.
@@ -434,7 +434,7 @@ impl From<HashMap<String, TopicMetadata>> for MetadataCache {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ProducerIdentity {
+pub struct ProducerIdentity {
     /// Shared with the sender so ID rotation remains observable.
     pub id: Arc<AtomicI64>,
     /// The idempotent producer epoch. The sender task shares it, and it raises
@@ -442,11 +442,7 @@ pub(crate) struct ProducerIdentity {
     pub epoch: Arc<AtomicI16>,
 }
 
-fn wake_sender_after_append(
-    wake_tx: &tokio::sync::mpsc::Sender<DrainIntent>,
-    linger: Time,
-    wakes_sender: bool,
-) {
+fn wake_sender_after_append(wake_tx: &mpsc::Sender<DrainIntent>, linger: Time, wakes_sender: bool) {
     if linger == <Time as TimeExt>::ZERO {
         let _ = wake_tx.try_send(DrainIntent::Force);
     } else if wakes_sender {
@@ -457,7 +453,7 @@ fn wake_sender_after_append(
 /// Kafka's `send.buffer.bytes` and `receive.buffer.bytes` of a producer.
 /// `None` keeps the operating system default.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct SocketBuffers {
+pub struct SocketBuffers {
     pub(crate) send: Option<ByteSize>,
     pub(crate) receive: Option<ByteSize>,
 }
@@ -546,7 +542,7 @@ pub struct Producer {
     /// sticky pick prefers a partition whose leader is in this rack.
     pub(crate) client_rack: Option<String>,
     pub(crate) state: Arc<AtomicU8>,
-    pub(crate) wake_tx: tokio::sync::mpsc::Sender<DrainIntent>,
+    pub(crate) wake_tx: mpsc::Sender<DrainIntent>,
     pub(crate) flush_notify: Arc<Notify>,
     /// Count of batches the sender has popped from an accumulator but has not
     /// yet finished sending, that is, the Produce is in flight and awaits the
@@ -635,10 +631,8 @@ fn add_partitions_error_code(response: &AddPartitionsToTxnResponse) -> i16 {
         .results_by_topic_v3_and_below
         .first()
         .or_else(|| {
-            response
-                .results_by_transaction
-                .first()
-                .and_then(|transaction| transaction.topic_results.first())
+            let transaction = response.results_by_transaction.first()?;
+            transaction.topic_results.first()
         })
         .and_then(|topic| topic.results_by_partition.first())
         .map_or(response.error_code, |partition| {
@@ -838,7 +832,15 @@ impl Producer {
         if self.transaction_recovery_required() {
             return Err(ProducerError::RecoveryRequired);
         }
-        let mut state = self.txn_state.lock().await;
+        self.begin_transaction_locked(self.txn_state.lock().await)
+    }
+
+    /// Move `state`, the locked transaction state, into a transaction, and
+    /// give the generation of the new transaction guard.
+    fn begin_transaction_locked(
+        &self,
+        mut state: MutexGuard<'_, TxnState>,
+    ) -> Result<u64, ProducerError> {
         match *state {
             TxnState::Ready => {
                 *state = TxnState::InTransaction;
@@ -995,7 +997,7 @@ impl Producer {
     #[tracing::instrument(
         level = "info",
         skip_all,
-        fields(committed, error_code = tracing::field::Empty),
+        fields(committed, error_code = field::Empty),
         err(level = "info"),
     )]
     pub(crate) async fn end_transaction(&self, committed: bool) -> Result<(), ProducerError> {
@@ -1078,7 +1080,19 @@ impl Producer {
             .send_end_txn_until_decided(coord, request, committed)
             .await;
 
-        let mut state = self.txn_state.lock().await;
+        self.apply_end_txn(self.txn_state.lock().await, end_txn, previous_state)
+            .await
+    }
+
+    /// Move the transaction state for the outcome of `EndTxn`. The caller
+    /// passes the transaction state lock, which stays held until the state
+    /// has moved.
+    async fn apply_end_txn(
+        &self,
+        mut state: MutexGuard<'_, TxnState>,
+        end_txn: Result<(EndTxnDecision, Option<(i64, i16)>), ClientError>,
+        previous_state: TxnState,
+    ) -> Result<(), ProducerError> {
         let (decision, producer_identity) = match end_txn {
             Ok(answer) => answer,
             Err(error) => {
@@ -1183,7 +1197,7 @@ impl Producer {
         request: EndTxnRequest,
         committed: bool,
     ) -> Result<(EndTxnDecision, Option<(i64, i16)>), ClientError> {
-        let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
+        let deadline = Instant::now() + self.init_retry_timeout.to_std();
         let max_backoff = self.retry_backoff_max.to_std();
         let mut backoff = self.init_retry_backoff.to_std();
         let mut earlier_attempt_lost = false;
@@ -1216,14 +1230,14 @@ impl Producer {
             let EndTxnDecision::Retry { rediscover } = decision else {
                 return Ok((decision, identity));
             };
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok((
                     txn_retry::decide_end_txn_at_deadline(attempt, earlier_attempt_lost),
                     None,
                 ));
             }
-            tokio::time::sleep(backoff.min(remaining)).await;
+            time::sleep(backoff.min(remaining)).await;
             backoff = backoff.saturating_mul(2).min(max_backoff);
             if rediscover {
                 match self
@@ -1257,7 +1271,7 @@ impl Producer {
     async fn reconnect_txn_coordinator(
         &self,
         tid: &str,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<Client, LookupError> {
         let address = self.find_txn_coordinator(tid, deadline).await?;
         let coordinator = self.connect_txn_coordinator(address).await?;
@@ -1332,10 +1346,10 @@ impl Producer {
         skip_all,
         fields(
             transactional_id = self.transactional_id.as_deref(),
-            coordinator = tracing::field::Empty,
-            producer_id = tracing::field::Empty,
-            producer_epoch = tracing::field::Empty,
-            error_code = tracing::field::Empty,
+            coordinator = field::Empty,
+            producer_id = field::Empty,
+            producer_epoch = field::Empty,
+            error_code = field::Empty,
         ),
         err(level = "info"),
     )]
@@ -1362,10 +1376,10 @@ impl Producer {
         fields(
             transactional_id = self.transactional_id.as_deref(),
             keep_prepared,
-            coordinator = tracing::field::Empty,
-            producer_id = tracing::field::Empty,
-            producer_epoch = tracing::field::Empty,
-            error_code = tracing::field::Empty,
+            coordinator = field::Empty,
+            producer_id = field::Empty,
+            producer_epoch = field::Empty,
+            error_code = field::Empty,
         ),
         err(level = "info"),
     )]
@@ -1401,7 +1415,7 @@ impl Producer {
 
         // Kafka's `initTransactions` waits for the lookup and `InitProducerId`
         // together, within one `max.block.ms`.
-        let deadline = tokio::time::Instant::now() + self.init_retry_timeout.to_std();
+        let deadline = Instant::now() + self.init_retry_timeout.to_std();
         let initialized = async {
             let coord_addr = match self.find_txn_coordinator(tid, deadline).await {
                 Ok(address) => address,
@@ -1506,7 +1520,7 @@ impl Producer {
         transactional_id: &str,
         request: &InitProducerIdRequest,
         coordinator: Client,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<(Client, InitProducerIdResponse), ProducerError> {
         let mut coordinator = coordinator;
         let mut retry = self.coordinator_retry_until(deadline);
@@ -1551,7 +1565,7 @@ impl Producer {
     async fn find_txn_coordinator(
         &self,
         tid: &str,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<String, LookupError> {
         self.find_coordinator(tid, CoordinatorKeyType::Transaction, deadline)
             .await
@@ -1570,7 +1584,7 @@ impl Producer {
         &self,
         key: &str,
         key_type: CoordinatorKeyType,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<String, LookupError> {
         let mut retry = self.coordinator_retry_until(deadline);
         loop {
@@ -1688,7 +1702,7 @@ impl Producer {
             transactional_id = self.transactional_id.as_deref(),
             group_id = %group_meta.group_id,
             generation_id = group_meta.generation_id,
-            offset_count = tracing::field::Empty,
+            offset_count = field::Empty,
         ),
         err(level = "info"),
     )]
@@ -1701,11 +1715,12 @@ impl Producer {
             .transactional_id
             .as_deref()
             .ok_or(ProducerError::NotTransactional)?
-            .to_string();
+            .to_owned();
         if let Some(error) = self.fatal_error_state() {
             return Err(error);
         }
-        match *self.txn_state.lock().await {
+        let state = *self.txn_state.lock().await;
+        match state {
             TxnState::InTransaction => {}
             TxnState::Preparing | TxnState::Prepared => {
                 return Err(ProducerError::InvalidTransactionState(
@@ -1926,7 +1941,7 @@ impl Producer {
     async fn connect_group_coordinator(
         &self,
         group_id: &str,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<Client, LookupError> {
         let group_addr = self.find_group_coordinator(group_id, deadline).await?;
         Client::builder()
@@ -1965,7 +1980,7 @@ impl Producer {
     async fn find_group_coordinator(
         &self,
         group_id: &str,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<String, LookupError> {
         self.find_coordinator(group_id, CoordinatorKeyType::Group, deadline)
             .await
@@ -1976,12 +1991,12 @@ impl Producer {
     /// The retry limits of a coordinator request. The producer-ID
     /// initialization retry timeout limits every such loop.
     fn coordinator_retry(&self) -> CoordinatorRetry {
-        self.coordinator_retry_until(tokio::time::Instant::now() + self.init_retry_timeout.to_std())
+        self.coordinator_retry_until(Instant::now() + self.init_retry_timeout.to_std())
     }
 
     /// The retry limits of a coordinator request that ends at `deadline`,
     /// which the operation that sends it set.
-    fn coordinator_retry_until(&self, deadline: tokio::time::Instant) -> CoordinatorRetry {
+    fn coordinator_retry_until(&self, deadline: Instant) -> CoordinatorRetry {
         CoordinatorRetry {
             deadline,
             backoff: self.init_retry_backoff.to_std(),
@@ -1997,7 +2012,7 @@ impl Producer {
         &self,
         transactional_id: &str,
         current: Client,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<Client, LookupRefusal> {
         match self
             .reconnect_txn_coordinator(transactional_id, deadline)
@@ -2134,14 +2149,12 @@ impl Producer {
 
     #[allow(dead_code)] // wired by sender on INVALID_PRODUCER_EPOCH; kept for symmetry
     pub(crate) fn fence(&self) {
-        self.state
-            .compare_exchange(
-                STATE_ACTIVE,
-                STATE_FENCED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok();
+        let _ = self.state.compare_exchange(
+            STATE_ACTIVE,
+            STATE_FENCED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     /// Send a record and wait for its delivery result.
@@ -2180,7 +2193,7 @@ impl Producer {
         let span = tracing::debug_span!(
             "producer.send",
             topic = %record.topic,
-            partition = tracing::field::Empty,
+            partition = field::Empty,
         );
         self.enqueue_inner(record).instrument(span).await
     }
@@ -2210,7 +2223,7 @@ impl Producer {
 
         // Produce v13 carries only the `topic_id` on the wire, so the cache
         // must hold the topic also when the caller names the partition.
-        let metadata_started = tokio::time::Instant::now();
+        let metadata_started = Instant::now();
         let partition_count = self
             .partition_count(&record.topic, record.partition)
             .await?;
@@ -2286,7 +2299,7 @@ impl Producer {
                 .is_none()
                 .then(|| self.peek_sticky(&record.topic, &partitions));
             let partition = fixed_partition
-                .or(sticky.map(StickyPartition::partition))
+                .or_else(|| sticky.map(StickyPartition::partition))
                 .unwrap_or_default();
             tracing::Span::current().record("partition", partition);
             let acc = Arc::clone(
@@ -2322,6 +2335,7 @@ impl Producer {
                     // wait.
                     if needs_memory && a.current.as_ref().is_some_and(|batch| !batch.is_empty()) {
                         a.seal_current();
+                        drop(a);
                         let _ = self.wake_tx.try_send(DrainIntent::Ready);
                     }
                     needs_memory
@@ -2385,8 +2399,9 @@ impl Producer {
                 record.headers,
                 timestamp,
                 transaction_generation,
-                memory,
+                memory.take(),
             );
+            drop(memory);
             if let Some(sticky) = sticky {
                 // Kafka's `RecordAccumulator.updatePartitionInfoOnAppend`.
                 self.update_sticky(
@@ -2398,6 +2413,7 @@ impl Producer {
                 );
             }
             drop(a);
+            drop(acc);
             drop(transaction_state);
             wake_sender_after_append(&self.wake_tx, self.linger, wakes_sender);
             return Ok(DeliveryHandle::new(rx));
@@ -2439,7 +2455,8 @@ impl Producer {
         if leader < 0 {
             return None;
         }
-        self.broker_racks.get(&leader).and_then(|rack| rack.clone())
+        let rack = self.broker_racks.get(&leader)?;
+        rack.clone()
     }
 
     /// [`BuiltInPartitioner::peek`], with `partitioner.rack.aware` when
@@ -2520,7 +2537,8 @@ impl Producer {
     /// The rack of broker `id`, or `None` when it is not known or the broker
     /// has none.
     fn leader_rack_of_broker(&self, id: i32) -> Option<String> {
-        self.broker_racks.get(&id).and_then(|rack| rack.clone())
+        let rack = self.broker_racks.get(&id)?;
+        rack.clone()
     }
 
     /// The limit that a record of `serialized_size` bytes is larger than, in
@@ -2544,7 +2562,7 @@ impl Producer {
         accumulator: &'a Mutex<Accumulator>,
         state: Option<TxnState>,
         expected_generation: Option<u64>,
-    ) -> Result<tokio::sync::MutexGuard<'a, Accumulator>, ProducerError> {
+    ) -> Result<MutexGuard<'a, Accumulator>, ProducerError> {
         let queue = accumulator.lock().await;
         if self.append_transaction_generation(state)? != expected_generation {
             return Err(ProducerError::RecoveryRequired);
@@ -2623,7 +2641,7 @@ impl Producer {
     #[tracing::instrument(
         level = "debug",
         skip_all,
-        fields(topic = %topic, num_partitions = tracing::field::Empty),
+        fields(topic = %topic, num_partitions = field::Empty),
     )]
     pub(crate) async fn partition_count(
         &self,
@@ -2722,11 +2740,11 @@ impl Producer {
     /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
     pub async fn flush(&self) -> Result<(), ProducerError> {
         self.is_active()?;
-        let deadline = tokio::time::Instant::now()
+        let deadline = Instant::now()
             .checked_add(self.flush_timeout.duration())
             .ok_or(ProducerError::FlushTimeout)?;
 
-        tokio::time::timeout_at(deadline, async {
+        time::timeout_at(deadline, async {
             let _ = self.wake_tx.send(DrainIntent::Force).await;
             loop {
                 let notified = self.flush_notify.notified();
@@ -2759,10 +2777,10 @@ impl Producer {
             a.abort_undrained_batches();
         }
 
-        let deadline = tokio::time::Instant::now()
+        let deadline = Instant::now()
             .checked_add(self.flush_timeout.duration())
             .ok_or(ProducerError::FlushTimeout)?;
-        tokio::time::timeout_at(deadline, async {
+        time::timeout_at(deadline, async {
             loop {
                 let notified = self.flush_notify.notified();
                 tokio::pin!(notified);
@@ -2791,8 +2809,8 @@ impl Producer {
     }
 }
 
-impl std::fmt::Debug for Producer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Producer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Producer")
             .field("producer_id", &self.producer_id())
             .field("producer_epoch", &self.producer_epoch())
@@ -2808,8 +2826,8 @@ impl std::fmt::Debug for Producer {
 
 fn current_millis() -> i64 {
     i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis()),
     )
     .unwrap_or(0)
@@ -2851,11 +2869,13 @@ fn build_topics_payload(
 mod tests {
     use std::{
         collections::BTreeSet,
+        io,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
         },
-        time::Duration,
+        task::Poll,
+        time::{Duration, Instant},
     };
 
     use bytes::{Bytes, BytesMut};
@@ -2877,6 +2897,10 @@ mod tests {
         },
         primitives::uuid::Uuid,
     };
+    use tokio::{
+        sync::{Mutex as AsyncMutex, mpsc},
+        time,
+    };
 
     use super::{
         DrainIntent, Producer, TxnOffsetCommitCap, TxnOffsetCommitRequest,
@@ -2887,9 +2911,11 @@ mod tests {
     use crate::{
         ProducerRecord,
         accumulator::{Accumulator, AppendResult},
+        builder::DEFAULT_PRODUCER_MAX_BLOCK,
         compression::Compression,
         error::ProducerError,
         partitioner::{PartitionInfo, Partitioner, partition_for_key},
+        transactional::TxnState,
     };
 
     /// A custom partitioner that always picks one partition, and records the
@@ -2995,7 +3021,7 @@ mod tests {
 
     #[test]
     fn only_new_deadlines_and_rollovers_wake_nonzero_linger() {
-        let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel(4);
+        let (wake_tx, mut wake_rx) = mpsc::channel(4);
 
         let mut coalesced = Accumulator::new(1024);
         let AppendResult { wakes_sender, .. } =
@@ -3004,21 +3030,21 @@ mod tests {
         assert_eq!(wake_rx.try_recv(), Ok(DrainIntent::Ready));
         let AppendResult { wakes_sender, .. } =
             coalesced.try_append(None, Some(Bytes::from_static(b"b")), vec![], 0, None);
+        drop(coalesced);
         wake_sender_after_append(&wake_tx, krabka_units::millis(10), wakes_sender);
-        assert_eq!(
-            wake_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        );
+        assert_eq!(wake_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
 
         let mut rollover = Accumulator::new(20);
         let _ = rollover.try_append(None, Some(Bytes::from_static(b"a")), vec![], 0, None);
         let AppendResult { wakes_sender, .. } =
             rollover.try_append(None, Some(Bytes::from_static(b"b")), vec![], 0, None);
+        drop(rollover);
         wake_sender_after_append(&wake_tx, krabka_units::millis(10), wakes_sender);
         assert_eq!(wake_rx.try_recv(), Ok(DrainIntent::Ready));
 
         let mut immediate = Accumulator::new(1024);
         let _ = immediate.try_append(None, Some(Bytes::from_static(b"a")), vec![], 0, None);
+        drop(immediate);
         wake_sender_after_append(&wake_tx, krabka_units::secs(0), false);
         assert_eq!(wake_rx.try_recv(), Ok(DrainIntent::Force));
     }
@@ -3102,7 +3128,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
             .client_id(CLIENT_ID)
@@ -3117,7 +3144,8 @@ mod tests {
         let mock = MockBroker::start(|api_key, _version, _corr_id, _body| {
             (api_key == api_versions_request::API_KEY).then(|| api_versions_response(4))
         })
-        .await;
+        .await
+        .unwrap();
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
             .client_id(CLIENT_ID)
@@ -3136,7 +3164,7 @@ mod tests {
     }
 
     async fn find_coordinator(producer: &Producer, kind: LookupKind, key: &str) -> String {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = time::Instant::now() + Duration::from_secs(5);
         match kind {
             LookupKind::Group => producer.find_group_coordinator(key, deadline).await,
             LookupKind::Transaction => producer.find_txn_coordinator(key, deadline).await,
@@ -3196,8 +3224,7 @@ mod tests {
 
             let addr = find_coordinator(&producer, kind, key).await;
             assert2::assert!(addr == "127.0.0.1:19092");
-            let requests = seen.lock().unwrap();
-            assert2::assert!(*requests == vec![expected_request]);
+            assert2::assert!(*seen.lock().unwrap() == vec![expected_request]);
             mock.stop();
         }
     }
@@ -3211,13 +3238,13 @@ mod tests {
         tokio::pin!(flush);
         assert!(futures::poll!(flush.as_mut()).is_pending());
 
-        tokio::time::advance(Duration::from_millis(6)).await;
+        time::advance(Duration::from_millis(6)).await;
         assert!(futures::poll!(flush.as_mut()).is_pending());
 
-        tokio::time::advance(Duration::from_millis(1)).await;
+        time::advance(Duration::from_millis(1)).await;
         assert!(matches!(
             futures::poll!(flush.as_mut()),
-            std::task::Poll::Ready(Err(ProducerError::FlushTimeout))
+            Poll::Ready(Err(ProducerError::FlushTimeout))
         ));
         mock.stop();
     }
@@ -3225,7 +3252,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn flush_timeout_bounds_a_blocked_force_wake() {
         let (mock, mut producer) = producer_with_flush_timeout(Duration::from_millis(7)).await;
-        let (wake_tx, _wake_rx) = tokio::sync::mpsc::channel(16);
+        let (wake_tx, _wake_rx) = mpsc::channel(16);
         producer.wake_tx = wake_tx;
         for _ in 0..16 {
             producer
@@ -3238,13 +3265,13 @@ mod tests {
         tokio::pin!(flush);
         assert!(futures::poll!(flush.as_mut()).is_pending());
 
-        tokio::time::advance(Duration::from_millis(6)).await;
+        time::advance(Duration::from_millis(6)).await;
         assert!(futures::poll!(flush.as_mut()).is_pending());
 
-        tokio::time::advance(Duration::from_millis(1)).await;
+        time::advance(Duration::from_millis(1)).await;
         assert!(matches!(
             futures::poll!(flush.as_mut()),
-            std::task::Poll::Ready(Err(ProducerError::FlushTimeout))
+            Poll::Ready(Err(ProducerError::FlushTimeout))
         ));
         mock.stop();
     }
@@ -3252,7 +3279,7 @@ mod tests {
     #[tokio::test]
     async fn flush_does_not_miss_notification_during_state_check() {
         let (mock, producer) = producer_with_flush_timeout(Duration::from_millis(20)).await;
-        let accumulator = Arc::new(tokio::sync::Mutex::new(Accumulator::new(1024)));
+        let accumulator = Arc::new(AsyncMutex::new(Accumulator::new(1024)));
         producer
             .accumulators
             .insert(("held".to_owned(), 0), Arc::clone(&accumulator));
@@ -3266,8 +3293,9 @@ mod tests {
         guard.ready.clear();
         producer.flush_notify.notify_waiters();
         drop(guard);
+        drop(accumulator);
 
-        tokio::time::timeout(Duration::from_millis(20), flush)
+        time::timeout(Duration::from_millis(20), flush)
             .await
             .expect("flush must not wait for another notification")
             .expect("empty producer flushes");
@@ -3277,23 +3305,26 @@ mod tests {
     #[tokio::test]
     async fn append_waiting_for_a_swept_queue_rejects_its_old_generation() {
         let (mock, producer) = producer_with_flush_timeout(Duration::from_millis(20)).await;
-        let accumulator = tokio::sync::Mutex::new(Accumulator::new(1024));
-        let queue = accumulator.lock().await;
-        let transaction = Some(crate::transactional::TxnState::InTransaction);
-        let expected = producer.append_transaction_generation(transaction).unwrap();
-        let append = producer.lock_accumulator_for_append(&accumulator, transaction, expected);
-        tokio::pin!(append);
-        assert2::assert!(futures::poll!(append.as_mut()).is_pending());
+        let accumulator = AsyncMutex::new(Accumulator::new(1024));
+        let transaction = Some(TxnState::InTransaction);
+        {
+            let queue = accumulator.lock().await;
+            let expected = producer.append_transaction_generation(transaction).unwrap();
+            let append = producer.lock_accumulator_for_append(&accumulator, transaction, expected);
+            tokio::pin!(append);
+            assert2::assert!(futures::poll!(append.as_mut()).is_pending());
 
-        // Recovery can sweep this locked queue before the append acquires it.
-        // Completing reinitialization clears the required flag, but must not
-        // allow the append captured in the previous generation through.
-        producer.require_transaction_recovery();
-        producer
-            .txn_recovery_required
-            .store(false, Ordering::Release);
-        drop(queue);
-        assert2::assert!(matches!(append.await, Err(ProducerError::RecoveryRequired)));
+            // Recovery can sweep this locked queue before the append acquires
+            // it. Completing reinitialization clears the required flag, but
+            // must not allow the append captured in the previous generation
+            // through.
+            producer.require_transaction_recovery();
+            producer
+                .txn_recovery_required
+                .store(false, Ordering::Release);
+            drop(queue);
+            assert2::assert!(matches!(append.await, Err(ProducerError::RecoveryRequired)));
+        }
         assert2::assert!(accumulator.lock().await.current.is_none());
         let current = producer.append_transaction_generation(transaction).unwrap();
         let fresh = producer
@@ -3302,6 +3333,7 @@ mod tests {
             .expect("a new-generation append can acquire the swept queue");
         assert2::assert!(fresh.current.is_none());
         drop(fresh);
+        drop(accumulator);
         mock.stop();
     }
 
@@ -3648,7 +3680,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         port.store(mock.addr.port(), Ordering::SeqCst);
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
@@ -3674,9 +3707,14 @@ mod tests {
             produced_partitions: produce_log.lock().unwrap().clone(),
             metadata_requests: metadata_log.lock().unwrap().clone(),
         };
-        producer.close().await.expect("close producer");
-        mock.stop();
-        outcome
+        producer
+            .close()
+            .await
+            .map(|()| {
+                mock.stop();
+                outcome
+            })
+            .expect("close producer")
     }
 
     /// `send` waits for metadata that holds the topic, as Kafka's
@@ -3719,7 +3757,7 @@ mod tests {
             produced_partitions: vec![],
             metadata_requests: orders_request(),
         };
-        let default_block = crate::builder::DEFAULT_PRODUCER_MAX_BLOCK;
+        let default_block = DEFAULT_PRODUCER_MAX_BLOCK;
         let short_block = Duration::from_millis(100);
         let cases = [
             (
@@ -3840,7 +3878,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         port.store(mock.addr.port(), Ordering::SeqCst);
         (mock, produce_requests)
     }
@@ -3911,7 +3950,8 @@ mod tests {
                 response.encode(&mut buf, version).expect("encode Metadata");
                 Some(buf.to_vec())
             })
-            .await;
+            .await
+            .unwrap();
             port.store(mock.addr.port(), Ordering::SeqCst);
             let producer = Producer::builder()
                 .bootstrap(mock.addr.to_string())
@@ -4014,7 +4054,7 @@ mod tests {
                 value: Some(Bytes::from_static(b"v")),
                 ..Default::default()
             });
-            let delivered = tokio::time::timeout(Duration::from_secs(5), receiver)
+            let delivered = time::timeout(Duration::from_secs(5), receiver)
                 .await
                 .map_or_else(
                     |_| Err("pending".to_owned()),
@@ -4048,6 +4088,7 @@ mod tests {
                 .await
                 .expect("producer connects to mock broker");
             let debug = format!("{producer:?}");
+            drop(producer);
             actual.push(
                 debug
                     .split(", ")
@@ -4096,7 +4137,7 @@ mod tests {
 
         let first = producer.enqueue(record()).await.expect("first is queued");
         let second = producer.enqueue(record()).await.expect("second is queued");
-        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        let delivered = time::timeout(Duration::from_secs(5), async {
             let first = first.await.map(drop);
             let second = producer.flush().await.and(second.await.map(drop));
             (
@@ -4305,19 +4346,21 @@ mod tests {
         let _second = producer.enqueue(pinned(1)).await.expect("second is queued");
         if let Some(delay) = answer_after {
             tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
+                time::sleep(delay).await;
                 answer_produce.store(true, Ordering::SeqCst);
             });
         }
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let third = producer.enqueue(pinned(2)).await;
         let blocked = started.elapsed() >= Duration::from_millis(80);
         let delivered = match third {
             Err(error) => Err(error.to_string()),
-            Ok(handle) => match tokio::time::timeout(Duration::from_secs(3), handle).await {
-                Ok(result) => result.map(drop).map_err(|error| error.to_string()),
-                Err(_) => Err("pending".to_owned()),
-            },
+            Ok(handle) => time::timeout(Duration::from_secs(3), handle)
+                .await
+                .map_or_else(
+                    |_| Err("pending".to_owned()),
+                    |result| result.map(drop).map_err(|error| error.to_string()),
+                ),
         };
         mock.stop();
         drop(producer);
@@ -4378,7 +4421,7 @@ mod tests {
             ("request timeout", ClientError::Timeout(secs(1)), true),
             (
                 "io failure",
-                ClientError::Io(std::io::Error::other("broken pipe")),
+                ClientError::Io(io::Error::other("broken pipe")),
                 true,
             ),
             (
@@ -4478,7 +4521,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         port.store(mock.addr.port(), Ordering::SeqCst);
         (mock, produce_log)
     }
@@ -4542,46 +4586,50 @@ mod tests {
                 },
             ),
         ] {
-            let (mock, produce_log) = leader_broker(leaders).await;
-            let producer = Producer::builder()
-                .bootstrap(mock.addr.to_string())
-                .client_id(CLIENT_ID)
-                .enable_idempotence(false)
-                .linger(Duration::ZERO)
-                .build()
-                .await
-                .expect("producer connects to mock broker");
-            let mut keyless = BTreeSet::new();
-            let mut keyed_partition = None;
-            for index in 0..6 {
-                let key = (keyed_at == Some(index)).then_some(Bytes::from_static(KEYED));
-                let partition = producer
-                    .send(ProducerRecord {
-                        topic: METADATA_TOPIC.into(),
-                        key: key.clone(),
-                        value: Some(Bytes::from_static(b"value")),
-                        ..Default::default()
-                    })
+            let closed = {
+                let (mock, produce_log) = leader_broker(leaders).await;
+                let producer = Producer::builder()
+                    .bootstrap(mock.addr.to_string())
+                    .client_id(CLIENT_ID)
+                    .enable_idempotence(false)
+                    .linger(Duration::ZERO)
+                    .build()
                     .await
-                    .expect("the record is delivered")
-                    .partition;
-                if key.is_some() {
-                    keyed_partition = Some(partition);
-                } else {
-                    keyless.insert(partition);
+                    .expect("producer connects to mock broker");
+                let mut keyless = BTreeSet::new();
+                let mut keyed_partition = None;
+                for index in 0..6 {
+                    let key = (keyed_at == Some(index)).then_some(Bytes::from_static(KEYED));
+                    let partition = producer
+                        .send(ProducerRecord {
+                            topic: METADATA_TOPIC.into(),
+                            key: key.clone(),
+                            value: Some(Bytes::from_static(b"value")),
+                            ..Default::default()
+                        })
+                        .await
+                        .expect("the record is delivered")
+                        .partition;
+                    if key.is_some() {
+                        keyed_partition = Some(partition);
+                    } else {
+                        keyless.insert(partition);
+                    }
                 }
-            }
-            let actual = KeylessSpread {
-                keyless_partitions: keyless.len(),
-                keyless_on_a_partition_without_leader: keyless.iter().any(|&partition| {
-                    usize::try_from(partition).is_ok_and(|index| leaders[index] < 0)
-                }),
-                keyed_partition,
-                produce_requests: produce_log.lock().unwrap().len(),
+                let actual = KeylessSpread {
+                    keyless_partitions: keyless.len(),
+                    keyless_on_a_partition_without_leader: keyless.iter().any(|&partition| {
+                        usize::try_from(partition).is_ok_and(|index| leaders[index] < 0)
+                    }),
+                    keyed_partition,
+                    produce_requests: produce_log.lock().unwrap().len(),
+                };
+                producer.close().await.map(|()| {
+                    mock.stop();
+                    actual
+                })
             };
-            producer.close().await.expect("close producer");
-            mock.stop();
-            actual_rows.push((name, actual));
+            actual_rows.push((name, closed.expect("close producer")));
             expected_rows.push((name, expected));
         }
         assert2::assert!(actual_rows == expected_rows);
@@ -4590,6 +4638,8 @@ mod tests {
 
 #[cfg(test)]
 mod transport_configuration_tests {
+    use std::time::Duration;
+
     use assert2::assert;
     use bytes::BytesMut;
     use krabka_client_core::{ClientDnsLookup, MockBroker};
@@ -4599,10 +4649,11 @@ mod transport_configuration_tests {
     };
     use krabka_units::{millis, secs};
 
-    use super::{Acks, Producer};
+    use super::{Acks, Producer, ProducerError};
 
     #[tokio::test]
-    async fn producer_retains_transport_overrides_in_primary_and_coordinator_clients() {
+    async fn producer_retains_transport_overrides_in_primary_and_coordinator_clients()
+    -> Result<(), ProducerError> {
         let mock = MockBroker::start(|api, _, _, _| {
             if api != api_versions_request::API_KEY {
                 return None;
@@ -4613,10 +4664,11 @@ mod transport_configuration_tests {
                 .expect("encode ApiVersions");
             Some(body.to_vec())
         })
-        .await;
+        .await
+        .unwrap();
         let producer = Producer::builder()
             .bootstrap(mock.addr.to_string())
-            .request_timeout(std::time::Duration::from_millis(10))
+            .request_timeout(Duration::from_millis(10))
             .acks(Acks::Zero)
             .enable_idempotence(false)
             .enable_metrics_push(false)
@@ -4660,7 +4712,6 @@ mod transport_configuration_tests {
         }
         assert!(producer.client.refresh_metadata().await.is_err());
         coordinator.close();
-        producer.close().await.expect("close producer");
-        mock.stop();
+        producer.close().await.map(|()| mock.stop())
     }
 }

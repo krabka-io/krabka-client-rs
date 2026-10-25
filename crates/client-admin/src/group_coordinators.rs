@@ -12,8 +12,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    mem, slice,
 };
 
+use futures_util::future::join_all;
 use krabka_client_core::{
     ClientError, Connection, CoordinatorEndpoint, CoordinatorKeyType, build_find_coordinator,
 };
@@ -30,11 +32,11 @@ use crate::{
 };
 
 /// `COORDINATOR_LOAD_IN_PROGRESS`: the coordinator is loading the group.
-pub(crate) const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
+pub const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
 /// `COORDINATOR_NOT_AVAILABLE`: no broker coordinates the group now.
-pub(crate) const COORDINATOR_NOT_AVAILABLE: i16 = 15;
+pub const COORDINATOR_NOT_AVAILABLE: i16 = 15;
 /// `NOT_COORDINATOR`: the broker does not coordinate the group.
-pub(crate) const NOT_COORDINATOR: i16 = 16;
+pub const NOT_COORDINATOR: i16 = 16;
 /// The first `FindCoordinator` version that looks up many keys at once
 /// (`FindCoordinatorRequest.MIN_BATCHED_VERSION`, KIP-699).
 const MIN_BATCHED_FIND_COORDINATOR_VERSION: i16 = 4;
@@ -44,7 +46,7 @@ const IN_FLIGHT_AT_DEADLINE: &str = "the request was in flight at the deadline";
 /// What one coordinator answer means for one group, as the three maps of
 /// Kafka's `AdminApiHandler.ApiResult` classify it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GroupOutcome<V> {
+pub enum GroupOutcome<V> {
     /// The group is complete, with a value or a final error.
     Done(Result<V, KafkaError>),
     /// Send the group to the same coordinator again after the backoff. The
@@ -56,7 +58,7 @@ pub(crate) enum GroupOutcome<V> {
 }
 
 /// A [`KafkaError`] with the name of `code`.
-pub(crate) fn kafka_error(code: i16, message: Option<String>) -> KafkaError {
+pub fn kafka_error(code: i16, message: Option<String>) -> KafkaError {
     KafkaError {
         code,
         name: kafka_error_name(code),
@@ -69,7 +71,7 @@ pub(crate) fn kafka_error(code: i16, message: Option<String>) -> KafkaError {
 /// of `retry_codes` retry on the same coordinator, `COORDINATOR_NOT_AVAILABLE`
 /// and `NOT_COORDINATOR` look the coordinator up again, and every other code
 /// is final.
-pub(crate) fn group_error_outcome<V>(
+pub fn group_error_outcome<V>(
     code: i16,
     message: Option<String>,
     retry_codes: &[i16],
@@ -88,7 +90,7 @@ pub(crate) fn group_error_outcome<V>(
 
 /// Where the coordinator lookup puts one group.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CoordinatorLookup {
+pub enum CoordinatorLookup {
     /// The coordinator of the group.
     Found(CoordinatorEndpoint),
     /// Look the group up again after the backoff. The string says why.
@@ -121,7 +123,7 @@ fn classify_coordinator(
 /// the answer omits stays in the lookup, as in Kafka's `AdminApiDriver`,
 /// where only mapped and failed keys leave the lookup map. A v0 to v3 answer
 /// holds the single key in its top-level fields.
-pub(crate) fn coordinator_lookups(
+pub fn coordinator_lookups(
     keys: &[String],
     response: FindCoordinatorResponse,
 ) -> Vec<(String, CoordinatorLookup)> {
@@ -214,8 +216,8 @@ impl AdminClient {
                 Err(error) => return failed_lookups(keys, &error),
             }
         }
-        let lookups = futures_util::future::join_all(keys.iter().map(|key| async move {
-            let single = std::slice::from_ref(key);
+        let lookups = join_all(keys.iter().map(|key| async move {
+            let single = slice::from_ref(key);
             match self
                 .conn
                 .send(build_find_coordinator(key, CoordinatorKeyType::Group))
@@ -282,9 +284,7 @@ impl AdminClient {
         while !(unmapped.is_empty() && mapped.is_empty()) {
             attempts = attempts.saturating_add(1);
             if !unmapped.is_empty() {
-                let keys = std::mem::take(&mut unmapped)
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                let keys = mem::take(&mut unmapped).into_iter().collect::<Vec<_>>();
                 let Some(lookups) = deadline.bounded(self.find_group_coordinators(&keys)).await
                 else {
                     IN_FLIGHT_AT_DEADLINE.clone_into(&mut last_error);
@@ -315,12 +315,10 @@ impl AdminClient {
                     .1
                     .push(group.clone());
             }
-            let answers = futures_util::future::join_all(by_coordinator.into_values().map(
-                |(coordinator, keys)| {
-                    let answer = call(coordinator, keys.clone());
-                    async move { (keys, deadline.bounded(answer).await) }
-                },
-            ))
+            let answers = join_all(by_coordinator.into_values().map(|(coordinator, keys)| {
+                let answer = call(coordinator, keys.clone());
+                async move { (keys, deadline.bounded(answer).await) }
+            }))
             .await;
             for (keys, answer) in answers {
                 match answer {
@@ -532,7 +530,7 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     //! A mock cluster for the batched group call tests.
 
     use std::{
@@ -557,7 +555,7 @@ pub(crate) mod test_support {
 
     /// Where the bootstrap broker's `FindCoordinator` answer puts a group.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Lookup {
+    pub enum Lookup {
         /// The broker with this index coordinates the group.
         At(usize),
         /// The entry of the group carries this error code.
@@ -566,7 +564,7 @@ pub(crate) mod test_support {
 
     /// One request of a scripted API that a broker of the cluster received.
     #[derive(Debug, Clone)]
-    pub(crate) struct SeenRequest {
+    pub struct SeenRequest {
         pub(crate) broker: usize,
         pub(crate) api_key: i16,
         pub(crate) version: i16,
@@ -575,7 +573,7 @@ pub(crate) mod test_support {
 
     /// What the brokers of a [`GroupCluster`] saw.
     #[derive(Debug, Clone, Default)]
-    pub(crate) struct Seen {
+    pub struct Seen {
         /// The version and the keys of each `FindCoordinator` request.
         pub(crate) find_coordinator: Vec<(i16, Vec<String>)>,
         /// Every other request except `ApiVersions`, in arrival order.
@@ -583,7 +581,7 @@ pub(crate) mod test_support {
     }
 
     /// A cluster of mock brokers. Broker 0 is the bootstrap broker.
-    pub(crate) struct GroupCluster {
+    pub struct GroupCluster {
         pub(crate) addrs: Vec<SocketAddr>,
         brokers: Vec<MockBroker>,
         seen: Arc<Mutex<Seen>>,
@@ -668,7 +666,7 @@ pub(crate) mod test_support {
     /// request goes to `answer(broker, api_key, version, body, own_address)`
     /// and is recorded in [`Seen::requests`].
     #[bon::builder]
-    pub(crate) async fn group_cluster(
+    pub async fn group_cluster(
         count: usize,
         mut apis: Vec<ApiVersionRange>,
         lookup: impl Fn(&str, usize) -> Lookup + Send + Sync + 'static,
@@ -737,7 +735,8 @@ pub(crate) mod test_support {
                     let mut answer = answer.lock().expect("answer lock");
                     (*answer)(broker, api_key, version, body, addrs[broker])
                 })
-                .await,
+                .await
+                .unwrap(),
             );
         }
         let started = brokers.iter().map(|broker| broker.addr).collect::<Vec<_>>();

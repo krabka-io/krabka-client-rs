@@ -1,4 +1,6 @@
 use std::{
+    collections::BTreeMap,
+    fs,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -18,7 +20,10 @@ use krabka_protocol::{
         sasl_handshake_response::SaslHandshakeResponse,
     },
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex},
+    time::sleep_until,
+};
 
 use super::*;
 use crate::{Connection, ConnectionOptions, sasl};
@@ -81,7 +86,7 @@ async fn broker(
             sasl_authenticate_request::API_KEY => {
                 let start = 10 + client_id_len + usize::from(flexible);
                 let mut cursor = &request[start..];
-                let decoded = <krabka_protocol::owned::sasl_authenticate_request::SaslAuthenticateRequest as krabka_protocol::Decode>::decode(&mut cursor, version).unwrap();
+                let decoded = <sasl_authenticate_request::SaslAuthenticateRequest as krabka_protocol::Decode>::decode(&mut cursor, version).unwrap();
                 let index = {
                     let mut seen = seen.lock().unwrap();
                     seen.tokens.push(decoded.auth_bytes.to_vec());
@@ -140,7 +145,7 @@ async fn run(
     waits: &[Duration],
     between: impl Fn(usize),
 ) -> Observed {
-    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let (mut client, server) = duplex(64 * 1024);
     let seen = Arc::new(Mutex::new(Seen::default()));
     let script = tokio::spawn(broker(
         server,
@@ -176,7 +181,7 @@ async fn run(
     let started = Instant::now();
     let mut requests = Vec::new();
     for (index, wait) in waits.iter().enumerate() {
-        tokio::time::sleep_until(started + *wait).await;
+        sleep_until(started + *wait).await;
         between(index);
         requests.push(
             connection
@@ -288,17 +293,17 @@ async fn connections_authenticate_again_before_the_session_ends() {
 async fn oauthbearer_reauthentication_sends_the_refreshed_token() {
     let dir = tempfile::tempdir().unwrap();
     let token_path = dir.path().join("token");
-    std::fs::write(&token_path, "first").unwrap();
+    fs::write(&token_path, "first").unwrap();
     let refreshed = token_path.clone();
     let observed = run(
         SaslCredentials::OAuthBearer {
             token: sasl::OAuthBearerTokenSource::File(token_path),
-            extensions: std::collections::BTreeMap::new(),
+            extensions: BTreeMap::new(),
         },
         10_000,
         None,
         &[Duration::from_secs_f64(9.6)],
-        move |_| std::fs::write(&refreshed, "second").unwrap(),
+        move |_| fs::write(&refreshed, "second").unwrap(),
     )
     .await;
     check!(
@@ -365,7 +370,7 @@ fn the_due_time_is_85_to_95_percent_of_the_lifetime() {
 /// than writing one to the broker.
 #[tokio::test]
 async fn the_connection_channel_refuses_a_headerless_token() {
-    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (client, server) = duplex(64 * 1024);
     let seen = Arc::new(Mutex::new(Seen::default()));
     let script = tokio::spawn(broker(server, 0, None, Arc::clone(&seen)));
     let options = ConnectionOptions::default();

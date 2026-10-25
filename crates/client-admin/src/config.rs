@@ -133,7 +133,7 @@ impl Default for AdminClientConfig {
 
 /// The connection options and retry policy of one admin client.
 #[derive(Clone, Debug)]
-pub(crate) struct ResolvedAdminConfig {
+pub struct ResolvedAdminConfig {
     pub(crate) connection: ConnectionOptions,
     pub(crate) retry: RetryPolicy,
     pub(crate) metadata_recovery_strategy: MetadataRecoveryStrategy,
@@ -300,7 +300,7 @@ fn default_api_timeout(request_timeout: Time, explicit: Option<Time>) -> Result<
 
 /// The retry policy of a client built from bare [`ConnectionOptions`]:
 /// Kafka's defaults, with the call deadline raised to the request timeout.
-pub(crate) fn retry_for_connection_options(options: &ConnectionOptions) -> RetryPolicy {
+pub fn retry_for_connection_options(options: &ConnectionOptions) -> RetryPolicy {
     let timeout = if options.request_timeout > DEFAULT_API_TIMEOUT {
         options.request_timeout
     } else {
@@ -337,9 +337,10 @@ mod tests {
             unregister_broker_response::UnregisterBrokerResponse,
         },
     };
+    use tokio::time::Instant;
 
     use super::*;
-    use crate::AdminClient;
+    use crate::{AdminClient, AdminClientLike as _};
 
     /// The settings that a test compares: client id prefix or value, request
     /// timeout, connection setup timeouts, idle time, and the retry policy.
@@ -592,6 +593,7 @@ mod tests {
             Some(body.to_vec())
         })
         .await
+        .unwrap()
     }
 
     /// A client built from `AdminClientConfig` sends its client id in each
@@ -640,7 +642,7 @@ mod tests {
                 .await
                 .expect("admin connects");
 
-            let started = tokio::time::Instant::now();
+            let started = Instant::now();
             let result = admin.unregister_broker(1).await;
             let elapsed = started.elapsed();
 
@@ -667,6 +669,8 @@ mod tests {
 
 #[cfg(test)]
 mod transport_configuration_tests {
+    use std::time::Duration;
+
     use assert2::assert;
     use krabka_client_core::{ClientDnsLookup, ClientFrameMax, ConnectionDispatchQueueCapacity};
     use krabka_units::{
@@ -710,7 +714,7 @@ mod transport_configuration_tests {
                 mebibytes(2)
             )
         );
-        assert!(resolved.retry.initial_backoff == std::time::Duration::from_millis(37));
+        assert!(resolved.retry.initial_backoff == Duration::from_millis(37));
         let invalid = AdminClientConfig {
             reconnect_backoff: millis(2000),
             ..Default::default()

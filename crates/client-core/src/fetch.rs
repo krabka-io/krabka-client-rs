@@ -29,6 +29,8 @@ use crate::{connection::Connection, error::ClientError};
 pub const DEFAULT_FETCH_RESPONSE_MAX: ByteSize = mebibytes(50);
 /// Default minimum response size for a single-partition fetch.
 pub const DEFAULT_FETCH_MIN: ByteSize = bytes(1);
+/// [`DEFAULT_FETCH_MIN`] as a protocol byte count.
+const DEFAULT_FETCH_MIN_BYTES: i32 = 1;
 
 /// Positive whole-byte minimum response size for a single-partition fetch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Into)]
@@ -76,7 +78,7 @@ impl TryFrom<ByteSize> for FetchMinBytes {
 
 impl Default for FetchMinBytes {
     fn default() -> Self {
-        Self::try_from(DEFAULT_FETCH_MIN).expect("default fetch min bytes is valid")
+        Self(DEFAULT_FETCH_MIN_BYTES)
     }
 }
 
@@ -93,7 +95,7 @@ impl Default for FetchMinBytes {
 /// write and read on the wire.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
-pub(crate) trait FetchTransport: Send + Sync {
+pub trait FetchTransport: Send + Sync {
     async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse, ClientError>;
 }
 
@@ -308,7 +310,7 @@ fn build_fetch_request(fetch: IsolatedFetch<'_>) -> FetchRequest {
         max_bytes: fetch.max.bytes_i32(),
         isolation_level: fetch.isolation_level,
         topics: vec![FetchTopic {
-            topic: fetch.topic.to_string(),
+            topic: fetch.topic.to_owned(),
             topic_id: fetch.topic_id,
             partitions: vec![FetchPartition {
                 partition: fetch.partition,
@@ -324,7 +326,7 @@ fn build_fetch_request(fetch: IsolatedFetch<'_>) -> FetchRequest {
 
 /// Decode one partition response with client-side transaction filtering.
 fn fetch_partition_with_isolation_progress_response(
-    resp: &krabka_protocol::owned::fetch_response::FetchResponse,
+    resp: &FetchResponse,
     partition: i32,
     fetch_floor: i64,
     isolation_level: i8,
@@ -609,11 +611,11 @@ mod tests {
                             value: Some(Bytes::from(vec![0xa5; 130])),
                         },
                         FetchedHeader {
-                            key: "dup".to_string(),
+                            key: "dup".to_owned(),
                             value: None,
                         },
                         FetchedHeader {
-                            key: "dup".to_string(),
+                            key: "dup".to_owned(),
                             value: Some(Bytes::new()),
                         },
                     ],
@@ -647,7 +649,7 @@ mod tests {
                 session_id: 0,
                 session_epoch: -1,
                 topics: vec![FetchTopic {
-                    topic: "orders".to_string(),
+                    topic: "orders".to_owned(),
                     topic_id: WireUuid([7; 16]),
                     partitions: vec![FetchPartition {
                         partition: 3,
@@ -678,6 +680,7 @@ mod tests {
     #[test]
     fn fetch_min_validates_protocol_boundaries() {
         assert!(FetchMinBytes::default().size() == bytes(1));
+        assert!(FetchMinBytes::default() == FetchMinBytes::try_from(DEFAULT_FETCH_MIN).unwrap());
         assert!(FetchMinBytes::try_from(bytes(0)).is_err());
         assert!(FetchMinBytes::try_from(ByteSize::from_bytes_f64(1.5)).is_err());
         assert!(

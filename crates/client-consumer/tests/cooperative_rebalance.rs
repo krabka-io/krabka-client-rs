@@ -13,6 +13,7 @@
 //!
 //! Every case needs the Docker container from [`support`], so every case
 //! carries `#[ignore]`.
+#![cfg(test)]
 
 mod support;
 
@@ -22,6 +23,10 @@ use bytes::Bytes;
 use krabka_client_consumer::{Assignor, AutoOffsetReset, Consumer, ConsumerError};
 use krabka_client_core::Client;
 use krabka_units::{millis, secs};
+use tokio::{
+    task::yield_now,
+    time::{sleep, timeout},
+};
 
 /// Bound for every settle loop in this suite.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -174,7 +179,7 @@ async fn cooperative_single_member_steady_state() {
 /// timing property of the protocol, not a guess at a duration that makes the
 /// case pass.
 async fn pace_join() {
-    tokio::time::sleep(JOIN_PACE).await;
+    sleep(JOIN_PACE).await;
 }
 
 /// The UTF-8 value of a record, or an empty string when the record has none.
@@ -211,7 +216,7 @@ async fn cooperative_consumer(
         .max_poll_interval(secs(2))
         .heartbeat_interval(millis(500))
         .auto_offset_reset(AutoOffsetReset::Earliest)
-        .subscribe([topic.to_string()])
+        .subscribe([topic.to_owned()])
         .build()
         .await
         .expect("build cooperative consumer")
@@ -224,7 +229,7 @@ async fn poll_until_values(
     keep: fn(&str) -> bool,
 ) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         while seen.len() < want {
             for record in consumer.poll(millis(200)).await.expect("poll") {
                 let value = value_string(record.value.as_ref());
@@ -232,7 +237,7 @@ async fn poll_until_values(
                     seen.insert(value);
                 }
             }
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
     })
     .await
@@ -246,7 +251,7 @@ async fn poll_until_values(
 /// satisfy `keep`.
 async fn drain_to_empty(consumer: &mut Consumer, keep: fn(&str) -> bool) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             let records = consumer.poll(millis(200)).await.expect("poll");
             if records.is_empty() {
@@ -258,7 +263,7 @@ async fn drain_to_empty(consumer: &mut Consumer, keep: fn(&str) -> bool) -> Hash
                     seen.insert(value);
                 }
             }
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
     })
     .await
@@ -268,12 +273,12 @@ async fn drain_to_empty(consumer: &mut Consumer, keep: fn(&str) -> bool) -> Hash
 
 /// Wait until `consumer` holds `expected` partitions.
 async fn wait_for_assignment_count(consumer: &Consumer, expected: usize) {
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             if consumer.assignment().await.len() == expected {
                 return;
             }
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
     })
     .await
@@ -297,7 +302,7 @@ async fn wait_for_settled_split(
     consumers: &[&Consumer],
     expected: usize,
 ) -> HashSet<(String, i32)> {
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             let mut union: HashSet<(String, i32)> = HashSet::new();
             let mut overlap = false;
@@ -312,7 +317,7 @@ async fn wait_for_settled_split(
             if union.len() == expected && !overlap && !empty_member {
                 return union;
             }
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
     })
     .await
@@ -329,7 +334,7 @@ async fn wait_for_settled_split(
 /// loop ignores them. Once m2 owns its partitions the leader has completed
 /// phase 2, which runs after the pre-rebalance auto commit of m1.
 async fn wait_for_even_split(m1: &mut Consumer, m2: &Consumer, each: usize) {
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             if let Err(ConsumerError::CommitInvalid | ConsumerError::RebalanceFailed(_)) =
                 m1.poll(millis(200)).await
@@ -339,7 +344,7 @@ async fn wait_for_even_split(m1: &mut Consumer, m2: &Consumer, each: usize) {
             if m1.assignment().await.len() == each && m2.assignment().await.len() == each {
                 return;
             }
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
     })
     .await

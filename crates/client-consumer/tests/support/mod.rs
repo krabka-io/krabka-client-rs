@@ -25,6 +25,7 @@
 #![allow(dead_code)]
 
 use std::{
+    process,
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
@@ -45,6 +46,7 @@ use testcontainers::{ContainerAsync, ContainerRequest, runners::AsyncRunner};
 // `testcontainers_modules::kafka` re-exports `confluent::*`, so the bare
 // `Kafka` here is the Confluent module's container type.
 use testcontainers_modules::kafka::{KAFKA_PORT, Kafka};
+use tokio::time::{sleep, timeout};
 
 /// The deadline for a container to start, which includes the image pull.
 pub const CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(2);
@@ -74,7 +76,7 @@ pub fn init_tracing() {
 pub fn unique(prefix: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{}-{n}", std::process::id())
+    format!("{prefix}-{}-{n}", process::id())
 }
 
 /// A running Kafka container and the address a client bootstraps from.
@@ -118,7 +120,7 @@ pub async fn start_kafka() -> KafkaBroker {
 
 /// Start a Kafka container built from a caller-configured image.
 pub async fn start_kafka_with(image: ContainerRequest<Kafka>) -> KafkaBroker {
-    let container = tokio::time::timeout(CONTAINER_START_TIMEOUT, image.start())
+    let container = timeout(CONTAINER_START_TIMEOUT, image.start())
         .await
         .expect("kafka container start timed out")
         .expect("kafka container failed to start");
@@ -166,7 +168,7 @@ async fn warm_up_pause(attempt: u32) {
         max = BOOTSTRAP_MAX_ATTEMPTS,
         "broker is still warming up; retrying"
     );
-    tokio::time::sleep(BOOTSTRAP_RETRY_DELAY).await;
+    sleep(BOOTSTRAP_RETRY_DELAY).await;
 }
 
 /// Create `name` with `partitions` partitions and replication factor 1.
@@ -230,7 +232,7 @@ pub async fn topic_id_for(client: &Client, name: &str) -> WireUuid {
         );
         // Real-time wait, not a progress poll: the metadata refresh happens in
         // the broker process and publishes no signal this side can await.
-        tokio::time::sleep(METADATA_RETRY_DELAY).await;
+        sleep(METADATA_RETRY_DELAY).await;
     }
     panic!("metadata never published topic {name} after {METADATA_MAX_ATTEMPTS} attempts");
 }
@@ -298,6 +300,6 @@ pub async fn produce_to_partition(client: &Client, topic: &str, partition: i32, 
         );
         // Real-time wait, not a progress poll: the metadata refresh happens in
         // the broker process and publishes no signal this side can await.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
     }
 }

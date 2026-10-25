@@ -9,7 +9,7 @@
 
 /// The retry class of one Kafka error code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ErrorClass {
+pub enum ErrorClass {
     /// `NONE` (0).
     None,
     /// The exception of the code extends `InvalidMetadataException`. The
@@ -34,7 +34,7 @@ impl ErrorClass {
 
 /// Give the retry class of `code`, from Kafka's `Errors` table (trunk
 /// `f87be33`).
-pub(crate) const fn class(code: i16) -> ErrorClass {
+pub const fn class(code: i16) -> ErrorClass {
     match code {
         0 => ErrorClass::None,
         // UNKNOWN_TOPIC_OR_PARTITION, LEADER_NOT_AVAILABLE,
@@ -58,7 +58,7 @@ pub(crate) const fn class(code: i16) -> ErrorClass {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use assert2::assert;
 
     use super::{ErrorClass, class};
@@ -69,7 +69,7 @@ pub(crate) mod tests {
     /// The rows come from `clients/src/main/java/org/apache/kafka/common/`
     /// `protocol/Errors.java` and the `extends` clause of each exception in
     /// `common/errors/`, at trunk `f87be33`.
-    pub(crate) const KAFKA_ERRORS: [(i16, &str, ErrorClass); 138] = {
+    pub const KAFKA_ERRORS: [(i16, &str, ErrorClass); 138] = {
         use ErrorClass::{InvalidMetadata as M, None as Ok, NotRetriable as N, Retriable as R};
         [
             (-1, "UNKNOWN_SERVER_ERROR", N),

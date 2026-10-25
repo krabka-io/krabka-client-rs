@@ -3,7 +3,7 @@
 
 mod jks;
 
-use std::path::Path;
+use std::{fs, path::Path};
 
 use p12_keystore::{KeyStoreEntry, Pkcs12ImportPolicy};
 use pkcs8::{EncryptedPrivateKeyInfoRef, der::pem};
@@ -117,14 +117,14 @@ pub(super) fn key_pairs(store: &KeyStore) -> Result<Vec<KeyPair>, TlsConfigError
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, TlsConfigError> {
-    std::fs::read(path).map_err(|source| TlsConfigError::Read {
+    fs::read(path).map_err(|source| TlsConfigError::Read {
         path: path.to_owned(),
         source,
     })
 }
 
 fn read_text(path: &Path) -> Result<String, TlsConfigError> {
-    std::fs::read_to_string(path).map_err(|source| TlsConfigError::Read {
+    fs::read_to_string(path).map_err(|source| TlsConfigError::Read {
         path: path.to_owned(),
         source,
     })
@@ -140,21 +140,19 @@ fn pem_blocks(text: &str) -> Result<Vec<(String, Vec<u8>)>, TlsConfigError> {
     const BEGIN: &str = "-----BEGIN ";
     let mut blocks = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find(BEGIN) {
-        let block = &rest[start..];
-        let label_end = block[BEGIN.len()..]
-            .find("-----")
+    while let Some((_, after_begin)) = rest.split_once(BEGIN) {
+        let (label, _) = after_begin
+            .split_once("-----")
             .ok_or_else(|| TlsConfigError::Pem("unterminated BEGIN line".to_owned()))?;
-        let label = &block[BEGIN.len()..BEGIN.len() + label_end];
         let end_line = format!("-----END {label}-----");
-        let end = block
-            .find(&end_line)
-            .ok_or_else(|| TlsConfigError::Pem(format!("no END line for {label}")))?
-            + end_line.len();
-        let (decoded_label, der) = pem::decode_vec(&block.as_bytes()[..end])
+        let (inside, after_end) = after_begin
+            .split_once(&end_line)
+            .ok_or_else(|| TlsConfigError::Pem(format!("no END line for {label}")))?;
+        let block = format!("{BEGIN}{inside}{end_line}");
+        let (decoded_label, der) = pem::decode_vec(block.as_bytes())
             .map_err(|error| TlsConfigError::Pem(format!("{label}: {error}")))?;
         blocks.push((decoded_label.to_owned(), der));
-        rest = &block[end..];
+        rest = after_end;
     }
     Ok(blocks)
 }

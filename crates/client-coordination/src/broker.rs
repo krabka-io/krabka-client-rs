@@ -64,12 +64,18 @@
 //! partition to the last stable offset, and it drops every record whose key
 //! belongs to another role.
 
-use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use krabka_client_admin::{
-    AdminClient, AdminError, CreateTopicOutcome, CreateTopicSpec, TopicMutationOptions,
-    TransactionDescription,
+    AdminClient, AdminClientLike as _, AdminError, CreateTopicOutcome, CreateTopicSpec,
+    TopicMutationOptions, TransactionDescription,
 };
 use krabka_client_core::{
     BrokerInfo, BrokerPool, ClientDnsTimeout, ClientError, ClientSecurity, Connection,
@@ -92,11 +98,12 @@ use krabka_protocol::{
 use krabka_units::{ByteSize, Time, convert::TimeExt as _, mebibytes, millis, secs};
 use tokio::{
     sync::{Mutex, OnceCell},
-    time::error::Elapsed,
+    time::{error::Elapsed, timeout},
 };
 
 use crate::{
     error::CoordinationError,
+    lease::DEFAULT_LEASE_DURATION,
     record::{
         COORDINATION_STATE_TOPIC, CoordinationKey, CoordinationRecord, FencingToken, Lease,
         MemberId, Registration, Role, decode_key, decode_value, encode_key, encode_value,
@@ -258,7 +265,7 @@ impl BrokerTransport {
     pub async fn start(
         #[builder(into)] bootstrap: String,
         #[builder(into, default = DEFAULT_COORDINATION_CLIENT_ID.to_owned())] client_id: String,
-        #[builder(default = crate::lease::DEFAULT_LEASE_DURATION)] lease_duration: Time,
+        #[builder(default = DEFAULT_LEASE_DURATION)] lease_duration: Time,
         #[builder(default = DEFAULT_COORDINATION_REQUEST_TIMEOUT)] request_timeout: Time,
         #[builder(default = DEFAULT_COORDINATION_FETCH_MAX_WAIT)] fetch_max_wait: Time,
         #[builder(default = DEFAULT_COORDINATION_FETCH_PARTITION_MAX)]
@@ -417,6 +424,55 @@ impl BrokerTransport {
         list_offsets_offset(&response, partition)
     }
 
+    /// Mints the epoch of `role` with its transactional `producer`, and makes
+    /// the producer the holder of `role`.
+    ///
+    /// # Errors
+    ///
+    /// As [`CoordinationTransport::acquire_epoch`].
+    async fn hold_role(
+        &self,
+        role: &Role,
+        producer: Producer,
+    ) -> Result<FencingToken, CoordinationError> {
+        producer
+            .init_transactions()
+            .await
+            .map_err(|error| fenced_or(role, error))?;
+        // Read the minted pair back from the producer itself. A read through
+        // DescribeTransactions would report whatever the coordinator holds at
+        // that moment, so a competitor that mints between the two requests
+        // would give this member the token of another member.
+        let (producer_id, producer_epoch) =
+            producer
+                .transactional_identity()
+                .await
+                .ok_or(CoordinationError::Producer(
+                    ProducerError::InvalidTransactionState(
+                        "init_transactions returned without an identity",
+                    ),
+                ))?;
+        let token = FencingToken::new(producer_id, producer_epoch)?;
+        self.install_holder(
+            role,
+            Holder {
+                producer: Arc::new(producer),
+                token,
+            },
+        )
+        .await;
+        Ok(token)
+    }
+
+    /// Makes `holder` the holder of `role`, and closes the producer of the
+    /// holder it replaces.
+    async fn install_holder(&self, role: &Role, holder: Holder) {
+        let replaced = self.holders.lock().await.insert(role.clone(), holder);
+        if let Some(replaced) = replaced {
+            close_producer(role, replaced.producer).await;
+        }
+    }
+
     /// The plain producer that appends registrations, built on first use.
     async fn registrar(&self) -> Result<&Producer, CoordinationError> {
         self.registrar
@@ -492,35 +548,7 @@ impl CoordinationTransport for BrokerTransport {
     async fn acquire_epoch(&self, role: &Role) -> Result<FencingToken, CoordinationError> {
         self.topic_layout().await?;
         let producer = self.build_role_producer(role).await?;
-        producer
-            .init_transactions()
-            .await
-            .map_err(|error| fenced_or(role, error))?;
-        // Read the minted pair back from the producer itself. A read through
-        // DescribeTransactions would report whatever the coordinator holds at
-        // that moment, so a competitor that mints between the two requests
-        // would give this member the token of another member.
-        let (producer_id, producer_epoch) =
-            producer
-                .transactional_identity()
-                .await
-                .ok_or(CoordinationError::Producer(
-                    ProducerError::InvalidTransactionState(
-                        "init_transactions returned without an identity",
-                    ),
-                ))?;
-        let token = FencingToken::new(producer_id, producer_epoch)?;
-        let replaced = self.holders.lock().await.insert(
-            role.clone(),
-            Holder {
-                producer: Arc::new(producer),
-                token,
-            },
-        );
-        if let Some(replaced) = replaced {
-            close_producer(role, replaced.producer).await;
-        }
-        Ok(token)
+        self.hold_role(role, producer).await
     }
 
     /// Reads the partition of `role` and returns its records in offset order.
@@ -597,9 +625,11 @@ impl CoordinationTransport for BrokerTransport {
     #[tracing::instrument(level = "info", skip_all, fields(role = %role, member = %member), err(level = "info"))]
     async fn register(&self, role: &Role, member: &MemberId) -> Result<(), CoordinationError> {
         let partition = self.partition_of(role).await?;
-        let producer = self.registrar().await?;
-        let record = registration_record(role, member, partition, current_millis());
-        send_one(producer, record).await?;
+        send_one(
+            self.registrar().await?,
+            registration_record(role, member, partition, current_millis()),
+        )
+        .await?;
         Ok(())
     }
 
@@ -718,7 +748,7 @@ async fn resolve_addresses(
 ) -> Result<Vec<(SocketAddr, String)>, CoordinationError> {
     let mut resolved = Vec::new();
     for address in addresses {
-        let lookup = tokio::time::timeout(dns_timeout.time().to_std(), resolve(address)).await;
+        let lookup = timeout(dns_timeout.time().to_std(), resolve(address)).await;
         resolved.extend(
             lookup_addresses(address, lookup)?
                 .into_iter()
@@ -1084,8 +1114,8 @@ fn server(error_code: i16) -> CoordinationError {
 /// anti-flap device, so a wrong instant moves the failover time and does not
 /// affect safety.
 fn current_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {
             i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
         })
@@ -1195,9 +1225,9 @@ mod tests {
         check!(message == "the DNS lookup of broker-without-port failed: invalid socket address");
 
         // A lookup still running at the deadline times out.
-        let unanswered = tokio::time::timeout(
-            std::time::Duration::ZERO,
-            std::future::pending::<io::Result<Vec<SocketAddr>>>(),
+        let unanswered = timeout(
+            Duration::ZERO,
+            future::pending::<io::Result<Vec<SocketAddr>>>(),
         )
         .await;
         assert!(
@@ -1207,10 +1237,11 @@ mod tests {
         check!(message == "the DNS lookup of broker:9092 timed out");
     }
 
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, future, time::Duration};
 
     use assert2::{assert, check};
     use krabka_client_admin::KafkaError;
+    use krabka_client_core::mock_test_support::recorded_levels;
     use krabka_protocol::owned::{
         list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
         metadata_response::{
@@ -1761,20 +1792,26 @@ mod tests {
     /// these cases need no cluster.
     #[tokio::test]
     async fn the_builder_refuses_a_configuration_kafka_would_reject() {
-        assert!(let Err(CoordinationError::InvalidConfig(_)) = BrokerTransport::builder()
-            .bootstrap("")
-            .build()
-            .await);
-        assert!(let Err(CoordinationError::InvalidConfig(_)) = BrokerTransport::builder()
-            .bootstrap("localhost:9092")
-            .topic_partitions(0)
-            .build()
-            .await);
-        assert!(let Err(CoordinationError::InvalidConfig(_)) = BrokerTransport::builder()
-            .bootstrap("localhost:9092")
-            .topic_replication(0)
-            .build()
-            .await);
+        assert!(matches!(
+            BrokerTransport::builder().bootstrap("").build().await,
+            Err(CoordinationError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            BrokerTransport::builder()
+                .bootstrap("localhost:9092")
+                .topic_partitions(0)
+                .build()
+                .await,
+            Err(CoordinationError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            BrokerTransport::builder()
+                .bootstrap("localhost:9092")
+                .topic_replication(0)
+                .build()
+                .await,
+            Err(CoordinationError::InvalidConfig(_))
+        ));
     }
 
     /// A refused start is an error returned to the caller, so `start` records
@@ -1782,10 +1819,8 @@ mod tests {
     /// (krabka-io/krabka-broker#1515).
     #[tokio::test]
     async fn a_refused_start_is_recorded_at_its_span_level() {
-        let (result, levels) = krabka_client_core::mock_test_support::recorded_levels(
-            BrokerTransport::builder().bootstrap("").build(),
-        )
-        .await;
+        let (result, levels) =
+            recorded_levels(BrokerTransport::builder().bootstrap("").build()).await;
         assert!(let Err(CoordinationError::InvalidConfig(_)) = result);
         check!(levels == vec![tracing::Level::INFO]);
     }

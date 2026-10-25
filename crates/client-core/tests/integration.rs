@@ -40,6 +40,7 @@
 //! the suite robust without a dependency on broker internals, every test
 //! bootstraps with [`bootstrap_client`], which retries the initial
 //! `ApiVersions` send for up to ~15s before it gives up.
+#![cfg(test)]
 
 // Skip compilation on Windows runners where testcontainers + Docker reliability
 // is poor. On Linux CI the tests run via the `client-core-integration` job.
@@ -53,6 +54,7 @@ use testcontainers::runners::AsyncRunner;
 // `testcontainers_modules::kafka` re-exports `confluent::*`, so the bare
 // `Kafka` here is the Confluent module's container type.
 use testcontainers_modules::kafka::{KAFKA_PORT, Kafka};
+use tokio::time::{sleep, timeout};
 
 /// The deadline for a container to start, which includes the image pull.
 ///
@@ -78,7 +80,7 @@ fn init_tracing() {
 
 /// Start a Kafka container and return the container handle + bootstrap address.
 async fn start_kafka() -> (testcontainers::ContainerAsync<Kafka>, String) {
-    let kafka = tokio::time::timeout(CONTAINER_START_TIMEOUT, Kafka::default().start())
+    let kafka = timeout(CONTAINER_START_TIMEOUT, Kafka::default().start())
         .await
         .expect("kafka container start timed out")
         .expect("kafka container failed to start");
@@ -126,7 +128,7 @@ async fn bootstrap_client(bootstrap: &str) -> Client {
                 // real-time wait (not a progress poll): retry/backoff between full
                 // ApiVersions RPC round-trips while a real Docker broker warms up;
                 // iteration-count-bounded by BOOTSTRAP_MAX_ATTEMPTS.
-                tokio::time::sleep(BOOTSTRAP_RETRY_DELAY).await;
+                sleep(BOOTSTRAP_RETRY_DELAY).await;
             }
             Err(e) => panic!("bootstrap ApiVersions failed with non-retryable error: {e}"),
         }

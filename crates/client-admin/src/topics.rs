@@ -83,9 +83,12 @@ pub struct DeleteTopicOutcome {
     pub throttle_time: Option<Time>,
 }
 
-/// Options of [`AdminClient::create_topics`], [`AdminClient::delete_topics`]
-/// and [`AdminClient::create_partitions`], as Kafka's `CreateTopicsOptions`,
+/// Options of the topic mutation calls, as Kafka's `CreateTopicsOptions`,
 /// `DeleteTopicsOptions` and `CreatePartitionsOptions`.
+///
+/// They apply to [`AdminClientLike::create_topics`](crate::AdminClientLike::create_topics),
+/// [`AdminClientLike::delete_topics`](crate::AdminClientLike::delete_topics) and
+/// [`AdminClientLike::create_partitions`](crate::AdminClientLike::create_partitions).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TopicMutationOptions {
     /// The deadline of the call, including retries. Each request carries the
@@ -118,13 +121,10 @@ impl TopicMutationOptions {
 
     /// The retry policy of the call: `base` with the call timeout, when set.
     fn retry_policy(self, base: RetryPolicy) -> RetryPolicy {
-        match self.timeout {
-            Some(timeout) => RetryPolicy {
-                timeout: Duration::from_millis(u64::try_from(timeout.millis_i64()).unwrap_or(0)),
-                ..base
-            },
-            None => base,
-        }
+        self.timeout.map_or(base, |timeout| RetryPolicy {
+            timeout: Duration::from_millis(u64::try_from(timeout.millis_i64()).unwrap_or(0)),
+            ..base
+        })
     }
 }
 
@@ -207,15 +207,9 @@ pub struct PartitionAssignmentOutcome {
 }
 
 impl AdminClient {
-    /// Returns current replica membership for every selected partition.
-    ///
-    /// Pass an empty topic slice to inspect the whole cluster before broker
-    /// evacuation.
-    ///
-    /// # Errors
-    /// Returns a transport or protocol error.
-    pub async fn describe_partition_assignments(
-        &mut self,
+    /// The call behind [`AdminClientLike::describe_partition_assignments`](crate::AdminClientLike::describe_partition_assignments).
+    pub(crate) async fn describe_partition_assignments_impl(
+        &self,
         topics: &[&str],
     ) -> Result<Vec<PartitionAssignment>, AdminError> {
         let response: MetadataResponse = self.conn.send(build_metadata(topics)).await?;
@@ -238,14 +232,9 @@ impl AdminClient {
             .collect())
     }
 
-    /// Lists active partition reassignments and their replica membership.
-    ///
-    /// An empty filter lists every active reassignment.
-    ///
-    /// # Errors
-    /// Returns a transport, protocol, or top-level broker error.
-    pub async fn list_partition_reassignments(
-        &mut self,
+    /// The call behind [`AdminClientLike::list_partition_reassignments`](crate::AdminClientLike::list_partition_reassignments).
+    pub(crate) async fn list_partition_reassignments_impl(
+        &self,
         partitions: &BTreeMap<String, Vec<i32>>,
         timeout: Time,
     ) -> Result<Vec<PartitionAssignment>, AdminError> {
@@ -289,13 +278,8 @@ impl AdminClient {
             .collect())
     }
 
-    /// Submits exact replica lists; `None` cancels an active reassignment.
-    /// A reassignment may change a partition's replication factor, Kafka's
-    /// default; [`Self::alter_partition_assignments_with`] can refuse that.
-    ///
-    /// # Errors
-    /// Returns a transport, protocol, or top-level broker error.
-    pub async fn alter_partition_assignments(
+    /// The call behind [`AdminClientLike::alter_partition_assignments`](crate::AdminClientLike::alter_partition_assignments).
+    pub(crate) async fn alter_partition_assignments_impl(
         &mut self,
         assignments: &BTreeMap<(String, i32), Option<Vec<i32>>>,
         timeout: Time,
@@ -340,30 +324,16 @@ impl AdminClient {
         }
     }
 
-    /// Metadata for the named topics. Pass an empty slice to fetch all
-    /// topics, per Kafka semantics.
-    ///
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
-    pub async fn metadata(&mut self, topics: &[&str]) -> Result<TopicMetadata, AdminError> {
+    /// The call behind [`AdminClientLike::metadata`](crate::AdminClientLike::metadata).
+    pub(crate) async fn metadata_impl(&self, topics: &[&str]) -> Result<TopicMetadata, AdminError> {
         let req = build_metadata(topics);
         let resp = self.conn.send(req).await?;
         Ok(parse_metadata(resp))
     }
 
-    /// Converges every partition of `topic` to `replication_factor` through
-    /// `AlterPartitionReassignments`.
-    ///
-    /// Existing replicas are retained where possible. Added replicas rotate
-    /// across the broker list, and decreases preserve the leading replica
-    /// order. An existing reassignment is never overwritten.
-    ///
-    /// # Errors
-    /// Returns an error when the factor is invalid for the live broker set,
-    /// metadata cannot be read, Kafka rejects a reassignment, or transport I/O
-    /// fails.
-    pub async fn reconcile_topic_replication_factor(
-        &mut self,
+    /// The call behind [`AdminClientLike::reconcile_topic_replication_factor`](crate::AdminClientLike::reconcile_topic_replication_factor).
+    pub(crate) async fn reconcile_topic_replication_factor_impl(
+        &self,
         topic: &str,
         replication_factor: i32,
         timeout: Time,
@@ -404,7 +374,7 @@ impl AdminClient {
     }
 
     async fn reconcile_topic_replication_factor_once(
-        &mut self,
+        &self,
         topic: &str,
         replication_factor: i32,
         timeout: Time,
@@ -476,28 +446,9 @@ impl AdminClient {
         Ok(TopicReplicationStatus::ReassignmentSubmitted)
     }
 
-    /// Creates topics through the active controller, as Kafka's
-    /// `KafkaAdminClient.createTopics` does.
-    ///
-    /// The call retries until the deadline of `options`:
-    ///
-    /// - `NOT_CONTROLLER` (41) for any topic: find the controller again, wait
-    ///   for the backoff, and send every topic that has no outcome again
-    ///   (`handleNotControllerError`). With controller bootstrap,
-    ///   `NOT_LEADER_OR_FOLLOWER` (6) does the same.
-    /// - `THROTTLING_QUOTA_EXCEEDED` (89): when
-    ///   [`TopicMutationOptions::retry_on_quota_violation`] is set, wait for the
-    ///   throttle time of the response and send only the throttled topics
-    ///   again. A topic that has an outcome is not sent again.
-    ///
-    /// At the deadline a throttled topic keeps code 89, with the throttle time
-    /// that remains. Another topic without an outcome gets
-    /// `REQUEST_TIMED_OUT` (7). The outcomes keep the order of `specs`.
-    ///
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, or transport I/O fails.
-    pub async fn create_topics(
-        &mut self,
+    /// The call behind [`AdminClientLike::create_topics`](crate::AdminClientLike::create_topics).
+    pub(crate) async fn create_topics_impl(
+        &self,
         specs: &[CreateTopicSpec],
         options: TopicMutationOptions,
     ) -> Result<Vec<CreateTopicOutcome>, AdminError> {
@@ -506,7 +457,7 @@ impl AdminClient {
     }
 
     async fn create_topics_with_retry(
-        &mut self,
+        &self,
         specs: &[CreateTopicSpec],
         options: TopicMutationOptions,
         policy: RetryPolicy,
@@ -530,15 +481,9 @@ impl AdminClient {
         .await
     }
 
-    /// Deletes topics through the active controller, as Kafka's
-    /// `KafkaAdminClient.deleteTopics` does. The call retries
-    /// `NOT_CONTROLLER` (41) and `THROTTLING_QUOTA_EXCEEDED` (89) as
-    /// [`AdminClient::create_topics`] does.
-    ///
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, or transport I/O fails.
-    pub async fn delete_topics(
-        &mut self,
+    /// The call behind [`AdminClientLike::delete_topics`](crate::AdminClientLike::delete_topics).
+    pub(crate) async fn delete_topics_impl(
+        &self,
         names: &[&str],
         options: TopicMutationOptions,
     ) -> Result<Vec<DeleteTopicOutcome>, AdminError> {
@@ -547,7 +492,7 @@ impl AdminClient {
     }
 
     async fn delete_topics_with_retry(
-        &mut self,
+        &self,
         names: &[&str],
         options: TopicMutationOptions,
         policy: RetryPolicy,
@@ -564,15 +509,9 @@ impl AdminClient {
         .await
     }
 
-    /// Adds partitions through the active controller, as Kafka's
-    /// `KafkaAdminClient.createPartitions` does. The call retries
-    /// `NOT_CONTROLLER` (41) and `THROTTLING_QUOTA_EXCEEDED` (89) as
-    /// [`AdminClient::create_topics`] does.
-    ///
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, or transport I/O fails.
-    pub async fn create_partitions(
-        &mut self,
+    /// The call behind [`AdminClientLike::create_partitions`](crate::AdminClientLike::create_partitions).
+    pub(crate) async fn create_partitions_impl(
+        &self,
         ops: &[CreatePartitionsOp],
         options: TopicMutationOptions,
     ) -> Result<Vec<CreatePartitionsOutcome>, AdminError> {
@@ -581,7 +520,7 @@ impl AdminClient {
     }
 
     async fn create_partitions_with_retry(
-        &mut self,
+        &self,
         ops: &[CreatePartitionsOp],
         options: TopicMutationOptions,
         policy: RetryPolicy,
@@ -606,9 +545,9 @@ impl AdminClient {
     }
 
     /// Sends one topic mutation until every topic has an outcome or the
-    /// deadline passes. See [`AdminClient::create_topics`] for the rules.
+    /// deadline passes. See [`AdminClientLike::create_topics`](crate::AdminClientLike::create_topics) for the rules.
     async fn mutate_topics<R, T>(
-        &mut self,
+        &self,
         api: &'static str,
         topics: Vec<String>,
         retry_on_quota_violation: bool,
@@ -749,19 +688,9 @@ impl AdminClient {
             .collect())
     }
 
-    /// Deletes records below each requested partition offset.
-    ///
-    /// `offset == -1` follows Kafka `DeleteRecords` semantics and truncates to
-    /// the partition high watermark. The returned `low_watermark` is the
-    /// broker's resulting log-start offset for that partition.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`AdminError`] when metadata lookup, leader routing, transport,
-    /// or protocol handling fails. Kafka partition-level failures remain in the
-    /// returned [`DeleteRecordsOutcome::error_code`].
-    pub async fn delete_records(
-        &mut self,
+    /// The call behind [`AdminClientLike::delete_records`](crate::AdminClientLike::delete_records).
+    pub(crate) async fn delete_records_impl(
+        &self,
         ops: &[DeleteRecordsOp],
         timeout: Time,
     ) -> Result<Vec<DeleteRecordsOutcome>, AdminError> {
@@ -785,7 +714,7 @@ impl AdminClient {
     /// Fetches Metadata, finds the controller's `host:port`, and replaces
     /// `self.conn` with a connection to it. The per-method `NOT_CONTROLLER`
     /// retry paths above use it.
-    pub(crate) async fn refresh_controller_connection(&mut self) -> Result<(), AdminError> {
+    pub(crate) async fn refresh_controller_connection(&self) -> Result<(), AdminError> {
         if self.conn.uses_controller_bootstrap() {
             return self.conn.rebootstrap().await;
         }
@@ -806,7 +735,7 @@ impl AdminClient {
     }
 
     async fn delete_records_leader_groups(
-        &mut self,
+        &self,
         ops: &[DeleteRecordsOp],
         outcomes: &mut Vec<DeleteRecordsOutcome>,
     ) -> Result<BTreeMap<String, Vec<DeleteRecordsOp>>, AdminError> {
@@ -1081,7 +1010,7 @@ fn build_metadata(topics: &[&str]) -> MetadataRequest {
                     .iter()
                     .map(|n| MetadataRequestTopic {
                         topic_id: ProtoUuid::ZERO,
-                        name: Some((*n).to_string()),
+                        name: Some((*n).to_owned()),
                         ..Default::default()
                     })
                     .collect(),
@@ -1162,11 +1091,11 @@ fn build_replication_factor_reassignment(
             .filter(|broker| available.contains(broker) && selected.insert(*broker))
             .take(desired)
             .collect::<Vec<_>>();
-        for offset in 0..brokers.len() {
+        let start = rotation.checked_rem(brokers.len()).unwrap_or(0);
+        for &broker in brokers.iter().cycle().skip(start).take(brokers.len()) {
             if target.len() == desired {
                 break;
             }
-            let broker = brokers[(rotation + offset) % brokers.len()];
             if selected.insert(broker) {
                 target.push(broker);
             }
@@ -1187,7 +1116,7 @@ fn build_replication_factor_reassignment(
         timeout_ms: timeout.millis_i32(),
         allow_replication_factor_change: true,
         topics: vec![ReassignableTopic {
-            name: topic_name.to_string(),
+            name: topic_name.to_owned(),
             partitions,
             ..Default::default()
         }],
@@ -1437,7 +1366,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::retry::KAFKA_ADMIN_RETRY;
+    use crate::{AdminClientLike as _, retry::KAFKA_ADMIN_RETRY};
 
     #[test]
     fn exact_assignment_request_preserves_replica_order() {
@@ -1527,7 +1456,8 @@ mod tests {
                 }
                 _ => None,
             })
-            .await;
+            .await
+            .unwrap();
             let mut admin = AdminClient::connect(&[broker.addr.to_string()])
                 .await
                 .expect("admin connects");
@@ -1689,7 +1619,7 @@ mod tests {
                 .partitions(3)
                 .replicas(1)
                 .configs(maplit::btreemap! {
-                    "retention.ms".to_string() => "60000".to_string(),
+                    "retention.ms".to_owned() => "60000".to_owned(),
                 })
                 .build()],
             5_000,
@@ -1697,13 +1627,13 @@ mod tests {
         assert2::assert!(
             req == CreateTopicsRequest {
                 topics: vec![CreatableTopic {
-                    name: "foo".to_string(),
+                    name: "foo".to_owned(),
                     num_partitions: 3,
                     replication_factor: 1,
                     assignments: vec![],
                     configs: vec![CreatableTopicConfig {
-                        name: "retention.ms".to_string(),
-                        value: Some("60000".to_string()),
+                        name: "retention.ms".to_owned(),
+                        value: Some("60000".to_owned()),
                         unknown_tagged_fields: UnknownTaggedFields(vec![]),
                     }],
                     unknown_tagged_fields: UnknownTaggedFields(vec![]),
@@ -1797,17 +1727,17 @@ mod tests {
         let req = build_delete_records(
             &[
                 DeleteRecordsOp {
-                    topic: "beta".to_string(),
+                    topic: "beta".to_owned(),
                     partition: 1,
                     offset: -1,
                 },
                 DeleteRecordsOp {
-                    topic: "alpha".to_string(),
+                    topic: "alpha".to_owned(),
                     partition: 0,
                     offset: 50,
                 },
                 DeleteRecordsOp {
-                    topic: "alpha".to_string(),
+                    topic: "alpha".to_owned(),
                     partition: 2,
                     offset: 75,
                 },
@@ -1819,7 +1749,7 @@ mod tests {
             req == DeleteRecordsRequest {
                 topics: vec![
                     DeleteRecordsTopic {
-                        name: "alpha".to_string(),
+                        name: "alpha".to_owned(),
                         partitions: vec![
                             DeleteRecordsPartition {
                                 partition_index: 0,
@@ -1835,7 +1765,7 @@ mod tests {
                         unknown_tagged_fields: UnknownTaggedFields(vec![]),
                     },
                     DeleteRecordsTopic {
-                        name: "beta".to_string(),
+                        name: "beta".to_owned(),
                         partitions: vec![DeleteRecordsPartition {
                             partition_index: 1,
                             offset: -1,
@@ -1858,7 +1788,7 @@ mod tests {
 
         let resp = DeleteRecordsResponse {
             topics: vec![DeleteRecordsTopicResult {
-                name: "wal".to_string(),
+                name: "wal".to_owned(),
                 partitions: vec![
                     DeleteRecordsPartitionResult {
                         partition_index: 0,
@@ -1883,13 +1813,13 @@ mod tests {
             outcomes,
             vec![
                 DeleteRecordsOutcome {
-                    topic: "wal".to_string(),
+                    topic: "wal".to_owned(),
                     partition: 0,
                     error_code: 0,
                     low_watermark: 50,
                 },
                 DeleteRecordsOutcome {
-                    topic: "wal".to_string(),
+                    topic: "wal".to_owned(),
                     partition: 1,
                     error_code: 1,
                     low_watermark: -1,
@@ -2030,14 +1960,14 @@ mod tests {
                 controller_id: -1,
                 topics: vec![
                     TopicMetadataEntry {
-                        name: "ok-topic".to_string(),
+                        name: "ok-topic".to_owned(),
                         topic_id: None,
                         partition_count: 0,
                         replication_factor: 0,
                         error: None,
                     },
                     TopicMetadataEntry {
-                        name: "missing".to_string(),
+                        name: "missing".to_owned(),
                         topic_id: None,
                         partition_count: 0,
                         replication_factor: 0,
@@ -2130,24 +2060,24 @@ mod tests {
             outcomes
                 == vec![
                     CreateTopicOutcome {
-                        name: "ok".to_string(),
+                        name: "ok".to_owned(),
                         // Non-zero uuid maps to Some.
                         topic_id: Some(Uuid::from_bytes([7; 16])),
                         error: None,
                         throttle_time: None,
                     },
                     CreateTopicOutcome {
-                        name: "dup".to_string(),
+                        name: "dup".to_owned(),
                         topic_id: None,
                         error: Some(KafkaError {
                             code: 36,
                             name: "TOPIC_ALREADY_EXISTS",
-                            message: Some("already there".to_string()),
+                            message: Some("already there".to_owned()),
                         }),
                         throttle_time: None,
                     },
                     CreateTopicOutcome {
-                        name: "throttled".to_string(),
+                        name: "throttled".to_owned(),
                         topic_id: None,
                         error: Some(KafkaError {
                             code: THROTTLING_QUOTA_EXCEEDED,
@@ -2194,11 +2124,11 @@ mod tests {
                     throttle_time: None,
                 },
                 DeleteTopicOutcome {
-                    name: "named".to_string(),
+                    name: "named".to_owned(),
                     error: Some(KafkaError {
                         code: 3,
                         name: "UNKNOWN_TOPIC_OR_PARTITION",
-                        message: Some("nope".to_string()),
+                        message: Some("nope".to_owned()),
                     }),
                     throttle_time: None,
                 },
@@ -2234,16 +2164,16 @@ mod tests {
         assert2::assert!(
             outs == vec![
                 CreatePartitionsOutcome {
-                    name: "ok".to_string(),
+                    name: "ok".to_owned(),
                     error: None,
                     throttle_time: None,
                 },
                 CreatePartitionsOutcome {
-                    name: "bad".to_string(),
+                    name: "bad".to_owned(),
                     error: Some(KafkaError {
                         code: 37,
                         name: "INVALID_PARTITIONS",
-                        message: Some("bad count".to_string()),
+                        message: Some("bad count".to_owned()),
                     }),
                     throttle_time: None,
                 },
@@ -2253,7 +2183,10 @@ mod tests {
 
     // ── topic mutation retries against a scripted controller ──────────
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU16, Ordering},
+    };
 
     use bytes::{Buf, BytesMut};
     use krabka_client_core::{MockBroker, MockReply};
@@ -2374,10 +2307,10 @@ mod tests {
         script: Vec<Answer>,
         requests: Arc<Mutex<Vec<SentRequest>>>,
     ) -> MockBroker {
-        let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let port = Arc::new(AtomicU16::new(0));
         let handler_port = Arc::clone(&port);
         let mut next = 0_usize;
-        let close = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let close = Arc::new(AtomicBool::new(false));
         let handler_close = Arc::clone(&close);
         let mut handler = move |api_key: i16, version: i16, request: &[u8]| {
             let api_version = |api_key, max_version| ApiVersion {
@@ -2393,7 +2326,7 @@ mod tests {
                     .push((names, timeout_ms));
                 let entry = script[next.min(script.len() - 1)].clone();
                 next += 1;
-                handler_close.store(entry.closed, std::sync::atomic::Ordering::SeqCst);
+                handler_close.store(entry.closed, Ordering::SeqCst);
                 entry
             };
             match api_key {
@@ -2417,7 +2350,7 @@ mod tests {
                         brokers: vec![MetadataResponseBroker {
                             node_id: 1,
                             host: "127.0.0.1".into(),
-                            port: i32::from(handler_port.load(std::sync::atomic::Ordering::SeqCst)),
+                            port: i32::from(handler_port.load(Ordering::SeqCst)),
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -2526,13 +2459,14 @@ mod tests {
         };
         let broker = MockBroker::start_with_replies(move |api_key, version, _, request| {
             let reply = handler(api_key, version, request);
-            if close.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if close.swap(false, Ordering::SeqCst) {
                 return MockReply::Close;
             }
             reply.map_or(MockReply::Silent, MockReply::Respond)
         })
-        .await;
-        port.store(broker.addr.port(), std::sync::atomic::Ordering::SeqCst);
+        .await
+        .unwrap();
+        port.store(broker.addr.port(), Ordering::SeqCst);
         broker
     }
 
@@ -2550,7 +2484,7 @@ mod tests {
     }
 
     async fn run_mutation(
-        admin: &mut AdminClient,
+        admin: &AdminClient,
         mutation: Mutation,
         topics: &[&str],
         options: TopicMutationOptions,
@@ -2728,7 +2662,7 @@ mod tests {
             for (name, script, timeout, options, expected_requests, expected) in cases.clone() {
                 let requests = Arc::new(Mutex::new(Vec::new()));
                 let controller = scripted_controller(script, Arc::clone(&requests)).await;
-                let mut admin = AdminClient::connect(&[controller.addr.to_string()])
+                let admin = AdminClient::connect(&[controller.addr.to_string()])
                     .await
                     .expect("admin connects");
                 let backoff = if timeout == LONG {
@@ -2744,9 +2678,8 @@ mod tests {
                     max_retries: u32::MAX,
                 };
 
-                let started = tokio::time::Instant::now();
-                let observed =
-                    run_mutation(&mut admin, mutation, &["a", "b"], options, policy).await;
+                let started = Instant::now();
+                let observed = run_mutation(&admin, mutation, &["a", "b"], options, policy).await;
                 let within_deadline = started.elapsed() < timeout + Duration::from_secs(2);
 
                 controller.stop();
@@ -2774,7 +2707,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let controller =
             scripted_controller(vec![throttled(&[("a", 89)], 60_000)], Arc::clone(&requests)).await;
-        let mut admin = AdminClient::connect(&[controller.addr.to_string()])
+        let admin = AdminClient::connect(&[controller.addr.to_string()])
             .await
             .expect("admin connects");
         let policy = RetryPolicy {

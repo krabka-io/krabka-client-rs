@@ -19,6 +19,7 @@ use bytes::BytesMut;
 use krabka_client_core::{
     AuthenticationError, Client, ClientError, MockBroker, MockReply, MockSaslAnswer,
     SaslAuthenticationError,
+    mock_test_support::api_versions_response_ranges,
     security::{ClientSecurity, SaslCredentials},
 };
 use krabka_protocol::{
@@ -88,12 +89,12 @@ async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) 
                 .copied()
                 .unwrap_or_else(|| *script.last().unwrap());
         }
-        if let Some(reply) = answer.reply(api_key, version) {
+        if let Some(reply) = answer.reply(api_key, version).unwrap() {
             return reply;
         }
         match api_key {
             api_versions_request::API_KEY => MockReply::Respond(encode(
-                &krabka_client_core::mock_test_support::api_versions_response_ranges([
+                &api_versions_response_ranges([
                     (api_versions_request::API_KEY, 0, 3),
                     (metadata_request::API_KEY, 0, 8),
                 ]),
@@ -106,6 +107,7 @@ async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) 
         }
     })
     .await
+    .unwrap()
 }
 
 async fn sasl_client(broker: &MockBroker) -> Client {

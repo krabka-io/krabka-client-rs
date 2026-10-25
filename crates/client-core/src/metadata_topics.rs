@@ -200,6 +200,7 @@ pub fn topics_request(
 #[cfg(test)]
 mod tests {
     use assert2::check;
+    use tokio::time::advance;
 
     use super::*;
 
@@ -283,10 +284,10 @@ mod tests {
         });
         topics.set(["a", "b"]);
         check!(topics.names() == vec!["a".to_owned(), "b".to_owned()]);
-        tokio::time::advance(Duration::from_secs(200)).await;
+        advance(Duration::from_secs(200)).await;
         check!(!topics.add("b"));
         check!(topics.add("c"));
-        tokio::time::advance(Duration::from_secs(101)).await;
+        advance(Duration::from_secs(101)).await;
         check!(topics.remove_idle(Duration::from_mins(5)) == vec!["a".to_owned()]);
         check!(topics.names() == vec!["b".to_owned(), "c".to_owned()]);
     }

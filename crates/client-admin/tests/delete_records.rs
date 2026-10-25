@@ -1,4 +1,4 @@
-//! Proves that `AdminClient::delete_records` moves a partition's log start
+//! Proves that `AdminClientLike::delete_records` moves a partition's log start
 //! offset on a real broker.
 //!
 //! The suite writes 100 records to one partition, asks the broker to delete
@@ -15,14 +15,18 @@
 //! ```text
 //! cargo test -p krabka-client-admin --test delete_records -- --ignored --nocapture
 //! ```
+#![cfg(test)]
 
 mod support;
 
 use assert2::assert;
-use krabka_client_admin::{AdminClient, DeleteRecordsOp, DeleteRecordsOutcome};
+use krabka_client_admin::{
+    AdminClient, AdminClientLike as _, DeleteRecordsOp, DeleteRecordsOutcome,
+};
 use krabka_client_core::{ClientError, Connection, ConnectionOptions, fetch_partition};
 use krabka_client_producer::{Producer, ProducerRecord};
 use krabka_protocol::primitives::uuid::Uuid as WireUuid;
+use tokio::net::lookup_host;
 
 /// Number of records written before the deletion.
 const RECORD_COUNT: i64 = 100;
@@ -112,6 +116,7 @@ async fn produce_frames(bootstrap: &str, topic: &str) {
     }
 
     producer.flush().await.expect("flush");
+    drop(producer);
 }
 
 /// Read the topic id from Metadata.
@@ -137,7 +142,7 @@ async fn topic_id_for(admin: &mut AdminClient, topic: &str) -> WireUuid {
 /// plain broker connection with its own client id, so the broker log names the
 /// reader.
 async fn connect_reader(bootstrap: &str) -> Connection {
-    let addr = tokio::net::lookup_host(bootstrap)
+    let addr = lookup_host(bootstrap)
         .await
         .expect("resolve bootstrap")
         .next()
@@ -145,7 +150,7 @@ async fn connect_reader(bootstrap: &str) -> Connection {
     Connection::connect_with_options(
         addr,
         ConnectionOptions {
-            client_id: "delete-records-test-reader".to_string(),
+            client_id: "delete-records-test-reader".to_owned(),
             ..Default::default()
         },
     )

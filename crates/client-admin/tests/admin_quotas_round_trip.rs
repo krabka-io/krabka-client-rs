@@ -10,13 +10,17 @@
 //! the diff gives, then read the state back.
 //!
 //! Both cases need the container, so both carry `#[ignore]`.
+#![cfg(test)]
 
 mod support;
 
 use std::time::Duration;
 
 use assert2::{assert, check};
-use krabka_client_admin::{AdminClient, QuotaOp, UserQuotaConfig, diff_user_quotas};
+use krabka_client_admin::{
+    AdminClient, AdminClientLike as _, QuotaOp, UserQuotaConfig, diff_user_quotas,
+};
+use tokio::time::{sleep, timeout};
 
 /// Bound on a read-back loop. The broker writes a quota change and then makes
 /// it visible to `DescribeClientQuotas` in its own time.
@@ -161,7 +165,7 @@ async fn await_user_quotas(
     user: &str,
     expected: &UserQuotaConfig,
 ) -> UserQuotaConfig {
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             let actual = admin
                 .describe_user_quotas(user)
@@ -170,7 +174,7 @@ async fn await_user_quotas(
             if quotas_match(&actual, expected) {
                 break actual;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            sleep(POLL_INTERVAL).await;
         }
     })
     .await

@@ -13,8 +13,14 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use krabka_protocol::owned::metadata_response;
 use metadata_response::MetadataResponse;
+use tokio::sync::watch;
 
-use crate::{consumer::Consumer, error::ConsumerError, fetch_buffer};
+use crate::{
+    consumer::{CommitIdentity, Consumer},
+    consumer_group::RE2J_NEEDS_CONSUMER_PROTOCOL,
+    error::ConsumerError,
+    fetch_buffer,
+};
 
 /// A topic pattern for [`Consumer::subscribe_pattern`]. Kafka's
 /// `subscribe(java.util.regex.Pattern)`.
@@ -50,7 +56,7 @@ impl fmt::Debug for TopicPattern {
 
 /// What a consumer subscribes to.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Subscription {
+pub struct Subscription {
     /// The subscribed topics, sorted. For a pattern, the topics that matched
     /// the last metadata.
     pub topics: Vec<String>,
@@ -159,15 +165,15 @@ fn sorted(topics: impl IntoIterator<Item = String>) -> Vec<String> {
 }
 
 /// The subscription that the consumer and its coordinator task share.
-pub(crate) type SharedSubscription = Arc<tokio::sync::watch::Sender<Subscription>>;
+pub type SharedSubscription = Arc<watch::Sender<Subscription>>;
 
 /// The shared subscription of a new consumer.
-pub(crate) fn shared(
+pub fn shared(
     topics: Vec<String>,
     pattern: Option<TopicPattern>,
     exclude_internal_topics: bool,
 ) -> SharedSubscription {
-    Arc::new(tokio::sync::watch::Sender::new(Subscription {
+    Arc::new(watch::Sender::new(Subscription {
         pattern,
         ..Subscription::topics(topics, exclude_internal_topics)
     }))
@@ -175,7 +181,7 @@ pub(crate) fn shared(
 
 /// The `JoinGroup` reason after a subscription change. Kafka's
 /// `ConsumerCoordinator.rejoinNeededOrPending`.
-pub(crate) fn subscription_changed_reason(joined: &[String], now: &[String]) -> String {
+pub fn subscription_changed_reason(joined: &[String], now: &[String]) -> String {
     format!(
         "the subscription has changed from [{}] to [{}] since the last group join",
         joined.join(", "),
@@ -284,7 +290,7 @@ impl Consumer {
         self.require_group_membership()?;
         if self.group_protocol != crate::GroupProtocol::Consumer {
             return Err(ConsumerError::IllegalState(
-                crate::consumer_group::RE2J_NEEDS_CONSUMER_PROTOCOL.to_owned(),
+                RE2J_NEEDS_CONSUMER_PROTOCOL.to_owned(),
             ));
         }
         if self.subscription.borrow().manual_assignment {
@@ -332,8 +338,7 @@ impl Consumer {
         {
             let mut assigned = self.assigned.lock().await;
             let mut identity = self.commit_identity.lock().await;
-            assigned.clear();
-            identity.ownership_ids.clear();
+            clear_assignment(&mut assigned, &mut identity);
         }
         self.next_offsets.lock().await.clear();
         self.positions.lock().await.clear();
@@ -355,6 +360,13 @@ impl Consumer {
     pub fn subscription(&self) -> Vec<String> {
         self.subscription.borrow().topics.clone()
     }
+}
+
+/// Clear the assignment and the ownership ids of its partitions together. The
+/// caller holds both locks, `assigned` first.
+fn clear_assignment(assigned: &mut Vec<(String, i32)>, identity: &mut CommitIdentity) {
+    assigned.clear();
+    identity.ownership_ids.clear();
 }
 
 #[cfg(test)]

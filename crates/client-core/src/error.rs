@@ -1,6 +1,6 @@
 //! Error type for `krabka-client-core`.
 
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr};
 
 use krabka_units::{Time, fmt::Human as _};
 use thiserror::Error;
@@ -15,7 +15,7 @@ pub enum ClientError {
     Connect {
         addr: SocketAddr,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
 
     /// The TCP connection opened, but the TLS handshake failed before the
@@ -26,7 +26,7 @@ pub enum ClientError {
     Tls {
         addr: SocketAddr,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
 
     /// The SASL exchange failed after the TCP connection, and TLS if the
@@ -96,7 +96,7 @@ pub enum ClientError {
     Codec(#[from] krabka_protocol::ProtocolError),
 
     #[error("I/O: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 }
 
 impl ClientError {
@@ -116,7 +116,7 @@ pub enum AuthenticationError {
     /// error from the TLS engine, for example an untrusted certificate, a
     /// fatal alert from the peer, or a peer that does not speak TLS.
     #[error("TLS handshake failed: {0}")]
-    Tls(#[source] std::io::Error),
+    Tls(#[source] io::Error),
 
     /// The broker or the SASL mechanism rejected authentication.
     #[error(transparent)]

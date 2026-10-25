@@ -23,7 +23,10 @@ use krabka_protocol::{
     primitives::uuid::Uuid as WireUuid,
 };
 use krabka_units::{Time, convert::TimeExt as _};
-use tokio::sync::Mutex;
+use tokio::{
+    sync::Mutex,
+    time::{MissedTickBehavior, interval, timeout},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{coordinator, error::ConsumerError};
@@ -41,7 +44,7 @@ const STALE_MEMBER_EPOCH: i16 = 113;
 /// The `Arc<Mutex<...>>` fields are shared with the parent [`ShareConsumer`],
 /// so `poll()` sees the live member epoch and assignment as the broker
 /// rebalances the group.
-pub(crate) struct ShareCoordinatorState {
+pub struct ShareCoordinatorState {
     pub client: Client,
     pub group_id: String,
     pub member_id: String,
@@ -58,7 +61,7 @@ pub(crate) struct ShareCoordinatorState {
 }
 
 /// Outcome of a single `ShareGroupHeartbeat` RPC.
-pub(crate) enum HeartbeatOutcome {
+pub enum HeartbeatOutcome {
     /// `error_code == 0`, the steady state.
     Ok,
     /// Fenced, unknown-member, or stale-epoch. Reset to epoch 0 and re-send the
@@ -114,9 +117,9 @@ fn is_rejoin_error(error_code: i16) -> bool {
 
 /// Drive the heartbeat loop until `shutdown` fires.
 #[cfg_attr(test, mutants::skip)] // cargo-mutants: long-running I/O event loop, exercised by integration tests
-pub(crate) async fn run(state: ShareCoordinatorState, shutdown: CancellationToken) {
-    let mut ticker = tokio::time::interval(state.heartbeat_interval.to_std());
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+pub async fn run(state: ShareCoordinatorState, shutdown: CancellationToken) {
+    let mut ticker = interval(state.heartbeat_interval.to_std());
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // After a fence/unknown-member we must re-send `subscribed_topic_names` on
     // the next heartbeat (the broker treats epoch 0 + subscription as a join).
     let mut rejoining = false;
@@ -155,7 +158,7 @@ async fn leave_group(state: &ShareCoordinatorState) {
         state.group_id.clone(),
         state.member_id.clone(),
     ));
-    let _ = tokio::time::timeout(state.leave_heartbeat_timeout.to_std(), leave).await;
+    let _ = timeout(state.leave_heartbeat_timeout.to_std(), leave).await;
 }
 
 /// Send one `ShareGroupHeartbeat` and translate the response into a directive.
@@ -170,16 +173,9 @@ async fn leave_group(state: &ShareCoordinatorState) {
     skip_all,
     fields(group_id = %state.group_id, member_id = %state.member_id, rejoining)
 )]
-pub(crate) async fn heartbeat_once(
-    state: &ShareCoordinatorState,
-    rejoining: bool,
-) -> HeartbeatOutcome {
+pub async fn heartbeat_once(state: &ShareCoordinatorState, rejoining: bool) -> HeartbeatOutcome {
     let epoch = *state.member_epoch.lock().await;
-    let subscribed = if rejoining {
-        Some(state.subscribe.clone())
-    } else {
-        None
-    };
+    let subscribed = rejoining.then(|| state.subscribe.clone());
     let result = state
         .client
         .send(build_heartbeat_request(
@@ -260,6 +256,7 @@ fn hex_topic_id(id: WireUuid) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        mem,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -275,6 +272,7 @@ mod tests {
             api_versions_request,
             api_versions_response::{ApiVersion, ApiVersionsResponse},
             common::share_group_heartbeat_response::topic_partitions::TopicPartitions,
+            sasl_handshake_request::API_KEY,
             share_group_heartbeat_request,
         },
         tagged_fields::UnknownTaggedFields,
@@ -328,7 +326,8 @@ mod tests {
                 panic!("unexpected API key {api_key}");
             }
         })
-        .await;
+        .await
+        .unwrap();
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
             .client_id("share-leave-timeout-test")
@@ -349,7 +348,7 @@ mod tests {
             poll_error: coordinator::PollErrorSlot::default(),
         };
 
-        tokio::time::timeout(Duration::from_secs(1), leave_group(&state))
+        timeout(Duration::from_secs(1), leave_group(&state))
             .await
             .expect("configured leave deadline bounds shutdown");
 
@@ -359,7 +358,7 @@ mod tests {
 
     async fn state() -> ShareCoordinatorState {
         let mut names = HashMap::new();
-        names.insert(id(7), "topic-a".to_string());
+        names.insert(id(7), "topic-a".to_owned());
         ShareCoordinatorState {
             client: Client::builder()
                 .bootstrap("127.0.0.1:1")
@@ -435,8 +434,7 @@ mod tests {
             ("transient", 17, HeartbeatOutcome::Transient),
         ] {
             assert2::assert!(
-                std::mem::discriminant(&heartbeat_result(code))
-                    == std::mem::discriminant(&expected)
+                mem::discriminant(&heartbeat_result(code)) == mem::discriminant(&expected)
             );
         }
     }
@@ -500,12 +498,16 @@ mod tests {
         let counter = Arc::clone(&handshakes);
         let answer = MockSaslAnswer::AuthenticateError(58);
         let mock = MockBroker::start_with_replies(move |api_key, version, _corr, _body| {
-            if api_key == krabka_protocol::owned::sasl_handshake_request::API_KEY {
+            if api_key == API_KEY {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
-            answer.reply(api_key, version).unwrap_or(MockReply::Silent)
+            answer
+                .reply(api_key, version)
+                .unwrap()
+                .unwrap_or(MockReply::Silent)
         })
-        .await;
+        .await
+        .unwrap();
         let client = |bootstrap: String| async move {
             Client::builder()
                 .bootstrap(bootstrap)

@@ -7,8 +7,9 @@
 //! `AdminError::Connect` with the last cause. A rejected authentication stops
 //! the bootstrap at once, as Kafka's `AdminMetadataManager` makes an
 //! `AuthenticationException` fatal.
+#![cfg(test)]
 
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr};
 
 use assert2::assert;
 use bytes::BytesMut;
@@ -20,7 +21,7 @@ use krabka_client_core::{
 use krabka_protocol::{
     Encode,
     owned::{
-        sasl_authenticate_request,
+        api_versions_request, sasl_authenticate_request,
         sasl_authenticate_response::{self, SaslAuthenticateResponse},
         sasl_handshake_request,
         sasl_handshake_response::SaslHandshakeResponse,
@@ -41,8 +42,8 @@ const REJECTED_MESSAGE: &str = "Authentication failed: Invalid username or passw
 /// The cause of a failed bootstrap, as a caller classifies it.
 #[derive(Debug, PartialEq, Eq)]
 enum Cause {
-    Unreachable(SocketAddr, std::io::ErrorKind),
-    TlsRejected(SocketAddr, std::io::ErrorKind),
+    Unreachable(SocketAddr, io::ErrorKind),
+    TlsRejected(SocketAddr, io::ErrorKind),
     Rejected(SocketAddr, String),
 }
 
@@ -109,7 +110,8 @@ async fn rejecting_broker() -> MockBroker {
         if let Some(krabka_client_core::MockReply::Respond(body)) =
             krabka_client_core::MockSaslAnswer::Accept
                 .reply(api_key, version)
-                .filter(|_| api_key == krabka_protocol::owned::api_versions_request::API_KEY)
+                .unwrap()
+                .filter(|_| api_key == api_versions_request::API_KEY)
         {
             // The `ApiVersions` v0 that starts the SASL exchange.
             return Some(body);
@@ -139,6 +141,7 @@ async fn rejecting_broker() -> MockBroker {
         Some(bytes.to_vec())
     })
     .await
+    .unwrap()
 }
 
 fn tls() -> ClientSecurity {
@@ -191,7 +194,7 @@ async fn connect_error_keeps_the_last_bootstrap_cause() {
                     None,
                     (
                         Some(1),
-                        Cause::Unreachable(addr, std::io::ErrorKind::ConnectionRefused),
+                        Cause::Unreachable(addr, io::ErrorKind::ConnectionRefused),
                     ),
                 )
             }
@@ -200,10 +203,7 @@ async fn connect_error_keeps_the_last_bootstrap_cause() {
                 (
                     vec![addr],
                     Some(tls()),
-                    (
-                        None,
-                        Cause::TlsRejected(addr, std::io::ErrorKind::InvalidData),
-                    ),
+                    (None, Cause::TlsRejected(addr, io::ErrorKind::InvalidData)),
                 )
             }
             Scenario::RejectedPassword => {

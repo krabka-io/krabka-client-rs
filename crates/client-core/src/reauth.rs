@@ -7,16 +7,17 @@
 //! the lifetime and starts it before the next request that it sends after
 //! that time (`KafkaChannel.maybeBeginClientReauthentication`).
 
-use std::net::SocketAddr;
+use std::{future::ready, io, net::SocketAddr, time::Duration};
 
 use bytes::BufMut;
 use krabka_ids::{ApiKey, ApiVersion};
+use krabka_protocol::owned::sasl_authenticate_response::SaslAuthenticateResponse;
 use tokio::{sync::RwLock, time::Instant};
 
 use crate::{
     ClientFrameMax, backoff, connection,
     error::ClientError,
-    sasl::{OutboundSaslError, SaslChannel, SaslCredentials, SaslPolicy, SaslSession},
+    sasl::{self, OutboundSaslError, SaslChannel, SaslCredentials, SaslPolicy, SaslSession},
 };
 
 /// Kafka's `ReauthInfo` factor that leaves time for network latency and clock
@@ -27,7 +28,7 @@ const LIFETIME_FACTOR: f64 = 0.85;
 const LIFETIME_JITTER: f64 = 0.10;
 
 /// The SASL state that a connection needs to authenticate again.
-pub(crate) struct Reauth {
+pub struct Reauth {
     addr: SocketAddr,
     creds: SaslCredentials,
     server_name: String,
@@ -70,7 +71,7 @@ impl Reauth {
         C: SaslChannel,
     {
         let mut corr_id = 0;
-        let session = crate::sasl::authenticate(
+        let session = sasl::authenticate(
             channel,
             &self.creds,
             &self.server_name,
@@ -87,17 +88,16 @@ impl Reauth {
 /// factor from 0.85 to 0.95, as Kafka's
 /// `ReauthInfo.setAuthenticationEndAndSessionReauthenticationTimes` picks it.
 /// `unit` is a random value in `[0, 1)`.
-pub(crate) fn due_time(session: &SaslSession, unit: f64) -> Option<Instant> {
+pub fn due_time(session: &SaslSession, unit: f64) -> Option<Instant> {
     if !session.needs_reauthentication() {
         return None;
     }
-    let lifetime =
-        std::time::Duration::from_millis(u64::try_from(session.session_lifetime_ms?).ok()?);
-    Some(Instant::now() + lifetime.mul_f64(LIFETIME_FACTOR + unit * LIFETIME_JITTER))
+    let lifetime = Duration::from_millis(u64::try_from(session.session_lifetime_ms?).ok()?);
+    Some(Instant::now() + lifetime.mul_f64(unit.mul_add(LIFETIME_JITTER, LIFETIME_FACTOR)))
 }
 
 /// The request path of a re-authentication: the connection's own dispatch.
-pub(crate) struct ConnectionChannel<'a> {
+pub struct ConnectionChannel<'a> {
     pub(crate) connection: &'a crate::Connection,
 }
 
@@ -111,7 +111,8 @@ impl SaslChannel for ConnectionChannel<'_> {
     ) -> Result<Vec<u8>, OutboundSaslError> {
         let mut frame = self
             .connection
-            .request_header(api_key, api_version, corr_id, flexible);
+            .request_header(api_key, api_version, corr_id, flexible)
+            .map_err(channel_error)?;
         frame.put_slice(body);
         let response = self
             .connection
@@ -132,15 +133,10 @@ impl SaslChannel for ConnectionChannel<'_> {
         &mut self,
         _token: &[u8],
         _frame_max: ClientFrameMax,
-    ) -> impl Future<
-        Output = Result<
-            krabka_protocol::owned::sasl_authenticate_response::SaslAuthenticateResponse,
-            OutboundSaslError,
-        >,
-    > + Send {
+    ) -> impl Future<Output = Result<SaslAuthenticateResponse, OutboundSaslError>> + Send {
         // A session lifetime needs `SaslAuthenticate` v1 or later, so a
         // re-authentication never sends a token without a Kafka header.
-        std::future::ready(Err(OutboundSaslError::Codec(
+        ready(Err(OutboundSaslError::Codec(
             "re-authentication needs SaslAuthenticate".to_owned(),
         )))
     }
@@ -149,7 +145,7 @@ impl SaslChannel for ConnectionChannel<'_> {
 fn channel_error(error: ClientError) -> OutboundSaslError {
     match error {
         ClientError::Io(error) => OutboundSaslError::Io(error),
-        error => OutboundSaslError::Io(std::io::Error::other(error.to_string())),
+        error => OutboundSaslError::Io(io::Error::other(error.to_string())),
     }
 }
 

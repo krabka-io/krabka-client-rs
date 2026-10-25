@@ -9,6 +9,7 @@
 //! This suite proves the `krabka-protocol` decode path that
 //! `Consumer::poll` uses. It needs no broker and no container, so it carries
 //! no `#[ignore]` and CI runs it on every build.
+#![cfg(test)]
 
 use assert2::assert;
 use bytes::{Bytes, BytesMut};

@@ -31,7 +31,10 @@ use std::{sync::Arc, time::Duration};
 
 use krabka_protocol::ProtocolRequest;
 use krabka_units::{Time, convert::TimeExt as _};
-use tokio::{sync::watch, time::Instant};
+use tokio::{
+    sync::watch,
+    time::{self, Instant, sleep},
+};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use self::metrics::ConnectionMetrics;
@@ -43,7 +46,7 @@ use self::{
     otlp::{KeyValue, Resource},
     sender::{Failure, TelemetryRequest, TelemetrySender, TelemetryState},
 };
-use crate::{connection::Connection, error::ClientError};
+use crate::{backoff, connection::Connection, error::ClientError};
 
 /// The kind of client, which names its metric group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +206,7 @@ impl ClientTelemetry {
     /// returns an empty `Optional`. A zero `timeout` does not wait.
     pub async fn client_instance_id(&self, timeout: Duration) -> Option<uuid::Uuid> {
         let mut loaded = self.instance_id.subscribe();
-        tokio::time::timeout(timeout, loaded.wait_for(Option::is_some))
+        time::timeout(timeout, loaded.wait_for(Option::is_some))
             .await
             .ok()
             .and_then(Result::ok)
@@ -227,7 +230,9 @@ impl Drop for ClientTelemetry {
 }
 
 /// Kafka's `clientInstanceId` of a producer, consumer or admin client
-/// (`ClientTelemetryUtils.fetchClientInstanceId`): the broker-assigned
+/// (`ClientTelemetryUtils.fetchClientInstanceId`).
+///
+/// The broker-assigned
 /// client instance id, waiting up to `timeout` for the first subscription.
 /// `Ok(None)` when none has loaded by then, as Kafka returns `null`.
 ///
@@ -278,7 +283,7 @@ async fn run(
             _ if closing.is_some() => break,
             Some(wait) => {
                 tokio::select! {
-                    () = tokio::time::sleep(wait) => {}
+                    () = sleep(wait) => {}
                     () = close.cancelled() => {}
                 }
                 continue;
@@ -288,13 +293,14 @@ async fn run(
                 continue;
             }
         }
-        let Some((broker_id, connection)) = connections.open_connection(sticky) else {
+        let open = connections.open_connection(sticky);
+        let Some((broker_id, connection)) = open else {
             sticky = None;
             if closing.is_some() {
                 break;
             }
             tokio::select! {
-                () = tokio::time::sleep(timing.reconnect_backoff) => {}
+                () = sleep(timing.reconnect_backoff) => {}
                 () = close.cancelled() => {}
             }
             continue;
@@ -309,7 +315,7 @@ async fn run(
                     sender.handle_subscriptions_response(
                         &response,
                         Instant::now(),
-                        crate::backoff::random_unit(),
+                        backoff::random_unit(),
                     );
                     // Kafka's `subscriptionLoaded.signalAll()`.
                     let loaded = sender

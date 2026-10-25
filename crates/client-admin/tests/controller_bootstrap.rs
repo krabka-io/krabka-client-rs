@@ -11,17 +11,22 @@
 //!   `UNSUPPORTED_ENDPOINT_TYPE` (115). Replication-factor reconciliation has
 //!   its own 115 preflight, because it needs a broker bootstrap.
 //! - A 115 rejection sends nothing, so the controller connection stays usable.
+#![cfg(test)]
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU16, Ordering},
+use std::{
+    fmt::Debug,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU16, Ordering},
+    },
 };
 
 use assert2::assert;
 use bytes::BytesMut;
 use krabka_client_admin::{
-    AdminClient, AdminError, Config, ConfigEntry, ConfigResource, ConfigSource, ConfigType,
-    CreateTopicSpec, DescribeConfigsOptions, DescribeConfigsResults, TopicMutationOptions,
+    AdminClient, AdminClientLike as _, AdminError, Config, ConfigEntry, ConfigResource,
+    ConfigSource, ConfigType, CreateTopicSpec, DescribeConfigsOptions, DescribeConfigsResults,
+    TopicMutationOptions,
 };
 use krabka_client_core::MockBroker;
 use krabka_protocol::{
@@ -108,6 +113,7 @@ async fn start_broker_listener() -> MockBroker {
         _ => None,
     })
     .await
+    .unwrap()
 }
 
 /// A controller listener that advertises `DescribeCluster` and
@@ -174,7 +180,8 @@ impl ControllerListener {
                 _ => None,
             }
         })
-        .await;
+        .await
+        .unwrap();
         port.store(mock.addr.port(), Ordering::SeqCst);
         Self { mock, received }
     }
@@ -202,7 +209,7 @@ fn expected_configs() -> DescribeConfigsResults {
     }
 }
 
-async fn describe_topic(admin: &AdminClient) -> DescribeConfigsResults {
+async fn describe_topic(admin: &mut AdminClient) -> DescribeConfigsResults {
     admin
         .describe_configs(
             &[ConfigResource::topic(TOPIC)],
@@ -213,7 +220,7 @@ async fn describe_topic(admin: &AdminClient) -> DescribeConfigsResults {
 }
 
 /// Asserts a local 115 rejection and returns its message.
-fn unsupported_endpoint_message<T: std::fmt::Debug>(result: Result<T, AdminError>) -> String {
+fn unsupported_endpoint_message<T: Debug>(result: Result<T, AdminError>) -> String {
     let Err(AdminError::Broker {
         api: "ControllerEndpoint",
         code: 115,
@@ -309,7 +316,7 @@ async fn controller_connection_stays_usable_after_rejection() {
     let mut admin = AdminClient::connect_controller(&[controller.mock.addr.to_string()])
         .await
         .unwrap();
-    assert!(describe_topic(&admin).await == expected_configs());
+    assert!(describe_topic(&mut admin).await == expected_configs());
 
     unsupported_endpoint_message(
         admin
@@ -330,7 +337,7 @@ async fn controller_connection_stays_usable_after_rejection() {
     );
     let before = controller.received();
 
-    assert!(describe_topic(&admin).await == expected_configs());
+    assert!(describe_topic(&mut admin).await == expected_configs());
     // The same connection answers: no new ApiVersions or DescribeCluster.
     assert!(controller.received()[before.len()..] == [describe_configs_request::API_KEY]);
     controller.mock.stop();

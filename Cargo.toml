@@ -16,10 +16,106 @@ repository = "https://github.com/krabka-io/krabka-client-rs"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-# These three opt-outs are intentional while the public API is still pre-1.0;
-# re-evaluate once API surfaces stabilise.
-clone_on_copy = "warn"
+# Every lint below is an error. The groups sit at priority -1 so that the
+# single lints after them take precedence. `clippy.toml` holds their settings.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+
+# Restriction lints. Clippy leaves these off by default; each one is opted in.
+#
+# Imports and naming.
+absolute_paths = "deny"
+str_to_string = "deny"
+# Panics in shipped code. `clippy.toml` exempts test code.
+expect_used = "deny"
+indexing_slicing = "deny"
+unwrap_used = "deny"
+# Placeholders and debugging left behind.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Lost errors, leaks and surprising evaluation.
+assertions_on_result_states = "deny"
+infinite_loop = "deny"
+lossy_float_literal = "deny"
+mem_forget = "deny"
+mixed_read_write_in_expression = "deny"
+precedence_bits = "deny"
+string_slice = "deny"
+suspicious_xor_used_as_pow = "deny"
+try_err = "deny"
+unused_result_ok = "deny"
+# Shared ownership.
+clone_on_ref_ptr = "deny"
+mutex_atomic = "deny"
+rc_buffer = "deny"
+rc_mutex = "deny"
+# Simpler or clearer equivalents.
+as_underscore = "deny"
+cfg_not_test = "deny"
+doc_include_without_cfg = "deny"
+empty_drop = "deny"
+empty_enum_variants_with_brackets = "deny"
+empty_structs_with_brackets = "deny"
+filetype_is_file = "deny"
+fn_to_numeric_cast_any = "deny"
+format_push_string = "deny"
+get_unwrap = "deny"
+if_then_some_else_none = "deny"
+large_include_file = "deny"
+map_with_unused_argument_over_ranges = "deny"
+needless_raw_strings = "deny"
+non_zero_suggestions = "deny"
+pathbuf_init_then_push = "deny"
+redundant_type_annotations = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+return_and_then = "deny"
+same_name_method = "deny"
+string_lit_chars_any = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_self_imports = "deny"
+unneeded_field_pattern = "deny"
+verbose_file_reads = "deny"
+
+# Nursery lints, picked one by one. The whole group has too many false
+# positives to enable.
+branches_sharing_code = "deny"
+collection_is_never_read = "deny"
+debug_assert_with_mut_call = "deny"
+derive_partial_eq_without_eq = "deny"
+equatable_if_let = "deny"
+fallible_impl_from = "deny"
+imprecise_flops = "deny"
+iter_on_single_items = "deny"
+literal_string_with_formatting_args = "deny"
+needless_collect = "deny"
+needless_pass_by_ref_mut = "deny"
+non_send_fields_in_send_ty = "deny"
+option_if_let_else = "deny"
+or_fun_call = "deny"
+path_buf_push_overwrite = "deny"
+read_zero_byte_vec = "deny"
+redundant_clone = "deny"
+redundant_pub_crate = "deny"
+set_contains_or_insert = "deny"
+significant_drop_in_scrutinee = "deny"
+significant_drop_tightening = "deny"
+string_lit_as_bytes = "deny"
+suboptimal_flops = "deny"
+too_long_first_doc_paragraph = "deny"
+trait_duplication_in_bounds = "deny"
+tuple_array_conversions = "deny"
+type_repetition_in_bounds = "deny"
+unused_peekable = "deny"
+use_self = "deny"
+useless_let_if_seq = "deny"
+
+# Cargo lints, picked one by one. The whole group also flags duplicate
+# versions deep in the dependency tree, which no change here can fix.
+negative_feature_names = "deny"
+redundant_feature_names = "deny"
+wildcard_dependencies = "deny"
 
 [profile.mutants]
 inherits = "test"

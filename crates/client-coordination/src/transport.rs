@@ -44,7 +44,7 @@ pub type RoleRecords = Vec<(i64, CoordinationKey, CoordinationRecord)>;
 /// The cluster operations that the coordination client performs.
 ///
 /// A caller that wants the real cluster uses
-/// [`broker::BrokerTransport`]. A test uses the generated
+/// [`BrokerTransport`](crate::broker::BrokerTransport). A test uses the generated
 /// `MockCoordinationTransport`.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]

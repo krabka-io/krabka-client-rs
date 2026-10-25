@@ -13,15 +13,17 @@
 //! never reports.
 //!
 //! The case needs the container, so it carries `#[ignore]`.
+#![cfg(test)]
 
 mod support;
 
 use std::{collections::BTreeMap, time::Duration};
 
 use assert2::assert;
-use krabka_client_admin::{AdminClient, LogDirInfo, TopicPartitionReplica};
+use krabka_client_admin::{AdminClient, AdminClientLike as _, LogDirInfo, TopicPartitionReplica};
 use testcontainers::ImageExt as _;
 use testcontainers_modules::kafka::Kafka;
+use tokio::time::{sleep, timeout};
 
 /// The first `log.dirs` entry, which is the default of the image.
 const PRIMARY_LOG_DIR: &str = "/var/lib/kafka/data";
@@ -153,14 +155,14 @@ async fn assert_filtered_report(admin: &mut AdminClient, topic: &str) {
 /// a poll of progress that this task makes. The broker copies the log segments
 /// in its own time and gives this side no signal to await.
 async fn await_partitions(admin: &mut AdminClient, topic: &str, in_dir: Option<&str>, what: &str) {
-    tokio::time::timeout(SETTLE_TIMEOUT, async {
+    timeout(SETTLE_TIMEOUT, async {
         loop {
             let report = describe(admin, None).await;
             let (current, any_future) = partitions_of(&report, topic, in_dir);
             if !any_future && current == vec![0, 1] {
                 break;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            sleep(POLL_INTERVAL).await;
         }
     })
     .await

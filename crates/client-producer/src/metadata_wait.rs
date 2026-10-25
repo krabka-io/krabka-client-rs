@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     future::Future,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -25,7 +25,11 @@ use krabka_protocol::{
     },
     primitives::uuid::Uuid,
 };
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+    sync::{Mutex, MutexGuard},
+    time::{self, Instant},
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::ProducerError,
@@ -48,7 +52,7 @@ const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 /// waiter that finds a response newer than its last look uses that response
 /// when the request named its topic, and does not send a request of its own.
 #[derive(Debug, Default)]
-pub(crate) struct MetadataRefresh {
+pub struct MetadataRefresh {
     /// The number of responses stored in `last`. A waiter reads it before it
     /// looks at the cache, so it can see a response that came after that look.
     generation: AtomicU64,
@@ -57,10 +61,10 @@ pub(crate) struct MetadataRefresh {
     last: Mutex<Option<Refreshed>>,
     /// The topics that the requests name. The lock is never held across an
     /// `.await`.
-    topics: std::sync::Mutex<ProducerTopics>,
+    topics: StdMutex<ProducerTopics>,
     /// Cancelled when the producer drops this value, so the periodic refresh
     /// task ends with the producer.
-    dropped: tokio_util::sync::CancellationToken,
+    dropped: CancellationToken,
 }
 
 impl Drop for MetadataRefresh {
@@ -104,7 +108,7 @@ impl ProducerTopics {
 /// The `Metadata` request for `topics`. Kafka's `ProducerMetadata` builds
 /// `new MetadataRequest.Builder(topics, true)`, so the broker may create a
 /// topic that does not exist.
-pub(crate) fn metadata_request(topics: Vec<String>) -> MetadataRequest {
+pub fn metadata_request(topics: Vec<String>) -> MetadataRequest {
     MetadataRequest {
         topics: Some(
             topics
@@ -122,7 +126,7 @@ pub(crate) fn metadata_request(topics: Vec<String>) -> MetadataRequest {
 
 impl MetadataRefresh {
     /// A token that is cancelled when this value drops.
-    pub(crate) fn dropped(&self) -> tokio_util::sync::CancellationToken {
+    pub(crate) fn dropped(&self) -> CancellationToken {
         self.dropped.clone()
     }
 
@@ -130,10 +134,8 @@ impl MetadataRefresh {
         self.generation.load(Ordering::Acquire)
     }
 
-    fn topics(&self) -> std::sync::MutexGuard<'_, ProducerTopics> {
-        self.topics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn topics(&self) -> StdMutexGuard<'_, ProducerTopics> {
+        self.topics.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Remove `topics` from the topics that the requests name, as Kafka's
@@ -167,7 +169,7 @@ impl MetadataRefresh {
         F: FnMut(Vec<String>) -> Fut,
         Fut: Future<Output = Result<MetadataResponse, ClientError>>,
     {
-        let mut last = self.last.lock().await;
+        let last = self.last.lock().await;
         let current = self.generation();
         if current != *seen
             && let Some(refreshed) = last.as_ref()
@@ -176,6 +178,22 @@ impl MetadataRefresh {
             *seen = current;
             return Ok(Arc::clone(&refreshed.response));
         }
+        // The lock on `last` stays held across the refresh.
+        self.send_refresh(last, seen, refresh).await
+    }
+
+    /// Send a refresh while holding the lock on `last`, and keep its response
+    /// as the last one.
+    async fn send_refresh<F, Fut>(
+        &self,
+        mut last: MutexGuard<'_, Option<Refreshed>>,
+        seen: &mut u64,
+        refresh: &mut F,
+    ) -> Result<Arc<MetadataResponse>, ClientError>
+    where
+        F: FnMut(Vec<String>) -> Fut,
+        Fut: Future<Output = Result<MetadataResponse, ClientError>>,
+    {
         let topics = self.topics().next_request();
         match refresh(topics.clone()).await {
             Ok(response) => {
@@ -262,13 +280,13 @@ fn stops_the_wait(error: &ClientError) -> bool {
 /// Run `future` until `deadline`. No deadline means no limit.
 async fn before<F: Future>(deadline: Option<Instant>, future: F) -> Option<F::Output> {
     match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, future).await.ok(),
+        Some(deadline) => time::timeout_at(deadline, future).await.ok(),
         None => Some(future.await),
     }
 }
 
 /// The state and limits of one producer's metadata waits.
-pub(crate) struct MetadataWait<'a> {
+pub struct MetadataWait<'a> {
     pub cache: &'a MetadataCache,
     pub partition_leaders: &'a DashMap<(String, i32), i32>,
     pub refresh: &'a MetadataRefresh,
@@ -353,10 +371,7 @@ impl MetadataWait<'_> {
                 Err(error) if stops_the_wait(&error) => return Err(ProducerError::Client(error)),
                 Err(_) => {}
             }
-            if before(deadline, tokio::time::sleep(backoff))
-                .await
-                .is_none()
-            {
+            if before(deadline, time::sleep(backoff)).await.is_none() {
                 return Err(timeout(known));
             }
             backoff = backoff.saturating_mul(2).min(self.max_backoff);
@@ -433,10 +448,7 @@ impl MetadataWait<'_> {
                     }
                     Err(_) => {}
                 }
-                if before(deadline, tokio::time::sleep(backoff))
-                    .await
-                    .is_none()
-                {
+                if before(deadline, time::sleep(backoff)).await.is_none() {
                     return Err(timeout());
                 }
                 backoff = backoff.saturating_mul(2).min(self.max_backoff);
@@ -475,9 +487,11 @@ impl MetadataWait<'_> {
 mod tests {
     use std::{
         collections::VecDeque,
+        io, iter,
         sync::atomic::{AtomicUsize, Ordering},
     };
 
+    use futures::future::join_all;
     use krabka_client_core::{AuthenticationError, OutboundSaslError, SaslAuthenticationError};
     use krabka_protocol::{
         owned::metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
@@ -538,14 +552,14 @@ mod tests {
     /// A refresh that gives the scripted answers in order, and repeats the
     /// last one.
     struct Script {
-        answers: std::sync::Mutex<VecDeque<Answer>>,
+        answers: StdMutex<VecDeque<Answer>>,
         refreshes: AtomicUsize,
     }
 
     impl Script {
         fn new(answers: Vec<Answer>) -> Self {
             Self {
-                answers: std::sync::Mutex::new(answers.into()),
+                answers: StdMutex::new(answers.into()),
                 refreshes: AtomicUsize::new(0),
             }
         }
@@ -566,7 +580,7 @@ mod tests {
                     partitions,
                 } => Ok(response(error_code, partitions)),
                 Answer::Silent => {
-                    tokio::time::sleep(REQUEST_TIMEOUT).await;
+                    time::sleep(REQUEST_TIMEOUT).await;
                     Err(ClientError::Timeout(secs(1)))
                 }
                 Answer::Fails(error) => Err(error()),
@@ -727,8 +741,8 @@ mod tests {
                 vec![
                     Answer::Fails(|| ClientError::Sasl {
                         addr: ADDR.parse().expect("address"),
-                        source: OutboundSaslError::Io(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
+                        source: OutboundSaslError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
                             "eof",
                         )),
                     }),
@@ -873,8 +887,8 @@ mod tests {
                 "a TLS rejection stops the wait",
                 vec![Answer::Fails(|| ClientError::Authentication {
                     addr: ADDR.parse().expect("address"),
-                    source: AuthenticationError::Tls(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                    source: AuthenticationError::Tls(io::Error::new(
+                        io::ErrorKind::InvalidData,
                         "bad certificate",
                     )),
                 })],
@@ -909,7 +923,7 @@ mod tests {
                 vec![
                     Answer::Fails(|| ClientError::Tls {
                         addr: ADDR.parse().expect("address"),
-                        source: std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
+                        source: io::Error::new(io::ErrorKind::ConnectionReset, "reset"),
                     }),
                     topic(0, 1),
                 ],
@@ -972,17 +986,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_refresh_names_the_topics_of_the_producer() {
         let state = Producerless::new();
-        let requests = std::sync::Mutex::new(Vec::new());
+        let requests = StdMutex::new(Vec::new());
         let refresh = |topics: Vec<String>| {
             let answer = {
                 let mut requests = requests.lock().expect("requests");
                 requests.push(topics.clone());
+                let listing = requests.len();
+                drop(requests);
                 MetadataResponse {
                     topics: topics
                         .iter()
                         .map(|name| {
                             // `payments` has no leader on its first listing.
-                            let pending = name == "payments" && requests.len() == 2;
+                            let pending = name == "payments" && listing == 2;
                             MetadataResponseTopic {
                                 error_code: if pending { LEADER_NOT_AVAILABLE } else { 0 },
                                 name: Some(name.clone()),
@@ -1060,8 +1076,8 @@ mod tests {
         let state = Producerless::new();
         let script = Script::new(vec![topic(UNKNOWN_TOPIC_OR_PARTITION, 0), topic(0, 6)]);
         let wait = state.wait(Duration::from_mins(1));
-        let results = futures::future::join_all(
-            (0..8).map(|_| wait.partition_count(TOPIC, None, |_| script.refresh())),
+        let results = join_all(
+            iter::repeat_with(|| wait.partition_count(TOPIC, None, |_| script.refresh())).take(8),
         )
         .await
         .into_iter()
@@ -1220,8 +1236,8 @@ mod tests {
                     );
                 }
             }
-            let answers = std::sync::Mutex::new(VecDeque::from(answers));
-            let requests = std::sync::Mutex::new(Vec::new());
+            let answers = StdMutex::new(VecDeque::from(answers));
+            let requests = StdMutex::new(Vec::new());
             let refresh = |topics: Vec<String>| {
                 requests.lock().expect("requests").push(topics.clone());
                 let answer = {
@@ -1259,7 +1275,7 @@ mod tests {
                             ..Default::default()
                         }),
                         IdAnswer::Silent => {
-                            tokio::time::sleep(REQUEST_TIMEOUT).await;
+                            time::sleep(REQUEST_TIMEOUT).await;
                             Err(ClientError::Timeout(secs(1)))
                         }
                         IdAnswer::Fails(error) => Err(error()),

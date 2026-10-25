@@ -22,7 +22,7 @@ use tokio::time::Instant;
 use super::metrics::{Collector, MetricSelector};
 
 /// `ClientTelemetryReporter.DEFAULT_PUSH_INTERVAL_MS`.
-pub(crate) const DEFAULT_PUSH_INTERVAL: Duration = Duration::from_mins(5);
+pub const DEFAULT_PUSH_INTERVAL: Duration = Duration::from_mins(5);
 const DEFAULT_PUSH_INTERVAL_MS: i32 = 5 * 60 * 1000;
 
 /// The bounds of the factor on the push interval before the first push of a
@@ -84,8 +84,8 @@ impl TelemetryState {
 
 /// The subscription of the last `GetTelemetrySubscriptions` response
 /// (`ClientTelemetrySubscription`).
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Subscription {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subscription {
     pub(crate) client_instance_id: Uuid,
     pub(crate) id: i32,
     pub(crate) push_interval_ms: i32,
@@ -97,7 +97,7 @@ pub(crate) struct Subscription {
 
 /// The wait after an error code (`ClientTelemetryUtils.maybeFetchErrorIntervalMs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ErrorInterval {
+pub enum ErrorInterval {
     /// The error cannot be resolved by a retry: telemetry stops.
     Disable,
     /// Fetch the subscription again after this wait.
@@ -105,10 +105,7 @@ pub(crate) enum ErrorInterval {
 }
 
 /// `maybeFetchErrorIntervalMs`: `None` for no error.
-pub(crate) fn error_interval(
-    error_code: i16,
-    push_interval_ms: Option<i32>,
-) -> Option<ErrorInterval> {
+pub fn error_interval(error_code: i16, push_interval_ms: Option<i32>) -> Option<ErrorInterval> {
     match error_code {
         0 => None,
         INVALID_REQUEST | INVALID_RECORD | UNSUPPORTED_VERSION => Some(ErrorInterval::Disable),
@@ -134,7 +131,7 @@ fn millis(ms: i32) -> Duration {
 
 /// How a telemetry request failed without a response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Failure {
+pub enum Failure {
     /// A disconnect or a timeout: Kafka's `RetriableException`.
     Retriable,
     /// The broker does not support the API, or another error that a retry
@@ -143,15 +140,15 @@ pub(crate) enum Failure {
 }
 
 /// A telemetry request to send.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum TelemetryRequest {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TelemetryRequest {
     Subscriptions(GetTelemetrySubscriptionsRequest),
     Push(PushTelemetryRequest),
 }
 
 /// Kafka's `DefaultClientTelemetrySender`.
 #[derive(Debug)]
-pub(crate) struct TelemetrySender {
+pub struct TelemetrySender {
     state: TelemetryState,
     subscription: Option<Subscription>,
     /// When the last request was made or its response handled. `None`

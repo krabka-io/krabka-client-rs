@@ -15,6 +15,7 @@
 //! ```text
 //! cargo test -p krabka-client-consumer --test headers -- --ignored --nocapture
 //! ```
+#![cfg(test)]
 
 mod support;
 
@@ -82,6 +83,7 @@ async fn consumer_record_carries_headers() {
         .await
         .expect("producer ack");
     producer.flush().await.expect("producer flush");
+    drop(producer);
 
     let mut consumer = Consumer::builder()
         .bootstrap(bootstrap.as_str())

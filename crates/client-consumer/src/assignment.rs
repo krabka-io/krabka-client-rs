@@ -10,11 +10,16 @@
 //! `refreshCommittedOffsetsIfNeeded` and `resetInitializingPositions`).
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::{consumer::Consumer, error::ConsumerError, poll::COMMITTED_SENTINEL};
+use crate::{
+    consumer::{CommitIdentity, Consumer},
+    error::ConsumerError,
+    poll::COMMITTED_SENTINEL,
+    position::PartitionPosition,
+};
 
 /// Ownership ids of manual assignments. They start far above the ids of
 /// group assignments, and they never repeat, so a commit that waits across
@@ -62,35 +67,12 @@ impl Consumer {
             // coordinator task publishes an assignment.
             let mut assigned = self.assigned.lock().await;
             let mut identity = self.commit_identity.lock().await;
-            let added = wanted
-                .iter()
-                .filter(|partition| !assigned.contains(*partition))
-                .cloned()
-                .collect();
-            identity
-                .ownership_ids
-                .retain(|partition, _| wanted_set.contains(partition));
-            for partition in &wanted {
-                identity
-                    .ownership_ids
-                    .entry(partition.clone())
-                    .or_insert_with(|| MANUAL_OWNERSHIP_IDS.fetch_add(1, Ordering::Relaxed));
-            }
-            identity.generation = -1;
-            identity.member_id.clear();
-            identity.rejoin_on_poll = false;
-            assigned.clone_from(&wanted);
-            added
+            replace_manual_assignment(&mut assigned, &mut identity, &wanted, &wanted_set)
         };
         {
             let mut offsets = self.next_offsets.lock().await;
             let mut positions = self.positions.lock().await;
-            offsets.retain(|partition, _| wanted_set.contains(partition));
-            positions.retain(|partition, _| wanted_set.contains(partition));
-            for partition in added {
-                offsets.insert(partition.clone(), COMMITTED_SENTINEL);
-                positions.entry(partition).or_default();
-            }
+            reset_manual_positions(&mut offsets, &mut positions, &wanted_set, added);
         }
         self.end_offsets
             .lock()
@@ -99,12 +81,9 @@ impl Consumer {
         self.current_generation.store(-1, Ordering::Release);
         // Kafka's `assignFromUser` changes the metadata topics to the topics of
         // the assignment.
-        self.client.metadata_topics().set(
-            wanted
-                .iter()
-                .map(|(topic, _)| topic.clone())
-                .collect::<BTreeSet<_>>(),
-        );
+        self.client
+            .metadata_topics()
+            .set(wanted.iter().map(|(topic, _)| topic.clone()));
         self.subscription.send_if_modified(|subscription| {
             let manual = !wanted.is_empty();
             let changed = subscription.manual_assignment != manual;
@@ -133,5 +112,53 @@ impl Consumer {
             ));
         }
         Ok(())
+    }
+}
+
+/// Replace the manual assignment `assigned` with `wanted`, and give `identity`
+/// the generation `-1` ownership of `wanted`. The caller holds both locks for
+/// the whole change. Returns the partitions that `wanted` adds.
+fn replace_manual_assignment(
+    assigned: &mut Vec<(String, i32)>,
+    identity: &mut CommitIdentity,
+    wanted: &[(String, i32)],
+    wanted_set: &HashSet<(String, i32)>,
+) -> Vec<(String, i32)> {
+    let added = wanted
+        .iter()
+        .filter(|partition| !assigned.contains(*partition))
+        .cloned()
+        .collect();
+    identity
+        .ownership_ids
+        .retain(|partition, _| wanted_set.contains(partition));
+    for partition in wanted {
+        identity
+            .ownership_ids
+            .entry(partition.clone())
+            .or_insert_with(|| MANUAL_OWNERSHIP_IDS.fetch_add(1, Ordering::Relaxed));
+    }
+    identity.generation = -1;
+    identity.member_id.clear();
+    identity.rejoin_on_poll = false;
+    assigned.clear();
+    assigned.extend_from_slice(wanted);
+    added
+}
+
+/// Drop the offsets and positions of the partitions outside `wanted_set`, and
+/// start each `added` partition at its committed offset. The caller holds both
+/// locks for the whole change.
+fn reset_manual_positions(
+    offsets: &mut HashMap<(String, i32), i64>,
+    positions: &mut HashMap<(String, i32), PartitionPosition>,
+    wanted_set: &HashSet<(String, i32)>,
+    added: Vec<(String, i32)>,
+) {
+    offsets.retain(|partition, _| wanted_set.contains(partition));
+    positions.retain(|partition, _| wanted_set.contains(partition));
+    for partition in added {
+        offsets.insert(partition.clone(), COMMITTED_SENTINEL);
+        positions.entry(partition).or_default();
     }
 }

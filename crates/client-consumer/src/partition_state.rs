@@ -4,13 +4,22 @@
 //! These are Kafka's `KafkaConsumer.pause`, `resume`, `paused`, `position` and
 //! `committed`.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Mutex, PoisonError},
+};
 
 use krabka_units::convert::TimeExt as _;
+use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::{
-    commit::OffsetAndMetadata, consumer::Consumer, coordinator::CoordinatorRetryPolicy,
-    error::ConsumerError, offset_wire, poll::is_reset_sentinel,
+    commit::OffsetAndMetadata,
+    consumer::Consumer,
+    coordinator::{CoordinatorRetryPolicy, send_offset_fetch},
+    error::ConsumerError,
+    offset_wire,
+    poll::is_reset_sentinel,
+    position::with_offsets_and_positions,
 };
 
 /// Paused partitions, with the ownership of each partition at the pause.
@@ -21,7 +30,7 @@ use crate::{
 /// (`SubscriptionState.assignFromSubscribed`). The ownership id changes in the
 /// same cases, so a pause is in effect only while the ownership id is the one
 /// of the pause.
-pub(crate) type PausedPartitions = std::sync::Mutex<HashMap<(String, i32), u64>>;
+pub type PausedPartitions = Mutex<HashMap<(String, i32), u64>>;
 
 impl Consumer {
     /// Stop fetching from `partitions`. Kafka's `KafkaConsumer.pause`.
@@ -46,7 +55,7 @@ impl Consumer {
         }
         self.paused
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .extend(paused);
         Ok(())
     }
@@ -65,13 +74,10 @@ impl Consumer {
         {
             return Err(no_current_assignment(partition));
         }
-        let mut paused = self
-            .paused
+        self.paused
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for partition in partitions {
-            paused.remove(partition);
-        }
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|partition, _| !partitions.contains(partition));
         Ok(())
     }
 
@@ -87,10 +93,7 @@ impl Consumer {
         &self,
         ownership_ids: &HashMap<(String, i32), u64>,
     ) -> HashSet<(String, i32)> {
-        let mut paused = self
-            .paused
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut paused = self.paused.lock().unwrap_or_else(PoisonError::into_inner);
         paused.retain(|partition, ownership_id| ownership_ids.get(partition) == Some(ownership_id));
         paused.keys().cloned().collect()
     }
@@ -113,7 +116,7 @@ impl Consumer {
         partition: i32,
     ) -> Result<i64, ConsumerError> {
         let key = (topic.into(), partition);
-        let deadline = tokio::time::Instant::now() + self.default_api_timeout.to_std();
+        let deadline = Instant::now() + self.default_api_timeout.to_std();
         let wait = async {
             loop {
                 if !self.assigned.lock().await.contains(&key) {
@@ -124,33 +127,32 @@ impl Consumer {
                 }
                 self.update_fetch_positions(None, Some(deadline)).await?;
                 if self.valid_position(&key).await.is_none() {
-                    tokio::time::sleep(self.retry_policy.initial_backoff).await;
+                    sleep(self.retry_policy.initial_backoff).await;
                 }
             }
         };
         // The timeout bounds the requests too, as Kafka's `position` passes
         // its timer to `updateFetchPositions` and `client.poll`.
-        tokio::time::timeout_at(deadline, wait)
-            .await
-            .unwrap_or_else(|_| {
-                Err(ConsumerError::timeout(format!(
-                    "the position for partition {}-{} could not be determined",
-                    key.0, key.1
-                )))
-            })
+        timeout_at(deadline, wait).await.unwrap_or_else(|_| {
+            Err(ConsumerError::timeout(format!(
+                "the position for partition {}-{} could not be determined",
+                key.0, key.1
+            )))
+        })
     }
 
     /// The position of `key` when it is valid: Kafka's
     /// `SubscriptionState.validPosition`. A position that waits for a reset or
     /// for validation is not valid.
     async fn valid_position(&self, key: &(String, i32)) -> Option<i64> {
-        let offsets = self.next_offsets.lock().await;
-        let positions = self.positions.lock().await;
-        let offset = *offsets.get(key)?;
-        let awaiting_validation = positions
-            .get(key)
-            .is_some_and(|position| position.awaiting_validation);
-        (!is_reset_sentinel(offset) && !awaiting_validation).then_some(offset)
+        with_offsets_and_positions(&self.next_offsets, &self.positions, |offsets, positions| {
+            let offset = *offsets.get(key)?;
+            let awaiting_validation = positions
+                .get(key)
+                .is_some_and(|position| position.awaiting_validation);
+            (!is_reset_sentinel(offset) && !awaiting_validation).then_some(offset)
+        })
+        .await
     }
 
     /// The committed offsets of `partitions` in the group. Kafka's
@@ -167,7 +169,7 @@ impl Consumer {
         &self,
         partitions: &[(String, i32)],
     ) -> Result<HashMap<(String, i32), Option<OffsetAndMetadata>>, ConsumerError> {
-        let deadline = tokio::time::Instant::now() + self.default_api_timeout.to_std();
+        let deadline = Instant::now() + self.default_api_timeout.to_std();
         self.committed_until(partitions, deadline).await
     }
 
@@ -175,7 +177,7 @@ impl Consumer {
     pub(crate) async fn committed_until(
         &self,
         partitions: &[(String, i32)],
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<HashMap<(String, i32), Option<OffsetAndMetadata>>, ConsumerError> {
         self.require_group_id()?;
         if partitions.is_empty() {
@@ -186,25 +188,21 @@ impl Consumer {
             by_topic.entry(topic.clone()).or_default().push(*partition);
         }
         let request = offset_wire::build_offset_fetch(&self.group_id, &by_topic);
-        let fetch = crate::coordinator::send_offset_fetch(
+        let fetch = send_offset_fetch(
             &self.client,
             &self.group_id,
             &self.coordinator_id,
             &request,
             CoordinatorRetryPolicy {
-                timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
+                timeout: deadline.saturating_duration_since(Instant::now()),
                 ..self.retry_policy
             },
         );
         // The deadline bounds each request too. Kafka's
         // `fetchCommittedOffsets` gives up when its timer expires.
-        let response = tokio::time::timeout_at(deadline, fetch)
-            .await
-            .map_err(|_| {
-                ConsumerError::timeout(
-                    "the last committed offsets could not be determined".to_owned(),
-                )
-            })??;
+        let response = timeout_at(deadline, fetch).await.map_err(|_| {
+            ConsumerError::timeout("the last committed offsets could not be determined".to_owned())
+        })??;
         let mut committed = offset_wire::parse_committed_offsets(&response);
         committed.retain(|partition, _| partitions.contains(partition));
         for partition in partitions {
@@ -223,7 +221,7 @@ fn no_current_assignment((topic, partition): &(String, i32)) -> ConsumerError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, time::Duration};
 
     use krabka_client_core::{Client, MockBroker};
     use krabka_protocol::{
@@ -238,8 +236,13 @@ mod tests {
         },
     };
     use krabka_units::secs;
+    use tokio::time::Instant;
 
-    use crate::{commit::OffsetAndMetadata, poll::partition_error_tests::consumer_with_client};
+    use crate::{
+        commit::OffsetAndMetadata,
+        poll::{BEGINNING_SENTINEL, partition_error_tests::consumer_with_client},
+        subscription::shared,
+    };
 
     fn encode(response: &impl Encode, version: i16) -> Vec<u8> {
         let mut buf = bytes::BytesMut::new();
@@ -304,6 +307,7 @@ mod tests {
             Some(encode(&response, version))
         })
         .await
+        .unwrap()
     }
 
     /// Kafka's `committed` maps a partition without a committed offset to
@@ -325,9 +329,9 @@ mod tests {
             .expect("client");
         let consumer = consumer_with_client(client);
         let partitions = [
-            ("orders".to_string(), 0),
-            ("orders".to_string(), 1),
-            ("orders".to_string(), 2),
+            ("orders".to_owned(), 0),
+            ("orders".to_owned(), 1),
+            ("orders".to_owned(), 2),
         ];
         let committed = consumer
             .committed(&partitions)
@@ -337,11 +341,11 @@ mod tests {
         assert2::assert!(
             committed
                 == Ok(
-                    maplit::hashmap! {("orders".to_string(), 0) => Some(OffsetAndMetadata {
+                    maplit::hashmap! {("orders".to_owned(), 0) => Some(OffsetAndMetadata {
                         offset: 10,
                         leader_epoch: Some(3),
                         metadata: "note".into(),
-                    }), ("orders".to_string(), 1) => None, ("orders".to_string(), 2) => None}
+                    }), ("orders".to_owned(), 1) => None, ("orders".to_owned(), 2) => None}
                 )
         );
     }
@@ -351,7 +355,7 @@ mod tests {
     /// paused (`SubscriptionState.assignFromSubscribed` gives it a new state).
     #[tokio::test]
     async fn pause_follows_the_ownership_of_the_partition() {
-        let key = ("orders".to_string(), 0);
+        let key = ("orders".to_owned(), 0);
         let mut actual = Vec::new();
         let mut wanted = Vec::new();
         for (name, pause, resume, new_ownership, expected_error, expected_paused) in [
@@ -374,7 +378,7 @@ mod tests {
             ("owned again", vec![key.clone()], vec![], true, None, vec![]),
             (
                 "unowned partition",
-                vec![("orders".to_string(), 9)],
+                vec![("orders".to_owned(), 9)],
                 vec![],
                 false,
                 Some("no current assignment for partition orders-9"),
@@ -394,7 +398,7 @@ mod tests {
                 .err()
                 .map(|error| error.to_string());
             if let Err(resume_error) = consumer.resume(&resume).await {
-                error.get_or_insert(resume_error.to_string());
+                error.get_or_insert_with(|| resume_error.to_string());
             }
             if new_ownership {
                 consumer
@@ -442,7 +446,8 @@ mod tests {
                 )
             })
         })
-        .await;
+        .await
+        .unwrap();
         let client = Client::builder()
             .bootstrap(mock.addr.to_string())
             .request_timeout(secs(30))
@@ -451,12 +456,12 @@ mod tests {
             .expect("client");
         let mut consumer = consumer_with_client(client);
         consumer.default_api_timeout = krabka_units::millis(200);
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let committed = consumer
-            .committed(&[("orders".to_string(), 0)])
+            .committed(&[("orders".to_owned(), 0)])
             .await
             .map_err(|error| error.to_string());
-        let in_time = started.elapsed() < std::time::Duration::from_secs(5);
+        let in_time = started.elapsed() < Duration::from_secs(5);
         mock.stop();
         assert2::assert!(
             (committed, in_time)
@@ -478,7 +483,7 @@ mod tests {
             .await
             .expect("client");
         let consumer = consumer_with_client(client);
-        let key = ("orders".to_string(), 0);
+        let key = ("orders".to_owned(), 0);
         consumer.next_offsets.lock().await.insert(key.clone(), 12);
         consumer.end_offsets.lock().await.insert(key.clone(), 12);
         let before = consumer.at_log_end().await;
@@ -503,9 +508,9 @@ mod tests {
             .await
             .expect("client");
         let mut consumer = consumer_with_client(client);
-        consumer.subscription = crate::subscription::shared(Vec::new(), None, true);
+        consumer.subscription = shared(Vec::new(), None, true);
         consumer.auto_offset_reset = crate::AutoOffsetReset::Earliest;
-        let key = |partition: i32| ("orders".to_string(), partition);
+        let key = |partition: i32| ("orders".to_owned(), partition);
         consumer
             .assign(&[key(0), key(1), key(2)])
             .await
@@ -552,7 +557,7 @@ mod tests {
                 consumer.assignment().await,
                 rejected
             ) == (
-                vec![(key(0), 5), (key(1), 10), (key(2), crate::poll::BEGINNING_SENTINEL)],
+                vec![(key(0), 5), (key(1), 10), (key(2), BEGINNING_SENTINEL)],
                 true,
                 -1,
                 String::new(),

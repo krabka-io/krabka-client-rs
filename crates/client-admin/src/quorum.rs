@@ -7,9 +7,11 @@ use std::collections::BTreeSet;
 use krabka_protocol::{
     owned::{
         add_raft_voter_request::{AddRaftVoterRequest, Listener},
+        common::describe_quorum_response::replica_state::ReplicaState,
         describe_quorum_request::{
             DescribeQuorumRequest, PartitionData as RequestPartition, TopicData as RequestTopic,
         },
+        describe_quorum_response,
         remove_raft_voter_request::RemoveRaftVoterRequest,
     },
     primitives::uuid::Uuid as ProtoUuid,
@@ -174,9 +176,7 @@ fn broker_error(api: &'static str, code: i16, message: Option<String>) -> AdminE
     }
 }
 
-fn replica(
-    value: &krabka_protocol::owned::common::describe_quorum_response::replica_state::ReplicaState,
-) -> QuorumReplica {
+fn replica(value: &ReplicaState) -> QuorumReplica {
     QuorumReplica {
         node_id: value.replica_id,
         directory_id: uuid::Uuid::from_bytes(value.replica_directory_id.0),
@@ -189,7 +189,7 @@ fn replica(
 /// A response node as Kafka's `DescribeQuorumResponse.getNodes` maps it. The
 /// listener fields come straight from the wire, so they are not re-validated
 /// the way a caller-built `RaftVoterEndpoint` is.
-fn quorum_node(node: &krabka_protocol::owned::describe_quorum_response::Node) -> QuorumNode {
+fn quorum_node(node: &describe_quorum_response::Node) -> QuorumNode {
     QuorumNode {
         node_id: node.node_id,
         endpoints: node
@@ -205,11 +205,8 @@ fn quorum_node(node: &krabka_protocol::owned::describe_quorum_response::Node) ->
 }
 
 impl AdminClient {
-    /// Return the live `__cluster_metadata` partition-zero quorum view.
-    ///
-    /// # Errors
-    /// Returns a transport, protocol, or Kafka error from `DescribeQuorum`.
-    pub async fn describe_metadata_quorum(&mut self) -> Result<MetadataQuorum, AdminError> {
+    /// The call behind [`AdminClientLike::describe_metadata_quorum`](crate::AdminClientLike::describe_metadata_quorum).
+    pub(crate) async fn describe_metadata_quorum_impl(&self) -> Result<MetadataQuorum, AdminError> {
         let response = self
             .conn
             .send(DescribeQuorumRequest {
@@ -304,22 +301,9 @@ impl AdminClient {
         }
     }
 
-    /// Remove one exact node and directory identity from the metadata quorum,
-    /// as Kafka's `removeRaftVoter` operation does.
-    ///
-    /// `cluster_id` is Kafka's `RemoveRaftVoterOptions.clusterId`, the
-    /// cluster ID string as `meta.properties` holds it; `None` sends a null
-    /// cluster ID, which the controller does not check.
-    ///
-    /// `NOT_CONTROLLER` (41) makes the client find the controller again and
-    /// resend the request with the backoff until `default.api.timeout.ms`
-    /// (60 s), as Kafka's `handleNotControllerError` does.
-    ///
-    /// # Errors
-    /// Returns a transport, protocol, or Kafka error from `RemoveRaftVoter`,
-    /// and `REQUEST_TIMED_OUT` (7) at the deadline.
-    pub async fn remove_raft_voter(
-        &mut self,
+    /// The call behind [`AdminClientLike::remove_raft_voter`](crate::AdminClientLike::remove_raft_voter).
+    pub(crate) async fn remove_raft_voter_impl(
+        &self,
         cluster_id: Option<&str>,
         node_id: i32,
         directory_id: uuid::Uuid,
@@ -351,8 +335,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::partition_leaders::test_support::{
-        ApiVersionRange, decode_request, encode_response, fast_admin, scripted_broker,
+    use crate::{
+        AdminClientLike as _,
+        partition_leaders::test_support::{
+            ApiVersionRange, decode_request, encode_response, fast_admin, scripted_broker,
+        },
     };
 
     const DIRECTORY: uuid::Uuid = uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
@@ -630,6 +617,7 @@ mod tests {
                         }
                         _ => return MockReply::Silent,
                     };
+                    drop(requests);
                     MockReply::Respond(reply)
                 },
             )

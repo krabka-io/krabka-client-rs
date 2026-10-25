@@ -7,9 +7,12 @@
 //! each broker (`ConstantNodeIdProvider`). A broker that fails gives an error
 //! for that broker only.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+};
 
-use futures_util::{StreamExt as _, stream::FuturesUnordered};
+use futures_util::{StreamExt as _, future::join_all, stream::FuturesUnordered};
 use krabka_client_core::{Connection, ConnectionOptions};
 use krabka_protocol::{
     ProtocolRequest,
@@ -141,7 +144,7 @@ impl AdminClient {
     }
 
     async fn alter_replica_log_dirs_with_retry(
-        &mut self,
+        &self,
         assignments: &BTreeMap<TopicPartitionReplica, String>,
         retry: RetryPolicy,
     ) -> BTreeMap<TopicPartitionReplica, BrokerResult<()>> {
@@ -154,7 +157,7 @@ impl AdminClient {
                 .insert(replica.clone(), path.clone());
         }
         let (conn, options) = (&self.conn, &self.options);
-        let answers = futures_util::future::join_all(by_broker.iter().map(|(broker_id, moves)| {
+        let answers = join_all(by_broker.iter().map(|(broker_id, moves)| {
             call_broker(
                 conn,
                 *broker_id,
@@ -206,7 +209,7 @@ impl AdminClient {
     }
 
     async fn describe_log_dirs_with_retry(
-        &mut self,
+        &self,
         brokers: &[i32],
         filter: Option<&BTreeMap<String, Vec<i32>>>,
         retry: RetryPolicy,
@@ -215,7 +218,7 @@ impl AdminClient {
         let broker_ids = brokers.iter().copied().collect::<BTreeSet<_>>();
         let request = describe_request(filter);
         let (conn, options) = (&self.conn, &self.options);
-        let answers = futures_util::future::join_all(broker_ids.iter().map(|broker_id| {
+        let answers = join_all(broker_ids.iter().map(|broker_id| {
             let request = request.clone();
             async move {
                 let response = call_broker(
@@ -273,7 +276,7 @@ impl AdminClient {
     }
 
     async fn describe_replica_log_dirs_with_retry(
-        &mut self,
+        &self,
         replicas: &[TopicPartitionReplica],
         retry: RetryPolicy,
     ) -> BTreeMap<TopicPartitionReplica, BrokerResult<ReplicaLogDirInfo>> {
@@ -375,7 +378,7 @@ impl ReplicaResults {
                 }
             }
             Err(error) => {
-                for replica in std::mem::take(&mut self.pending) {
+                for replica in mem::take(&mut self.pending) {
                     self.done.insert(replica, Err(error.clone()));
                 }
             }
@@ -843,6 +846,7 @@ mod tests {
             metadata_response::{MetadataResponse, MetadataResponseBroker},
         },
     };
+    use tokio::net::TcpListener;
 
     use super::*;
 
@@ -1042,6 +1046,7 @@ mod tests {
             _ => None,
         })
         .await
+        .unwrap()
     }
 
     /// The broker addresses that the metadata names. `first` is used for the
@@ -1080,9 +1085,7 @@ mod tests {
             let two =
                 cluster_broker(2, broker_2, Arc::clone(&addresses), Arc::clone(&received)).await;
             let refused = {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("bind a port");
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
                 listener.local_addr().expect("local address")
             };
             *addresses.lock().expect("addresses lock") = match broker_2 {
@@ -1234,7 +1237,7 @@ mod tests {
                 },
             ),
         ] {
-            let mut cluster = Cluster::start(broker_2).await;
+            let cluster = Cluster::start(broker_2).await;
             let result = cluster
                 .admin
                 .describe_log_dirs_with_retry(&brokers, None, policy(timeout))
@@ -1251,7 +1254,7 @@ mod tests {
     async fn describe_log_dirs_sends_the_topic_filter() {
         let mut cluster = Cluster::start(Behavior::Normal).await;
         let filter = maplit::btreemap! {
-            "orders".to_string() => vec![0],
+            "orders".to_owned() => vec![0],
         };
         cluster.admin.describe_log_dirs(&[1], Some(&filter)).await;
         let received = cluster.stop();
@@ -1357,7 +1360,7 @@ mod tests {
                 },
             ),
         ] {
-            let mut cluster = Cluster::start(broker_2).await;
+            let cluster = Cluster::start(broker_2).await;
             let assignments = moves
                 .into_iter()
                 .map(|(replica, path)| (replica, path.to_owned()))
@@ -1468,7 +1471,7 @@ mod tests {
                 },
             ),
         ] {
-            let mut cluster = Cluster::start(broker_2).await;
+            let cluster = Cluster::start(broker_2).await;
             let result = cluster
                 .admin
                 .describe_replica_log_dirs_with_retry(&replicas, policy(timeout))
@@ -1666,7 +1669,7 @@ mod tests {
                 maplit::btreemap! {
                     replica(0, 1) => Err(illegal.clone()),
                     replica(5, 1) => Err(illegal.clone()),
-                    replica(1, 2) => Err(illegal.clone()),
+                    replica(1, 2) => Err(illegal),
                 },
             ),
             (
@@ -1675,7 +1678,7 @@ mod tests {
                 maplit::btreemap! {
                     replica(0, 1) => Err(timed_out.clone()),
                     replica(5, 1) => Err(timed_out.clone()),
-                    replica(1, 2) => Err(timed_out.clone()),
+                    replica(1, 2) => Err(timed_out),
                 },
             ),
         ] {

@@ -38,6 +38,7 @@
 //!
 //! To run the suite, point `tests/support/mod.rs` at such an image and give
 //! the case its own bootstrap address.
+#![cfg(test)]
 
 mod support;
 
@@ -46,7 +47,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use krabka_client_admin::AdminClient;
 use krabka_client_core::Client;
-use krabka_client_producer::{PreparedTransactionState, Producer, ProducerRecord};
+use krabka_client_producer::{PreparedTransactionState, Producer, ProducerError, ProducerRecord};
 use krabka_protocol::owned::{
     describe_transactions_request::DescribeTransactionsRequest,
     update_features_request::{FeatureUpdateKey, UpdateFeaturesRequest},
@@ -68,8 +69,12 @@ async fn prepare_recovery_commit_abort_and_admin_termination() {
     let topic = support::unique("two-pc-client");
     support::create_topic(&observer, &topic).await;
 
-    recover_and_commit(&kafka.bootstrap, &topic, &observer).await;
-    recover_and_abort(&kafka.bootstrap, &topic, &observer).await;
+    recover_and_commit(&kafka.bootstrap, &topic, &observer)
+        .await
+        .expect("close commit recovery");
+    recover_and_abort(&kafka.bootstrap, &topic, &observer)
+        .await
+        .expect("close abort recovery");
     force_terminate(&kafka.bootstrap, &topic, &observer).await;
 
     observer.close();
@@ -97,8 +102,13 @@ async fn enable_two_phase_commit(client: &Client) {
     assert2::assert!(response.error_code == 0, "{response:?}");
 }
 
-/// Prepare a transaction, recover it in a second producer, and commit it.
-async fn recover_and_commit(bootstrap: &str, topic: &str, observer: &Client) {
+/// Prepare a transaction, recover it in a second producer, and commit it. The
+/// recovery producer is closed.
+async fn recover_and_commit(
+    bootstrap: &str,
+    topic: &str,
+    observer: &Client,
+) -> Result<(), ProducerError> {
     let transactional_id = support::unique("two-pc-recover-commit");
     let prepared = prepare_record(bootstrap, &transactional_id, topic, b"commit").await;
     // An external transaction manager keeps the prepared state as text. The
@@ -119,12 +129,16 @@ async fn recover_and_commit(bootstrap: &str, topic: &str, observer: &Client) {
         .expect("matching state commits");
 
     assert2::assert!(transaction_state(observer, &transactional_id).await == "CompleteCommit");
-    recovery.close().await.expect("close commit recovery");
+    recovery.close().await
 }
 
 /// Prepare a transaction, recover it, and complete it with a state that does
-/// not match. The coordinator must abort.
-async fn recover_and_abort(bootstrap: &str, topic: &str, observer: &Client) {
+/// not match. The coordinator must abort. The recovery producer is closed.
+async fn recover_and_abort(
+    bootstrap: &str,
+    topic: &str,
+    observer: &Client,
+) -> Result<(), ProducerError> {
     let transactional_id = support::unique("two-pc-recover-abort");
     let _prepared = prepare_record(bootstrap, &transactional_id, topic, b"abort").await;
 
@@ -139,7 +153,7 @@ async fn recover_and_abort(bootstrap: &str, topic: &str, observer: &Client) {
         .expect("mismatched state aborts");
 
     assert2::assert!(transaction_state(observer, &transactional_id).await == "CompleteAbort");
-    recovery.close().await.expect("close abort recovery");
+    recovery.close().await
 }
 
 /// Prepare a transaction that no client comes back for, then clear it with the
@@ -211,8 +225,11 @@ async fn prepare_record(
         .expect("transactional produce");
     let prepared = transaction.prepare().await.expect("prepare transaction");
     drop(transaction);
-    producer.close().await.expect("close prepared producer");
-    prepared
+    producer
+        .close()
+        .await
+        .map(|()| prepared)
+        .expect("close prepared producer")
 }
 
 /// Read the coordinator's view of `transactional_id`.

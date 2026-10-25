@@ -7,16 +7,20 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, MutexGuard, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
 
 use dashmap::DashMap;
 use krabka_units::{Time, convert::TimeExt as _};
+use tokio::{
+    sync,
+    time::{Instant, sleep_until},
+};
 
 use crate::{
-    backoff::ExponentialBackoff,
+    backoff::{ExponentialBackoff, random_below},
     bootstrap::{bounded_lookup, filter_preferred_addresses},
     connection::{Connection, ConnectionOptions},
     error::ClientError,
@@ -150,13 +154,13 @@ struct NodeState<C> {
     address_index: usize,
     last_attempted: Option<SocketAddr>,
     /// When the last connection attempt started.
-    last_attempt_at: Option<tokio::time::Instant>,
+    last_attempt_at: Option<Instant>,
     /// Failures in a row, the exponent of the reconnect backoff.
     failed_attempts: u32,
     /// Failed connection attempts in a row, the exponent of the setup timeout.
     failed_connect_attempts: u32,
     /// The pool does not dial before this instant.
-    retry_at: Option<tokio::time::Instant>,
+    retry_at: Option<Instant>,
 }
 
 impl<C> Default for NodeState<C> {
@@ -206,7 +210,7 @@ impl<C> NodeState<C> {
     fn back_off(&mut self, policy: ConnectPolicy) {
         let backoff = policy.reconnect.backoff(self.failed_attempts);
         self.failed_attempts = self.failed_attempts.saturating_add(1);
-        self.retry_at = Some(tokio::time::Instant::now() + backoff);
+        self.retry_at = Some(Instant::now() + backoff);
     }
 
     /// Use `addresses` as the new address list. As Kafka's
@@ -239,24 +243,22 @@ impl<C> NodeState<C> {
 /// One broker id: its state, and a gate that lets one task at a time make a
 /// connection attempt. The state lock is never held across an `.await`.
 struct Node<C> {
-    state: std::sync::Mutex<NodeState<C>>,
-    connect: tokio::sync::Mutex<()>,
+    state: Mutex<NodeState<C>>,
+    connect: sync::Mutex<()>,
 }
 
 impl<C> Default for Node<C> {
     fn default() -> Self {
         Self {
-            state: std::sync::Mutex::new(NodeState::default()),
-            connect: tokio::sync::Mutex::new(()),
+            state: Mutex::new(NodeState::default()),
+            connect: sync::Mutex::new(()),
         }
     }
 }
 
 impl<C> Node<C> {
-    fn state(&self) -> std::sync::MutexGuard<'_, NodeState<C>> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn state(&self) -> MutexGuard<'_, NodeState<C>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -277,7 +279,7 @@ pub struct BrokerPool<C: BrokerConnector = TcpConnector> {
     prefer_bootstrap: AtomicBool,
     /// The finalized features with the highest epoch that a connection saw,
     /// as Kafka's `ApiVersions.update` keeps them.
-    finalized_features: std::sync::Mutex<FinalizedFeatures>,
+    finalized_features: Mutex<FinalizedFeatures>,
 }
 
 impl BrokerPool<TcpConnector> {
@@ -298,18 +300,13 @@ impl BrokerPool<TcpConnector> {
         options: ConnectionOptions,
     ) -> Self {
         let policy = ConnectPolicy::new(&options);
-        BrokerPool::with_connector_and_names(bootstrap, TcpConnector { options }, policy)
+        Self::with_connector_and_names(bootstrap, TcpConnector { options }, policy)
     }
 }
 
 /// A broker to dial for [`BrokerPool::least_loaded`]: (in backoff, backoff
 /// end, last attempt, id). The smallest of the first three wins.
-type Candidate = (
-    bool,
-    Option<tokio::time::Instant>,
-    Option<tokio::time::Instant>,
-    i32,
-);
+type Candidate = (bool, Option<Instant>, Option<Instant>, i32);
 
 /// What a connection attempt needs, read from the node state.
 struct Attempt {
@@ -331,7 +328,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
             policy,
             connector,
             prefer_bootstrap: AtomicBool::new(false),
-            finalized_features: std::sync::Mutex::default(),
+            finalized_features: Mutex::default(),
         }
     }
 
@@ -348,7 +345,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
     async fn wait_for_backoff(node: &Node<C::Conn>) {
         let retry_at = node.state().retry_at;
         if let Some(retry_at) = retry_at {
-            tokio::time::sleep_until(retry_at).await;
+            sleep_until(retry_at).await;
         }
     }
 
@@ -358,7 +355,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
         let mut state = node.state();
         let (addr, server_name) = state.addresses.get(state.address_index).cloned()?;
         state.last_attempted = Some(addr);
-        state.last_attempt_at = Some(tokio::time::Instant::now());
+        state.last_attempt_at = Some(Instant::now());
         Some(Attempt {
             addr,
             server_name,
@@ -386,7 +383,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
         let mut known = self
             .finalized_features
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if features.epoch > known.epoch {
             *known = features;
         }
@@ -608,12 +605,11 @@ impl<C: BrokerConnector> BrokerPool<C> {
         if ids.is_empty() || self.prefer_bootstrap.load(Ordering::Relaxed) {
             return self.bootstrap_connection().await;
         }
-        let offset = crate::backoff::random_below(ids.len());
-        let now = tokio::time::Instant::now();
+        let offset = random_below(ids.len());
+        let now = Instant::now();
         let mut fewest: Option<(usize, Arc<C::Conn>)> = None;
         let mut candidate: Option<Candidate> = None;
-        for index in 0..ids.len() {
-            let id = ids[(offset + index) % ids.len()];
+        for &id in ids.iter().cycle().skip(offset).take(ids.len()) {
             let node = self.node(id);
             let state = node.state();
             if let Some(connection) = state.connection.as_ref().filter(|c| C::is_open(c)) {
@@ -633,6 +629,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
                 state.last_attempt_at,
                 id,
             );
+            drop(state);
             if candidate
                 .as_ref()
                 .is_none_or(|best| (key.0, key.1, key.2) < (best.0, best.1, best.2))
@@ -777,7 +774,7 @@ impl<C: BrokerConnector> BrokerPool<C> {
     pub fn finalized_features(&self) -> FinalizedFeatures {
         self.finalized_features
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 

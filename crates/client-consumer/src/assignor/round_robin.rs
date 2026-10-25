@@ -37,12 +37,18 @@ pub fn assign(
         for partition in 0..count.max(0) {
             // Kafka's `CircularIterator`: advance to the next member that
             // subscribes to the topic. One member subscribes to it at least.
-            while !members[next % members.len()].1.contains(topic) {
-                next += 1;
-            }
-            let member = &members[next % members.len()].0.member_id;
-            next += 1;
-            if let Some(slot) = out.get_mut(member) {
+            let Some((skipped, (member, _))) = members
+                .iter()
+                .cycle()
+                .skip(next % members.len())
+                .take(members.len())
+                .enumerate()
+                .find(|(_, (_, member_topics))| member_topics.contains(topic))
+            else {
+                continue;
+            };
+            next += skipped + 1;
+            if let Some(slot) = out.get_mut(&member.member_id) {
                 slot.push((topic.clone(), partition));
             }
         }

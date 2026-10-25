@@ -160,19 +160,9 @@ pub struct DeleteAclFilterOutcome {
 }
 
 impl AdminClient {
-    /// Upserts SCRAM-SHA-512 credentials, deletes them, or both, in a single
-    /// call.
-    ///
-    /// `upsertions` carry plaintext passwords. The function generates a fresh
-    /// 16-byte salt per row and computes the KIP-554 wire `salted_password`
-    /// (PBKDF2-HMAC-SHA-512) client-side with
-    /// `krabka_security::pbkdf2_salted`. The broker never sees the raw
-    /// password.
-    ///
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
-    pub async fn alter_user_scram_credentials_sha512(
-        &mut self,
+    /// The call behind [`AdminClientLike::alter_user_scram_credentials_sha512`](crate::AdminClientLike::alter_user_scram_credentials_sha512).
+    pub(crate) async fn alter_user_scram_credentials_sha512_impl(
+        &self,
         upsertions: &[ScramUpsertion],
         deletions: &[ScramDeletion],
     ) -> Result<Vec<ScramUserOutcome>, AdminError> {
@@ -182,20 +172,9 @@ impl AdminClient {
         Ok(parse_alter_scram_results(resp))
     }
 
-    /// SCRAM-SHA-256 sibling of
-    /// [`Self::alter_user_scram_credentials_sha512`].
-    ///
-    /// The iteration counts, the salt generation, and the salted-password
-    /// derivation are identical to the SHA-512 path. Only the mechanism wire
-    /// byte and the HMAC algorithm differ.
-    ///
-    /// # Errors
-    ///
-    /// Same as `_sha512`: returns [`AdminError::Protocol`] when the
-    /// system RNG fails, otherwise propagates the broker's
-    /// per-username outcome rows.
-    pub async fn alter_user_scram_credentials_sha256(
-        &mut self,
+    /// The call behind [`AdminClientLike::alter_user_scram_credentials_sha256`](crate::AdminClientLike::alter_user_scram_credentials_sha256).
+    pub(crate) async fn alter_user_scram_credentials_sha256_impl(
+        &self,
         upsertions: &[ScramUpsertion],
         deletions: &[ScramDeletion],
     ) -> Result<Vec<ScramUserOutcome>, AdminError> {
@@ -205,16 +184,9 @@ impl AdminClient {
         Ok(parse_alter_scram_results(resp))
     }
 
-    /// Lists ACLs that match `filter`.
-    ///
-    /// The broker's response is resource-grouped on the wire, with one block
-    /// per `(resource_type, resource_name, pattern_type)`. This method
-    /// flattens it back into `AclEntry` rows for the diff.
-    ///
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
-    pub async fn describe_acls(
-        &mut self,
+    /// The call behind [`AdminClientLike::describe_acls`](crate::AdminClientLike::describe_acls).
+    pub(crate) async fn describe_acls_impl(
+        &self,
         filter: &AclEntryFilter,
     ) -> Result<Vec<AclEntry>, AdminError> {
         let resp = self.conn.send(filter_to_describe_request(filter)).await?;
@@ -244,16 +216,9 @@ impl AdminClient {
         parse_describe_user_scram_credentials_response(resp)
     }
 
-    /// Creates the supplied ACLs.
-    ///
-    /// # Errors
-    /// Returns [`AdminError::InvalidArgument`], before anything is sent, for
-    /// an entry whose pattern type is [`PatternType::Match`]: Kafka's
-    /// `ResourcePattern` refuses `patternType must not be MATCH`. Otherwise
-    /// returns an error when protocol encoding fails, the broker rejects the
-    /// request, or transport I/O fails.
-    pub async fn create_acls(
-        &mut self,
+    /// The call behind [`AdminClientLike::create_acls`](crate::AdminClientLike::create_acls).
+    pub(crate) async fn create_acls_impl(
+        &self,
         creations: &[AclEntry],
     ) -> Result<Vec<CreateAclOutcome>, AdminError> {
         check_concrete_patterns(creations)?;
@@ -271,15 +236,9 @@ impl AdminClient {
             .collect())
     }
 
-    /// Deletes every ACL that matches any of `filters`.
-    ///
-    /// Each filter's response surfaces the matched ACL set, so callers can
-    /// confirm that the deletion converged on the expected rows.
-    ///
-    /// # Errors
-    /// Returns an error when configuration is invalid, protocol encoding fails, the broker rejects the request, or transport I/O fails.
-    pub async fn delete_acls(
-        &mut self,
+    /// The call behind [`AdminClientLike::delete_acls`](crate::AdminClientLike::delete_acls).
+    pub(crate) async fn delete_acls_impl(
+        &self,
         filters: &[AclEntryFilter],
     ) -> Result<Vec<DeleteAclFilterOutcome>, AdminError> {
         let req = DeleteAclsRequest {
@@ -432,7 +391,7 @@ fn parse_describe_user_scram_credentials_response(
                 .credential_infos
                 .into_iter()
                 .map(|credential| UserScramCredential {
-                    mechanism: scram_mechanism_name(credential.mechanism).to_string(),
+                    mechanism: scram_mechanism_name(credential.mechanism).to_owned(),
                     iterations: credential.iterations,
                 })
                 .collect(),
@@ -685,6 +644,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::AdminClientLike as _;
 
     #[test]
     fn scram_iterations_match_broker_bounds() {
@@ -871,10 +831,10 @@ mod tests {
         assert2::assert!(
             c == AclCreation {
                 resource_type: 2,
-                resource_name: "orders".to_string(),
+                resource_name: "orders".to_owned(),
                 resource_pattern_type: 4,
-                principal: "User:alice".to_string(),
-                host: "*".to_string(),
+                principal: "User:alice".to_owned(),
+                host: "*".to_owned(),
                 operation: 3,
                 permission_type: 3,
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
@@ -911,7 +871,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         let mut admin = AdminClient::connect(&[mock.addr.to_string()])
             .await
             .expect("admin connects to mock broker");
@@ -990,10 +951,10 @@ mod tests {
         assert2::assert!(
             w == DeleteAclsFilter {
                 resource_type_filter: 2,
-                resource_name_filter: Some("orders".to_string()),
+                resource_name_filter: Some("orders".to_owned()),
                 pattern_type_filter: 3,
-                principal_filter: Some("User:alice".to_string()),
-                host_filter: Some("10.0.0.0".to_string()),
+                principal_filter: Some("User:alice".to_owned()),
+                host_filter: Some("10.0.0.0".to_owned()),
                 operation: 3,
                 permission_type: 3,
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),
@@ -1038,7 +999,8 @@ mod tests {
             }
             None
         })
-        .await;
+        .await
+        .unwrap();
         let mut admin = AdminClient::connect(&[mock.addr.to_string()])
             .await
             .expect("admin connects to mock broker");
@@ -1139,7 +1101,7 @@ mod tests {
         assert2::assert!(
             req == AlterUserScramCredentialsRequest {
                 deletions: vec![ScramCredentialDeletion {
-                    name: "alice".to_string(),
+                    name: "alice".to_owned(),
                     mechanism: 2, // SCRAM_SHA_512_WIRE, KIP-554
                     unknown_tagged_fields: UnknownTaggedFields(vec![]),
                 }],
@@ -1178,7 +1140,7 @@ mod tests {
                 resource_type_filter: 1,
                 resource_name_filter: None,
                 pattern_type_filter: 1,
-                principal_filter: Some("User:alice".to_string()),
+                principal_filter: Some("User:alice".to_owned()),
                 host_filter: None,
                 operation: 1,
                 permission_type: 1,
@@ -1191,7 +1153,7 @@ mod tests {
     fn users_describe_scram_top_level_error_returns_broker_error() {
         let resp = describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             error_code: 31,
-            error_message: Some("cluster auth denied".to_string()),
+            error_message: Some("cluster auth denied".to_owned()),
             ..Default::default()
         };
 
@@ -1224,7 +1186,7 @@ mod tests {
         let resp = describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             results: vec![
                 describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
-                    user: "alice".to_string(),
+                    user: "alice".to_owned(),
                     credential_infos: vec![
                         describe_user_scram_credentials_response::CredentialInfo {
                             mechanism: 1,
@@ -1256,11 +1218,11 @@ mod tests {
                 "alice",
                 [
                     UserScramCredential {
-                        mechanism: "SCRAM-SHA-256".to_string(),
+                        mechanism: "SCRAM-SHA-256".to_owned(),
                         iterations: 4096,
                     },
                     UserScramCredential {
-                        mechanism: "SCRAM-SHA-512".to_string(),
+                        mechanism: "SCRAM-SHA-512".to_owned(),
                         iterations: 8192,
                     },
                 ]
@@ -1274,9 +1236,9 @@ mod tests {
         let resp = describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             results: vec![
                 describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
-                    user: "ghost".to_string(),
+                    user: "ghost".to_owned(),
                     error_code: 91,
-                    error_message: Some("no such SCRAM user".to_string()),
+                    error_message: Some("no such SCRAM user".to_owned()),
                     ..Default::default()
                 },
             ],
@@ -1297,7 +1259,7 @@ mod tests {
                 Some(&KafkaError {
                     code: 91,
                     name: "RESOURCE_NOT_FOUND",
-                    message: Some("no such SCRAM user".to_string()),
+                    message: Some("no such SCRAM user".to_owned()),
                 })
             )
         );
@@ -1308,9 +1270,9 @@ mod tests {
         let resp = describe_user_scram_credentials_response::DescribeUserScramCredentialsResponse {
             results: vec![
                 describe_user_scram_credentials_response::DescribeUserScramCredentialsResult {
-                    user: "alice".to_string(),
+                    user: "alice".to_owned(),
                     error_code: 92,
-                    error_message: Some("duplicate user".to_string()),
+                    error_message: Some("duplicate user".to_owned()),
                     ..Default::default()
                 },
             ],
@@ -1331,7 +1293,7 @@ mod tests {
                 Some(&KafkaError {
                     code: 92,
                     name: "DUPLICATE_RESOURCE",
-                    message: Some("duplicate user".to_string()),
+                    message: Some("duplicate user".to_owned()),
                 })
             )
         );
@@ -1342,15 +1304,15 @@ mod tests {
         let resp = alter_user_scram_credentials_response::AlterUserScramCredentialsResponse {
             results: vec![
                 alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
-                    user: "alice".to_string(),
+                    user: "alice".to_owned(),
                     error_code: 33,
-                    error_message: Some("unknown mechanism".to_string()),
+                    error_message: Some("unknown mechanism".to_owned()),
                     ..Default::default()
                 },
                 alter_user_scram_credentials_response::AlterUserScramCredentialsResult {
-                    user: "bob".to_string(),
+                    user: "bob".to_owned(),
                     error_code: 93,
-                    error_message: Some("too many iterations".to_string()),
+                    error_message: Some("too many iterations".to_owned()),
                     ..Default::default()
                 },
             ],
@@ -1369,12 +1331,12 @@ mod tests {
                 Some(&KafkaError {
                     code: 33,
                     name: "UNSUPPORTED_SASL_MECHANISM",
-                    message: Some("unknown mechanism".to_string()),
+                    message: Some("unknown mechanism".to_owned()),
                 }),
                 Some(&KafkaError {
                     code: 93,
                     name: "UNACCEPTABLE_CREDENTIAL",
-                    message: Some("too many iterations".to_string()),
+                    message: Some("too many iterations".to_owned()),
                 }),
             )
         );
@@ -1397,10 +1359,10 @@ mod tests {
         assert2::assert!(
             r == DescribeAclsRequest {
                 resource_type_filter: 2,
-                resource_name_filter: Some("orders".to_string()),
+                resource_name_filter: Some("orders".to_owned()),
                 pattern_type_filter: 3,
-                principal_filter: Some("User:alice".to_string()),
-                host_filter: Some("10.0.0.0".to_string()),
+                principal_filter: Some("User:alice".to_owned()),
+                host_filter: Some("10.0.0.0".to_owned()),
                 operation: 3,
                 permission_type: 3,
                 unknown_tagged_fields: UnknownTaggedFields(vec![]),

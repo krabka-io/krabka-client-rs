@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
-use krabka_client_core::{Connection, telemetry::TelemetryConnections};
+use krabka_client_core::{
+    Connection,
+    telemetry::{TelemetryConnections, client_instance_id},
+};
 use krabka_units::Time;
 
 use crate::{AdminClient, AdminError, RecoveringConnection};
@@ -15,7 +18,7 @@ use crate::{AdminClient, AdminError, RecoveringConnection};
 /// The connection that the admin client's reporter sends on. It has no
 /// broker id in the metadata, so the reporter sees it as `-1`, as a
 /// bootstrap connection.
-pub(crate) struct AdminTelemetryConnection(pub(crate) Arc<RecoveringConnection>);
+pub struct AdminTelemetryConnection(pub(crate) Arc<RecoveringConnection>);
 
 impl TelemetryConnections for AdminTelemetryConnection {
     fn open_connection(&self, _preferred: Option<i32>) -> Option<(i32, Arc<Connection>)> {
@@ -42,17 +45,14 @@ impl AdminClient {
     /// [`AdminClientConfig::enable_metrics_push`] is `false`, as Kafka throws
     /// an `IllegalArgumentException` and an `IllegalStateException`.
     ///
-    /// [`ClientError::InvalidArgument`]: ClientError::InvalidArgument
-    /// [`ClientError::TelemetryDisabled`]: ClientError::TelemetryDisabled
+    /// [`ClientError::InvalidArgument`]: krabka_client_core::ClientError::InvalidArgument
+    /// [`ClientError::TelemetryDisabled`]: krabka_client_core::ClientError::TelemetryDisabled
     /// [`AdminClientConfig::enable_metrics_push`]: crate::AdminClientConfig::enable_metrics_push
     pub async fn client_instance_id(
         &self,
         timeout: Time,
     ) -> Result<Option<uuid::Uuid>, AdminError> {
-        Ok(
-            krabka_client_core::telemetry::client_instance_id(self.telemetry.as_ref(), timeout)
-                .await?,
-        )
+        Ok(client_instance_id(self.telemetry.as_ref(), timeout).await?)
     }
 
     /// Close the client: send the terminating telemetry push (KIP-714), if
@@ -89,7 +89,7 @@ mod tests {
         },
         primitives::uuid::Uuid as WireUuid,
     };
-    use tokio::sync::mpsc;
+    use tokio::{sync::mpsc, time};
 
     use crate::AdminClientConfig;
 
@@ -177,9 +177,7 @@ mod tests {
             get_telemetry_subscriptions_request::API_KEY => {
                 let mut body = request_body(frame);
                 let request = GetTelemetrySubscriptionsRequest::decode(&mut body, version).unwrap();
-                seen_tx
-                    .send(Seen::Subscriptions(request.client_instance_id))
-                    .ok();
+                let _ = seen_tx.send(Seen::Subscriptions(request.client_instance_id));
                 Some(flexible_response(&GetTelemetrySubscriptionsResponse {
                     client_instance_id: INSTANCE,
                     subscription_id: 5,
@@ -192,17 +190,18 @@ mod tests {
             push_telemetry_request::API_KEY => {
                 let mut body = request_body(frame);
                 let request = PushTelemetryRequest::decode(&mut body, version).unwrap();
-                seen_tx.send(seen_push(&request)).ok();
+                let _ = seen_tx.send(seen_push(&request));
                 Some(flexible_response(&PushTelemetryResponse::default()))
             }
             _ => None,
         })
-        .await;
+        .await
+        .unwrap();
         (broker, seen_rx)
     }
 
     async fn next(seen: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {
-        tokio::time::timeout(Duration::from_secs(10), seen.recv())
+        time::timeout(Duration::from_secs(10), seen.recv())
             .await
             .expect("a telemetry request within 10 s")
             .expect("the broker is running")
@@ -268,7 +267,7 @@ mod tests {
             for _ in 0..count {
                 requests.push(next(&mut seen).await);
             }
-            tokio::time::timeout(Duration::from_secs(20), admin.close())
+            time::timeout(Duration::from_secs(20), admin.close())
                 .await
                 .expect("the close ends");
             broker.stop();

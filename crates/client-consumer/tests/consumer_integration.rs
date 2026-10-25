@@ -30,6 +30,7 @@
 //! ```text
 //! cargo test -p krabka-client-consumer --test consumer_integration -- --ignored --nocapture
 //! ```
+#![cfg(test)]
 
 mod support;
 
@@ -57,6 +58,7 @@ use krabka_protocol::{
     primitives::uuid::Uuid as WireUuid,
 };
 use krabka_units::{millis, secs};
+use tokio::time::sleep;
 
 /// Outer bound for any wait that depends on the container. A rebalance, a
 /// metadata refresh and a log recovery all run in the broker process, and a
@@ -70,7 +72,7 @@ const SETTLE_TIMEOUT: Duration = Duration::from_mins(1);
 /// `tokio::task::yield_now` would spin a core without letting the broker
 /// advance.
 async fn broker_side_pause() {
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(200)).await;
 }
 
 /// Decode a record value as a lossy UTF-8 string.
@@ -301,7 +303,7 @@ async fn build_member(bootstrap: &str, client_id: &str, group: &str, topic: &str
         .max_poll_interval(secs(10))
         .heartbeat_interval(millis(500))
         .auto_offset_reset(AutoOffsetReset::Earliest)
-        .subscribe([topic.to_string()])
+        .subscribe([topic.to_owned()])
         .build()
         .await
         .expect("build consumer")
@@ -393,7 +395,7 @@ async fn eager_rebalance_reacquires_and_primes() {
     // Each member reads its own partition and commits. Those two commits are
     // the positions the eager rejoin must prime from.
     let seeded = maplit::hashset! {consume_one_and_commit(&mut m1, "m1").await, consume_one_and_commit(&mut m2, "m2").await};
-    assert!(seeded == maplit::hashset! {"a0".to_string(), "a1".to_string()});
+    assert!(seeded == maplit::hashset! {"a0".to_owned(), "a1".to_owned()});
 
     // The rejoin must replay nothing. A re-acquired partition that fetched from
     // 0 instead of from the committed position delivers its seed record here.
@@ -415,7 +417,7 @@ async fn eager_rebalance_reacquires_and_primes() {
         .map(|record| (record.partition, record.offset, value_of(record)))
         .collect();
     delivered.sort_unstable();
-    assert!(delivered == vec![(0, 1, "b0".to_string()), (1, 1, "b1".to_string())]);
+    assert!(delivered == vec![(0, 1, "b0".to_owned()), (1, 1, "b1".to_owned())]);
 
     m1.close().await.expect("close m1");
     producer.close();
@@ -462,7 +464,7 @@ async fn commit_succeeds_after_rebalance_bumps_generation() {
     support::produce_to_partition(&producer, &topic, 0, &["g0"]).await;
     support::produce_to_partition(&producer, &topic, 1, &["g1"]).await;
     let seen = collect_prefixed(&mut m1, 'g', 2).await;
-    assert!(seen == maplit::hashset! {"g0".to_string(), "g1".to_string()});
+    assert!(seen == maplit::hashset! {"g0".to_owned(), "g1".to_owned()});
 
     m1.commit_sync()
         .await
@@ -689,16 +691,14 @@ async fn seed_committed_offset_zero(bootstrap: &str, group: &str, topic: &str) {
         .max_poll_interval(secs(10))
         .heartbeat_interval(secs(1))
         .auto_offset_reset(AutoOffsetReset::Earliest)
-        .subscribe([topic.to_string()])
+        .subscribe([topic.to_owned()])
         .build()
         .await
         .expect("build seed consumer");
     wait_for_assignment(&seed, 1, "seed consumer").await;
-    seed.commit_offsets_sync(
-        maplit::hashmap! {(topic.to_string(), 0) => OffsetAndMetadata::new(0)},
-    )
-    .await
-    .expect("seed commit of offset 0");
+    seed.commit_offsets_sync(maplit::hashmap! {(topic.to_owned(), 0) => OffsetAndMetadata::new(0)})
+        .await
+        .expect("seed commit of offset 0");
     seed.close().await.expect("close seed consumer");
 }
 

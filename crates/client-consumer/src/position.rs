@@ -3,14 +3,38 @@
 //! This module also holds the pure truncation decision that the proactive
 //! validate pass and the in-band `diverging_epoch` path use.
 
+use std::collections::HashMap;
+
 use krabka_ids::LeaderEpoch;
+use tokio::sync::Mutex;
+
+/// The fetch offset of each assigned partition: `Consumer::next_offsets`.
+pub type NextOffsets = HashMap<(String, i32), i64>;
+
+/// The KIP-320 position of each assigned partition: `Consumer::positions`.
+pub type Positions = HashMap<(String, i32), PartitionPosition>;
+
+/// Run `update` on the fetch offsets and the KIP-320 positions with both locks
+/// held for the whole call.
+///
+/// The function takes `offsets` first and then `positions`, the lock order of
+/// the consumer and of its coordinator task.
+pub async fn with_offsets_and_positions<R>(
+    offsets: &Mutex<NextOffsets>,
+    positions: &Mutex<Positions>,
+    update: impl FnOnce(&mut NextOffsets, &mut Positions) -> R,
+) -> R {
+    let mut offsets = offsets.lock().await;
+    let mut positions = positions.lock().await;
+    update(&mut offsets, &mut positions)
+}
 
 /// Epoch metadata for one assigned partition.
 ///
 /// The fetch *offset* itself lives in `Consumer::next_offsets`. This struct
 /// carries the leader-epoch state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PartitionPosition {
+pub struct PartitionPosition {
     /// Leader epoch of the last consumed record. The client sends it as
     /// `last_fetched_epoch`. It is `-1` until the client consumes a record or
     /// seeds a committed epoch.
@@ -39,7 +63,7 @@ impl Default for PartitionPosition {
 
 /// Outcome of validating a fetch position against the leader's epoch history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ValidationOutcome {
+pub enum ValidationOutcome {
     /// The position is consistent with the leader. Resume fetching. This
     /// variant carries the leader's epoch for that offset, which refreshes
     /// `offset_epoch`.
@@ -56,7 +80,7 @@ pub(crate) enum ValidationOutcome {
 /// truncation iff the leader's epoch for the client's data is older than the
 /// client's, or the leader's end offset for that epoch is below the client's
 /// position.
-pub(crate) fn classify(
+pub fn classify(
     offset: i64,
     offset_epoch: LeaderEpoch,
     leader_epoch: LeaderEpoch,

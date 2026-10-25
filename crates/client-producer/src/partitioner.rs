@@ -11,9 +11,10 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     hash::{BuildHasher as _, RandomState},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -21,7 +22,7 @@ use std::{
 
 /// The settings of the built-in partitioner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PartitionerConfig {
+pub struct PartitionerConfig {
     /// The bytes that go to a sticky partition before the producer picks a
     /// new one. Kafka uses `batch.size`.
     pub sticky_batch_size: usize,
@@ -95,18 +96,18 @@ pub trait Partitioner: Send + Sync {
 /// The rack of the leader of a partition, or `None` when it is not known or
 /// the leader has none. `producer.rs` builds one from the broker rack cache;
 /// tests script one directly.
-pub(crate) type LeaderRack<'a> = &'a (dyn Fn(i32) -> Option<String> + Sync);
+pub type LeaderRack<'a> = &'a (dyn Fn(i32) -> Option<String> + Sync);
 
 /// The rack preference of `partitioner.rack.aware`: the rack of each
 /// partition leader, and the `client.rack` of the producer.
 #[derive(Clone, Copy)]
-pub(crate) struct RackPreference<'a> {
+pub struct RackPreference<'a> {
     pub leader_rack: LeaderRack<'a>,
     pub client_rack: &'a str,
 }
 
 /// A source of random 32-bit values. Tests give a scripted source.
-pub(crate) type RandomSource = Arc<dyn Fn() -> u32 + Send + Sync>;
+pub type RandomSource = Arc<dyn Fn() -> u32 + Send + Sync>;
 
 /// A random 32-bit value.
 ///
@@ -118,7 +119,7 @@ fn random_u32() -> u32 {
 }
 
 /// The partitions of a topic, as the metadata of the producer shows them.
-pub(crate) struct TopicPartitions<'a> {
+pub struct TopicPartitions<'a> {
     /// The partition count. It is greater than zero.
     pub count: i32,
     /// Tell if a partition has a leader.
@@ -131,7 +132,7 @@ pub(crate) struct TopicPartitions<'a> {
 /// the identity of its `StickyPartitionInfo` object in the same way, so a pick
 /// of the same partition number still counts as a change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StickyPartition {
+pub struct StickyPartition {
     partition: i32,
     pick: u64,
 }
@@ -148,7 +149,7 @@ impl StickyPartition {
 /// `partition_ids` hold only the partitions that the pick can use: they have a
 /// leader, and the availability timeout did not exclude them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct QueueSizes {
+pub struct QueueSizes {
     pub sizes: Vec<u32>,
     pub partition_ids: Vec<i32>,
     /// The number of partitions that have a queue, with or without a leader.
@@ -210,7 +211,7 @@ struct TopicState {
 }
 
 /// Kafka's `BuiltInPartitioner`, for every topic of a producer.
-pub(crate) struct BuiltInPartitioner {
+pub struct BuiltInPartitioner {
     config: PartitionerConfig,
     random: RandomSource,
     picks: AtomicU64,
@@ -218,8 +219,8 @@ pub(crate) struct BuiltInPartitioner {
     topics: Mutex<HashMap<String, TopicState>>,
 }
 
-impl std::fmt::Debug for BuiltInPartitioner {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for BuiltInPartitioner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("BuiltInPartitioner")
             .field("config", &self.config)
@@ -253,10 +254,13 @@ impl BuiltInPartitioner {
             .map(|key| partition_for_key(key, count))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, TopicState>> {
-        self.topics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, TopicState>> {
+        self.topics.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run `f` on the state of `topic` under the lock, when the topic has one.
+    fn with_topic<R>(&self, topic: &str, f: impl FnOnce(&mut TopicState) -> R) -> Option<R> {
+        self.lock().get_mut(topic).map(f)
     }
 
     /// Kafka's `BuiltInPartitioner.peekCurrentPartitionInfo`: the sticky
@@ -285,8 +289,20 @@ impl BuiltInPartitioner {
         partitions: &TopicPartitions<'_>,
         rack: Option<RackPreference<'_>>,
     ) -> StickyPartition {
-        let mut topics = self.lock();
-        let state = topics.entry(topic.to_owned()).or_default();
+        self.peek_locked(
+            self.lock().entry(topic.to_owned()).or_default(),
+            partitions,
+            rack,
+        )
+    }
+
+    /// [`Self::peek_inner`] for the locked `state` of the topic.
+    fn peek_locked(
+        &self,
+        state: &mut TopicState,
+        partitions: &TopicPartitions<'_>,
+        rack: Option<RackPreference<'_>>,
+    ) -> StickyPartition {
         if let Some((sticky, _)) = state.sticky {
             return sticky;
         }
@@ -353,22 +369,20 @@ impl BuiltInPartitioner {
         enable_switch: bool,
         rack: Option<RackPreference<'_>>,
     ) {
-        let mut topics = self.lock();
-        let Some(state) = topics.get_mut(topic) else {
-            return;
-        };
-        let Some((current, produced)) = state.sticky.as_mut() else {
-            return;
-        };
-        if *current != sticky {
-            return;
-        }
-        *produced = produced.saturating_add(appended);
         let size = self.config.sticky_batch_size.max(1);
-        if (*produced >= size && enable_switch) || *produced >= size.saturating_mul(2) {
-            let next = self.pick(state.load_stats.as_ref(), partitions, rack);
-            state.sticky = Some((next, 0));
-        }
+        self.with_topic(topic, |state| {
+            let Some((current, produced)) = state.sticky.as_mut() else {
+                return;
+            };
+            if *current != sticky {
+                return;
+            }
+            *produced = produced.saturating_add(appended);
+            if (*produced >= size && enable_switch) || *produced >= size.saturating_mul(2) {
+                let next = self.pick(state.load_stats.as_ref(), partitions, rack);
+                state.sticky = Some((next, 0));
+            }
+        });
     }
 
     /// Store the queue sizes of `topic` for the next pick, or `None` for a
@@ -402,35 +416,42 @@ impl BuiltInPartitioner {
     ) -> StickyPartition {
         // Kafka's `Utils.toPositive` of a random `int`.
         let random = (self.random)() & 0x7fff_ffff;
-        let rack_candidates = self.rack_aware_candidates(partitions, rack);
-        let partition = if let Some(candidates) = &rack_candidates {
-            Self::pick_among(load_stats, candidates, random)
-        } else if let Some(stats) = load_stats {
-            let total = stats
-                .cumulative_frequency
-                .last()
-                .copied()
-                .unwrap_or(1)
-                .max(1);
-            let weighted = random % total;
-            // The table only grows, so the first sum greater than the value
-            // names the partition.
-            let index = stats
-                .cumulative_frequency
-                .partition_point(|&sum| sum <= weighted);
-            stats.partition_ids.get(index).copied().unwrap_or(0)
-        } else {
-            let available: Vec<i32> = (0..partitions.count)
-                .filter(|&partition| (partitions.has_leader)(partition))
-                .collect();
-            let random = usize::try_from(random).unwrap_or(0);
-            if available.is_empty() {
-                // No partition has a leader, so every partition can take the
-                // record.
-                let count = usize::try_from(partitions.count.max(1)).unwrap_or(1);
-                i32::try_from(random % count).unwrap_or(0)
-            } else {
-                available[random % available.len()]
+        let rack_pick = self
+            .rack_aware_candidates(partitions, rack)
+            .and_then(|candidates| Self::pick_among(load_stats, &candidates, random));
+        let partition = match (rack_pick, load_stats) {
+            (Some(partition), _) => partition,
+            (None, Some(stats)) => {
+                let total = stats
+                    .cumulative_frequency
+                    .last()
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1);
+                let weighted = random % total;
+                // The table only grows, so the first sum greater than the value
+                // names the partition.
+                let index = stats
+                    .cumulative_frequency
+                    .partition_point(|&sum| sum <= weighted);
+                stats.partition_ids.get(index).copied().unwrap_or(0)
+            }
+            (None, None) => {
+                let available: Vec<i32> = (0..partitions.count)
+                    .filter(|&partition| (partitions.has_leader)(partition))
+                    .collect();
+                let random = usize::try_from(random).unwrap_or(0);
+                if let Some(&partition) = random
+                    .checked_rem(available.len())
+                    .and_then(|index| available.get(index))
+                {
+                    partition
+                } else {
+                    // No partition has a leader, so every partition can take
+                    // the record.
+                    let count = usize::try_from(partitions.count.max(1)).unwrap_or(1);
+                    i32::try_from(random % count).unwrap_or(0)
+                }
             }
         };
         StickyPartition {
@@ -469,8 +490,9 @@ impl BuiltInPartitioner {
     /// derives each candidate's weight from the primary table's cumulative
     /// frequencies and renormalizes over the restricted set. Kafka's
     /// `createPartitionLoadStatsForThisRackIfNeeded` instead caches a second
-    /// table, but the resulting distribution is the same.
-    fn pick_among(load_stats: Option<&LoadStats>, candidates: &[i32], random: u32) -> i32 {
+    /// table, but the resulting distribution is the same. It is `None` when
+    /// `candidates` is empty.
+    fn pick_among(load_stats: Option<&LoadStats>, candidates: &[i32], random: u32) -> Option<i32> {
         if let Some(stats) = load_stats {
             let mut previous_cumulative = 0_u32;
             let mut running = 0_u32;
@@ -490,11 +512,16 @@ impl BuiltInPartitioner {
                 let total = cumulative_frequency.last().copied().unwrap_or(1).max(1);
                 let weighted = random % total;
                 let index = cumulative_frequency.partition_point(|&sum| sum <= weighted);
-                return partition_ids.get(index).copied().unwrap_or(candidates[0]);
+                return partition_ids
+                    .get(index)
+                    .or_else(|| candidates.first())
+                    .copied();
             }
         }
-        let index = usize::try_from(random).unwrap_or(0) % candidates.len();
-        candidates[index]
+        let index = usize::try_from(random)
+            .unwrap_or(0)
+            .checked_rem(candidates.len())?;
+        candidates.get(index).copied()
     }
 }
 
@@ -527,10 +554,10 @@ fn murmur2(data: &[u8]) -> i32 {
     const R: u32 = 24;
 
     let length = data.len();
-    // Reference MurmurHash2 impl truncates length to u32 as part of the spec.
-    let usize_u32_max = usize::try_from(u32::MAX).unwrap_or(usize::MAX);
-    let length_low =
-        u32::try_from(length & usize_u32_max).expect("masked Murmur2 input length must fit in u32");
+    // Reference MurmurHash2 impl truncates length to u32 as part of the spec:
+    // the low four bytes of the little-endian length.
+    let [b0, b1, b2, b3, ..] = length.to_le_bytes();
+    let length_low = u32::from_le_bytes([b0, b1, b2, b3]);
     let mut h: u32 = SEED ^ length_low;
 
     let (chunks, remainder) = data.as_chunks::<4>();
@@ -543,20 +570,20 @@ fn murmur2(data: &[u8]) -> i32 {
         h ^= k;
     }
 
-    match remainder.len() {
-        3 => {
-            h ^= u32::from(remainder[2]) << 16;
-            h ^= u32::from(remainder[1]) << 8;
-            h ^= u32::from(remainder[0]);
+    match *remainder {
+        [r0, r1, r2] => {
+            h ^= u32::from(r2) << 16;
+            h ^= u32::from(r1) << 8;
+            h ^= u32::from(r0);
             h = h.wrapping_mul(M);
         }
-        2 => {
-            h ^= u32::from(remainder[1]) << 8;
-            h ^= u32::from(remainder[0]);
+        [r0, r1] => {
+            h ^= u32::from(r1) << 8;
+            h ^= u32::from(r0);
             h = h.wrapping_mul(M);
         }
-        1 => {
-            h ^= u32::from(remainder[0]);
+        [r0] => {
+            h ^= u32::from(r0);
             h = h.wrapping_mul(M);
         }
         _ => {}
@@ -572,7 +599,7 @@ fn murmur2(data: &[u8]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, iter};
 
     use assert2::check;
 
@@ -810,13 +837,13 @@ mod tests {
                 all: 3,
             }),
         );
-        let picks: Vec<i32> = (0..9)
-            .map(|_| {
-                let sticky = partitioner.peek(TOPIC, &partitions);
-                partitioner.update(TOPIC, sticky, 1, &partitions, true);
-                sticky.partition()
-            })
-            .collect();
+        let picks: Vec<i32> = iter::repeat_with(|| {
+            let sticky = partitioner.peek(TOPIC, &partitions);
+            partitioner.update(TOPIC, sticky, 1, &partitions, true);
+            sticky.partition()
+        })
+        .take(9)
+        .collect();
         check!(picks == vec![4, 4, 4, 4, 5, 6, 6, 6, 4]);
     }
 

@@ -174,7 +174,7 @@ struct Task {
 
 impl Task {
     fn new(name: &'static str, program: Vec<Op>) -> Self {
-        Task {
+        Self {
             name,
             program,
             pc: 0,
@@ -497,13 +497,10 @@ impl Model for LockOrderModel {
             let Some(op) = task.next_op() else { continue };
             let enabled = match op {
                 Op::Release(_) => true,
-                Op::Acquire(l) => match s.holder[l as usize] {
-                    // Free, or (impossible here) already self-held → can proceed.
-                    None => true,
-                    Some(h) => h == idx,
-                    // Held by another task → BLOCKED: not enabled. This is the
-                    // task suspended at a contended `.lock().await`.
-                },
+                // Free, or (impossible here) already self-held → can proceed.
+                // Held by another task → BLOCKED: not enabled. This is the
+                // task suspended at a contended `.lock().await`.
+                Op::Acquire(l) => s.holder[l as usize].is_none_or(|h| h == idx),
             };
             if enabled {
                 acts.push(Step { idx });

@@ -5,6 +5,7 @@
 //! that `NetworkClient` stored in `Metadata.fatalError`, and `send` completes
 //! the record with it. An idempotent producer fails `InitProducerId` with it
 //! (`Sender.runOnce`, `TransactionManager.authenticationFailed`).
+#![cfg(test)]
 
 use std::{
     sync::{
@@ -82,7 +83,7 @@ async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) 
                 .copied()
                 .unwrap_or_else(|| *script.last().unwrap());
         }
-        if let Some(reply) = answer.reply(api_key, version) {
+        if let Some(reply) = answer.reply(api_key, version).unwrap() {
             return reply;
         }
         match api_key {
@@ -111,6 +112,7 @@ async fn sasl_broker(script: Vec<MockSaslAnswer>, handshakes: Arc<AtomicUsize>) 
         }
     })
     .await
+    .unwrap()
 }
 
 /// Metadata with the topic `orders` and one partition, so `send` finds its
@@ -199,6 +201,7 @@ async fn send_fails_the_record_with_a_sasl_rejection() {
                 ..Default::default()
             })
             .await;
+        drop(producer);
         let outcome = match result {
             Ok(_) => Outcome::Pending,
             Err(error) => classify(&error),
@@ -224,15 +227,14 @@ async fn idempotent_build_fails_with_a_sasl_rejection() {
     )
     .await;
 
-    let result = Producer::builder()
+    let error = Producer::builder()
         .bootstrap(broker.addr.to_string())
         .security(plain_security())
         .build()
-        .await;
+        .await
+        .err();
     let observed = Observed {
-        outcome: result
-            .err()
-            .map_or_else(|| Outcome::Other("built".into()), |error| classify(&error)),
+        outcome: error.map_or_else(|| Outcome::Other("built".into()), |error| classify(&error)),
         handshakes: handshakes.load(Ordering::SeqCst),
     };
 

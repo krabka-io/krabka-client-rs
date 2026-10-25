@@ -123,6 +123,8 @@ impl AdminClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use assert2::assert;
     use krabka_client_core::MockReply;
     use krabka_protocol::owned::{
@@ -152,8 +154,8 @@ mod tests {
     /// group with no protocol type as simple.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_consumer_groups_keeps_consumer_protocol_groups() {
-        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = std::sync::Arc::clone(&requests);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
         let broker = scripted_broker(
             vec![
                 ApiVersionRange::builder()
