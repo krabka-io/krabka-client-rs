@@ -32,6 +32,12 @@ workspace = true
 default = []
 # `mock_test_support::recorded_levels` captures tracing events for tests.
 mock = ["dep:tracing-subscriber"]
+# SASL/GSSAPI (Kerberos) client, off by default. It turns on
+# `krabka-security/gssapi`, whose Kerberos stack pulls in `rsa` 0.10
+# (RUSTSEC-2023-0071, no patched release). Without it, a GSSAPI
+# `SaslCredentials` fails `ConnectionOptions::validate` and the handshake with
+# `UnsupportedMechanism`, and the build compiles no `rsa`.
+gssapi = ["krabka-security/gssapi"]
 
 [dependencies]
 krabka-protocol = { version = "0.7.0", default-features = false }

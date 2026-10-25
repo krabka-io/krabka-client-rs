@@ -268,7 +268,8 @@ impl ConnectionOptions {
     ///
     /// # Errors
     /// Rejects nonfinite, unrepresentable or invalid durations, inverted retry
-    /// bounds, and nonpositive or fractional socket buffer sizes.
+    /// bounds, nonpositive or fractional socket buffer sizes, and a SASL
+    /// mechanism this build cannot run: GSSAPI without the `gssapi` feature.
     pub fn validate(&self) -> Result<(), String> {
         for (name, value, allow_zero) in [
             ("request_timeout", self.request_timeout, false),
@@ -328,6 +329,19 @@ impl ConnectionOptions {
                     ));
                 }
             }
+        }
+        if let Some(mechanism) = self
+            .security
+            .as_ref()
+            .and_then(|security| security.sasl.as_ref())
+            .map(crate::sasl::SaslCredentials::mechanism)
+            && !mechanism.is_available()
+        {
+            return Err(format!(
+                "SASL/{}: {}",
+                mechanism.wire_name(),
+                crate::sasl::GSSAPI_UNAVAILABLE
+            ));
         }
         Ok(())
     }
@@ -1470,6 +1484,38 @@ mod tests {
         assert!(ConnectionDispatchQueueCapacity::default().get() == 64);
         assert!(ClientFrameMax::default().size() == mebibytes(100));
         assert!(MAX_CLIENT_FRAME_BYTES == mebibytes(100));
+    }
+
+    /// A GSSAPI credential is a config error in a build without the Kerberos
+    /// client, and valid with it. Other mechanisms are valid either way.
+    #[test]
+    fn validate_rejects_gssapi_only_without_the_kerberos_client() {
+        use crate::security::{ClientSecurity, SaslCredentials};
+
+        let with_sasl = |sasl| ConnectionOptions {
+            security: Some(Box::new(ClientSecurity {
+                protocol: krabka_security::ListenerProtocol::SaslPlaintext,
+                tls: None,
+                sasl: Some(sasl),
+                sasl_host: Some("broker-1.example.com".into()),
+            })),
+            ..Default::default()
+        };
+        let gssapi = with_sasl(SaslCredentials::Gssapi {
+            keytab_path: "/etc/krb5.keytab".into(),
+            client_principal: "client@EXAMPLE.COM".into(),
+            service_name: "kafka".into(),
+            kdc_url: "kdc.example.com:88".into(),
+        });
+        let plain = with_sasl(SaslCredentials::Plain {
+            username: "u".into(),
+            password: "p".into(),
+        });
+        let want_gssapi = krabka_security::SaslMechanism::Gssapi
+            .is_available()
+            .then_some(())
+            .ok_or_else(|| format!("SASL/GSSAPI: {}", crate::sasl::GSSAPI_UNAVAILABLE));
+        assert!((gssapi.validate(), plain.validate()) == (want_gssapi, Ok(())));
     }
 
     #[test]

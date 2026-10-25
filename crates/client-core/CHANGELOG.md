@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Breaking.** SASL/GSSAPI needs the new `gssapi` feature.
+
+- Add the `gssapi` feature, off by default, which turns on
+  `krabka-security/gssapi`
+  ([#196](https://github.com/krabka-io/krabka-client-rs/issues/196)). A default
+  build no longer compiles `rsa` (RUSTSEC-2023-0071). Without the feature, a
+  `SaslCredentials::Gssapi` credential fails `ConnectionOptions::validate`, and
+  so client construction, with `ClientError::InvalidConfig`, and the handshake
+  fails with `SaslAuthenticationError::UnsupportedMechanism`.
+- Build against krabka-protocol `e807cd8`, which makes GSSAPI optional in
+  krabka-security.
+
 ## [0.7.1] — 2026-10-20
 
 - Require Rustls 0.23.46 and update the locked certificate verifier to 0.103.16.

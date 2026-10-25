@@ -65,12 +65,22 @@
 //! - A TLS connection needs a configured trust store, because there is no
 //!   platform trust store.
 //! - SASL/GSSAPI fails with
-//!   [`SaslAuthenticationError::UnsupportedMechanism`].
+//!   [`SaslAuthenticationError::UnsupportedMechanism`], with or without the
+//!   `gssapi` feature.
 //!
 //! ## Cargo features
 //!
 //! - `mock` — exposes `MockBroker` beyond `#[cfg(test)]` for downstream
 //!   testing.
+//! - `gssapi` (off by default) — the SASL/GSSAPI (Kerberos) client, through
+//!   `krabka-security/gssapi`. It stays out of `default` because the Kerberos
+//!   stack depends on `rsa` 0.10, which carries RUSTSEC-2023-0071 and has no
+//!   patched release; a build without the feature compiles no `rsa`. Without
+//!   it, a [`SaslCredentials::Gssapi`] credential fails
+//!   [`ConnectionOptions::validate`], and so client construction, with
+//!   [`ClientError::InvalidConfig`]; a connection that skips validation fails
+//!   the handshake with [`SaslAuthenticationError::UnsupportedMechanism`]. The
+//!   admin, consumer and producer crates forward the feature.
 
 mod backoff;
 mod bootstrap;
