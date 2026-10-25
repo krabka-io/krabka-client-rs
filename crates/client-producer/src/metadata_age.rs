@@ -7,7 +7,6 @@
 //! partition count and moved leaders without a send error.
 
 use std::{
-    collections::HashMap,
     sync::{
         Arc, Weak,
         atomic::{AtomicUsize, Ordering},
@@ -17,12 +16,12 @@ use std::{
 
 use dashmap::DashMap;
 use krabka_client_core::Client;
-use tokio::{sync::Mutex, time::Instant};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     accumulator::AccumulatorMap, builder::ProducerRetryPolicy, error::ProducerError,
-    metadata_wait::MetadataRefresh, producer::TopicMetadata, sender::adopt_metadata,
+    metadata_wait::MetadataRefresh, producer::MetadataCache, sender::adopt_metadata,
 };
 
 /// Kafka's producer `metadata.max.age.ms` default (5 minutes).
@@ -42,7 +41,7 @@ pub(crate) struct MetadataAge {
     max_idle: Duration,
     retry_backoff: Duration,
     retry_backoff_max: Duration,
-    metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
+    metadata_cache: Arc<MetadataCache>,
     partition_leaders: Arc<DashMap<(String, i32), i32>>,
     metadata_refresh: Weak<MetadataRefresh>,
     /// Cancelled when the producer drops its `MetadataRefresh`.
@@ -95,7 +94,7 @@ impl MetadataAge {
     /// Use the caches of the producer.
     pub(crate) fn with_caches(
         mut self,
-        metadata_cache: &Arc<Mutex<HashMap<String, TopicMetadata>>>,
+        metadata_cache: &Arc<MetadataCache>,
         partition_leaders: &Arc<DashMap<(String, i32), i32>>,
         metadata_refresh: &Arc<MetadataRefresh>,
     ) -> Self {
@@ -145,7 +144,7 @@ impl MetadataAge {
             self.expire_idle_topics().await;
             match self.client.refresh_metadata().await {
                 Ok(response) => {
-                    adopt_metadata(&response, &self.metadata_cache, &self.partition_leaders).await;
+                    adopt_metadata(&response, &self.metadata_cache, &self.partition_leaders);
                     backoff = self.retry_backoff;
                 }
                 Err(error) => {
@@ -199,7 +198,7 @@ impl MetadataAge {
         if let Some(refresh) = self.metadata_refresh.upgrade() {
             refresh.forget(&expired);
         }
-        let mut cache = self.metadata_cache.lock().await;
+        let mut cache = self.metadata_cache.lock();
         for topic in &expired {
             cache.remove(topic);
         }
@@ -231,9 +230,10 @@ mod tests {
             },
         },
     };
+    use tokio::sync::Mutex;
 
     use super::*;
-    use crate::Producer;
+    use crate::{Producer, producer::TopicMetadata};
 
     const TOPIC: &str = "orders";
     const CLIENT_ID: &str = "metadata-age-test";
@@ -409,7 +409,6 @@ mod tests {
                 partitions: producer
                     .metadata_cache
                     .lock()
-                    .await
                     .get(TOPIC)
                     .map(|topic| topic.num_partitions),
                 leader_of_partition_0: producer
@@ -457,7 +456,7 @@ mod tests {
             .await
             .unwrap();
         client.metadata_topics().add(TOPIC);
-        let metadata_cache = Arc::new(Mutex::new(
+        let metadata_cache = Arc::new(MetadataCache::from(
             maplit::hashmap! {TOPIC.to_owned() => TopicMetadata {
                 num_partitions: 4,
                 topic_id: krabka_protocol::primitives::uuid::Uuid::ZERO,
@@ -493,7 +492,7 @@ mod tests {
         let last_request = broker.requests.lock().unwrap().last().cloned();
         let observed = AfterIdle {
             last_request,
-            cached: metadata_cache.lock().await.contains_key(TOPIC),
+            cached: metadata_cache.lock().contains_key(TOPIC),
             leaders: partition_leaders.len(),
             task_finished,
         };

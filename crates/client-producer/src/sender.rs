@@ -88,7 +88,7 @@ use crate::{
     error::ProducerError,
     error_class::{self, ErrorClass},
     partitioner::{BuiltInPartitioner, QueueSizes},
-    producer::{Acks, STATE_ACTIVE, STATE_FENCED, TopicMetadata},
+    producer::{Acks, MetadataCache, STATE_ACTIVE, STATE_FENCED},
     record::RecordMetadata,
     transactional::{AbortableError, FatalError, TxnErrorSlot, TxnState},
     transport::ProduceTransport,
@@ -225,7 +225,7 @@ pub(crate) struct SenderConfig {
     /// bounds how many *distinct partitions'* requests overlap on the wire at
     /// once.
     pub max_in_flight: usize,
-    pub metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
+    pub metadata_cache: Arc<MetadataCache>,
     /// Per-`(topic, partition)` leader-id cache, shared with the `Producer`.
     /// `Metadata` fills it; see `Producer::partition_count`. The sender reads it
     /// to route each Produce to the partition leader, and refreshes it on
@@ -367,7 +367,6 @@ async fn update_partition_load_stats(cfg: &SenderConfig, state: &PipelineState) 
     }
     for (topic, mut partitions) in topics {
         let complete = topic_partition_count(cfg, &topic)
-            .await
             .and_then(|count| usize::try_from(count).ok())
             .is_some_and(|count| partitions.len() >= count);
         if !complete {
@@ -1368,10 +1367,9 @@ fn resolve_leader(cfg: &SenderConfig, topic: &str, partition: i32) -> i32 {
     }
 }
 
-async fn topic_partition_count(cfg: &SenderConfig, topic: &str) -> Option<i32> {
+fn topic_partition_count(cfg: &SenderConfig, topic: &str) -> Option<i32> {
     cfg.metadata_cache
         .lock()
-        .await
         .get(topic)
         .and_then(|meta| positive_partition_count(meta.num_partitions))
 }
@@ -1418,7 +1416,6 @@ async fn prepare_batch(
     let topic_id = cfg
         .metadata_cache
         .lock()
-        .await
         .get(topic)
         .map_or(Uuid::ZERO, |m| m.topic_id);
 
@@ -2010,12 +2007,7 @@ async fn send_one_batch_to_leader(
     // id that `update_leaders_from_metadata` stored. The batch resends in
     // place with the same `base_sequence`, so the idempotent sequence stays
     // gap-free and no records are dropped.
-    if let Some(resolved) = cfg
-        .metadata_cache
-        .lock()
-        .await
-        .get(&pb.topic)
-        .map(|m| m.topic_id)
+    if let Some(resolved) = cfg.metadata_cache.lock().get(&pb.topic).map(|m| m.topic_id)
         && resolved != Uuid::ZERO
     {
         pb.topic_id = resolved;
@@ -2285,21 +2277,21 @@ fn build_single_batch_request(
 #[tracing::instrument(level = "debug", skip_all)]
 async fn update_leaders_from_metadata(cfg: &SenderConfig) {
     if let Ok(md) = cfg.transport.refresh_metadata().await {
-        adopt_metadata(&md, &cfg.metadata_cache, &cfg.partition_leaders).await;
+        adopt_metadata(&md, &cfg.metadata_cache, &cfg.partition_leaders);
     }
 }
 
 /// Take the partition leaders, and the partition count and id of each
 /// tracked topic, from a metadata response.
-pub(crate) async fn adopt_metadata(
+pub(crate) fn adopt_metadata(
     md: &MetadataResponse,
-    metadata_cache: &Mutex<HashMap<String, TopicMetadata>>,
+    metadata_cache: &MetadataCache,
     partition_leaders: &DashMap<(String, i32), i32>,
 ) {
     {
         // Hold the cache lock across the loop so a tracked topic's correction is
         // applied atomically alongside the leader-map update.
-        let mut cache = metadata_cache.lock().await;
+        let mut cache = metadata_cache.lock();
         for t in &md.topics {
             let Some(name) = &t.name else { continue };
             if t.error_code != 0 {
@@ -3126,7 +3118,7 @@ mod harness {
     use crate::{
         accumulator::Accumulator,
         partitioner::{PartitionerConfig, TopicPartitions},
-        producer::{STATE_ACTIVE, STATE_FENCED, TopicMetadata},
+        producer::{MetadataCache, STATE_ACTIVE, STATE_FENCED, TopicMetadata},
         transactional::{AbortableError, TxnState},
     };
 
@@ -3737,7 +3729,7 @@ mod harness {
         accumulators: AccumulatorMap,
         next_seq: Arc<DashMap<(String, i32), i32>>,
         partition_leaders: Arc<DashMap<(String, i32), i32>>,
-        metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>>,
+        metadata_cache: Arc<MetadataCache>,
         state: Arc<AtomicU8>,
         wake_tx: tokio::sync::mpsc::Sender<DrainIntent>,
         flush_notify: Arc<Notify>,
@@ -3924,8 +3916,7 @@ mod harness {
         let flush_notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicUsize::new(0));
         let shutdown = CancellationToken::new();
-        let metadata_cache: Arc<Mutex<HashMap<String, TopicMetadata>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let metadata_cache = Arc::new(MetadataCache::default());
         let partition_leaders: Arc<DashMap<(String, i32), i32>> = Arc::new(DashMap::new());
         let partitioner = Arc::new(BuiltInPartitioner::new(PartitionerConfig::default()));
         let state = Arc::new(AtomicU8::new(STATE_ACTIVE));
@@ -4535,7 +4526,7 @@ mod harness {
     async fn a_drained_batch_does_not_move_the_sticky_partition() {
         let transport = MockTransport::new(Duration::ZERO);
         let h = spawn_sender(transport.clone(), 5);
-        h.metadata_cache.lock().await.insert(
+        h.metadata_cache.lock().insert(
             "t".to_string(),
             TopicMetadata {
                 num_partitions: 3,
@@ -4581,7 +4572,7 @@ mod harness {
             retry_backoff: RetryBackoff::new(Duration::from_millis(1), Duration::from_secs(1)),
             delivery_timeout: secs(30),
             max_in_flight,
-            metadata_cache: Arc::new(Mutex::new(HashMap::new())),
+            metadata_cache: Arc::default(),
             partition_leaders: Arc::new(DashMap::new()),
             partitioner,
             accumulators: Arc::new(DashMap::new()),
@@ -4638,6 +4629,106 @@ mod harness {
             );
             accumulator.seal_current();
         }
+    }
+
+    /// A Produce request that the sender polled once and then parked in its
+    /// `FuturesUnordered` does not stop the next drain, and the application
+    /// reads the metadata cache meanwhile, as every enqueue does.
+    ///
+    /// The cache lock was an async mutex. A request first polled while the
+    /// application held the lock waited in the mutex queue, the unlock handed
+    /// the lock to it, and the next drain waited behind a future that only
+    /// the sender polls: the producer stopped. The request now takes the
+    /// synchronous lock and releases it in the same poll, so it parks only on
+    /// its transport.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_request_waiting_on_the_metadata_cache_does_not_block_the_next_drain() {
+        /// What the test saw while the first request was parked.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Observed {
+            parked: bool,
+            sends: usize,
+            cached_partitions: Option<i32>,
+            next_drain: Option<Vec<(String, i32)>>,
+            request_finished: bool,
+        }
+
+        let (cfg, transport) = direct_config(
+            Arc::new(BuiltInPartitioner::new(PartitionerConfig::default())),
+            8,
+        );
+        transport.add_known_broker(0);
+        transport.delay_leader(0, Duration::from_secs(10));
+        cfg.metadata_cache.lock().insert(
+            "t".to_owned(),
+            TopicMetadata {
+                num_partitions: 2,
+                topic_id: Uuid::ZERO,
+            },
+        );
+        for partition in 0..2 {
+            cfg.partition_leaders.insert(("t".to_owned(), partition), 0);
+        }
+        let capacity = ConnectionCapacity {
+            limit: cfg.max_in_flight,
+            used: HashMap::new(),
+        };
+        queue_batches(&cfg, "t", 0, 1).await;
+        let mut first = drain_batches(
+            &cfg,
+            &mut PipelineState::default(),
+            DrainIntent::Force,
+            &HashSet::new(),
+            &capacity,
+        )
+        .await;
+        let mut request = Box::pin(send_one_batch(&cfg, first.remove(0).1, None));
+        let parked = request.as_mut().now_or_never().is_none();
+        let sends = transport.send_count();
+        // The application reads the cache while the request is parked.
+        let cached_partitions = cfg
+            .metadata_cache
+            .lock()
+            .get("t")
+            .map(|meta| meta.num_partitions);
+        queue_batches(&cfg, "t", 1, 1).await;
+        let active = HashSet::from([("t".to_owned(), 0)]);
+        let next_drain = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_batches(
+                &cfg,
+                &mut PipelineState::default(),
+                DrainIntent::Force,
+                &active,
+                &capacity,
+            ),
+        )
+        .await
+        .ok()
+        .map(|batches| {
+            batches
+                .into_iter()
+                .map(|(_, batch)| (batch.topic, batch.partition))
+                .collect()
+        });
+        let request_finished = tokio::time::timeout(Duration::from_secs(20), request)
+            .await
+            .is_ok();
+        assert2::assert!(
+            Observed {
+                parked,
+                sends,
+                cached_partitions,
+                next_drain,
+                request_finished,
+            } == Observed {
+                parked: true,
+                sends: 1,
+                cached_partitions: Some(2),
+                next_drain: Some(vec![("t".to_owned(), 1)]),
+                request_finished: true,
+            }
+        );
     }
 
     /// The sender gives the partitioner the queue size of each partition, as
@@ -4762,7 +4853,7 @@ mod harness {
                 randoms,
             );
             let (cfg, _transport) = direct_config(partitioner, 5);
-            cfg.metadata_cache.lock().await.insert(
+            cfg.metadata_cache.lock().insert(
                 "t".to_owned(),
                 TopicMetadata {
                     num_partitions: 3,
@@ -5892,7 +5983,7 @@ mod harness {
             ..Default::default()
         });
         let h = spawn_sender(transport.clone(), 5);
-        h.metadata_cache.lock().await.insert(
+        h.metadata_cache.lock().insert(
             "t".to_string(),
             TopicMetadata {
                 num_partitions: 1,
@@ -6445,7 +6536,7 @@ mod harness {
             retry_backoff: RetryBackoff::new(Duration::from_millis(1), Duration::from_secs(1)),
             delivery_timeout: secs(30),
             max_in_flight: 5,
-            metadata_cache: Arc::new(Mutex::new(HashMap::new())),
+            metadata_cache: Arc::default(),
             partition_leaders: Arc::new(DashMap::new()),
             partitioner: Arc::new(BuiltInPartitioner::new(PartitionerConfig::default())),
             accumulators: Arc::new(DashMap::new()),
@@ -6768,7 +6859,7 @@ mod harness {
         });
         let h = spawn_sender(transport.clone(), 5);
         // Give "t" a non-zero topic_id so the batch carries it.
-        h.metadata_cache.lock().await.insert(
+        h.metadata_cache.lock().insert(
             "t".to_string(),
             TopicMetadata {
                 num_partitions: 1,

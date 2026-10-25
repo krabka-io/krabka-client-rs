@@ -27,7 +27,10 @@ use krabka_protocol::{
 };
 use tokio::{sync::Mutex, time::Instant};
 
-use crate::{error::ProducerError, producer::TopicMetadata};
+use crate::{
+    error::ProducerError,
+    producer::{MetadataCache, TopicMetadata},
+};
 
 /// The broker error code for no error.
 const NONE: i16 = 0;
@@ -266,7 +269,7 @@ async fn before<F: Future>(deadline: Option<Instant>, future: F) -> Option<F::Ou
 
 /// The state and limits of one producer's metadata waits.
 pub(crate) struct MetadataWait<'a> {
-    pub cache: &'a Mutex<HashMap<String, TopicMetadata>>,
+    pub cache: &'a MetadataCache,
     pub partition_leaders: &'a DashMap<(String, i32), i32>,
     pub refresh: &'a MetadataRefresh,
     /// Kafka's `max.block.ms`.
@@ -305,12 +308,7 @@ impl MetadataWait<'_> {
         Fut: Future<Output = Result<MetadataResponse, ClientError>>,
     {
         let mut seen = self.refresh.generation();
-        let mut known = self
-            .cache
-            .lock()
-            .await
-            .get(topic)
-            .map(|meta| meta.num_partitions);
+        let mut known = self.cache.lock().get(topic).map(|meta| meta.num_partitions);
         let covers = |count: i32| partition.is_none_or(|partition| partition < count);
         if let Some(count) = known
             && covers(count)
@@ -343,7 +341,7 @@ impl MetadataWait<'_> {
                 Ok(response) => match lookup(&response, topic) {
                     TopicLookup::Known(meta) => {
                         let count = meta.num_partitions;
-                        self.store(topic, meta, &response).await;
+                        self.store(topic, meta, &response);
                         if covers(count) {
                             return Ok(count);
                         }
@@ -392,7 +390,7 @@ impl MetadataWait<'_> {
     {
         let first_seen = self.refresh.generation();
         let missing: Vec<&String> = {
-            let cache = self.cache.lock().await;
+            let cache = self.cache.lock();
             topics
                 .iter()
                 .filter(|topic| !cache.contains_key(topic.as_str()))
@@ -426,7 +424,7 @@ impl MetadataWait<'_> {
                 match attempt {
                     Ok(response) => {
                         if let TopicLookup::Known(meta) = lookup(&response, topic) {
-                            self.store(topic, meta, &response).await;
+                            self.store(topic, meta, &response);
                         }
                         break;
                     }
@@ -444,7 +442,7 @@ impl MetadataWait<'_> {
                 backoff = backoff.saturating_mul(2).min(self.max_backoff);
             }
         }
-        let cache = self.cache.lock().await;
+        let cache = self.cache.lock();
         Ok(topics
             .iter()
             .map(|topic| {
@@ -456,7 +454,7 @@ impl MetadataWait<'_> {
 
     /// Cache the count and id of `topic`, and the leader of each partition,
     /// so the sender can route each Produce to the partition leader.
-    async fn store(&self, topic: &str, meta: TopicMetadata, response: &MetadataResponse) {
+    fn store(&self, topic: &str, meta: TopicMetadata, response: &MetadataResponse) {
         for entry in response
             .topics
             .iter()
@@ -469,7 +467,7 @@ impl MetadataWait<'_> {
                 );
             }
         }
-        self.cache.lock().await.insert(topic.to_owned(), meta);
+        self.cache.lock().insert(topic.to_owned(), meta);
     }
 }
 
@@ -585,7 +583,7 @@ mod tests {
     }
 
     struct Producerless {
-        cache: Mutex<HashMap<String, TopicMetadata>>,
+        cache: MetadataCache,
         partition_leaders: DashMap<(String, i32), i32>,
         refresh: MetadataRefresh,
     }
@@ -593,7 +591,7 @@ mod tests {
     impl Producerless {
         fn new() -> Self {
             Self {
-                cache: Mutex::new(HashMap::new()),
+                cache: MetadataCache::default(),
                 partition_leaders: DashMap::new(),
                 refresh: MetadataRefresh::default(),
             }
@@ -636,7 +634,7 @@ mod tests {
             result,
             waited: started.elapsed(),
             refreshes: script.refreshes.load(Ordering::SeqCst),
-            cached: state.cache.lock().await.get(TOPIC).cloned(),
+            cached: state.cache.lock().get(TOPIC).cloned(),
         }
     }
 
@@ -1211,7 +1209,7 @@ mod tests {
         ] {
             let state = Producerless::new();
             {
-                let mut cache = state.cache.lock().await;
+                let mut cache = state.cache.lock();
                 for topic in cached {
                     cache.insert(
                         topic.to_owned(),
