@@ -335,7 +335,7 @@ impl ConnectionOptions {
             .as_ref()
             .and_then(|security| security.sasl.as_ref())
             .map(crate::sasl::SaslCredentials::mechanism)
-            && !mechanism.is_available()
+            && !crate::sasl::mechanism_supported(mechanism)
         {
             return Err(format!(
                 "SASL/{}: {}",
@@ -1511,8 +1511,7 @@ mod tests {
             username: "u".into(),
             password: "p".into(),
         });
-        let want_gssapi = krabka_security::SaslMechanism::Gssapi
-            .is_available()
+        let want_gssapi = crate::sasl::GSSAPI_CLIENT
             .then_some(())
             .ok_or_else(|| format!("SASL/GSSAPI: {}", crate::sasl::GSSAPI_UNAVAILABLE));
         assert!((gssapi.validate(), plain.validate()) == (want_gssapi, Ok(())));
