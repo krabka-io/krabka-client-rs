@@ -21,6 +21,8 @@ workspace = true
 
 [features]
 default = []
+# SASL/GSSAPI (Kerberos). Forwards `krabka-client-core/gssapi`; see there.
+gssapi = ["krabka-client-core/gssapi"]
 
 [dependencies]
 assert2 = { workspace = true }

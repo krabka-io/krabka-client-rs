@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add the `gssapi` feature, off by default, which forwards
+  `krabka-client-core/gssapi` for SASL/GSSAPI
+  ([#196](https://github.com/krabka-io/krabka-client-rs/issues/196)).
+
 ## [0.7.1] — 2026-10-20
 
 - Require Rustls 0.23.46 and update the locked certificate verifier to 0.103.16.

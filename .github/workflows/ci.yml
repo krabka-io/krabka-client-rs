@@ -233,6 +233,77 @@ jobs:
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # The GSSAPI client is behind the opt-in `gssapi` feature, so the line
+      # above never compiles it.
+      - name: clippy with gssapi
+        run: cargo clippy --locked --workspace --all-targets --features krabka-client-core/gssapi -- -D warnings
+
+  # RUSTSEC-2023-0071: `rsa` has no fix for the Marvin timing attack, so it must
+  # stay behind the opt-in `gssapi` feature, which turns on
+  # `krabka-security/gssapi`. The first step fails if a default build gains
+  # `rsa` again. The second fails if, with `gssapi`, `rsa` gains a parent other
+  # than `krabka-sspi` and `picky`, which krabka-protocol's
+  # docs/rustsec-2023-0071.md has not reviewed. Both read the resolved graph.
+  rsa:
+    name: rsa reachability · gssapi
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - name: Keep temporary files off the size-limited /tmp tmpfs
+        run: echo "TMPDIR=${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+      - uses: actions/checkout@v7
+      - id: toolchain
+        run: |
+          set -euo pipefail
+          channel="$(sed -ne 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "${channel}"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: gssapi
+
+      - name: no rsa with default features
+        run: |
+          set -euo pipefail
+          packages="$(cargo tree --workspace --locked -e normal --target all --prefix none --format '{p}')"
+          if grep -E '^rsa v' <<<"${packages}"; then
+            echo "::error::rsa is in the default dependency graph; keep it behind the gssapi feature"
+            cargo tree --workspace --locked -e normal --target all -i rsa
+            exit 1
+          fi
+
+      - name: with gssapi, rsa only under krabka-sspi and picky
+        run: |
+          set -euo pipefail
+          parents="$(cargo tree --workspace --locked -e normal --target all \
+            --features krabka-client-core/gssapi -i rsa --depth 1 --prefix none --format '{p}' \
+            | awk 'NR > 1 { print $1 }' | sort -u | paste -sd ' ')"
+          if [ "${parents}" != "krabka-sspi picky" ]; then
+            echo "::error::rsa parents with gssapi are '${parents}', expected 'krabka-sspi picky'"
+            exit 1
+          fi
+
+      - name: test with gssapi
+        run: cargo test --locked -p krabka-client-core --features gssapi
+
+  # RustSec advisories over the whole graph, every feature on (`deny.toml`'s
+  # `[graph]`). The ignores there each carry the reason they are safe.
+  advisories:
+    name: cargo deny advisories
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check advisories
+
   # A mutation sweep rebuilds and re-runs a crate's unit tests once per mutant,
   # so it is far too slow to gate a pull request.
   #
