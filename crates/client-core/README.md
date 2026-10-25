@@ -75,6 +75,13 @@ client.close();
 ## Cargo Features
 
 - `mock` - exposes `MockBroker` support for downstream tests.
+- `gssapi` (off by default) - the SASL/GSSAPI (Kerberos) client, through
+  `krabka-security/gssapi`. Its Kerberos stack depends on `rsa` 0.10, which
+  carries [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071)
+  and has no patched release, so a build without the feature compiles no
+  `rsa`. Without it, a `SaslCredentials::Gssapi` credential fails client
+  construction with `ClientError::InvalidConfig`. The admin, consumer and
+  producer crates forward the feature.
 
 ## Transport policy
 

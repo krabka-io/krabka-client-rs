@@ -7,8 +7,9 @@
 //! tests. It supports PLAIN with one round-trip, SCRAM-SHA-256/512 with two
 //! round-trips and server-final verification, OAUTHBEARER with the RFC 7628
 //! success/failure exchange, and GSSAPI with multi-round AP-REQ / AP-REP plus
-//! RFC 4752 security-layer negotiation. The GSSAPI client needs an operating
-//! system: a WebAssembly build fails GSSAPI with
+//! RFC 4752 security-layer negotiation. The GSSAPI client needs the `gssapi`
+//! Cargo feature and an operating system: a build without the feature, or for
+//! WebAssembly, fails GSSAPI with
 //! [`SaslAuthenticationError::UnsupportedMechanism`].
 //!
 //! This is the shared implementation the broker's inter-broker dialer
@@ -45,6 +46,12 @@ use krabka_protocol::{
 };
 use krabka_security::SaslMechanism;
 use thiserror::Error;
+#[cfg(target_os = "wasi")]
+use std::{
+    fs,
+    future::{Ready, ready},
+};
+
 #[cfg(not(target_os = "wasi"))]
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -182,7 +189,7 @@ fn sasl_versions(response: &ApiVersionsResponse) -> (i16, Option<i16>) {
 /// choice. Auth-only QOP wraps no data after the handshake, so the value only
 /// needs to be a reasonable non-zero buffer. It mirrors the server's offer
 /// size.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "gssapi", not(target_family = "wasm")))]
 const GSSAPI_MAX_RECV: krabka_units::ByteSize = krabka_units::kibibytes(64);
 
 /// Outbound SASL credentials.
@@ -209,8 +216,10 @@ pub enum SaslCredentials {
         delegation_token: bool,
     },
     /// SASL/GSSAPI: authenticate as `client_principal` with the long-term
-    /// key in `keytab_path`. This mechanism needs no password. A WebAssembly
-    /// build fails it with [`SaslAuthenticationError::UnsupportedMechanism`].
+    /// key in `keytab_path`. This mechanism needs no password. A build without
+    /// the `gssapi` feature, or for WebAssembly, rejects it in
+    /// [`ConnectionOptions::validate`](crate::ConnectionOptions::validate) and
+    /// fails the handshake with [`SaslAuthenticationError::UnsupportedMechanism`].
     Gssapi {
         keytab_path: PathBuf,
         client_principal: String,
@@ -485,7 +494,7 @@ where
             )
             .await
         }
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(feature = "gssapi", not(target_family = "wasm")))]
         SaslCredentials::Gssapi {
             keytab_path,
             client_principal,
@@ -503,10 +512,11 @@ where
             )
             .await
         }
-        // The Kerberos client of `krabka-security` needs an operating system.
-        #[cfg(target_family = "wasm")]
+        // The Kerberos client of `krabka-security` needs the `gssapi` feature
+        // and an operating system.
+        #[cfg(not(all(feature = "gssapi", not(target_family = "wasm"))))]
         SaslCredentials::Gssapi { .. } => Err(SaslAuthenticationError::UnsupportedMechanism(
-            format!("GSSAPI to {server_name}: a WebAssembly build has no Kerberos client"),
+            format!("GSSAPI to {server_name}: {GSSAPI_UNAVAILABLE}"),
         )
         .into()),
         SaslCredentials::OAuthBearer { token, extensions } => {
@@ -548,8 +558,8 @@ async fn read_token_file(path: &Path) -> io::Result<Vec<u8>> {
 /// Read the OAUTHBEARER token file at `path` on the calling thread. WASI has
 /// no threads for a blocking pool, and a token file is small.
 #[cfg(target_os = "wasi")]
-fn read_token_file(path: &Path) -> std::future::Ready<std::io::Result<Vec<u8>>> {
-    std::future::ready(std::fs::read(path))
+fn read_token_file(path: &Path) -> Ready<io::Result<Vec<u8>>> {
+    ready(fs::read(path))
 }
 
 /// Run the RFC 7628 OAUTHBEARER client exchange.
@@ -798,6 +808,23 @@ where
     Ok(())
 }
 
+/// Whether this build of krabka-client-core has the Kerberos client.
+///
+/// This is the crate's own `gssapi` feature, not `krabka-security/gssapi`:
+/// Cargo can turn the second on for another dependency while this crate's
+/// handshake still has no GSSAPI path.
+pub(crate) const GSSAPI_CLIENT: bool = cfg!(all(feature = "gssapi", not(target_family = "wasm")));
+
+/// Whether this build can authenticate with `mechanism`.
+pub(crate) fn mechanism_supported(mechanism: SaslMechanism) -> bool {
+    mechanism != SaslMechanism::Gssapi || GSSAPI_CLIENT
+}
+
+/// Why a GSSAPI credential fails in a build without the Kerberos client.
+pub(crate) const GSSAPI_UNAVAILABLE: &str = "this build has no Kerberos client; turn on the \
+     `gssapi` feature of krabka-client-core (or of the admin, consumer or producer crate) on a \
+     native target";
+
 /// Run the SASL/GSSAPI (Kerberos) client state machine over
 /// `SaslAuthenticate v2` round-trips.
 ///
@@ -816,7 +843,7 @@ where
 ///
 /// The first initiator step does the synchronous AS/TGS exchange with the
 /// KDC. Later steps only process tokens locally.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "gssapi", not(target_family = "wasm")))]
 async fn run_gssapi_client<S>(
     stream: &mut S,
     keytab_path: &Path,
@@ -1541,6 +1568,58 @@ mod tests {
                 MIN_RESERVED_CORRELATION_ID,
                 MIN_RESERVED_CORRELATION_ID + 1
             ]
+        );
+    }
+
+    /// Without the Kerberos client, a GSSAPI exchange that the broker accepts
+    /// fails on the client with `UnsupportedMechanism` and sends no token.
+    #[cfg(not(all(feature = "gssapi", not(target_family = "wasm"))))]
+    #[tokio::test]
+    async fn gssapi_without_the_kerberos_client_is_an_unsupported_mechanism() {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn(async move {
+            answer_api_versions(&mut server).await;
+            let mut hs = BytesMut::new();
+            SaslHandshakeResponse {
+                error_code: 0,
+                mechanisms: vec!["GSSAPI".into()],
+                ..Default::default()
+            }
+            .encode(&mut hs, 1)
+            .unwrap();
+            let hs_req = reply_frame(&mut server, &hs, false).await;
+            let mut hs_body = request_body(&hs_req, false);
+            SaslHandshakeRequest::decode(&mut hs_body, 1)
+                .unwrap()
+                .mechanism
+        });
+        let creds = SaslCredentials::Gssapi {
+            keytab_path: PathBuf::from("/etc/krb5.keytab"),
+            client_principal: "client@EXAMPLE.COM".into(),
+            service_name: "kafka".into(),
+            kdc_url: "kdc.example.com:88".into(),
+        };
+        let result = outbound_sasl(
+            &mut client,
+            &creds,
+            "broker-1.example.com",
+            TEST_CLIENT_ID,
+            ClientFrameMax::default(),
+        )
+        .await;
+        drop(client);
+        let mechanism = timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server observed the handshake")
+            .unwrap();
+        check!(
+            (verdict(result.map(|_| ())), mechanism)
+                == (
+                    Verdict::Rejected(SaslAuthenticationError::UnsupportedMechanism(format!(
+                        "GSSAPI to broker-1.example.com: {GSSAPI_UNAVAILABLE}"
+                    ))),
+                    "GSSAPI".to_string(),
+                )
         );
     }
 

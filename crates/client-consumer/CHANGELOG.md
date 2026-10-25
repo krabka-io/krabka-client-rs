@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add the `gssapi` feature, off by default, which forwards
+  `krabka-client-core/gssapi` for SASL/GSSAPI
+  ([#196](https://github.com/krabka-io/krabka-client-rs/issues/196)).
+
 - Update consumed offsets and epochs once per fetched partition buffer instead of once per returned record (#203).
 
 ## [0.7.1] — 2026-10-20

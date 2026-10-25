@@ -1,6 +1,8 @@
 //! Parse a Kafka-style bootstrap string ("host:port,host:port") into
 //! a list of resolved [`SocketAddr`](std::net::SocketAddr)s.
 
+#[cfg(target_family = "wasm")]
+use std::future::{Ready, ready};
 use std::{
     future::Future,
     iter,
@@ -129,8 +131,8 @@ async fn reverse_lookup(ip: IpAddr, dns_timeout: ClientDnsTimeout) -> Option<Str
 fn reverse_lookup(
     _ip: IpAddr,
     _dns_timeout: ClientDnsTimeout,
-) -> std::future::Ready<Option<String>> {
-    std::future::ready(None)
+) -> Ready<Option<String>> {
+    ready(None)
 }
 
 /// Add the addresses of one canonical host name, once each. Kafka resolves the
