@@ -6579,7 +6579,9 @@ mod harness {
                 RecordsPayload::Raw(bytes) => {
                     let mut cursor = bytes.clone();
                     Carried {
-                        records: RecordBatch::decode(&mut cursor).expect("decode").records,
+                        records: RecordBatch::decode_batch(&mut cursor)
+                            .expect("decode")
+                            .records,
                         encoded: Some(bytes),
                     }
                 }

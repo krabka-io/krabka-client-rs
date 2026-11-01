@@ -126,11 +126,9 @@ appear only as a dev-dependency, and without a `version`, so that cargo drops
 it from the published manifest.
 
 `cargo publish` ignores `[patch.crates-io]`, so crates.io must already have the
-krabka-protocol crates at the version that the manifests name.
-`krabka-security` is not there yet: it waits on `krabka-sspi`, a temporary
-crates.io release of the `sspi` fork, and every client crate reaches it through
-`krabka-client-core`. Until it publishes,
-`cargo publish --dry-run` fails for every crate here, for that reason only.
+krabka-protocol crates at the version that the manifests name. From 0.8.0 they
+are all there, `krabka-security` included, with its Kerberos stack behind the
+opt-in `gssapi` feature.
 
 [`docs/releasing.md`](docs/releasing.md) is the procedure, including that
 prerequisite, the token bootstrap for a new crate name, and the switch to

@@ -55,7 +55,9 @@ fn fetch_response_with_truncated_trailing_batch_decodes_complete_batches() {
     // start of a second batch that the broker cut short.
     let complete = batch(0, b"hello");
     let mut field = BytesMut::new();
-    complete.encode(&mut field).expect("encode complete batch");
+    complete
+        .encode_batch(&mut field)
+        .expect("encode complete batch");
     field.extend_from_slice(&PARTIAL_BATCH);
 
     let response = FetchResponse {

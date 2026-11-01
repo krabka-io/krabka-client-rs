@@ -242,7 +242,7 @@ mod tests {
     fn exchange_completes_against_a_scram_server() {
         for mechanism in [SaslMechanism::ScramSha256, SaslMechanism::ScramSha512] {
             for delegation_token in [false, true] {
-                let credential = hash_scram_password(b"p", mechanism, 4096);
+                let credential = hash_scram_password(b"p", mechanism, 4096).unwrap();
                 let server = ScramServerExchange::new("u".into(), credential);
                 let (first, client) = client_first(mechanism, "u", "p", delegation_token).unwrap();
                 let text = String::from_utf8(first.clone()).unwrap();
@@ -264,7 +264,7 @@ mod tests {
     /// verifier, and the client reads the verifier alone.
     #[test]
     fn a_server_final_extension_after_the_verifier_is_accepted() {
-        let credential = hash_scram_password(b"p", SaslMechanism::ScramSha256, 4096);
+        let credential = hash_scram_password(b"p", SaslMechanism::ScramSha256, 4096).unwrap();
         let server = ScramServerExchange::new("u".into(), credential);
         let (first, client) = client_first(SaslMechanism::ScramSha256, "u", "p", false).unwrap();
         let StepResult::Continue(server_first, server) = server.step(&first) else {

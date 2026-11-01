@@ -40,10 +40,10 @@ mock = ["dep:tracing-subscriber"]
 gssapi = ["krabka-security/gssapi"]
 
 [dependencies]
-krabka-protocol = { version = "0.7.0", default-features = false }
-krabka-security = { version = "0.7.0" }
-krabka-ids = { version = "0.7.0" }
-krabka-compression = { version = "0.7.0" }
+krabka-protocol = { version = "0.8.0", default-features = false }
+krabka-security = { version = "0.8.0" }
+krabka-ids = { version = "0.8.0" }
+krabka-compression = { version = "0.8.0" }
 krabka-units = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
