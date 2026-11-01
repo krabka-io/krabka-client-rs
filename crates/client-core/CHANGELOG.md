@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-**Breaking.** SASL/GSSAPI needs the new `gssapi` feature.
+## [0.8.0] — 2026-11-01
+
+**Breaking Rust API.** Uses the krabka-protocol 0.8 crate types in its public
+API, such as the re-exported `ProtocolRequest`. SASL/GSSAPI needs the new
+`gssapi` feature.
 
 - Add the `gssapi` feature, off by default, which turns on
   `krabka-security/gssapi`
@@ -16,8 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SaslCredentials::Gssapi` credential fails `ConnectionOptions::validate`, and
   so client construction, with `ClientError::InvalidConfig`, and the handshake
   fails with `SaslAuthenticationError::UnsupportedMechanism`.
-- Build against krabka-protocol `e807cd8`, which makes GSSAPI optional in
-  krabka-security.
+- Move to the krabka-protocol 0.8 crates, from crates.io. A request encoder
+  now returns `ProtocolError::LengthOverflow` for a length that its prefix
+  cannot hold, where it panicked before, and krabka-security 0.8 makes GSSAPI
+  optional.
 
 ## [0.7.1] — 2026-10-20
 

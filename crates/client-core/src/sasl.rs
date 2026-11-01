@@ -1499,7 +1499,7 @@ mod tests {
         let scram_server = || {
             Some(ScramServerExchange::new(
                 "token-id".into(),
-                hash_scram_password(b"hmac", SaslMechanism::ScramSha256, 4096),
+                hash_scram_password(b"hmac", SaslMechanism::ScramSha256, 4096).unwrap(),
             ))
         };
         for (session_name, session) in sessions {
@@ -1945,7 +1945,7 @@ mod tests {
                 false,
             );
 
-            let cred = hash_scram_password(b"p", SaslMechanism::ScramSha256, 4096);
+            let cred = hash_scram_password(b"p", SaslMechanism::ScramSha256, 4096).unwrap();
             let scram_server = ScramServerExchange::new("u".to_owned(), cred);
 
             let first_req_len = server.read_u32().await.unwrap();

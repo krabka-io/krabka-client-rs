@@ -502,7 +502,7 @@ mod tests {
         batch[8..12].copy_from_slice(&batch_len.to_be_bytes());
         let crc = crc32c::crc32c(&batch[21..]);
         batch[17..21].copy_from_slice(&crc.to_be_bytes());
-        RecordBatch::decode(&mut &batch[..]).expect("hand-encoded v2 batch decodes")
+        RecordBatch::decode_batch(&mut &batch[..]).expect("hand-encoded v2 batch decodes")
     }
 
     fn batch_with(base_offset: i64, values: &[&[u8]]) -> RecordBatch {

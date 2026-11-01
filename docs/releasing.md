@@ -56,23 +56,11 @@ repository needs those required krabka-protocol versions on crates.io first.
 A client patch release can retain its existing protocol requirements. For
 example, client 0.7.1 retains protocol 0.7.0.
 
-crates.io must have `krabka-security`, which waits on `krabka-sspi`.
-`krabka-security` uses `sspi` from a git fork, which a crates.io package cannot
-name. The fork is to be published to crates.io as `krabka-sspi` 0.23.0, which
-keeps the library name `sspi`. krabka-protocol then switches `krabka-security`
-to `sspi = { package = "krabka-sspi", version = "0.23.0" }` and publishes it.
-See the "The sspi dependency" section of krabka-protocol's
+From 0.8.0, crates.io has every krabka-protocol crate, `krabka-security`
+included. Its Kerberos stack, `krabka-sspi`, is optional behind its `gssapi`
+feature, which this repository's `gssapi` feature turns on. See the "The sspi
+dependency" section of krabka-protocol's
 [`docs/releasing.md`](https://github.com/krabka-io/krabka-protocol/blob/main/docs/releasing.md).
-
-`krabka-sspi` is temporary. The fork's fixes are being upstreamed, and
-`krabka-sspi` will be deprecated and yanked once an upstream `sspi` release has
-them.
-
-Every crate of this repository reaches `krabka-security` through
-`krabka-client-core`. Until crates.io has `krabka-security`, `cargo publish
---dry-run` fails for every crate here, and the `plan` job stops before any
-upload. The `crates` input does not help, because no crate here is free of
-`krabka-security`.
 
 ## 1. Prepare the version
 

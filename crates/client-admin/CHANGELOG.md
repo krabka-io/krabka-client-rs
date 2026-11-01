@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-01
+
+**Breaking Rust API.** Uses the krabka-protocol 0.8 crate types in its public
+API, such as the SCRAM iteration types that `users` re-exports from
+krabka-security.
+
+- Move to the krabka-protocol 0.8 crates, from crates.io.
 - Add the `gssapi` feature, off by default, which forwards
   `krabka-client-core/gssapi` for SASL/GSSAPI
   ([#196](https://github.com/krabka-io/krabka-client-rs/issues/196)).
