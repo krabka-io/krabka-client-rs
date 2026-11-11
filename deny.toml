@@ -40,6 +40,10 @@ ignore = [
     # dependency used by the new internal profiles crates; no fixed release is
     # available through that DataFusion revision.
     "RUSTSEC-2024-0436",
+    # pin-utils is unmaintained, not vulnerable. It enters through async-dnssd
+    # in krabka-sspi's macOS/iOS DNS discovery, only with the gssapi feature.
+    # No async-dnssd release drops it yet; remove this when upstream migrates.
+    "RUSTSEC-2026-0441",
 ]
 
 [licenses]
@@ -110,6 +114,7 @@ allow-git = [
     "https://github.com/krabka-io/krabka-schema-registry",
     "https://github.com/krabka-io/krabka-streams-rs",
     "https://github.com/robot-head/sspi-rs",
+    "https://github.com/testcontainers/testcontainers-rs",
     "https://github.com/testcontainers/testcontainers-rs-modules-community",
 ]
 
