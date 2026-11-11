@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "krabka-client-admin"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "assert2",
  "async-trait",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "krabka-client-consumer"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "assert2",
  "async-trait",
@@ -1982,7 +1982,7 @@ dependencies = [
 
 [[package]]
 name = "krabka-client-coordination"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "assert2",
  "async-trait",
@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "krabka-client-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "assert2",
  "async-trait",
@@ -2054,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "krabka-client-producer"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "assert2",
  "async-trait",
