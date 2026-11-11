@@ -5,7 +5,7 @@ members = ["crates/*"]
 exclude = ["tools/mutants"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["The Krabka Authors"]
@@ -202,6 +202,8 @@ krabka-units = "0.8.0"
 # against crates.io above and in the member manifests; the patch below is
 # the single place a sibling revision is bumped.
 [patch.crates-io]
+# Remove the unmaintained async tar implementation used by testcontainers.
+testcontainers = { git = "https://github.com/testcontainers/testcontainers-rs", rev = "dba4383d9bdbaed68d499f6e3ba933a289ba0a4a" }
 krabka-admin-ui = { git = "https://github.com/krabka-io/krabka-cli", rev = "b39dc88d0da3792db02ad62469b45f4fe312ea75" }
 krabka-app-sdk = { git = "https://github.com/krabka-io/krabka-gateway", rev = "49870fd8e5f708274ff69a3e64a092844e2f8809" }
 krabka-audit = { git = "https://github.com/krabka-io/krabka-broker", rev = "a23b3c0f930d034d8c9d791eed953537e3028279" }

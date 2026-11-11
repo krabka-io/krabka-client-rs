@@ -1,6 +1,7 @@
 name: ci
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
   schedule:
@@ -339,3 +340,14 @@ jobs:
             echo EOF
           } >>"${GITHUB_OUTPUT}"
       - run: bazel test ${{ steps.targets.outputs.targets }}
+
+  gate:
+    name: gate
+    if: always()
+    needs: [ci, coverage, docs, wasm, clippy, rsa, advisories, mutants]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: krabka-io/tooling/actions/gate@1fb9d942c2def2fcfa20c19ed8ae8a7d8f220f65
+        with:
+          results: ${{ toJSON(needs) }}
+          allow-skipped: ci,coverage,docs,wasm,clippy,rsa,advisories,mutants

@@ -27,8 +27,8 @@ gssapi = ["krabka-client-core/gssapi"]
 [dependencies]
 assert2 = { workspace = true }
 krabka-protocol = { version = "0.8.0", default-features = false }
-krabka-client-core = { version = "0.8.0", path = "../client-core" }
-krabka-client-consumer = { version = "0.8.0", path = "../client-consumer" }
+krabka-client-core = { version = "0.8.1", path = "../client-core" }
+krabka-client-consumer = { version = "0.8.1", path = "../client-consumer" }
 krabka-compression = { version = "0.8.0" }
 krabka-units = { workspace = true }
 async-trait = { workspace = true }
