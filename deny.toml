@@ -10,17 +10,6 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = [
-    # quick-xml DoS advisories (quadratic duplicate-attribute check and
-    # unbounded namespace-declaration allocation). Patched in quick-xml
-    # >= 0.41, which is the version `crabka-pgtypes` pins for the `xml`
-    # type — the one place attacker-controlled XML enters, since any client
-    # that can run `SELECT '…'::xml` chooses the document. These ignores
-    # cover only the transitive 0.39 copy under polars-io and the S3 XML
-    # paths, whose input is a response from a configured endpoint. Drop them
-    # once those upstreams take 0.41 too; do NOT extend the reasoning to a
-    # SQL-reachable parser.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
     # RSA "Marvin" timing side-channel; no fixed release exists. This ignore
     # applies only to builds with the `gssapi` feature (krabka-client-core's,
     # forwarded by the admin, consumer and producer crates), which turns on
@@ -31,11 +20,6 @@ ignore = [
     # keytab keys and performs no RSA private-key operations (no PKINIT, PKU2U
     # or certificate keys); see krabka-protocol's docs/rustsec-2023-0071.md.
     "RUSTSEC-2023-0071",
-    # bincode is unmaintained (the team ceased development; v2.0.1 is considered
-    # feature-complete and "no safe upgrade is available"). This is an
-    # unmaintained notice, not a vulnerability. Pulled in transitively via
-    # `polars-utils` (the `polars` columnar-streams feature).
-    "RUSTSEC-2025-0141",
     # paste is unmaintained. Pulled in transitively by the pinned DataFusion
     # dependency used by the new internal profiles crates; no fixed release is
     # available through that DataFusion revision.
